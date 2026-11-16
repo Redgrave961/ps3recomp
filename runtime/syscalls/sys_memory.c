@@ -102,10 +102,32 @@ static uint32_t user_address(uint32_t size, uint32_t alignment)
     }
 }
 
+static uint64_t read_be64(uint32_t addr)
+{
+    const uint8_t* p = (const uint8_t*)vm_to_host(addr);
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++) v = (v << 8) | p[i];
+    return v;
+}
+
+static void log_guest_chain(const ppu_context* ctx)
+{
+    if (!ctx) return;
+    uint32_t sp = (uint32_t)ctx->gpr[1];
+    fprintf(stderr, "[sys_memory]   guest chain: lr=0x%08X", (uint32_t)ctx->lr);
+    for (int depth = 0; depth < 32; depth++) {
+        uint32_t next = (uint32_t)read_be64(sp);
+        if (next <= sp || next >= 0xF0000000u) break;
+        fprintf(stderr, " <- 0x%08X", (uint32_t)read_be64(next + 16));
+        sp = next;
+    }
+    fprintf(stderr, "\n");
+}
+
 /* sys_memory_allocate and sys_memory_allocate_from_container share this. cid 0
  * is the process's main pool; a container's allocations are also charged to
  * that container (its used_size), checked against its total. */
-static int64_t memory_allocate(uint64_t requested, uint32_t flags, uint32_t cid, uint32_t addr_out)
+static int64_t memory_allocate(const ppu_context* ctx, uint64_t requested, uint32_t flags, uint32_t cid, uint32_t addr_out)
 {
     uint32_t alignment = (flags & SYS_MEMORY_PAGE_SIZE_1M) ? 0x100000u : 0x10000u;
     uint64_t rounded = (requested + alignment - 1u) & ~(uint64_t)(alignment - 1u);
@@ -114,7 +136,11 @@ static int64_t memory_allocate(uint64_t requested, uint32_t flags, uint32_t cid,
     uint32_t size = (uint32_t)rounded;
     bump_lock();
     if (size > SYS_MEM_USER_TOTAL - s_total_allocated) {
-        bump_unlock(); return (int64_t)(int32_t)CELL_ENOMEM;
+        bump_unlock();
+        fprintf(stderr, "[sys_memory] allocate(size=0x%X) -> ENOMEM (0x%X of 0x%X in use)\n",
+                size, s_total_allocated, SYS_MEM_USER_TOTAL);
+        log_guest_chain(ctx);
+        return (int64_t)(int32_t)CELL_ENOMEM;
     }
     sys_mem_container_info* ct = NULL;
     if (cid) {
@@ -128,7 +154,11 @@ static int64_t memory_allocate(uint64_t requested, uint32_t flags, uint32_t cid,
         if (!g_sys_mem_allocs[i].active) { slot = i; break; }
     uint32_t addr = slot < 0 ? 0 : user_address(size, alignment);
     if (!addr || vm_commit(addr, size) != CELL_OK) {
-        bump_unlock(); return (int64_t)(int32_t)CELL_ENOMEM;
+        bump_unlock();
+        fprintf(stderr, "[sys_memory] allocate(size=0x%X) -> ENOMEM (%s)\n", size,
+                slot < 0 ? "allocation table full" : !addr ? "no address range" : "commit failed");
+        log_guest_chain(ctx);
+        return (int64_t)(int32_t)CELL_ENOMEM;
     }
     memset(vm_to_host(addr), 0, size);
     sys_mem_alloc_info* a = &g_sys_mem_allocs[slot];
@@ -145,7 +175,7 @@ static int64_t memory_allocate(uint64_t requested, uint32_t flags, uint32_t cid,
 
 int64_t sys_memory_allocate(ppu_context* ctx)
 {
-    return memory_allocate(LV2_ARG_U64(ctx, 0), LV2_ARG_U32(ctx, 1), 0, LV2_ARG_PTR(ctx, 2));
+    return memory_allocate(ctx, LV2_ARG_U64(ctx, 0), LV2_ARG_U32(ctx, 1), 0, LV2_ARG_PTR(ctx, 2));
 }
 
 /* ---------------------------------------------------------------------------
@@ -162,10 +192,10 @@ int64_t sys_memory_allocate_from_container(ppu_context* ctx)
 {
     uint32_t cid = LV2_ARG_U32(ctx, 1);
     if (cid == SYS_MEMORY_CONTAINER_DEFAULT)
-        return memory_allocate(LV2_ARG_U64(ctx, 0), LV2_ARG_U32(ctx, 2), 0, LV2_ARG_PTR(ctx, 3));
+        return memory_allocate(ctx, LV2_ARG_U64(ctx, 0), LV2_ARG_U32(ctx, 2), 0, LV2_ARG_PTR(ctx, 3));
     if (cid == 0 || cid > SYS_MEMORY_CONTAINER_MAX || !g_sys_mem_containers[cid - 1].active)
         return (int64_t)(int32_t)CELL_ESRCH;
-    return memory_allocate(LV2_ARG_U64(ctx, 0), LV2_ARG_U32(ctx, 2), cid, LV2_ARG_PTR(ctx, 3));
+    return memory_allocate(ctx, LV2_ARG_U64(ctx, 0), LV2_ARG_U32(ctx, 2), cid, LV2_ARG_PTR(ctx, 3));
 }
 
 /* ---------------------------------------------------------------------------
@@ -403,7 +433,14 @@ int64_t sys_mmapper_allocate_address(ppu_context* ctx)
         r->start = r->next = addr; r->end = s_mapper_bump_ptr;
     }
     bump_unlock();
-    if (!addr) return (int64_t)(int32_t)CELL_ENOMEM;
+    if (!addr) {
+        fprintf(stderr, "[sys_mmapper] allocate_address(size=0x%llX, align=0x%llX) -> ENOMEM\n",
+                (unsigned long long)size, (unsigned long long)alignment);
+        return (int64_t)(int32_t)CELL_ENOMEM;
+    }
+    { static int n = 0; if (PS3_LOG_FIRST(n, 256))
+        fprintf(stderr, "[sys_mmapper] allocate_address(size=0x%llX, align=0x%llX) -> 0x%08X\n",
+                (unsigned long long)size, (unsigned long long)alignment, addr); }
     if (out) write_be32(out, addr);
     return CELL_OK;
 }
@@ -430,8 +467,13 @@ int64_t sys_mmapper_search_map_address(uint32_t start, uint32_t size, uint32_t* 
     addr = (addr + 0xFFFFFu) & ~0xFFFFFull;
     uint64_t end = (addr + size + 0xFFFFFu) & ~0xFFFFFull;
     if (end > found->end || vm_commit((uint32_t)addr, size) != CELL_OK) {
-        bump_unlock(); return (int64_t)(int32_t)CELL_ENOMEM;
+        bump_unlock();
+        fprintf(stderr, "[sys_mmapper] search_and_map(start=0x%08X, size=0x%X) -> ENOMEM (%s)\n", start, size,
+                end > found->end ? "reservation exhausted" : "commit failed");
+        return (int64_t)(int32_t)CELL_ENOMEM;
     }
+    { static int n = 0; if (PS3_LOG_FIRST(n, 256))
+        fprintf(stderr, "[sys_mmapper] search_and_map(start=0x%08X, size=0x%X) -> 0x%08X\n", start, size, (uint32_t)addr); }
     found->next = (uint32_t)end;
     *out = (uint32_t)addr;
     bump_unlock(); return CELL_OK;
@@ -469,8 +511,14 @@ int64_t sys_mmapper_allocate_shared_memory(ppu_context* ctx)
     for (int i = 0; i < SYS_MMAPPER_SHARED_MAX; i++) {
         if (!g_sys_mmapper_shared[i].active) { slot = i; break; }
     }
-    if (slot < 0)
+    if (slot < 0) {
+        fprintf(stderr, "[sys_mmapper] allocate_shared_memory(size=0x%X) -> EAGAIN (all %d slots in use)\n",
+                size, SYS_MMAPPER_SHARED_MAX);
         return (int64_t)(int32_t)CELL_EAGAIN;
+    }
+    { static int n = 0; if (PS3_LOG_FIRST(n, 256))
+        fprintf(stderr, "[sys_mmapper] allocate_shared_memory(key=0x%llX, size=0x%X) -> id %d\n",
+                (unsigned long long)key, size, slot + 1); }
 
     sys_mmapper_shared_info* s = &g_sys_mmapper_shared[slot];
     s->active = 1;
@@ -566,8 +614,12 @@ int64_t sys_mmapper_map_shared_memory(ppu_context* ctx)
 
     /* Commit the memory at the specified address */
     int32_t rc = vm_commit(addr, s->size);
-    if (rc != CELL_OK)
+    if (rc != CELL_OK) {
+        fprintf(stderr, "[sys_mmapper] map_shared_memory(addr=0x%08X, id=%u) -> 0x%08X\n", addr, shm_id, (unsigned)rc);
         return (int64_t)(int32_t)rc;
+    }
+    { static int n = 0; if (PS3_LOG_FIRST(n, 256))
+        fprintf(stderr, "[sys_mmapper] map_shared_memory(addr=0x%08X, id=%u, size=0x%X)\n", addr, shm_id, s->size); }
 
     s->addr = addr;
     memset(vm_to_host(addr), 0, s->size);

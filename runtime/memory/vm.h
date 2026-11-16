@@ -62,12 +62,12 @@ extern "C" {
 #define VM_PPU_TLS_SIZE     0x00100000u
 
 /* Dedicated guest windows owned by runtime allocators, not LV2 mmapper. */
-#define VM_HLE_HEAP_BASE    0x50000000u
+#define VM_HLE_HEAP_BASE    0xB0000000u
 #define VM_HLE_HEAP_SIZE    0x08000000u
-#define VM_AUDIO_BASE       0x58000000u
+#define VM_AUDIO_BASE       0xB8000000u
 #define VM_AUDIO_PORT_SIZE  0x00200000u
 #define VM_AUDIO_SIZE       0x01000000u
-#define VM_SYS_VM_BASE      0x60000000u
+#define VM_SYS_VM_BASE      0xA0000000u
 #define VM_SYS_VM_SIZE      0x10000000u
 
 /* Home for guest-visible structures the RUNTIME injects -- the GCM label window,
