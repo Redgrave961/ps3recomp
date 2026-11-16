@@ -182,6 +182,8 @@ typedef struct rsx_spv_vp_info {
     u32 input_mask;
     u32 output_mask;
     u32 texture_mask;
+    u32 constants_used[(RSX_SPV_VP_CONSTANTS + 31u) / 32u];
+    int constants_relative;
 } rsx_spv_vp_info;
 
 int  rsx_spv_vertex(const u32* ucode, const rsx_spv_vp_key* key, rsx_spv_blob* out, rsx_spv_vp_info* info);

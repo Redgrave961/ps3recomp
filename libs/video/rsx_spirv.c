@@ -607,6 +607,8 @@ typedef struct vpc {
     int indexed_in;
     int has_flow;
     int has_bra;
+    u32 cused[(RSX_SPV_VP_CONSTANTS + 31u) / 32u];
+    int crel;
 } vpc;
 
 static void vp_decode(const u32* uc, u32 pc, vpi* i)
@@ -981,6 +983,7 @@ static u32 vp_const(vpc* c, const vpi* i)
     u32 cs = bf(i->d1, 12, 10);
     u32 pt = tptr(s, SC_Uniform, tv4(s));
     if (bf(i->d3, 1, 1)) {
+        c->crel = 1;
         u32 a = vp_addr(c, i);
         u32 idx = uand(s, ti(s), I(s, OpIAdd, ti(s), a, ci(s, (s32)cs)), ci(s, 511));
         u32 inb = I(s, OpSLessThan, tbool(s), idx, ci(s, (s32)RSX_SPV_VP_CONSTANTS));
@@ -989,6 +992,7 @@ static u32 vp_const(vpc* c, const vpi* i)
         return sel(s, tv4(s), inb, v, cvs(s, 0.0f));
     }
     if (cs >= RSX_SPV_VP_CONSTANTS) return cvs(s, 0.0f);
+    c->cused[cs >> 5] |= 1u << (cs & 31u);
     return ld(s, tv4(s), I(s, OpAccessChain, pt, vp_consts(c), ci(s, 0), ci(s, (s32)cs)));
 }
 
@@ -1447,6 +1451,8 @@ int rsx_spv_vertex(const u32* ucode, const rsx_spv_vp_key* key, rsx_spv_blob* ou
         info->input_mask = c->inputs | 1u;
         info->output_mask = c->written;
         info->texture_mask = c->texmask;
+        memcpy(info->constants_used, c->cused, sizeof info->constants_used);
+        info->constants_relative = c->crel;
     }
     free(c);
     return rc;

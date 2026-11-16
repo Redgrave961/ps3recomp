@@ -419,12 +419,24 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
     VkDescriptorBufferInfo vdata{}, vlayout{};
     if (!upload_vertices(clause, e0, ecount, vb, vdata, vlayout)) return;
 
-    if ((dirty & rsx::D_VERTEX_CONSTANTS) || !m_constants_valid) {
+    if ((dirty & rsx::D_VERTEX_CONSTANTS) || m_constants_vp != m_vp) {
         vk_slice cs = m_ring.alloc(sizeof constants, m_ubo_align);
         if (!cs.ptr) return;
-        std::memcpy(cs.ptr, constants, sizeof constants);
+        const rsx_spv_vp_info& vi = m_vp->info;
+        if (vi.constants_relative) {
+            std::memcpy(cs.ptr, constants, sizeof constants);
+        } else {
+            for (u32 w = 0; w < std::size(vi.constants_used); w++)
+                for (u32 bits = vi.constants_used[w]; bits;) {
+                    const u32 first = (u32)__builtin_ctz(bits);
+                    const u32 ones = ~(bits >> first);
+                    const u32 n = ones ? (u32)__builtin_ctz(ones) : 32u;
+                    std::memcpy(cs.ptr + (size_t)(w * 32u + first) * 16u, constants + (size_t)(w * 32u + first) * 4u, (size_t)n * 16u);
+                    bits &= n == 32u ? 0u : ~(((1u << n) - 1u) << first);
+                }
+        }
         m_constants = { cs.buffer, cs.offset, sizeof constants };
-        m_constants_valid = true;
+        m_constants_vp = m_vp;
         dirty &= ~rsx::D_VERTEX_CONSTANTS;
     }
 
