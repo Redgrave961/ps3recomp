@@ -233,8 +233,7 @@ uint32_t refresh_divider()
 
 void set_pacing(pacing p)
 {
-    if (p == g.mode) return;
-    g.mode = p;
+    if (g.mode.exchange(p) == p) return;
 #ifdef _WIN32
     if (p == pacing::locked) {
         clock_bind_output();
@@ -373,10 +372,10 @@ bool swapchain_build()
         : VkCompositeAlphaFlagBitsKHR(caps.supportedCompositeAlpha & (0u - caps.supportedCompositeAlpha));
     ci.presentMode = g.sc.mode;
     ci.clipped = VK_TRUE;
-    ci.oldSwapchain = g.sc.handle;
+    if (g.sc.handle) vkDestroySwapchainKHR(g.d.dev, g.sc.handle, nullptr);
+    g.sc.handle = VK_NULL_HANDLE;
     VkSwapchainKHR made;
     VK_TRY(vkCreateSwapchainKHR(g.d.dev, &ci, nullptr, &made));
-    if (g.sc.handle) vkDestroySwapchainKHR(g.d.dev, g.sc.handle, nullptr);
     g.sc.handle = made;
     uint32_t n = 0;
     vkGetSwapchainImagesKHR(g.d.dev, made, &n, nullptr);
@@ -511,7 +510,7 @@ void rebuild_swapchain()
 {
     {
         std::lock_guard<std::mutex> hold(g.d.queue_lock);
-        vkQueueWaitIdle(g.d.queue);
+        vkDeviceWaitIdle(g.d.dev);
     }
     if (!swapchain_build()) std::fprintf(stderr, "[vk] swapchain rebuild failed\n");
 }
@@ -625,6 +624,9 @@ void present_slot(uint32_t i)
 
 void present_main()
 {
+    g.resized = false;
+    if (!swapchain_build()) std::fprintf(stderr, "[vk] swapchain creation failed\n");
+    mark("swapchain");
     uint64_t seen = 0;
     for (;;) {
         uint64_t tick;
@@ -710,9 +712,6 @@ bool vulkan_open()
     mark("renderer");
     read_refresh();
     restart_measurement();
-    g.resized = false;
-    if (!swapchain_build()) return false;
-    mark("swapchain");
     return true;
 }
 
