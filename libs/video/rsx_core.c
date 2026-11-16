@@ -284,10 +284,11 @@ static DWORD WINAPI rsx_vblank_thread(LPVOID unused)
             rsx_sleep_until(timer, base + group * n / RSX_VBLANK_GROUP);
         }
         AcquireSRWLockExclusive(&s.vblank_lock);
-        s.vblank_count++;
+        const u64 count = ++s.vblank_count;
         s.last_vblank_time = rsx_core_system_time();
         ReleaseSRWLockExclusive(&s.vblank_lock);
         WakeAllConditionVariable(&s.vblank_cv);
+        if (s.renderer && s.renderer->vblank) s.renderer->vblank(s.renderer->user, count);
         rsx_core_raise(RSX_EVENT_VBLANK, 1);
     }
 }

@@ -29,8 +29,7 @@ namespace {
 constexpr uint32_t k_slots = 3;
 constexpr uint32_t k_present_frames = 3;
 constexpr int64_t k_frame_ns = 1001000000ll / 60ll;
-constexpr int64_t k_present_lead_ns = 1500000;
-constexpr uint32_t k_samples = 120;
+constexpr int64_t k_scanout_phase_ns = 2000000;
 
 enum class pacing { measuring, vrr, locked, free };
 
@@ -46,7 +45,6 @@ struct slot {
     uint32_t height = 0;
     uint64_t rendered = 0;
     uint64_t released = 0;
-    int64_t stamp = 0;
 };
 
 struct present_frame {
@@ -95,11 +93,14 @@ struct state {
     vk::renderer r;
 
     slot slots[k_slots];
-    uint32_t next_slot = 0;
     std::mutex queue_lock;
     std::condition_variable queue_cv;
-    int pending = -1;
-    int64_t pending_stamp = 0;
+    int latest = -1;
+    bool latest_new = false;
+    uint64_t latest_tick = 0;
+    int shown = -1;
+    uint64_t tick = 0;
+    int64_t tick_ns = 0;
 
     VkSemaphore present_timeline = VK_NULL_HANDLE;
     std::atomic<uint64_t> presented{ 0 };
@@ -107,7 +108,6 @@ struct state {
     uint32_t frame_index = 0;
     std::atomic<pacing> mode{ pacing::measuring };
     std::atomic<uint32_t> generation{ 0 };
-    int64_t next_deadline = 0;
 #ifdef _WIN32
     display_clock clock;
 #endif
@@ -542,12 +542,6 @@ void present_slot(uint32_t i)
     vkResetCommandPool(g.d.dev, f.pool, 0);
     record_present(f.cmd, s, g.sc.images[index]);
 
-    if (g.mode == pacing::vrr) {
-        const int64_t target = std::max(s.stamp + k_present_lead_ns, g.next_deadline);
-        if (target - now_ns() < k_frame_ns) sleep_until(target);
-        g.next_deadline = std::max(target, now_ns()) + k_frame_ns - k_frame_ns / 8;
-    }
-
     const uint64_t value = g.presented.load() + 1u;
     VkSemaphoreSubmitInfo waits[2] = { { VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO }, { VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO } };
     waits[0].semaphore = f.acquired;
@@ -584,6 +578,39 @@ void present_slot(uint32_t i)
         vkQueueSubmit2(g.d.queue, 1, &si, VK_NULL_HANDLE);
         r = vkQueuePresentKHR(g.d.queue, &pi);
     }
+    {
+        static int64_t last, lo = INT64_MAX, hi, sum, sq;
+        static uint32_t n;
+        const int64_t now = now_ns();
+        if (last && stats_on()) {
+            const int64_t d = now - last;
+            lo = std::min(lo, d);
+            hi = std::max(hi, d);
+            sum += d;
+            sq += (d / 1000) * (d / 1000);
+            static int64_t seq[120];
+            static uint32_t sn, dumped;
+            if (dumped < 2 && n >= 300) {
+                seq[sn++] = d;
+                if (sn == 120) {
+                    std::string line = "[vk] intervals:";
+                    for (uint32_t k = 0; k < 120; k++) line += " " + std::to_string((int)(seq[k] / 100000) / 10.0).substr(0, 4);
+                    std::fprintf(stderr, "%s\n", line.c_str());
+                    sn = 0;
+                    dumped++;
+                }
+            }
+            if (++n == 600) {
+                const double mean = (double)sum / n / 1e6, var = (double)sq / n / 1e6 - mean * mean;
+                std::fprintf(stderr, "[vk] present interval mean %.3f ms, sd %.3f, min %.3f, max %.3f (%s)\n", mean, std::sqrt(std::max(var, 0.0)),
+                             lo / 1e6, hi / 1e6, pacing_name(g.mode));
+                n = 0;
+                lo = INT64_MAX;
+                hi = sum = sq = 0;
+            }
+        }
+        last = now;
+    }
     g.presented = value;
     f.done = value;
     s.released = value;
@@ -600,23 +627,46 @@ void present_slot(uint32_t i)
 
 void present_main()
 {
+    uint64_t seen = 0;
     for (;;) {
-        int i;
+        uint64_t tick;
+        int64_t tick_ns;
         {
             std::unique_lock<std::mutex> hold(g.queue_lock);
-            g.queue_cv.wait(hold, [] { return g.pending >= 0 || g.resized.load() || g.display_changed.load(); });
-            i = g.pending;
-            g.pending = -1;
+            g.queue_cv.wait(hold, [&] { return g.tick != seen || g.resized.load() || g.display_changed.load(); });
+            tick = g.tick;
+            tick_ns = g.tick_ns;
         }
         if (g.display_changed.exchange(false)) {
             read_refresh();
             restart_measurement();
         }
         if (g.resized.exchange(false)) rebuild_swapchain();
-        if (i >= 0) present_slot((uint32_t)i);
+        if (tick == seen) continue;
+        seen = tick;
+        sleep_until(tick_ns + k_scanout_phase_ns);
+        int pick;
+        {
+            std::lock_guard<std::mutex> hold(g.queue_lock);
+            if (g.latest_new) {
+                g.shown = g.latest;
+                g.latest_new = false;
+            }
+            pick = g.shown;
+        }
+        if (pick >= 0) present_slot((uint32_t)pick);
     }
 }
 
+void vk_vblank(void*, u64 count)
+{
+    {
+        std::lock_guard<std::mutex> hold(g.queue_lock);
+        g.tick = count;
+        g.tick_ns = now_ns();
+    }
+    g.queue_cv.notify_one();
+}
 bool slot_reserve(slot& s, uint32_t w, uint32_t h)
 {
     if (s.image && s.width == w && s.height == h) return true;
@@ -757,7 +807,6 @@ void vk_wrote(void*, u32 ea, u32 size)
 
 void vk_present(void*, u32, const rsx_display_buffer* db)
 {
-    const int64_t stamp = now_ns();
     const uint32_t w = db->width, h = db->height, pitch = db->pitch;
     static uint32_t last_w, last_h, last_p;
     if (w != last_w || h != last_h || pitch != last_p) {
@@ -772,11 +821,10 @@ void vk_present(void*, u32, const rsx_display_buffer* db)
         return;
     }
 
-    const uint32_t i = g.next_slot;
-    g.next_slot = (g.next_slot + 1u) % k_slots;
+    uint32_t i = 0;
     {
         std::lock_guard<std::mutex> hold(g.queue_lock);
-        if (g.pending == (int)i) g.pending = -1;
+        while ((int)i == g.shown || (int)i == g.latest) i++;
     }
     slot& s = g.slots[i];
     timeline_wait(g.present_timeline, s.released);
@@ -823,10 +871,11 @@ void vk_present(void*, u32, const rsx_display_buffer* db)
     vkCmdPipelineBarrier2(cmd, &di);
     g.r.submit(VK_NULL_HANDLE, 0, VK_NULL_HANDLE);
     s.rendered = g.submitted;
-    s.stamp = stamp;
     {
         std::lock_guard<std::mutex> hold(g.queue_lock);
-        g.pending = (int)i;
+        g.latest = (int)i;
+        g.latest_new = true;
+        g.latest_tick = rsx_core_vblank_count();
     }
     g.queue_cv.notify_one();
 
@@ -850,7 +899,7 @@ void vk_close(void*)
 extern "C" const rsx_renderer* rsx_vk_renderer(const char* title)
 {
     static const rsx_renderer renderer = {
-        nullptr, vk_open, vk_methods, vk_flush, nullptr, vk_reset, nullptr, vk_present, vk_read_back, vk_wrote, vk_close,
+        nullptr, vk_open, vk_methods, vk_flush, nullptr, vk_reset, nullptr, vk_present, vk_read_back, vk_wrote, vk_vblank, vk_close,
     };
     static std::once_flag started;
     std::call_once(started, [title] {

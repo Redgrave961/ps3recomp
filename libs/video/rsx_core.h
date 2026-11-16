@@ -62,6 +62,7 @@ typedef struct rsx_renderer {
     void (*present)(void* user, u32 buffer, const rsx_display_buffer* display);
     void (*read_back)(void* user, u32 ea, u32 size);
     void (*wrote)(void* user, u32 ea, u32 size);
+    void (*vblank)(void* user, u64 count);
     void (*close)(void* user);
 } rsx_renderer;
 
