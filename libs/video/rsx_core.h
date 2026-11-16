@@ -66,10 +66,12 @@ typedef struct rsx_renderer {
 } rsx_renderer;
 
 typedef void (*rsx_event_sink)(enum rsx_event event, u32 arg);
+typedef int (*rsx_vblank_clock)(void* user);
 
 void rsx_core_init(u32 local_size, u32 main_size);
 void rsx_core_set_renderer(const rsx_renderer* renderer);
 void rsx_core_set_event_sink(rsx_event_sink sink);
+void rsx_core_set_vblank_clock(rsx_vblank_clock clock, void* user);
 void rsx_core_start(void);
 void rsx_core_fifo_reset(u32 put, u32 get);
 void rsx_core_doorbell(void);

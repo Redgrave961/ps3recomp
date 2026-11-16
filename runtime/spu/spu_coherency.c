@@ -23,96 +23,11 @@
 extern "C" {
 #endif
 
-/* ===========================================================================
- * The lock-line lock
- *
- * Moved here from spu_channels.c, where it was a file-static and so could
- * serialize SPU against SPU but not SPU against PPU -- which left the PPU free
- * to write a line in the middle of a PUTLLC's compare-and-commit. Same
- * exclusion semantics, now shared. MSVC uses a bounded polite spin loop;
- * POSIX spins briefly and then parks on a mutex (see below).
- * ===========================================================================*/
-#if defined(_MSC_VER)
-#include <intrin.h>
-#include <windows.h>   /* SwitchToThread */
-static volatile long g_lockline = 0;
-/* Test-and-test-and-set: spin on a plain read (no cache-line ping-pong) with a
- * pause, and yield after a long wait. The bare exchange loop let GH3's four
- * idle job-policy pollers saturate the line and delay every other SPU atomic
- * -- FMOD's mixer task among them, 25-40 ms at a time. */
-/* After ~1 ms of spinning (six rounds of 4096 pauses) the waiter sleeps instead.
- * SwitchToThread only hands the core to a thread queued on this same processor,
- * and Sleep(0) only to one of equal or higher priority -- neither reaches a
- * lower-priority holder that is waiting for a core. With every core busy, waiters
- * above the holder's priority could keep it off the CPU for tens of milliseconds.
- * A normal wait is far under a microsecond and never gets here. */
-void spu_lockline_lock(void)
-{
-    unsigned spins = 0, rounds = 0;
-    while (_InterlockedExchange(&g_lockline, 1)) {
-        do {
-            _mm_pause();
-            if (++spins >= 4096) {
-                spins = 0;
-                if (rounds++ < 6) SwitchToThread(); else Sleep(1);
-            }
-        } while (g_lockline);
-    }
-}
-void spu_lockline_unlock(void) { _InterlockedExchange(&g_lockline, 0); }
-#elif defined(_WIN32)
-/* Non-MSVC Windows keeps the plain spin, without a pthread dependency. */
-#include <stdatomic.h>
-static atomic_flag g_lockline = ATOMIC_FLAG_INIT;
-void spu_lockline_lock(void)   { while (atomic_flag_test_and_set_explicit(&g_lockline, memory_order_acquire)) { } }
-void spu_lockline_unlock(void) { atomic_flag_clear_explicit(&g_lockline, memory_order_release); }
-#else
-#include <pthread.h>
-#include <time.h>
-/* Every SPU reservation and every PPU coherent store takes this one lock, so
- * it is acquired very often and held very briefly (a line copy and a short
- * list walk). But its owner is an ordinary host thread: with more guest
- * threads than cores it can be preempted while holding the lock, and a bare
- * test-and-set loop then keeps every waiter spinning on a full core -- the
- * cores the owner needs to run again -- for the rest of its time slice.
- *
- * So: retry for up to 20 us, with exponentially spaced attempts so the
- * waiters do not keep pulling the lock's cache line away from its owner, and
- * then park on the mutex. A running owner releases well inside the spin; a
- * preempted one no longer costs the waiters their cores. The mutex keeps the
- * same non-recursive exclusion and acquire/release publication. */
-static pthread_mutex_t g_lockline = PTHREAD_MUTEX_INITIALIZER;
-static inline uint64_t spu_lockline_now_ns(void)
-{
-#if defined(__APPLE__)
-    return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-#else
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
-#endif
-}
-static inline void spu_lockline_relax(void)
-{
-#if defined(__aarch64__)
-    __asm__ __volatile__("yield");
-#elif defined(__x86_64__) || defined(__i386__)
-    __builtin_ia32_pause();
-#endif
-}
-void spu_lockline_lock(void)
-{
-    if (!pthread_mutex_trylock(&g_lockline)) return;
-    const uint64_t give_up = spu_lockline_now_ns() + 20000u;
-    for (unsigned backoff = 16;; backoff = backoff < 1024u ? backoff * 2u : backoff) {
-        for (unsigned i = 0; i < backoff; ++i) spu_lockline_relax();
-        if (!pthread_mutex_trylock(&g_lockline)) return;
-        if (spu_lockline_now_ns() >= give_up) break;
-    }
-    if (pthread_mutex_lock(&g_lockline)) abort();
-}
-void spu_lockline_unlock(void) { if (pthread_mutex_unlock(&g_lockline)) abort(); }
-#endif
+#include "../platform/ps3_sync.h"
+
+static ps3_lock g_lockline;
+void spu_lockline_lock(void)   { ps3_lock_acquire(&g_lockline); }
+void spu_lockline_unlock(void) { ps3_lock_release(&g_lockline); }
 
 /* ===========================================================================
  * The reserved-line bitmap
@@ -396,9 +311,6 @@ void spu_coh_notify_write(uint32_t ea)
             SPU_EVENT_SET(c, SPU_EVENT_LR);
             __atomic_store_n(&c->resv_valid, 0, __ATOMIC_RELAXED);   /* reservation lost, PUTLLC must fail */
             g_spu_lr_raise++;
-            /* The event_status store has to be visible before the wake. The
-             * waiter re-polls its predicate on a timeout as well, so a
-             * straggling store costs latency and not the wakeup itself. */
             spu_ch_wake(c);
         }
     }

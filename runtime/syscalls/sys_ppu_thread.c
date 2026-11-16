@@ -21,6 +21,7 @@ static PPU_TLS int     s_exit_armed = 0;
 
 #include <stddef.h>
 #include "sys_ppu_thread.h"
+#include "../platform/ps3_sync.h"
 #include "../platform/win32_compat.h"   /* GetCurrentThreadId on POSIX */
 #include "ps3emu/ps3_ftrace.h"           /* PS3_FTRACE: thread names for the report */
 #include "ps3emu/ps3_tprof.h"            /* PS3_TPROF: in-process thread samples */
@@ -107,6 +108,19 @@ static ppu_thread_info* find_thread(uint64_t thread_id)
     return t;
 }
 
+int32_t ppu_thread_priority(uint64_t tid)
+{
+    if (tid == 0 || tid > PPU_THREAD_MAX) return 1000;
+    return __atomic_load_n(&g_ppu_threads[tid - 1].priority, __ATOMIC_RELAXED);
+}
+
+int ppu_thread_exists(uint64_t tid)
+{
+    if (tid == 0 || tid > PPU_THREAD_MAX) return 0;
+    const int state = __atomic_load_n(&g_ppu_threads[tid - 1].state, __ATOMIC_ACQUIRE);
+    return state != PPU_THREAD_STATE_FREE && state != PPU_THREAD_STATE_FINISHED;
+}
+
 /* ---------------------------------------------------------------------------
  * Priority at thread start (PS3_PRIO_START=1, off by default)
  *
@@ -123,7 +137,6 @@ static ppu_thread_info* find_thread(uint64_t thread_id)
  * -----------------------------------------------------------------------*/
 #define PPU_DEFAULT_PRIORITY   1000   /* what sys_ppu_thread_get_priority reports for a thread not in the table */
 #define PRIO_START_TIMEOUT_MS  200
-#define PRIO_START_SPIN_MS     2      /* yield instead of sleeping for this long: Sleep(1) is ~15 ms on Windows */
 
 static int prio_start_enabled(void)
 {
@@ -136,9 +149,10 @@ void ppu_thread_note_block(uint64_t tid)
 {
     if (tid == 0 || tid > PPU_THREAD_MAX) return;
     int* blocked = &g_ppu_threads[tid - 1].blocked;
-    /* Load first: the wait syscalls call this on every wait, and most threads blocked long ago. */
-    if (!__atomic_load_n(blocked, __ATOMIC_RELAXED))
+    if (!__atomic_load_n(blocked, __ATOMIC_RELAXED)) {
         __atomic_store_n(blocked, 1, __ATOMIC_RELEASE);
+        ps3_futex_wake_all((volatile uint32_t*)blocked);
+    }
 }
 
 /* Priority the creator runs at. Must be called under the table lock. Main
@@ -155,19 +169,14 @@ static int32_t creator_priority(uint64_t tid)
  * ppu_thread_note_block, so whatever `t` wrote before it blocked (the event queue key above) is visible here. */
 static void wait_first_block(const ppu_thread_info* t, uint64_t tid)
 {
-    const ULONGLONG start = GetTickCount64();
-    for (;;) {
-        if (__atomic_load_n(&t->blocked, __ATOMIC_ACQUIRE)) return;
-        const int state = __atomic_load_n(&t->state, __ATOMIC_ACQUIRE);
-        /* Ended before blocking (a detached thread is DETACHED while it still runs). */
-        if (state == PPU_THREAD_STATE_FINISHED || state == PPU_THREAD_STATE_FREE) return;
-        const ULONGLONG waited = GetTickCount64() - start;
-        if (waited >= PRIO_START_TIMEOUT_MS) break;
-        if (waited < PRIO_START_SPIN_MS) SwitchToThread();
-        else                             Sleep(1);
+    const uint64_t deadline = ps3_sync_deadline_us(PRIO_START_TIMEOUT_MS * 1000ull);
+    while (!__atomic_load_n(&t->blocked, __ATOMIC_ACQUIRE)) {
+        if (!ps3_futex_wait((volatile uint32_t*)&t->blocked, 0u, deadline)) {
+            fprintf(stderr, "[SYS] PS3_PRIO_START: tid=%llu \"%s\" (prio %d) did not block within %d ms; its creator goes on\n",
+                    (unsigned long long)tid, t->name, t->priority, PRIO_START_TIMEOUT_MS);
+            return;
+        }
     }
-    fprintf(stderr, "[SYS] PS3_PRIO_START: tid=%llu \"%s\" (prio %d) did not block within %d ms; its creator goes on\n",
-            (unsigned long long)tid, t->name, t->priority, PRIO_START_TIMEOUT_MS);
 }
 
 /* ---------------------------------------------------------------------------
@@ -240,7 +249,7 @@ static void* ppu_host_thread_proc(void* param)
     }
 
     ps3_tprof_thread_exit();
-    /* Mark as finished */
+    ppu_thread_note_block(info->ctx.thread_id);
     table_lock();
     info->exit_status = (int64_t)info->ctx.gpr[3];
 
@@ -994,7 +1003,7 @@ uint32_t g_ppu_main_stack_size = 0;
 
 /* What the main thread is told. The default names the first allocation in the
  * thread stack region (VM_STACK_BASE), which is where a host that gives main an
- * lv2-style stack puts it (boot_main.cpp, PS3_MAIN_STACK_LV2). */
+ * lv2-style stack puts it. */
 static void main_stack_info(uint32_t* addr, uint32_t* size)
 {
     if (g_ppu_main_stack_size) {

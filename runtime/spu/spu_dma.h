@@ -516,61 +516,6 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
     uint32_t tag  = spu->mfc_tag & 0x1F;
     int rc = 0;
 
-    /* A job re-issuing the SAME transfer forever is wedged, not slow: nothing
-     * about its state can change if the DMA is all it is doing. This used to
-     * count only REJECTED transfers, so once the EA check started committing
-     * pages on demand the counter never advanced and a spinning job simply hung
-     * the chain walker instead. Count repeats whether or not the transfer
-     * succeeds, and halt at a known pc rather than hanging silently.
-     * The count alone is not enough: polling a value another agent writes is
-     * also the same transfer over and over. God of War: Ascension's EDGE
-     * geometry jobs wait for ring space by re-reading an RSX label until the
-     * GPU catches up, and 256 reads take well under a millisecond, so a
-     * count-only rule halted a healthy job and wedged the frame. Halt only once
-     * the repeats have also lasted 30 seconds of wall
-     * time. Below that, back off 1 ms per repeat rather than spinning. */
-    /* One thread-local object: every Darwin TLV access is a call, and this
-     * runs on every MFC command. */
-    { static SPU_THREAD_LOCAL struct { uint32_t last_ea, last_lsa, rep; unsigned long long since; } t_rep;
-#define s_last_ea  t_rep.last_ea
-#define s_last_lsa t_rep.last_lsa
-#define s_rep      t_rep.rep
-#define s_since    t_rep.since
-      const uint32_t s_limit = 256u; const unsigned long long s_secs = 30u, s_backoff_ms = 2u;
-      extern unsigned long long ps3_ms_now(void);
-      if ((uint32_t)ea == s_last_ea && lsa == s_last_lsa) {
-          if (++s_rep >= s_limit) {
-              unsigned long long now = ps3_ms_now();
-              if (!s_since) s_since = now;
-              if (now - s_since >= s_secs * 1000u) {
-                  s_rep = 0; s_since = 0;   /* re-arm: the chain may run this job again */
-                  extern void spu_halt(spu_context*);
-                  fprintf(stderr, "[spu-dma] img=%d pc=0x%05X: %u identical "
-                          "transfers to ea=0x%08X -- halting the SPU\n",
-                          spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK, s_limit,
-                          (uint32_t)ea);
-                  fflush(stderr);
-                  spu_halt(spu);
-              }
-              /* A job re-reading a word another agent writes (an RSX label, a
-               * ring-space counter, a peer job's completion flag) is bound by
-               * that write, and a 1 ms sleep per poll lands it up to a
-               * millisecond late -- on the frame's critical path when the
-               * poller is the frame's longest job. Yield for the first
-               * 2 ms of an episode, where a
-               * healthy wait ends, and back off 1 ms per repeat after that. */
-              else if (now - s_since < s_backoff_ms) SwitchToThread();
-              else Sleep(1);
-          }
-      } else {
-          s_last_ea = (uint32_t)ea; s_last_lsa = lsa; s_rep = 0; s_since = 0;
-      }
-#undef s_last_ea
-#undef s_last_lsa
-#undef s_rep
-#undef s_since
-    }
-
     /* Mark tag as in-progress */
     mfc->tag_completed &= ~(1u << tag);
 

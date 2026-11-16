@@ -1,152 +1,55 @@
 /*
- * ps3recomp - Event queue and event flag syscalls (implementation)
+ * ps3recomp - Event queue, event port and event flag syscalls (implementation)
  */
 
 #include "sys_event.h"
-#include "sys_ppu_thread.h"         /* ppu_thread_note_block */
-#include "../ps3_log.h"
-#include "sys_timer.h"             /* lv2_usec_deadline: sub-ms timed waits */
+#include "sys_ppu_thread.h"
 #include "../memory/vm.h"
 #include <string.h>
-#include <stdlib.h>               /* getenv */
-#include "ps3emu/log_first.h"
 
-
-/* ---------------------------------------------------------------------------
- * Globals
- * -----------------------------------------------------------------------*/
 sys_event_queue_info g_sys_event_queues[SYS_EVENT_QUEUE_MAX];
 sys_event_port_info  g_sys_event_ports[SYS_EVENT_PORT_MAX];
 sys_event_flag_info  g_sys_event_flags[SYS_EVENT_FLAG_MAX];
 
-/* Table lock for allocation */
-#ifdef _WIN32
-static CRITICAL_SECTION s_evt_table_lock;
-static int              s_evt_table_lock_init = 0;
-#else
-static pthread_mutex_t  s_evt_table_lock = PTHREAD_MUTEX_INITIALIZER;
-#endif
+static ps3_lock s_evt_table_lock;
 
-static void evt_table_lock(void)
+static uint32_t read_be32(const uint8_t* p)
 {
-#ifdef _WIN32
-    if (!s_evt_table_lock_init) {
-        InitializeCriticalSection(&s_evt_table_lock);
-        s_evt_table_lock_init = 1;
-    }
-    EnterCriticalSection(&s_evt_table_lock);
-#else
-    pthread_mutex_lock(&s_evt_table_lock);
-#endif
-}
-
-static void evt_table_unlock(void)
-{
-#ifdef _WIN32
-    LeaveCriticalSection(&s_evt_table_lock);
-#else
-    pthread_mutex_unlock(&s_evt_table_lock);
-#endif
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
 }
 
 static void write_be32(uint32_t addr, uint32_t val)
 {
-    uint32_t* p = (uint32_t*)vm_to_host(addr);
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
-    val = ((val >> 24) & 0xFF) | ((val >> 8) & 0xFF00) |
-          ((val <<  8) & 0xFF0000) | ((val << 24) & 0xFF000000u);
-#endif
-    *p = val;
+    uint8_t* p = (uint8_t*)vm_to_host(addr);
+    p[0] = (uint8_t)(val >> 24); p[1] = (uint8_t)(val >> 16);
+    p[2] = (uint8_t)(val >> 8);  p[3] = (uint8_t)val;
 }
 
-
-static uint64_t bswap64(uint64_t v)
+static void write_be64(uint32_t addr, uint64_t val)
 {
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
-    return ((v >> 56) & 0xFFULL) |
-           ((v >> 40) & 0xFF00ULL) |
-           ((v >> 24) & 0xFF0000ULL) |
-           ((v >>  8) & 0xFF000000ULL) |
-           ((v <<  8) & 0xFF00000000ULL) |
-           ((v << 24) & 0xFF0000000000ULL) |
-           ((v << 40) & 0xFF000000000000ULL) |
-           ((v << 56) & 0xFF00000000000000ULL);
-#else
-    return v;
-#endif
+    write_be32(addr, (uint32_t)(val >> 32));
+    write_be32(addr + 4, (uint32_t)val);
 }
 
-#ifdef _WIN32
-/* Milliseconds left to a lv2_usec_deadline() deadline, rounded UP (a timed
- * receive must not return before the guest's timeout); 0 once it has passed. */
-static DWORD evt_ms_until(int64_t deadline)
+static uint32_t proto_of(uint32_t protocol)
 {
-    LARGE_INTEGER f, now;
-    QueryPerformanceFrequency(&f);
-    QueryPerformanceCounter(&now);
-    if (now.QuadPart >= deadline) return 0;
-    const uint64_t left = (uint64_t)(deadline - now.QuadPart), q = (uint64_t)f.QuadPart;
-    const uint64_t ms = (left / q) * 1000ull + ((left % q) * 1000ull + q - 1) / q;
-    return ms >= (uint64_t)INFINITE ? (DWORD)(INFINITE - 1) : (DWORD)ms;
+    return protocol == 1 ? PS3_SYNC_FIFO : PS3_SYNC_PRIORITY;
 }
-#endif
 
-/* =========================================================================
- * EVENT QUEUES
- * ========================================================================= */
-
-/* ---------------------------------------------------------------------------
- * sys_event_queue_create
- *
- * r3 = pointer to receive queue ID (u32*)
- * r4 = pointer to attribute struct
- * r5 = key (u64)
- * r6 = size (s32)
- * -----------------------------------------------------------------------*/
-/* Create a queue directly, without a guest ppu_context.
- *
- * HLE libraries sometimes have to CREATE a queue rather than merely find one:
- * cellAudioCreateNotifyEventQueue hands the game back a queue id + key that the
- * game then blocks on. Without this the game receives on an id nothing ever
- * created and gets ESRCH forever -- YDKJ printed 1.7 MILLION "LIBAUDIO DROPOUT"
- * lines a run that way. Returns the queue id, or 0 if the table is full. */
-uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size)
+static void wake_list(ps3_waiter* w)
 {
-    if (size <= 0 || size > SYS_EVENT_QUEUE_BUF_MAX)
-        size = SYS_EVENT_QUEUE_BUF_MAX;
-
-    evt_table_lock();
-    int slot = -1;
-    for (int i = 0; i < SYS_EVENT_QUEUE_MAX; i++) {
-        if (!g_sys_event_queues[i].active) { slot = i; break; }
+    while (w) {
+        ps3_waiter* next = w->next;
+        ps3_waiter_wake(w, w->result);
+        w = next;
     }
-    if (slot < 0) { evt_table_unlock(); return 0; }
+}
 
-    sys_event_queue_info* q = &g_sys_event_queues[slot];
-    memset(q, 0, sizeof(*q));
-    q->active   = 1;
-    q->key      = key;
-    q->capacity = size;
-    q->type     = SYS_PPU_QUEUE;
-
-    /* The waiter primitives MUST be initialised here too. memset+fields is
-     * not enough: a zeroed CRITICAL_SECTION is not a valid one, and the
-     * first EnterCriticalSection on it faults writing near offset 0x24 of a
-     * null internal pointer -- which is exactly how YDKJ's FMOD audio thread
-     * died the moment it was finally given a real queue to block on. */
-#ifdef _WIN32
-    InitializeCriticalSection(&q->lock);
-    InitializeConditionVariable(&q->not_empty);
-#else
-    pthread_mutex_init(&q->lock, NULL);
-    pthread_cond_init(&q->not_empty, NULL);
-#endif
-
-    evt_table_unlock();
-
-    fprintf(stderr, "[evt] queue_create_direct -> id=%d key=0x%llX size=%d\n",
-            slot + 1, (unsigned long long)key, size);
-    return (uint32_t)(slot + 1);
+static sys_event_queue_info* queue_get(uint32_t id)
+{
+    if (id == 0 || id > SYS_EVENT_QUEUE_MAX) return NULL;
+    sys_event_queue_info* q = &g_sys_event_queues[id - 1];
+    return __atomic_load_n(&q->active, __ATOMIC_ACQUIRE) ? q : NULL;
 }
 
 int64_t sys_event_queue_create(ppu_context* ctx)
@@ -159,587 +62,198 @@ int64_t sys_event_queue_create(ppu_context* ctx)
     if (size <= 0 || size > SYS_EVENT_QUEUE_BUF_MAX)
         size = SYS_EVENT_QUEUE_BUF_MAX;
 
-    evt_table_lock();
-
+    ps3_lock_acquire(&s_evt_table_lock);
     int slot = -1;
     for (int i = 0; i < SYS_EVENT_QUEUE_MAX; i++) {
         if (!g_sys_event_queues[i].active) { slot = i; break; }
     }
     if (slot < 0) {
-        evt_table_unlock();
+        ps3_lock_release(&s_evt_table_lock);
         return (int64_t)(int32_t)CELL_EAGAIN;
     }
 
     sys_event_queue_info* q = &g_sys_event_queues[slot];
-    memset(q, 0, sizeof(*q));
-    q->active   = 1;
+    memset((char*)q + sizeof q->lock, 0, sizeof *q - sizeof q->lock);
     q->key      = key;
     q->capacity = size;
-    q->head     = 0;
-    q->tail     = 0;
-    q->count    = 0;
     q->type     = SYS_PPU_QUEUE;
-    fprintf(stderr, "[evt] queue_create -> id=%d key=0x%llX size=%d\n",
-            slot + 1, (unsigned long long)key, size);
-
     if (attr_addr != 0) {
-        uint8_t* attr_raw = (uint8_t*)vm_to_host(attr_addr);
-        uint32_t proto_be;
-        memcpy(&proto_be, attr_raw, 4);
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
-        proto_be = ((proto_be >> 24) & 0xFF) | ((proto_be >> 8) & 0xFF00) |
-                   ((proto_be << 8) & 0xFF0000) | ((proto_be << 24) & 0xFF000000u);
-#endif
-        q->protocol = proto_be;
-
-        uint32_t type_be;
-        memcpy(&type_be, attr_raw + 4, 4);
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
-        type_be = ((type_be >> 24) & 0xFF) | ((type_be >> 8) & 0xFF00) |
-                  ((type_be << 8) & 0xFF0000) | ((type_be << 24) & 0xFF000000u);
-#endif
-        q->type = (int32_t)type_be;
-
-        memcpy(q->name, attr_raw + 8, 8);
+        const uint8_t* a = (const uint8_t*)vm_to_host(attr_addr);
+        q->protocol = read_be32(a);
+        q->type     = (int32_t)read_be32(a + 4);
+        memcpy(q->name, a + 8, 8);
     }
+    __atomic_store_n(&q->active, 1, __ATOMIC_RELEASE);
+    ps3_lock_release(&s_evt_table_lock);
 
-#ifdef _WIN32
-    InitializeCriticalSection(&q->lock);
-    InitializeConditionVariable(&q->not_empty);
-#else
-    pthread_mutex_init(&q->lock, NULL);
-    pthread_cond_init(&q->not_empty, NULL);
-#endif
-
-    uint32_t queue_id = (uint32_t)(slot + 1);
-    if (id_out_addr != 0) {
-        write_be32(id_out_addr, queue_id);
-    }
-
-    evt_table_unlock();
+    if (id_out_addr != 0) write_be32(id_out_addr, (uint32_t)(slot + 1));
     return CELL_OK;
 }
 
 int64_t sys_event_queue_destroy(ppu_context* ctx)
 {
-    uint32_t queue_id = LV2_ARG_U32(ctx, 0);
-    /* r4 = mode: 0, or SYS_EVENT_QUEUE_DESTROY_FORCE. It was ignored. */
-    int32_t  mode     = LV2_ARG_S32(ctx, 1);
-
-    if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX)
-        return (int64_t)(int32_t)CELL_ESRCH;
+    const uint32_t queue_id = LV2_ARG_U32(ctx, 0);
+    const int32_t  mode     = LV2_ARG_S32(ctx, 1);
+    sys_event_queue_info* q = queue_get(queue_id);
+    if (!q) return (int64_t)(int32_t)CELL_ESRCH;
     if (mode != 0 && mode != SYS_EVENT_QUEUE_DESTROY_FORCE)
         return (int64_t)(int32_t)CELL_EINVAL;
 
-    evt_table_lock();
-
-    sys_event_queue_info* q = &g_sys_event_queues[queue_id - 1];
+    ps3_waiter* wake = NULL;
+    ps3_lock_acquire(&s_evt_table_lock);
+    ps3_lock_acquire(&q->lock);
     if (!q->active) {
-        evt_table_unlock();
+        ps3_lock_release(&q->lock);
+        ps3_lock_release(&s_evt_table_lock);
         return (int64_t)(int32_t)CELL_ESRCH;
     }
-
-    /* Receivers blocked in the queue. This used to delete the lock and
-     * condition variable under them: a receiver parked with no timeout never
-     * woke again. lv2: a plain destroy with waiters is EBUSY; FORCE wakes every
-     * waiter with CELL_ECANCELED. The lock and condition variable are
-     * deliberately NOT destroyed: a receiver that passed its unlocked `active`
-     * test just before this can still enter them safely and will see !active,
-     * and create re-initialises them when the slot is reused. */
-#ifdef _WIN32
-    EnterCriticalSection(&q->lock);
-    if (q->waiters > 0 && mode != SYS_EVENT_QUEUE_DESTROY_FORCE) {
-        LeaveCriticalSection(&q->lock);
-        evt_table_unlock();
+    if (q->q.head && mode != SYS_EVENT_QUEUE_DESTROY_FORCE) {
+        ps3_lock_release(&q->lock);
+        ps3_lock_release(&s_evt_table_lock);
         return (int64_t)(int32_t)CELL_EBUSY;
     }
-    q->active = 0;
-    WakeAllConditionVariable(&q->not_empty);
-    while (q->waiters > 0) {            /* let them return ECANCELED first */
-        LeaveCriticalSection(&q->lock);
-        SwitchToThread();
-        EnterCriticalSection(&q->lock);
+    for (ps3_waiter* w; (w = ps3_waitq_pop(&q->q, PS3_SYNC_FIFO, 0)) != NULL;) {
+        w->result = (int64_t)(int32_t)CELL_ECANCELED;
+        w->next = wake;
+        wake = w;
     }
-    LeaveCriticalSection(&q->lock);
-#else
-    pthread_mutex_lock(&q->lock);
-    if (q->waiters > 0 && mode != SYS_EVENT_QUEUE_DESTROY_FORCE) {
-        pthread_mutex_unlock(&q->lock);
-        evt_table_unlock();
-        return (int64_t)(int32_t)CELL_EBUSY;
-    }
-    q->active = 0;
-    pthread_cond_broadcast(&q->not_empty);
-    while (q->waiters > 0) {
-        pthread_mutex_unlock(&q->lock);
-        sched_yield();
-        pthread_mutex_lock(&q->lock);
-    }
-    pthread_mutex_unlock(&q->lock);
-#endif
-
-    /* Ports still wired to this queue are now unconnected: a send answers
-     * ENOTCONN, and the stale index can no longer deliver into whatever queue
-     * next reuses this slot. */
+    __atomic_store_n(&q->active, 0, __ATOMIC_RELEASE);
+    ps3_lock_release(&q->lock);
     for (int i = 0; i < SYS_EVENT_PORT_MAX; i++)
         if (g_sys_event_ports[i].active && g_sys_event_ports[i].connected_queue == (int32_t)queue_id)
             g_sys_event_ports[i].connected_queue = 0;
-
-    evt_table_unlock();
+    ps3_lock_release(&s_evt_table_lock);
+    wake_list(wake);
     return CELL_OK;
 }
 
-/* ---------------------------------------------------------------------------
- * sys_event_queue_receive
- *
- * r3 = queue_id
- * r4 = pointer to sys_event_t in guest memory
- * r5 = timeout_usec (0 = infinite)
- * -----------------------------------------------------------------------*/
-/* A queue has a producer again (SPURS re-attach after a finalize). Without this
- * the cancel is permanent: the flag survives, every later receive fails, and a
- * title that tears its audio down and brings it back never runs again. */
-void sys_event_queue_uncancel_by_id(uint32_t queue_id)
-{
-    if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX) return;
-    sys_event_queue_info* q = &g_sys_event_queues[queue_id - 1];
-    if (!q->active || !q->cancelled) return;
-#ifdef _WIN32
-    EnterCriticalSection(&q->lock);
-    q->cancelled = 0;
-    LeaveCriticalSection(&q->lock);
-#else
-    pthread_mutex_lock(&q->lock);
-    q->cancelled = 0;
-    pthread_mutex_unlock(&q->lock);
-#endif
-    fprintf(stderr, "[evt] queue %u un-cancelled (producer attached again)\n", queue_id);
-}
-
-void sys_event_queue_cancel_by_id(uint32_t queue_id)
-{
-    if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX) return;
-    sys_event_queue_info* q = &g_sys_event_queues[queue_id - 1];
-    if (!q->active) return;
-
-#ifdef _WIN32
-    EnterCriticalSection(&q->lock);
-    q->cancelled = 1;
-    WakeAllConditionVariable(&q->not_empty);   /* every waiter, not one */
-    LeaveCriticalSection(&q->lock);
-#else
-    pthread_mutex_lock(&q->lock);
-    q->cancelled = 1;
-    pthread_cond_broadcast(&q->not_empty);
-    pthread_mutex_unlock(&q->lock);
-#endif
-    fprintf(stderr, "[evt] queue %u cancelled (producer gone) -- waiters released\n",
-            queue_id);
-}
-
-/* Diagnostic gates polled on every receive (~140k/s in GH3): read once. */
-static int s_ps3_waitbt = -1;
-
 int64_t sys_event_queue_receive(ppu_context* ctx)
 {
-    uint32_t queue_id    = LV2_ARG_U32(ctx, 0);
-    uint32_t event_addr  = LV2_ARG_PTR(ctx, 1);
-    uint64_t timeout_us  = LV2_ARG_U64(ctx, 2);
-    ppu_thread_note_block(ctx->thread_id);   /* PS3_PRIO_START */
-    if (ps3_log_verbose())
-        fprintf(stderr, "[WAIT] event_queue_receive(q=%u timeout=%llu) tid=%llu cia=0x%08X lr=0x%08X\n",
-                queue_id, (unsigned long long)timeout_us,
-                (unsigned long long)ctx->thread_id, (uint32_t)ctx->cia, (uint32_t)ctx->lr);
+    sys_event_queue_info* q = queue_get(LV2_ARG_U32(ctx, 0));
+    const uint32_t event_addr = LV2_ARG_PTR(ctx, 1);
+    const uint64_t timeout_us = LV2_ARG_U64(ctx, 2);
+    if (!q) return (int64_t)(int32_t)CELL_ESRCH;
+    if (q->type != SYS_PPU_QUEUE) return (int64_t)(int32_t)CELL_EINVAL;
 
-    /* PS3_WAITBT: one-shot guest-stack dump per (tid,queue) so we can name the
-     * exact game function the main thread is stuck polling in the flip loop. */
-    if ((s_ps3_waitbt < 0 ? (s_ps3_waitbt = getenv("PS3_WAITBT") ? 1 : 0) : s_ps3_waitbt)) {
-        static unsigned char seen[8][8] = {{0}};
-        unsigned t = (unsigned)ctx->thread_id & 7, qk = queue_id & 7;
-        if (!seen[t][qk]) {
-            seen[t][qk] = 1;
-            extern void ppu_dump_guest_stack(ppu_context*, const char*);
-            char tag[48]; snprintf(tag, sizeof tag, "waitbt tid=%u q=%u", t, queue_id);
-            ppu_dump_guest_stack(ctx, tag);
-        }
-    }
+    ps3_waiter w;
+    ps3_waiter_init(&w, ctx->thread_id, 0);
+    int64_t rc = CELL_OK;
 
-    /* A guest that receives on a queue id it never initialised gets ESRCH
-     * straight back and, if it does not check, spins on it. That is the
-     * guest's bug, but returning instantly makes it ours: GT5P's Job Manager
-     * handler hit this and issued 2,323,673 receives in a 45-second boot,
-     * pinning a core and starving the very threads that would have made
-     * progress. Yield before answering -- it costs a mis-behaving caller
-     * nothing it was entitled to, and stops one bad loop deciding how much
-     * CPU every other thread gets. */
-    if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX) {
-#ifdef _WIN32
-        SwitchToThread();
-#else
-        sched_yield();
-#endif
-    /* WAITBT_EVERY=<n>: the same dump, but every nth wait per (tid,queue)
-     * instead of once. The one-shot above names where a thread FIRST parks,
-     * which is a boot-time answer; when a title runs for a while and then stops
-     * doing something, the question is where it is parked at the END, and the
-     * last dump in the log answers that. */
-    { static int every = -1;
-      if (every < 0) { const char* e = getenv("WAITBT_EVERY"); every = e ? atoi(e) : 0; }
-      if (every > 0) {
-          static unsigned n[8][8] = {{0}};
-          unsigned t = (unsigned)ctx->thread_id & 7, qk = queue_id & 7;
-          if ((n[t][qk]++ % (unsigned)every) == 0) {
-              extern void ppu_dump_guest_stack(ppu_context*, const char*);
-              char tag[64];
-              snprintf(tag, sizeof tag, "wait#%u tid=%u q=%u",
-                       n[t][qk] - 1u, t, queue_id);
-              ppu_dump_guest_stack(ctx, tag);
-          }
-      } }
-
-    if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX)
-        return (int64_t)(int32_t)CELL_ESRCH;
-    }
-
-    sys_event_queue_info* q = &g_sys_event_queues[queue_id - 1];
+    ps3_lock_acquire(&q->lock);
     if (!q->active) {
-#ifdef _WIN32
-        SwitchToThread();
-#else
-        sched_yield();
-#endif
+        ps3_lock_release(&q->lock);
         return (int64_t)(int32_t)CELL_ESRCH;
     }
-
-#ifdef _WIN32
-    EnterCriticalSection(&q->lock);
-    if (!q->active) {                   /* destroyed since the unlocked test */
-        LeaveCriticalSection(&q->lock);
-        return (int64_t)(int32_t)CELL_ESRCH;
-    }
-    /* Counted while inside (every return below gives it back): destroy needs it
-     * for its EBUSY / FORCE decision and to know when we are out. */
-    q->waiters++;
-
-    if (timeout_us == 0) {
-        while (q->count == 0 && q->active && !q->cancelled) {
-            SleepConditionVariableCS(&q->not_empty, &q->lock, INFINITE);
-        }
-        if (q->count == 0 && q->cancelled) {
-            q->waiters--;
-            LeaveCriticalSection(&q->lock);
-            return (int64_t)(int32_t)CELL_ECANCELED;
-        }
-    } else if (timeout_us < 1000) {
-        /* Sub-millisecond timeout = the title's non-blocking event poll (it polls
-         * queues 2 & 3 every frame with a 30us timeout). Windows' ~15.6ms timer
-         * granularity inflates even a 1ms SleepConditionVariableCS to ~15ms, so a
-         * naive floor-to-1ms throttled the game's per-frame poll loop ~500x
-         * (each frame ate ~30ms in two polls). Honor the intent: check once and
-         * return ETIMEDOUT immediately if empty -- same result the game already
-         * handles, just without the bogus 15ms stall. */
-        if (q->count == 0 || !q->active) {
-            q->waiters--;
-            LeaveCriticalSection(&q->lock);
-            return (int64_t)(int32_t)CELL_ETIMEDOUT;
-        }
+    if (q->count) {
+        const sys_event_t* e = &q->buffer[q->head];
+        w.arg[0] = e->source; w.arg[1] = e->data1; w.arg[2] = e->data2; w.arg[3] = e->data3;
+        q->head = (q->head + 1) % q->capacity;
+        q->count--;
+        ps3_lock_release(&q->lock);
     } else {
-        /* Wait to an absolute deadline. A fixed `timeout_us / 1000` per wait
-         * truncated (1500 us became 1 ms) and restarted the FULL timeout after
-         * every wake that found the queue empty (another receiver took the
-         * event), so a contended timed receive could overrun without bound.
-         * The slice is rounded up, so it never returns before the guest's
-         * timeout, and an event that lands right at the deadline is still
-         * taken (the loop re-tests the count before giving up). Past 2^40 us
-         * (12.7 days) the QPC arithmetic would wrap; that is forever anyway. */
-        const int64_t deadline = lv2_usec_deadline(timeout_us < (1ull << 40) ? timeout_us : (1ull << 40));
-        while (q->count == 0 && q->active && !q->cancelled) {
-            const DWORD ms = evt_ms_until(deadline);
-            if (ms == 0) {
-                q->waiters--;
-                LeaveCriticalSection(&q->lock);
-                return (int64_t)(int32_t)CELL_ETIMEDOUT;
-            }
-            SleepConditionVariableCS(&q->not_empty, &q->lock, ms);
+        ppu_thread_note_block(ctx->thread_id);
+        const uint64_t deadline = ps3_sync_deadline_us(timeout_us);
+        ps3_waitq_push(&q->q, &w);
+        ps3_lock_release(&q->lock);
+        if (!ps3_waiter_sleep(&w, deadline)) {
+            ps3_lock_acquire(&q->lock);
+            const int removed = ps3_waitq_remove(&q->q, &w);
+            ps3_lock_release(&q->lock);
+            if (removed) return (int64_t)(int32_t)CELL_ETIMEDOUT;
+            ps3_waiter_sleep(&w, 0);
         }
+        rc = w.result;
+        if (rc != CELL_OK) return rc;
     }
 
-    if (!q->active) {
-        /* Destroyed with SYS_EVENT_QUEUE_DESTROY_FORCE while we waited: lv2
-         * hands every waiter CELL_ECANCELED. */
-        q->waiters--;
-        LeaveCriticalSection(&q->lock);
-        return (int64_t)(int32_t)CELL_ECANCELED;
-    }
-    if (q->count == 0 && q->cancelled) {
-        q->waiters--;
-        LeaveCriticalSection(&q->lock);
-        return (int64_t)(int32_t)CELL_ECANCELED;
-    }
-    if (q->count == 0) {
-        q->waiters--;
-        LeaveCriticalSection(&q->lock);
-        return (int64_t)(int32_t)CELL_ESRCH;
-    }
-
-    sys_event_t evt = q->buffer[q->head];
-    q->head = (q->head + 1) % q->capacity;
-    q->count--;
-
-    q->waiters--;
-    LeaveCriticalSection(&q->lock);
-#else
-    pthread_mutex_lock(&q->lock);
-    if (!q->active) {                   /* destroyed since the unlocked test */
-        pthread_mutex_unlock(&q->lock);
-        return (int64_t)(int32_t)CELL_ESRCH;
-    }
-    q->waiters++;                       /* see the _WIN32 branch */
-
-    if (timeout_us == 0) {
-        while (q->count == 0 && q->active && !q->cancelled) {
-            pthread_cond_wait(&q->not_empty, &q->lock);
-        }
-    } else {
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_sec  += (time_t)(timeout_us / 1000000);
-        ts.tv_nsec += (long)((timeout_us % 1000000) * 1000);
-        if (ts.tv_nsec >= 1000000000L) {
-            ts.tv_sec++;
-            ts.tv_nsec -= 1000000000L;
-        }
-        while (q->count == 0 && q->active && !q->cancelled) {
-            int rc = pthread_cond_timedwait(&q->not_empty, &q->lock, &ts);
-            if (rc == ETIMEDOUT && q->count == 0) {
-                q->waiters--;
-                pthread_mutex_unlock(&q->lock);
-                return (int64_t)(int32_t)CELL_ETIMEDOUT;
-            }
-        }
-    }
-
-    if (!q->active) {                   /* FORCE-destroyed while waiting */
-        q->waiters--;
-        pthread_mutex_unlock(&q->lock);
-        return (int64_t)(int32_t)CELL_ECANCELED;
-    }
-    if (q->count == 0 && q->cancelled) {
-        q->waiters--;
-        pthread_mutex_unlock(&q->lock);
-        return (int64_t)(int32_t)CELL_ECANCELED;
-    }
-    if (q->count == 0) {
-        q->waiters--;
-        pthread_mutex_unlock(&q->lock);
-        return (int64_t)(int32_t)CELL_ESRCH;
-    }
-
-    sys_event_t evt = q->buffer[q->head];
-    q->head = (q->head + 1) % q->capacity;
-    q->count--;
-
-    q->waiters--;
-    pthread_mutex_unlock(&q->lock);
-#endif
-
-    /* lv2 sys_event_queue_receive returns the event in REGISTERS r4..r7
-     * (r3=rc, r4=source, r5=data1, r6=data2, r7=data3) -- this is the ABI the
-     * caller reads (e.g. the SPURS service func_00C5DAB0 checks r4==source key,
-     * extracts the selector from r6). We were only writing the (legacy) memory
-     * buffer, so callers that read the registers saw stale values -> the SPURS
-     * dispatch failed its source check and re-received forever, never dispatching
-     * handler B. Set the registers. */
-    ctx->gpr[4] = evt.source;
-    ctx->gpr[5] = evt.data1;
-    ctx->gpr[6] = evt.data2;
-    ctx->gpr[7] = evt.data3;
-    { static int _r=0; if (getenv("PS3_EVT_RECV_TRACE") && PS3_LOG_FIRST(_r, 60)) fprintf(stderr,
-        "[RECV] q=%u source=0x%llX data1=0x%llX data2=0x%llX\n", queue_id,
-        (unsigned long long)evt.source, (unsigned long long)evt.data1,
-        (unsigned long long)evt.data2); }
-
-    /* Also write the (legacy) guest memory buffer in big-endian, for callers that
-     * pass a real sys_event_t* and read from it. */
+    ctx->gpr[4] = w.arg[0];
+    ctx->gpr[5] = w.arg[1];
+    ctx->gpr[6] = w.arg[2];
+    ctx->gpr[7] = w.arg[3];
     if (event_addr != 0) {
-        uint64_t* out = (uint64_t*)vm_to_host(event_addr);
-        out[0] = bswap64(evt.source);
-        out[1] = bswap64(evt.data1);
-        out[2] = bswap64(evt.data2);
-        out[3] = bswap64(evt.data3);
+        write_be64(event_addr,      w.arg[0]);
+        write_be64(event_addr + 8,  w.arg[1]);
+        write_be64(event_addr + 16, w.arg[2]);
+        write_be64(event_addr + 24, w.arg[3]);
     }
-    /* Diagnostic: prove the blocked receiver was WOKEN and is returning an event
-     * (vs. staying blocked forever). Distinguishes a wake bug from game logic. */
-    /* Was hardcoded to queue 1, which makes every other queue look silent: the
-     * [WAIT] line prints on entry, so a queue with thousands of receives and no
-     * deliveries is indistinguishable from one that is delivering fine.
-     * PS3_EVT_RECV=<queue id> follows a different one; PS3_EVT_RECV=all follows
-     * every queue. Default stays queue 1 so existing logs read the same. */
-    {
-        static int _sel = -2;
-        if (_sel == -2) { const char* e = getenv("PS3_EVT_RECV");
-                          _sel = !e ? 1 : (strcmp(e, "all") == 0 ? -1 : atoi(e)); }
-    if (_sel == -1 || (int)queue_id == _sel) {
-        static int _r = 0;
-        if (PS3_LOG_FIRST(_r, 64))
-            fprintf(stderr, "[evt] q=%u receive RETURNED to tid=%llu: src=0x%llX d1=0x%llX d2=0x%llX d3=0x%llX (qcount now %u)\n",
-                    queue_id,
-                    (unsigned long long)ctx->thread_id, (unsigned long long)evt.source,
-                    (unsigned long long)evt.data1, (unsigned long long)evt.data2,
-                    (unsigned long long)evt.data3, q->count);
-    } }
-
     return CELL_OK;
 }
 
 int64_t sys_event_queue_tryreceive(ppu_context* ctx)
 {
-    uint32_t queue_id   = LV2_ARG_U32(ctx, 0);
-    uint32_t event_addr = LV2_ARG_PTR(ctx, 1);
-    int32_t  max_count  = LV2_ARG_S32(ctx, 2);
-    uint32_t count_addr = LV2_ARG_PTR(ctx, 3);
-
-    if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX)
-        return (int64_t)(int32_t)CELL_ESRCH;
-
-    sys_event_queue_info* q = &g_sys_event_queues[queue_id - 1];
-    if (!q->active)
-        return (int64_t)(int32_t)CELL_ESRCH;
-
+    sys_event_queue_info* q = queue_get(LV2_ARG_U32(ctx, 0));
+    const uint32_t event_addr = LV2_ARG_PTR(ctx, 1);
+    int32_t        max_count  = LV2_ARG_S32(ctx, 2);
+    const uint32_t count_addr = LV2_ARG_PTR(ctx, 3);
+    if (!q) return (int64_t)(int32_t)CELL_ESRCH;
     if (max_count <= 0) max_count = 1;
 
     int32_t received = 0;
-
-#ifdef _WIN32
-    EnterCriticalSection(&q->lock);
-#else
-    pthread_mutex_lock(&q->lock);
-#endif
-
+    ps3_lock_acquire(&q->lock);
     while (received < max_count && q->count > 0) {
-        sys_event_t evt = q->buffer[q->head];
+        const sys_event_t* e = &q->buffer[q->head];
+        if (event_addr != 0) {
+            const uint32_t o = event_addr + (uint32_t)received * 32u;
+            write_be64(o,      e->source);
+            write_be64(o + 8,  e->data1);
+            write_be64(o + 16, e->data2);
+            write_be64(o + 24, e->data3);
+        }
         q->head = (q->head + 1) % q->capacity;
         q->count--;
-
-        if (event_addr != 0) {
-            uint64_t* out = (uint64_t*)vm_to_host(event_addr + (uint32_t)(received * 32));
-            out[0] = bswap64(evt.source);
-            out[1] = bswap64(evt.data1);
-            out[2] = bswap64(evt.data2);
-            out[3] = bswap64(evt.data3);
-        }
         received++;
     }
+    ps3_lock_release(&q->lock);
 
-#ifdef _WIN32
-    LeaveCriticalSection(&q->lock);
-#else
-    pthread_mutex_unlock(&q->lock);
-#endif
-
-    if (count_addr != 0) {
-        write_be32(count_addr, (uint32_t)received);
-    }
-
+    if (count_addr != 0) write_be32(count_addr, (uint32_t)received);
     return CELL_OK;
 }
 
 int64_t sys_event_queue_drain(ppu_context* ctx)
 {
-    uint32_t queue_id = LV2_ARG_U32(ctx, 0);
-
-    if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX)
-        return (int64_t)(int32_t)CELL_ESRCH;
-
-    sys_event_queue_info* q = &g_sys_event_queues[queue_id - 1];
-    if (!q->active)
-        return (int64_t)(int32_t)CELL_ESRCH;
-
-#ifdef _WIN32
-    EnterCriticalSection(&q->lock);
-    q->head = 0;
-    q->tail = 0;
-    q->count = 0;
-    LeaveCriticalSection(&q->lock);
-#else
-    pthread_mutex_lock(&q->lock);
-    q->head = 0;
-    q->tail = 0;
-    q->count = 0;
-    pthread_mutex_unlock(&q->lock);
-#endif
-
+    sys_event_queue_info* q = queue_get(LV2_ARG_U32(ctx, 0));
+    if (!q) return (int64_t)(int32_t)CELL_ESRCH;
+    ps3_lock_acquire(&q->lock);
+    q->head = q->tail = q->count = 0;
+    ps3_lock_release(&q->lock);
     return CELL_OK;
 }
 
-/* =========================================================================
- * EVENT PORTS
- * ========================================================================= */
-
-/* Helper to enqueue an event into a queue */
 static int event_queue_push(sys_event_queue_info* q, const sys_event_t* evt)
 {
-    /* EVT_PUSHLOG=<qid>: log every push to that queue with the host caller, to
-     * find which producer feeds a queue when nothing logs a port_send. */
-    { static int s_q = -1; if (s_q < 0) { const char* e = getenv("EVT_PUSHLOG"); s_q = e ? atoi(e) : 0; }
-      if (s_q && q == &g_sys_event_queues[s_q - 1]) { static int s_n = 0;
-        if (s_n++ < 200) fprintf(stderr, "[evt-push] q=%d src=0x%llX d=0x%llX/0x%llX/0x%llX ra=%p\n",
-                s_q, (unsigned long long)evt->source, (unsigned long long)evt->data1,
-                (unsigned long long)evt->data2, (unsigned long long)evt->data3, __builtin_return_address(0)); } }
-    /* PS3_EVQSTAT=<n>: every n pushes, report each live queue's push count and
-     * how many events are sitting in it unread.
-     *
-     * For a deadlock the pending count is the whole answer. The R3000 spins
-     * waiting for spu4; spu4 waits for SigNotify2 from the guest thread that
-     * services an event queue; that thread sits in sys_event_queue_receive.
-     * pending > 0 means the receiver is not waking (our bug); pending == 0
-     * means nothing produced the event (the guest's, or a missing HLE
-     * producer). Those need opposite fixes, and nothing else distinguishes
-     * them. */
-    { static int s_es = -1;
-      if (s_es < 0) { const char* e = getenv("PS3_EVQSTAT");
-                      s_es = e ? (atoi(e) > 0 ? atoi(e) : 2000) : 0; }
-      if (s_es) { static unsigned long long np[SYS_EVENT_QUEUE_MAX + 1], n;
-          const unsigned qi = (unsigned)(q - g_sys_event_queues) + 1u;
-          if (qi <= SYS_EVENT_QUEUE_MAX) np[qi]++;
-          if ((++n % (unsigned long long)s_es) == 0) {
-              fprintf(stderr, "[evqstat] %llu pushes;", n);
-              for (unsigned k = 1; k <= SYS_EVENT_QUEUE_MAX; k++)
-                  if (np[k] || g_sys_event_queues[k - 1].count)
-                      fprintf(stderr, " q%u[pushed=%llu pending=%u]", k, np[k],
-                              (unsigned)g_sys_event_queues[k - 1].count);
-              fprintf(stderr, "\n"); fflush(stderr);
-          } } }
-#ifdef _WIN32
-    EnterCriticalSection(&q->lock);
-#else
-    pthread_mutex_lock(&q->lock);
-#endif
-
-    if (q->count >= q->capacity) {
-#ifdef _WIN32
-        LeaveCriticalSection(&q->lock);
-#else
-        pthread_mutex_unlock(&q->lock);
-#endif
-        return -1; /* full */
+    ps3_lock_acquire(&q->lock);
+    if (!q->active) {
+        ps3_lock_release(&q->lock);
+        return -2;
     }
-
+    ps3_waiter* w = ps3_waitq_pop(&q->q, proto_of(q->protocol), 0);
+    if (w) {
+        ps3_lock_release(&q->lock);
+        w->arg[0] = evt->source; w->arg[1] = evt->data1;
+        w->arg[2] = evt->data2;  w->arg[3] = evt->data3;
+        ps3_waiter_wake(w, CELL_OK);
+        return 0;
+    }
+    if (q->count >= q->capacity) {
+        ps3_lock_release(&q->lock);
+        return -1;
+    }
     q->buffer[q->tail] = *evt;
     q->tail = (q->tail + 1) % q->capacity;
     q->count++;
-
-#ifdef _WIN32
-    WakeConditionVariable(&q->not_empty);
-    LeaveCriticalSection(&q->lock);
-#else
-    pthread_cond_signal(&q->not_empty);
-    pthread_mutex_unlock(&q->lock);
-#endif
-
+    ps3_lock_release(&q->lock);
     return 0;
 }
 
+int sys_event_queue_push_by_id(uint32_t queue_id,
+                               uint64_t source, uint64_t data1,
+                               uint64_t data2,  uint64_t data3)
+{
+    sys_event_queue_info* q = queue_get(queue_id);
+    if (!q) return -1;
+    const sys_event_t evt = { source, data1, data2, data3 };
+    return event_queue_push(q, &evt) == 0 ? 0 : -1;
+}
 
 int64_t sys_event_port_create(ppu_context* ctx)
 {
@@ -747,650 +261,333 @@ int64_t sys_event_port_create(ppu_context* ctx)
     int32_t  port_type   = LV2_ARG_S32(ctx, 1);
     uint64_t name        = LV2_ARG_U64(ctx, 2);
 
-    evt_table_lock();
-
+    ps3_lock_acquire(&s_evt_table_lock);
     int slot = -1;
     for (int i = 0; i < SYS_EVENT_PORT_MAX; i++) {
         if (!g_sys_event_ports[i].active) { slot = i; break; }
     }
     if (slot < 0) {
-        evt_table_unlock();
+        ps3_lock_release(&s_evt_table_lock);
         return (int64_t)(int32_t)CELL_EAGAIN;
     }
-
     sys_event_port_info* p = &g_sys_event_ports[slot];
-    memset(p, 0, sizeof(*p));
     p->active = 1;
     p->type   = port_type;
     p->name   = name;
     p->connected_queue = 0;
+    ps3_lock_release(&s_evt_table_lock);
 
-    uint32_t port_id = (uint32_t)(slot + 1);
-    fprintf(stderr, "[evt] port_create -> id=%u type=%d name=0x%llX\n",
-            port_id, (int)port_type, (unsigned long long)name);
-    if (id_out_addr != 0) {
-        write_be32(id_out_addr, port_id);
-    }
-
-    evt_table_unlock();
+    if (id_out_addr != 0) write_be32(id_out_addr, (uint32_t)(slot + 1));
     return CELL_OK;
+}
+
+static sys_event_port_info* port_get(uint32_t id)
+{
+    if (id == 0 || id > SYS_EVENT_PORT_MAX) return NULL;
+    sys_event_port_info* p = &g_sys_event_ports[id - 1];
+    return p->active ? p : NULL;
 }
 
 int64_t sys_event_port_destroy(ppu_context* ctx)
 {
-    uint32_t port_id = LV2_ARG_U32(ctx, 0);
-
-    if (port_id == 0 || port_id > SYS_EVENT_PORT_MAX)
-        return (int64_t)(int32_t)CELL_ESRCH;
-
-    evt_table_lock();
-
-    sys_event_port_info* p = &g_sys_event_ports[port_id - 1];
-    if (!p->active) {
-        evt_table_unlock();
-        return (int64_t)(int32_t)CELL_ESRCH;
-    }
-
-    p->active = 0;
-    evt_table_unlock();
-    return CELL_OK;
+    ps3_lock_acquire(&s_evt_table_lock);
+    sys_event_port_info* p = port_get(LV2_ARG_U32(ctx, 0));
+    int64_t rc = CELL_OK;
+    if (!p) rc = (int64_t)(int32_t)CELL_ESRCH;
+    else if (p->connected_queue) rc = (int64_t)(int32_t)CELL_EISCONN;
+    else p->active = 0;
+    ps3_lock_release(&s_evt_table_lock);
+    return rc;
 }
 
 int64_t sys_event_port_connect_local(ppu_context* ctx)
 {
-    uint32_t port_id  = LV2_ARG_U32(ctx, 0);
-    uint32_t queue_id = LV2_ARG_U32(ctx, 1);
-
-    if (port_id == 0 || port_id > SYS_EVENT_PORT_MAX)
-        return (int64_t)(int32_t)CELL_ESRCH;
-    if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX)
-        return (int64_t)(int32_t)CELL_ESRCH;
-    fprintf(stderr, "[evt] port_connect(port=%u -> queue=%u)\n", port_id, queue_id);
-
-    evt_table_lock();
-
-    sys_event_port_info* p = &g_sys_event_ports[port_id - 1];
-    if (!p->active) {
-        evt_table_unlock();
-        return (int64_t)(int32_t)CELL_ESRCH;
-    }
-
-    if (!g_sys_event_queues[queue_id - 1].active) {
-        evt_table_unlock();
-        return (int64_t)(int32_t)CELL_ESRCH;
-    }
-
-    if (p->connected_queue != 0) {
-        evt_table_unlock();
-        return (int64_t)(int32_t)CELL_EISCONN;
-    }
-
-    p->connected_queue = (int32_t)queue_id;
-    evt_table_unlock();
-    /* Port->queue wiring was invisible: create and connect logged nothing, so a
-     * queue nobody is wired to reads exactly like one that is. GT5P's PDI queue
-     * takes 1,901 receives and delivers zero events; knowing whether any port
-     * points at it is the difference between "no sender ran" and "no sender
-     * exists". */
-    fprintf(stderr, "[evt] port_connect_local(port=%u -> q=%u)\n", port_id, queue_id);
-    return CELL_OK;
+    const uint32_t queue_id = LV2_ARG_U32(ctx, 1);
+    ps3_lock_acquire(&s_evt_table_lock);
+    sys_event_port_info* p = port_get(LV2_ARG_U32(ctx, 0));
+    int64_t rc = CELL_OK;
+    if (!p || !queue_get(queue_id)) rc = (int64_t)(int32_t)CELL_ESRCH;
+    else if (p->type != SYS_EVENT_PORT_LOCAL) rc = (int64_t)(int32_t)CELL_EINVAL;
+    else if (p->connected_queue) rc = (int64_t)(int32_t)CELL_EISCONN;
+    else p->connected_queue = (int32_t)queue_id;
+    ps3_lock_release(&s_evt_table_lock);
+    return rc;
 }
 
 int64_t sys_event_port_disconnect(ppu_context* ctx)
 {
-    uint32_t port_id = LV2_ARG_U32(ctx, 0);
-
-    if (port_id == 0 || port_id > SYS_EVENT_PORT_MAX)
-        return (int64_t)(int32_t)CELL_ESRCH;
-
-    evt_table_lock();
-
-    sys_event_port_info* p = &g_sys_event_ports[port_id - 1];
-    if (!p->active) {
-        evt_table_unlock();
-        return (int64_t)(int32_t)CELL_ESRCH;
-
-    }
-
-    if (p->connected_queue == 0) {
-        evt_table_unlock();
-        return (int64_t)(int32_t)CELL_ENOTCONN;
-    }
-
-    p->connected_queue = 0;
-    evt_table_unlock();
-    return CELL_OK;
-}
-
-/* Public helper for non-syscall callers: push an event into a queue by
- * ID. Returns 0 on success, -1 if the queue is unknown/inactive or full. */
-int sys_event_queue_push_by_id(uint32_t queue_id,
-                               uint64_t source, uint64_t data1,
-                               uint64_t data2,  uint64_t data3)
-{
-    if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX) return -1;
-    sys_event_queue_info* q = &g_sys_event_queues[queue_id - 1];
-    if (!q->active) return -1;
-    sys_event_t evt;
-    evt.source = source;
-    evt.data1  = data1;
-    evt.data2  = data2;
-    evt.data3  = data3;
-    return event_queue_push(q, &evt);
-}
-
-/* Public helper: resolve an event queue by its ipc_key (as registered at
- * sys_event_queue_create). Returns the queue_id (1-based) or 0 if none. Used by
- * cellAudio to route the audio-period notify event to the game's queue. */
-uint32_t sys_event_find_queue_by_key(uint64_t key)
-{
-    if (key == 0) return 0;
-    for (int i = 0; i < SYS_EVENT_QUEUE_MAX; i++) {
-        if (g_sys_event_queues[i].active && g_sys_event_queues[i].key == key)
-            return (uint32_t)(i + 1);
-    }
-    return 0;
+    ps3_lock_acquire(&s_evt_table_lock);
+    sys_event_port_info* p = port_get(LV2_ARG_U32(ctx, 0));
+    int64_t rc = CELL_OK;
+    if (!p) rc = (int64_t)(int32_t)CELL_ESRCH;
+    else if (!p->connected_queue) rc = (int64_t)(int32_t)CELL_ENOTCONN;
+    else p->connected_queue = 0;
+    ps3_lock_release(&s_evt_table_lock);
+    return rc;
 }
 
 int64_t sys_event_port_send(ppu_context* ctx)
 {
-    uint32_t port_id = LV2_ARG_U32(ctx, 0);
-    uint64_t data1   = LV2_ARG_U64(ctx, 1);
-    uint64_t data2   = LV2_ARG_U64(ctx, 2);
-    uint64_t data3   = LV2_ARG_U64(ctx, 3);
-    static int s_send_stack = -1; if (s_send_stack < 0) s_send_stack = getenv("PS3_EVT_SEND_STACK") != NULL;
-    if (s_send_stack) { static unsigned char seen[8]={0}; unsigned pk=port_id&7;
-        if(!seen[pk]){ seen[pk]=1; extern void ppu_dump_guest_stack(ppu_context*,const char*);
-            char tag[40]; snprintf(tag,sizeof tag,"port_send producer port=%u",port_id); ppu_dump_guest_stack(ctx,tag); } }
-    if (ps3_log_verbose()) fprintf(stderr, "[evt] port_send(port=%u data=0x%llX/0x%llX/0x%llX)\n",
-            port_id, (unsigned long long)data1, (unsigned long long)data2, (unsigned long long)data3);
-
-    if (port_id == 0 || port_id > SYS_EVENT_PORT_MAX)
-        return (int64_t)(int32_t)CELL_ESRCH;
-
-    sys_event_port_info* p = &g_sys_event_ports[port_id - 1];
-    if (!p->active) {
-        fprintf(stderr, "[evt] port_send(port=%u): port NOT ACTIVE\n", port_id);
-        return (int64_t)(int32_t)CELL_ESRCH;
-    }
-
-    if (p->connected_queue == 0) {
-        fprintf(stderr, "[evt] port_send(port=%u): NOT CONNECTED to any queue\n", port_id);
-        return (int64_t)(int32_t)CELL_ENOTCONN;
-    }
-    if (ps3_log_verbose()) fprintf(stderr, "[evt] port_send(port=%u) -> queue id=%d (source=0x%llX)\n",
-            port_id, p->connected_queue, (unsigned long long)p->name);
-
-    int32_t qidx = p->connected_queue;
-    if (qidx <= 0 || qidx > SYS_EVENT_QUEUE_MAX)
-        return (int64_t)(int32_t)CELL_ENOTCONN;
-
-    sys_event_queue_info* q = &g_sys_event_queues[qidx - 1];
-    if (!q->active)
-        return (int64_t)(int32_t)CELL_ENOTCONN;
-
-    sys_event_t evt;
-    evt.source = p->name;
-    evt.data1  = data1;
-    evt.data2  = data2;
-    evt.data3  = data3;
-
-    if (event_queue_push(q, &evt) < 0) {
-        fprintf(stderr, "[evt] port_send(port=%u): queue %d FULL -> EBUSY%c",
-                port_id, qidx, 10);
-        return (int64_t)(int32_t)CELL_EBUSY;
-    }
-
+    sys_event_port_info* p = port_get(LV2_ARG_U32(ctx, 0));
+    if (!p) return (int64_t)(int32_t)CELL_ESRCH;
+    sys_event_queue_info* q = queue_get((uint32_t)p->connected_queue);
+    if (!q) return (int64_t)(int32_t)CELL_ENOTCONN;
+    const sys_event_t evt = { p->name, LV2_ARG_U64(ctx, 1), LV2_ARG_U64(ctx, 2), LV2_ARG_U64(ctx, 3) };
+    const int rc = event_queue_push(q, &evt);
+    if (rc == -2) return (int64_t)(int32_t)CELL_ENOTCONN;
+    if (rc == -1) return (int64_t)(int32_t)CELL_EBUSY;
     return CELL_OK;
 }
 
-/* =========================================================================
- * EVENT FLAGS
- * ========================================================================= */
-
-int64_t sys_event_flag_create(ppu_context* ctx);
-
-/* An event flag the runtime makes for a guest object (no attribute block),
- * its id stored big-endian at the guest address id_out. */
-int64_t sys_event_flag_create_host(uint32_t id_out, uint64_t init_pattern)
+static sys_event_flag_info* flag_get(uint32_t id)
 {
-    ppu_context c;
-    memset(&c, 0, sizeof c);
-    c.gpr[3] = id_out;
-    c.gpr[4] = 0;
-    c.gpr[5] = init_pattern;
-    return sys_event_flag_create(&c);
+    if (id == 0 || id > SYS_EVENT_FLAG_MAX) return NULL;
+    sys_event_flag_info* f = &g_sys_event_flags[id - 1];
+    return __atomic_load_n(&f->active, __ATOMIC_ACQUIRE) ? f : NULL;
+}
+
+static int flag_mode_valid(uint32_t mode)
+{
+    const uint32_t wait = mode & 0xF, clear = mode & ~0xFu;
+    return (wait == SYS_EVENT_FLAG_WAIT_AND || wait == SYS_EVENT_FLAG_WAIT_OR) &&
+           (clear == 0 || clear == SYS_EVENT_FLAG_WAIT_CLEAR || clear == SYS_EVENT_FLAG_WAIT_CLEAR_ALL);
+}
+
+static int flag_take(uint64_t* pattern, uint64_t bits, uint32_t mode, uint64_t* result)
+{
+    const int hit = (mode & 0xF) == SYS_EVENT_FLAG_WAIT_AND ? (*pattern & bits) == bits
+                                                           : (*pattern & bits) != 0;
+    if (!hit) return 0;
+    *result = *pattern;
+    if (mode & SYS_EVENT_FLAG_WAIT_CLEAR) *pattern &= ~bits;
+    else if (mode & SYS_EVENT_FLAG_WAIT_CLEAR_ALL) *pattern = 0;
+    return 1;
 }
 
 int64_t sys_event_flag_create(ppu_context* ctx)
 {
-    uint32_t id_out_addr = LV2_ARG_PTR(ctx, 0);
-    uint32_t attr_addr   = LV2_ARG_PTR(ctx, 1);
+    uint32_t id_out_addr  = LV2_ARG_PTR(ctx, 0);
+    uint32_t attr_addr    = LV2_ARG_PTR(ctx, 1);
     uint64_t init_pattern = LV2_ARG_U64(ctx, 2);
 
-    evt_table_lock();
+    if (!id_out_addr || !attr_addr) return (int64_t)(int32_t)CELL_EFAULT;
+    const uint8_t* a = (const uint8_t*)vm_to_host(attr_addr);
+    const uint32_t protocol = read_be32(a), type = read_be32(a + 4);
+    if (protocol != 1 && protocol != 2) return (int64_t)(int32_t)CELL_EINVAL;
+    if (type != SYS_SYNC_WAITER_SINGLE && type != SYS_SYNC_WAITER_MULTIPLE)
+        return (int64_t)(int32_t)CELL_EINVAL;
 
+    ps3_lock_acquire(&s_evt_table_lock);
     int slot = -1;
     for (int i = 0; i < SYS_EVENT_FLAG_MAX; i++) {
         if (!g_sys_event_flags[i].active) { slot = i; break; }
     }
     if (slot < 0) {
-        evt_table_unlock();
+        ps3_lock_release(&s_evt_table_lock);
         return (int64_t)(int32_t)CELL_EAGAIN;
     }
-
     sys_event_flag_info* f = &g_sys_event_flags[slot];
-    memset(f, 0, sizeof(*f));
-    f->active  = 1;
-    f->pattern = init_pattern;
+    memset((char*)f + sizeof f->lock, 0, sizeof *f - sizeof f->lock);
+    f->protocol = protocol;
+    f->type     = type;
+    f->pattern  = init_pattern;
+    memcpy(f->name, a + 8, 8);
+    __atomic_store_n(&f->active, 1, __ATOMIC_RELEASE);
+    ps3_lock_release(&s_evt_table_lock);
 
-    if (attr_addr != 0) {
-        uint8_t* attr_raw = (uint8_t*)vm_to_host(attr_addr);
-        uint32_t proto_be, type_be;
-        memcpy(&proto_be, attr_raw, 4);
-        memcpy(&type_be, attr_raw + 4, 4);
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
-        proto_be = ((proto_be >> 24) & 0xFF) | ((proto_be >> 8) & 0xFF00) |
-                   ((proto_be << 8) & 0xFF0000) | ((proto_be << 24) & 0xFF000000u);
-        type_be  = ((type_be >> 24) & 0xFF)  | ((type_be >> 8) & 0xFF00) |
-                   ((type_be << 8) & 0xFF0000) | ((type_be << 24) & 0xFF000000u);
-#endif
-        f->protocol = proto_be;
-        f->type     = type_be;
-        memcpy(f->name, attr_raw + 8, 8);
-    }
-
-#ifdef _WIN32
-    InitializeCriticalSection(&f->lock);
-    InitializeConditionVariable(&f->cv);
-#else
-    pthread_mutex_init(&f->lock, NULL);
-    pthread_cond_init(&f->cv, NULL);
-#endif
-
-    uint32_t flag_id = (uint32_t)(slot + 1);
-    if (id_out_addr != 0) {
-        write_be32(id_out_addr, flag_id);
-    }
-    { char nm[9]; memcpy(nm, f->name, 8); nm[8]=0;
-      for(int i=0;i<8;i++) if(nm[i] && (nm[i]<32||nm[i]>126)) nm[i]='.';
-      fprintf(stderr, "[evt] flag_create id=%u name=\"%s\" init=0x%llX type=%u\n",
-              flag_id, nm, (unsigned long long)init_pattern, f->type); }
-
-    evt_table_unlock();
+    write_be32(id_out_addr, (uint32_t)(slot + 1));
     return CELL_OK;
 }
 
 int64_t sys_event_flag_destroy(ppu_context* ctx)
 {
-    uint32_t flag_id = LV2_ARG_U32(ctx, 0);
-
-    if (flag_id == 0 || flag_id > SYS_EVENT_FLAG_MAX)
-        return (int64_t)(int32_t)CELL_ESRCH;
-
-    evt_table_lock();
-
-    sys_event_flag_info* f = &g_sys_event_flags[flag_id - 1];
-    if (!f->active) {
-        evt_table_unlock();
-        return (int64_t)(int32_t)CELL_ESRCH;
-    }
-
-#ifdef _WIN32
-    DeleteCriticalSection(&f->lock);
-#else
-    pthread_cond_destroy(&f->cv);
-    pthread_mutex_destroy(&f->lock);
-#endif
-
-    f->active = 0;
-    evt_table_unlock();
-    return CELL_OK;
+    sys_event_flag_info* f = flag_get(LV2_ARG_U32(ctx, 0));
+    if (!f) return (int64_t)(int32_t)CELL_ESRCH;
+    ps3_lock_acquire(&s_evt_table_lock);
+    ps3_lock_acquire(&f->lock);
+    int64_t rc = CELL_OK;
+    if (!f->active) rc = (int64_t)(int32_t)CELL_ESRCH;
+    else if (f->q.head) rc = (int64_t)(int32_t)CELL_EBUSY;
+    else __atomic_store_n(&f->active, 0, __ATOMIC_RELEASE);
+    ps3_lock_release(&f->lock);
+    ps3_lock_release(&s_evt_table_lock);
+    return rc;
 }
 
-/* Check if wait condition is met */
-static int flag_check(uint64_t pattern, uint64_t bitpat, uint32_t mode)
-{
-    if (mode & SYS_EVENT_FLAG_WAIT_AND) {
-        return (pattern & bitpat) == bitpat;
-    } else {
-        /* OR mode */
-        return (pattern & bitpat) != 0;
-    }
-}
-
-/* ---------------------------------------------------------------------------
- * sys_event_flag_wait
- *
- * r3 = flag_id
- * r4 = bitpattern (u64)
- * r5 = mode (AND/OR + clear flags)
- * r6 = pointer to receive result pattern (u64*)
- * r7 = timeout_usec (0 = infinite)
- * -----------------------------------------------------------------------*/
 int64_t sys_event_flag_wait(ppu_context* ctx)
 {
-    ppu_thread_note_block(ctx->thread_id);   /* PS3_PRIO_START */
-    uint32_t flag_id    = LV2_ARG_U32(ctx, 0);
-    uint64_t bitpat     = LV2_ARG_U64(ctx, 1);
-    uint32_t mode       = LV2_ARG_U32(ctx, 2);
-    uint32_t result_addr = LV2_ARG_PTR(ctx, 3);
-    { static int n=0; if(PS3_LOG_FIRST(n, 30)) fprintf(stderr,"[WAIT] event_flag_wait(flag=%u pat=0x%llX mode=%u)\n", flag_id,(unsigned long long)bitpat,mode); }
-    uint64_t timeout_us = LV2_ARG_U64(ctx, 4);
-    { static int _w=0; if (PS3_LOG_FIRST(_w, 40)) fprintf(stderr, "[WAIT] event_flag_wait(flag=%u bits=0x%llX timeout=%llu)\n", flag_id, (unsigned long long)bitpat, (unsigned long long)timeout_us); }
-    if (flag_id == 0 || flag_id > SYS_EVENT_FLAG_MAX) {
-        { static int _e=0; if(PS3_LOG_FIRST(_e, 8)) fprintf(stderr,"[evt] flag_wait flag=%u OUT-OF-RANGE (max=%d) -> ESRCH\n", flag_id, SYS_EVENT_FLAG_MAX); }
-        return (int64_t)(int32_t)CELL_ESRCH;
-    }
+    sys_event_flag_info* f = flag_get(LV2_ARG_U32(ctx, 0));
+    const uint64_t bits        = LV2_ARG_U64(ctx, 1);
+    const uint32_t mode        = LV2_ARG_U32(ctx, 2);
+    const uint32_t result_addr = LV2_ARG_PTR(ctx, 3);
+    const uint64_t timeout_us  = LV2_ARG_U64(ctx, 4);
 
-    sys_event_flag_info* f = &g_sys_event_flags[flag_id - 1];
-    if (!f->active) {
-        { static int _e=0; if(PS3_LOG_FIRST(_e, 8))
-            fprintf(stderr,"[evt] flag_wait flag=%u NOT ACTIVE -> ESRCH\n", flag_id); }
-        /* Titles busy-wait on a not-yet-created (or, via the 141/142 syscall
-         * collision, a usleep-that-lands-here) flag, hot-spinning at 100% and
-         * starving the RSX FIFO-drain / producer thread that would satisfy the
-         * condition -- making progress timing-dependent (e.g. rubberducky's
-         * cellGcmFinish ref-sync). Yield so the busy-wait is cooperative and the
-         * other thread gets to run; still returns ESRCH. ponytail: a scheduling
-         * yield, not a semantic change; the real fix is the syscall-number table. */
-#ifdef _WIN32
-        SwitchToThread();
-#else
-        sched_yield();
-#endif
-        return (int64_t)(int32_t)CELL_ESRCH;
-    }
-    { static int _a=0; if(PS3_LOG_FIRST(_a, 8)) fprintf(stderr,"[evt] flag_wait flag=%u ACTIVE, pattern=0x%llX awaiting bits=0x%llX -> BLOCK\n", flag_id,(unsigned long long)f->pattern,(unsigned long long)bitpat); }
-
-    if (bitpat == 0)
-        return (int64_t)(int32_t)CELL_EINVAL;
-
-#ifdef _WIN32
-    EnterCriticalSection(&f->lock);
-
-    if (timeout_us == 0) {
-        while (!flag_check(f->pattern, bitpat, mode) && f->active) {
-            SleepConditionVariableCS(&f->cv, &f->lock, INFINITE);
-        }
-    } else if (timeout_us < 1000) {
-        /* Sub-ms timed wait: poll the pattern to a QPC deadline instead of a
-         * floored-to-1ms condvar wait. Safe to poll: f->pattern only changes
-         * under f->lock (sys_event_flag_set/clear), so yielding with the lock
-         * dropped never misses a committed pattern change -- it just re-reads
-         * the latest value on the next lock acquisition. */
-        int64_t deadline = lv2_usec_deadline(timeout_us);
-        while (!flag_check(f->pattern, bitpat, mode) && f->active) {
-            if (lv2_deadline_passed(deadline)) {
-                /* Write current pattern even on timeout */
-                if (result_addr != 0) {
-                    uint64_t* out = (uint64_t*)vm_to_host(result_addr);
-                    *out = bswap64(f->pattern);
-                }
-                LeaveCriticalSection(&f->lock);
-                return (int64_t)(int32_t)CELL_ETIMEDOUT;
-            }
-            LeaveCriticalSection(&f->lock);
-            SwitchToThread();
-            EnterCriticalSection(&f->lock);
-        }
+    uint64_t result = 0;
+    int64_t rc;
+    if (!flag_mode_valid(mode)) {
+        rc = (int64_t)(int32_t)CELL_EINVAL;
+    } else if (!f) {
+        rc = (int64_t)(int32_t)CELL_ESRCH;
     } else {
-        DWORD ms = (DWORD)(timeout_us / 1000);
-        while (!flag_check(f->pattern, bitpat, mode) && f->active) {
-            if (!SleepConditionVariableCS(&f->cv, &f->lock, ms)) {
-                if (GetLastError() == ERROR_TIMEOUT) {
-                    /* Write current pattern even on timeout */
-                    if (result_addr != 0) {
-                        uint64_t* out = (uint64_t*)vm_to_host(result_addr);
-                        *out = bswap64(f->pattern);
-                    }
-                    LeaveCriticalSection(&f->lock);
-                    return (int64_t)(int32_t)CELL_ETIMEDOUT;
+        ps3_waiter w;
+        ps3_waiter_init(&w, ctx->thread_id, 0);
+        w.arg[0] = bits;
+        w.arg[1] = mode;
+        ps3_lock_acquire(&f->lock);
+        uint64_t pat = f->pattern;
+        if (flag_take(&pat, bits, mode, &result)) {
+            f->pattern = pat;
+            ps3_lock_release(&f->lock);
+            rc = CELL_OK;
+        } else if (f->type == SYS_SYNC_WAITER_SINGLE && f->q.head) {
+            ps3_lock_release(&f->lock);
+            rc = (int64_t)(int32_t)CELL_EPERM;
+        } else {
+            ppu_thread_note_block(ctx->thread_id);
+            const uint64_t deadline = ps3_sync_deadline_us(timeout_us);
+            ps3_waitq_push(&f->q, &w);
+            ps3_lock_release(&f->lock);
+            rc = CELL_OK;
+            if (!ps3_waiter_sleep(&w, deadline)) {
+                ps3_lock_acquire(&f->lock);
+                if (ps3_waitq_remove(&f->q, &w)) {
+                    rc = (int64_t)(int32_t)CELL_ETIMEDOUT;
+                    w.arg[2] = f->pattern;
                 }
+                ps3_lock_release(&f->lock);
+                if (rc == CELL_OK) ps3_waiter_sleep(&w, 0);
             }
+            if (rc == CELL_OK) rc = w.result;
+            result = w.arg[2];
         }
     }
-
-    uint64_t result = f->pattern;
-
-    /* Clear matched bits if requested */
-    if (mode & SYS_EVENT_FLAG_WAIT_CLEAR) {
-        f->pattern &= ~bitpat;
-    } else if (mode & SYS_EVENT_FLAG_WAIT_CLEAR_ALL) {
-        f->pattern = 0;
-    }
-
-    if (result_addr != 0) {
-        uint64_t* out = (uint64_t*)vm_to_host(result_addr);
-        *out = bswap64(result);
-    }
-
-    LeaveCriticalSection(&f->lock);
-#else
-    pthread_mutex_lock(&f->lock);
-
-    if (timeout_us == 0) {
-        while (!flag_check(f->pattern, bitpat, mode) && f->active) {
-            pthread_cond_wait(&f->cv, &f->lock);
-        }
-    } else {
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_sec  += (time_t)(timeout_us / 1000000);
-        ts.tv_nsec += (long)((timeout_us % 1000000) * 1000);
-        if (ts.tv_nsec >= 1000000000L) {
-            ts.tv_sec++;
-            ts.tv_nsec -= 1000000000L;
-        }
-        while (!flag_check(f->pattern, bitpat, mode) && f->active) {
-            int rc = pthread_cond_timedwait(&f->cv, &f->lock, &ts);
-            if (rc == ETIMEDOUT) {
-                if (result_addr != 0) {
-                    uint64_t* out = (uint64_t*)vm_to_host(result_addr);
-                    *out = bswap64(f->pattern);
-                }
-                pthread_mutex_unlock(&f->lock);
-                return (int64_t)(int32_t)CELL_ETIMEDOUT;
-            }
-        }
-    }
-
-    uint64_t result = f->pattern;
-
-    if (mode & SYS_EVENT_FLAG_WAIT_CLEAR) {
-        f->pattern &= ~bitpat;
-    } else if (mode & SYS_EVENT_FLAG_WAIT_CLEAR_ALL) {
-        f->pattern = 0;
-    }
-
-    if (result_addr != 0) {
-        uint64_t* out = (uint64_t*)vm_to_host(result_addr);
-        *out = bswap64(result);
-    }
-
-    pthread_mutex_unlock(&f->lock);
-#endif
-
-    return CELL_OK;
+    if (result_addr) write_be64(result_addr, result);
+    return rc;
 }
 
 int64_t sys_event_flag_trywait(ppu_context* ctx)
 {
-    uint32_t flag_id     = LV2_ARG_U32(ctx, 0);
-    uint64_t bitpat      = LV2_ARG_U64(ctx, 1);
-    uint32_t mode        = LV2_ARG_U32(ctx, 2);
-    uint32_t result_addr = LV2_ARG_PTR(ctx, 3);
+    sys_event_flag_info* f = flag_get(LV2_ARG_U32(ctx, 0));
+    const uint64_t bits        = LV2_ARG_U64(ctx, 1);
+    const uint32_t mode        = LV2_ARG_U32(ctx, 2);
+    const uint32_t result_addr = LV2_ARG_PTR(ctx, 3);
 
-    if (flag_id == 0 || flag_id > SYS_EVENT_FLAG_MAX)
-        return (int64_t)(int32_t)CELL_ESRCH;
+    if (!flag_mode_valid(mode)) return (int64_t)(int32_t)CELL_EINVAL;
+    if (!f) return (int64_t)(int32_t)CELL_ESRCH;
 
-    sys_event_flag_info* f = &g_sys_event_flags[flag_id - 1];
-    if (!f->active)
-        return (int64_t)(int32_t)CELL_ESRCH;
-
-#ifdef _WIN32
-    EnterCriticalSection(&f->lock);
-#else
-    pthread_mutex_lock(&f->lock);
-#endif
-
-    if (!flag_check(f->pattern, bitpat, mode)) {
-        if (result_addr != 0) {
-            uint64_t* out = (uint64_t*)vm_to_host(result_addr);
-            *out = bswap64(f->pattern);
-        }
-#ifdef _WIN32
-        LeaveCriticalSection(&f->lock);
-#else
-        pthread_mutex_unlock(&f->lock);
-#endif
-        return (int64_t)(int32_t)CELL_EBUSY;
-    }
-
-    uint64_t result = f->pattern;
-
-    if (mode & SYS_EVENT_FLAG_WAIT_CLEAR) {
-        f->pattern &= ~bitpat;
-    } else if (mode & SYS_EVENT_FLAG_WAIT_CLEAR_ALL) {
-        f->pattern = 0;
-    }
-
-    if (result_addr != 0) {
-        uint64_t* out = (uint64_t*)vm_to_host(result_addr);
-        *out = bswap64(result);
-    }
-
-#ifdef _WIN32
-    LeaveCriticalSection(&f->lock);
-#else
-    pthread_mutex_unlock(&f->lock);
-#endif
-
+    uint64_t result = 0;
+    ps3_lock_acquire(&f->lock);
+    uint64_t pat = f->pattern;
+    const int hit = flag_take(&pat, bits, mode, &result);
+    f->pattern = pat;
+    ps3_lock_release(&f->lock);
+    if (!hit) return (int64_t)(int32_t)CELL_EBUSY;
+    if (result_addr) write_be64(result_addr, result);
     return CELL_OK;
 }
 
 int64_t sys_event_flag_set(ppu_context* ctx)
 {
-    uint32_t flag_id = LV2_ARG_U32(ctx, 0);
-    uint64_t bitpat  = LV2_ARG_U64(ctx, 1);
+    sys_event_flag_info* f = flag_get(LV2_ARG_U32(ctx, 0));
+    const uint64_t bits = LV2_ARG_U64(ctx, 1);
+    if (!f) return (int64_t)(int32_t)CELL_ESRCH;
 
-    { static int _n=0; if(PS3_LOG_FIRST(_n, 200)) fprintf(stderr,"[evt] flag_set(flag=%u bits=0x%llX)\n",
-        flag_id,(unsigned long long)bitpat); }
-
-    if (flag_id == 0 || flag_id > SYS_EVENT_FLAG_MAX)
-        return (int64_t)(int32_t)CELL_ESRCH;
-
-    sys_event_flag_info* f = &g_sys_event_flags[flag_id - 1];
-    if (!f->active)
-        return (int64_t)(int32_t)CELL_ESRCH;
-
-#ifdef _WIN32
-    EnterCriticalSection(&f->lock);
-    f->pattern |= bitpat;
-    WakeAllConditionVariable(&f->cv);
-    LeaveCriticalSection(&f->lock);
-#else
-    pthread_mutex_lock(&f->lock);
-    f->pattern |= bitpat;
-    pthread_cond_broadcast(&f->cv);
-    pthread_mutex_unlock(&f->lock);
-#endif
-
+    ps3_waiter* wake = NULL;
+    ps3_lock_acquire(&f->lock);
+    uint64_t pat = f->pattern | bits;
+    const uint32_t proto = proto_of(f->protocol);
+    for (ps3_waiter* it = f->q.head; it; it = it->next) it->arg[3] = 0;
+    for (;;) {
+        ps3_waiter* best = NULL;
+        for (ps3_waiter* it = f->q.head; it; it = it->next) {
+            if (it->arg[3]) continue;
+            if (!best || (proto == PS3_SYNC_PRIORITY && it->prio < best->prio)) best = it;
+            if (proto != PS3_SYNC_PRIORITY) break;
+        }
+        if (!best) break;
+        best->arg[3] = 1;
+        if (flag_take(&pat, best->arg[0], (uint32_t)best->arg[1], &best->arg[2])) {
+            ps3_waitq_remove(&f->q, best);
+            best->result = CELL_OK;
+            best->next = wake;
+            wake = best;
+        }
+        if (proto != PS3_SYNC_PRIORITY && !f->q.head) break;
+    }
+    f->pattern = pat;
+    ps3_lock_release(&f->lock);
+    wake_list(wake);
     return CELL_OK;
 }
 
 int64_t sys_event_flag_clear(ppu_context* ctx)
 {
-    uint32_t flag_id = LV2_ARG_U32(ctx, 0);
-    uint64_t bitpat  = LV2_ARG_U64(ctx, 1);
+    sys_event_flag_info* f = flag_get(LV2_ARG_U32(ctx, 0));
+    if (!f) return (int64_t)(int32_t)CELL_ESRCH;
+    ps3_lock_acquire(&f->lock);
+    f->pattern &= LV2_ARG_U64(ctx, 1);
+    ps3_lock_release(&f->lock);
+    return CELL_OK;
+}
 
-    if (flag_id == 0 || flag_id > SYS_EVENT_FLAG_MAX)
-        return (int64_t)(int32_t)CELL_ESRCH;
+int64_t sys_event_flag_cancel(ppu_context* ctx)
+{
+    sys_event_flag_info* f = flag_get(LV2_ARG_U32(ctx, 0));
+    const uint32_t num_addr = LV2_ARG_PTR(ctx, 1);
+    if (num_addr) write_be32(num_addr, 0);
+    if (!f) return (int64_t)(int32_t)CELL_ESRCH;
 
-    sys_event_flag_info* f = &g_sys_event_flags[flag_id - 1];
-    if (!f->active)
-        return (int64_t)(int32_t)CELL_ESRCH;
-
-#ifdef _WIN32
-    EnterCriticalSection(&f->lock);
-    f->pattern &= bitpat;  /* PS3 clear: AND with bitpat (clear bits that are 0 in bitpat) */
-    LeaveCriticalSection(&f->lock);
-#else
-    pthread_mutex_lock(&f->lock);
-    f->pattern &= bitpat;
-    pthread_mutex_unlock(&f->lock);
-#endif
-
+    ps3_waiter* wake = NULL;
+    uint32_t n = 0;
+    ps3_lock_acquire(&f->lock);
+    for (ps3_waiter* w; (w = ps3_waitq_pop(&f->q, PS3_SYNC_FIFO, 0)) != NULL; n++) {
+        w->result = (int64_t)(int32_t)CELL_ECANCELED;
+        w->arg[2] = f->pattern;
+        w->next = wake;
+        wake = w;
+    }
+    ps3_lock_release(&f->lock);
+    wake_list(wake);
+    if (num_addr) write_be32(num_addr, n);
     return CELL_OK;
 }
 
 int64_t sys_event_flag_get(ppu_context* ctx)
 {
-    uint32_t flag_id  = LV2_ARG_U32(ctx, 0);
-    uint32_t out_addr = LV2_ARG_PTR(ctx, 1);
-
-    if (flag_id == 0 || flag_id > SYS_EVENT_FLAG_MAX)
+    sys_event_flag_info* f = flag_get(LV2_ARG_U32(ctx, 0));
+    const uint32_t out_addr = LV2_ARG_PTR(ctx, 1);
+    if (!f) {
+        if (out_addr) write_be64(out_addr, 0);
         return (int64_t)(int32_t)CELL_ESRCH;
-
-    sys_event_flag_info* f = &g_sys_event_flags[flag_id - 1];
-    if (!f->active)
-        return (int64_t)(int32_t)CELL_ESRCH;
-
-    uint64_t pattern;
-#ifdef _WIN32
-    EnterCriticalSection(&f->lock);
-    pattern = f->pattern;
-    LeaveCriticalSection(&f->lock);
-#else
-    pthread_mutex_lock(&f->lock);
-    pattern = f->pattern;
-    pthread_mutex_unlock(&f->lock);
-#endif
-
-    if (out_addr != 0) {
-        uint64_t* out = (uint64_t*)vm_to_host(out_addr);
-        *out = bswap64(pattern);
     }
-
+    if (!out_addr) return (int64_t)(int32_t)CELL_EFAULT;
+    ps3_lock_acquire(&f->lock);
+    const uint64_t pat = f->pattern;
+    ps3_lock_release(&f->lock);
+    write_be64(out_addr, pat);
     return CELL_OK;
 }
 
-/* ---------------------------------------------------------------------------
- * Registration
- * -----------------------------------------------------------------------*/
 void sys_event_init(lv2_syscall_table* tbl)
 {
-    memset(g_sys_event_queues, 0, sizeof(g_sys_event_queues));
-    memset(g_sys_event_ports,  0, sizeof(g_sys_event_ports));
-    memset(g_sys_event_flags,  0, sizeof(g_sys_event_flags));
-
-#ifdef _WIN32
-    if (!s_evt_table_lock_init) {
-        InitializeCriticalSection(&s_evt_table_lock);
-        s_evt_table_lock_init = 1;
-    }
-#endif
-
-    /* Event queues */
     lv2_syscall_register(tbl, SYS_EVENT_QUEUE_CREATE,      sys_event_queue_create);
     lv2_syscall_register(tbl, SYS_EVENT_QUEUE_DESTROY,     sys_event_queue_destroy);
     lv2_syscall_register(tbl, SYS_EVENT_QUEUE_RECEIVE,     sys_event_queue_receive);
     lv2_syscall_register(tbl, SYS_EVENT_QUEUE_TRYRECEIVE,  sys_event_queue_tryreceive);
     lv2_syscall_register(tbl, SYS_EVENT_QUEUE_DRAIN,       sys_event_queue_drain);
 
-    /* Event ports */
     lv2_syscall_register(tbl, SYS_EVENT_PORT_CREATE,        sys_event_port_create);
     lv2_syscall_register(tbl, SYS_EVENT_PORT_DESTROY,       sys_event_port_destroy);
     lv2_syscall_register(tbl, SYS_EVENT_PORT_CONNECT_LOCAL, sys_event_port_connect_local);
     lv2_syscall_register(tbl, SYS_EVENT_PORT_DISCONNECT,    sys_event_port_disconnect);
     lv2_syscall_register(tbl, SYS_EVENT_PORT_SEND,          sys_event_port_send);
 
-    /* Event flags */
     lv2_syscall_register(tbl, SYS_EVENT_FLAG_CREATE,   sys_event_flag_create);
     lv2_syscall_register(tbl, SYS_EVENT_FLAG_DESTROY,  sys_event_flag_destroy);
     lv2_syscall_register(tbl, SYS_EVENT_FLAG_WAIT,     sys_event_flag_wait);
     lv2_syscall_register(tbl, SYS_EVENT_FLAG_TRYWAIT,  sys_event_flag_trywait);
     lv2_syscall_register(tbl, SYS_EVENT_FLAG_SET,      sys_event_flag_set);
     lv2_syscall_register(tbl, SYS_EVENT_FLAG_CLEAR,    sys_event_flag_clear);
+    lv2_syscall_register(tbl, SYS_EVENT_FLAG_CANCEL,   sys_event_flag_cancel);
     lv2_syscall_register(tbl, SYS_EVENT_FLAG_GET,      sys_event_flag_get);
 }

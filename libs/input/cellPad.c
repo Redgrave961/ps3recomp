@@ -18,6 +18,7 @@
 #include <string.h>
 #include <math.h>
 #include "../../runtime/platform/win32_compat.h"   /* GetTickCount64 on POSIX */
+#include "../../runtime/platform/ps3_sync.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host */
 #include "ps3emu/log_first.h"
 #include "../video/rsx_core.h"
@@ -129,16 +130,14 @@ static void pad_host_release(PadHostState* hs)
 /* One poll at a time: the guest polls from several threads, and a poll that
  * opens or closes a controller must not race another one using it.
  * cellPadSetActDirect takes it too (it talks to the controller). */
-#ifdef _WIN32
-  #define pad_yield() Sleep(0)
-#else
-  #include <sched.h>
-  #define pad_yield() sched_yield()
-#endif
-static volatile char s_poll_lock;
-static int  pad_lock_try(void) { return !__atomic_test_and_set(&s_poll_lock, __ATOMIC_ACQUIRE); }
-static void pad_lock(void)     { while (!pad_lock_try()) pad_yield(); }
-static void pad_unlock(void)   { __atomic_clear(&s_poll_lock, __ATOMIC_RELEASE); }
+static ps3_lock s_poll_lock;
+static int  pad_lock_try(void)
+{
+    uint32_t z = 0;
+    return __atomic_compare_exchange_n(&s_poll_lock.v, &z, 1u, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED);
+}
+static void pad_lock(void)     { ps3_lock_acquire(&s_poll_lock); }
+static void pad_unlock(void)   { ps3_lock_release(&s_poll_lock); }
 
 /* CELL_PAD_STATUS_ASSIGN_CHANGES: a port whose reported connection changed
  * since the title last asked (cellPadGetInfo/GetInfo2/PeriphGetInfo), as

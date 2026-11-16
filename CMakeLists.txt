@@ -103,6 +103,7 @@ if(WIN32)
         ole32
         bcrypt
         synchronization
+        dxgi
     )
     if(PS3RECOMP_PAD_SDL)
         target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_PAD_USE_SDL)

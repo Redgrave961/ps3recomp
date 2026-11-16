@@ -19,11 +19,6 @@
  * interrupt. That is why eoi here simply returns -- the body then falls out
  * naturally and ppu_host_thread_proc re-invokes the entry once the next
  * interrupt arrives.
- *
- * ponytail: a flag plus a 200us poll rather than a condition variable, so the
- * whole mechanism stays inside this file with no cross-module plumbing. The
- * ceiling is 200us of interrupt latency; swap in a CV if a title ever needs
- * tighter than that.
  */
 
 #define PS3_INTR_MAX 8
@@ -31,11 +26,17 @@
 typedef struct {
     uint32_t tag;
     uint64_t thread;
-    volatile long pending;
     int       used;
 } ps3_intr_bind;
 
 static ps3_intr_bind s_intr[PS3_INTR_MAX];
+static volatile uint32_t s_intr_seq;
+
+static void ps3_intr_signal(void)
+{
+    __atomic_add_fetch(&s_intr_seq, 1u, __ATOMIC_RELEASE);
+    ps3_futex_wake_all(&s_intr_seq);
+}
 
 /* Bind an interrupt tag to the PPU thread that services it. */
 int ps3_intr_establish(uint32_t tag, uint64_t thread)
@@ -51,7 +52,6 @@ int ps3_intr_establish(uint32_t tag, uint64_t thread)
             s_intr[i].used = 1;
             s_intr[i].tag = tag;
             s_intr[i].thread = thread;
-            s_intr[i].pending = 0;
             fprintf(stderr, "[intr] tag 0x%08X -> ppu thread %llu\n",
                     tag, (unsigned long long)thread);
             return 0;
@@ -71,16 +71,8 @@ int ps3_intr_is_handler(uint64_t thread)
 /* Raise the interrupt for a tag. Called from the SPU side. */
 static void ps3_intr_raise(uint32_t tag)
 {
-    for (int i = 0; i < PS3_INTR_MAX; i++) {
-        if (s_intr[i].used && s_intr[i].tag == tag) {
-#ifdef _WIN32
-            InterlockedExchange(&s_intr[i].pending, 1);
-#else
-            s_intr[i].pending = 1;
-#endif
-            return;
-        }
-    }
+    (void)tag;
+    ps3_intr_signal();
 }
 
 /* Is an interrupt actually asserted for this tag right now?
@@ -110,18 +102,9 @@ int ps3_intr_wait(uint64_t thread)
         if (s_intr[i].used && s_intr[i].thread == thread) { b = &s_intr[i]; break; }
     if (!b) return 0;
     for (;;) {
-        if (ps3_intr_level(b->tag)) {
-            static unsigned long _n = 0;
-            if (++_n <= 8)
-                fprintf(stderr, "[intr] deliver tag 0x%08X -> thread %llu\n",
-                        b->tag, (unsigned long long)thread);
-            return 1;
-        }
-#ifdef _WIN32
-        Sleep(1);
-#else
-        { struct timespec ts = {0, 200 * 1000}; nanosleep(&ts, 0); }
-#endif
+        const uint32_t seq = __atomic_load_n(&s_intr_seq, __ATOMIC_ACQUIRE);
+        if (ps3_intr_level(b->tag)) return 1;
+        ps3_futex_wait(&s_intr_seq, seq, 0);
     }
 }
 

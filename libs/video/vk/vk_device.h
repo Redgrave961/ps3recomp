@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 #define VK_TRY(expr) \
@@ -33,6 +34,7 @@ struct vk_caps {
     bool memory_budget;
     bool buffer_address;
     bool float16;
+    bool fifo_latest_ready;
 };
 
 struct vk_device {
@@ -41,6 +43,7 @@ struct vk_device {
     VkPhysicalDevice gpu = VK_NULL_HANDLE;
     VkDevice dev = VK_NULL_HANDLE;
     VkQueue queue = VK_NULL_HANDLE;
+    std::mutex queue_lock;
     uint32_t family = 0;
     VmaAllocator vma = nullptr;
     VkPhysicalDeviceProperties props{};

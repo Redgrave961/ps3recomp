@@ -223,6 +223,7 @@ typedef struct {
     /* Live spu_context while a lifted worker is running on its host thread
      * (a stack local there), so the PPU can poke its mailbox and wake it. */
     void*               live_ctx;
+    volatile uint32_t   state_seq;
     /* Command written by sys_spu_thread_write_spu_mb and not yet consumed.
      * Handed to the next lifted run as its inbound mailbox word. */
     uint32_t            pending_inmbox;
@@ -267,6 +268,12 @@ typedef struct {
 
 static spu_group_t  s_spu_groups[MAX_SPU_GROUPS];
 static spu_thread_t s_spu_threads[MAX_SPU_THREADS];
+
+static void spu_thread_signal(spu_thread_t* t)
+{
+    __atomic_add_fetch(&t->state_seq, 1u, __ATOMIC_RELEASE);
+    ps3_futex_wake_all(&t->state_seq);
+}
 static uint32_t     s_spu_next_group_id  = 0x1000;
 static uint32_t     s_spu_next_thread_id = 0x2000;
 static int          s_spu_initialized    = 0;
@@ -567,6 +574,7 @@ static void* spu_exec_thread_proc(void* arg)
     }
 #ifdef _WIN32
     t->running = 0;
+    spu_thread_signal(t);
     SetEvent(t->finish_event);
     return 0;
 #else
@@ -575,6 +583,7 @@ static void* spu_exec_thread_proc(void* arg)
     t->finish_event.done = 1;
     pthread_cond_broadcast(&t->finish_event.cv);
     pthread_mutex_unlock(&t->finish_event.mu);
+    spu_thread_signal(t);
     return NULL;
 #endif
 }
@@ -600,6 +609,7 @@ static void* spu_fallback_thread_proc(void* arg)
     /* Mark complete and signal anyone waiting in group_join. */
 #ifdef _WIN32
     t->running = 0;
+    spu_thread_signal(t);
     SetEvent(t->finish_event);
     return 0;
 #else
@@ -608,6 +618,7 @@ static void* spu_fallback_thread_proc(void* arg)
     t->finish_event.done = 1;
     pthread_cond_broadcast(&t->finish_event.cv);
     pthread_mutex_unlock(&t->finish_event.mu);
+    spu_thread_signal(t);
     return NULL;
 #endif
 }
@@ -811,16 +822,13 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
          * race is genuinely tight: it only stayed hidden while the mailbox path
          * was logging every write, because the fprintf/fflush was slowing the
          * PPU down enough for the worker to win. spu_raw.c gates on a `started`
-         * flag for the same reason.
-         *
-         * Bounded, so a worker that dies during init cannot hang group_start. */
+         * flag for the same reason. */
         if (fb == spu_registry_fallback) {
-            for (int spin = 0; spin < 2000 && !t->live_ctx && t->running; spin++)
-#ifdef _WIN32
-                Sleep(1);
-#else
-                { struct timespec ts = {0, 1000000}; nanosleep(&ts, 0); }
-#endif
+            for (;;) {
+                const uint32_t seq = __atomic_load_n(&t->state_seq, __ATOMIC_ACQUIRE);
+                if (__atomic_load_n(&t->live_ctx, __ATOMIC_ACQUIRE) || !__atomic_load_n(&t->running, __ATOMIC_ACQUIRE)) break;
+                ps3_futex_wait(&t->state_seq, seq, 0);
+            }
             if (!t->live_ctx)
                 fprintf(stderr, "[SPU] group_start tid=0x%X: worker never published "
                         "a context -- mailbox writes will fall back to re-runs\n",
@@ -957,18 +965,21 @@ static int64_t sys_spu_thread_group_destroy_handler(ppu_context* ctx)
          * refuse and free nothing. Only threads that own memory freed below
          * count (a lifted context or a local store). */
         int busy = 0;
-        const uint64_t t0 = GetTickCount64();   /* wall time: Sleep(1) can be a 15.6 ms tick */
-        for (;;) {
-            busy = 0;
-            for (int i = 0; i < 8 && i < (int)g->num_threads; i++) {
-                uint32_t idx = g->thread_indices[i];
-                if (idx < MAX_SPU_THREADS && s_spu_threads[idx].in_use &&
-                    *(volatile int*)&s_spu_threads[idx].running &&
-                    (s_spu_threads[idx].sctx || s_spu_threads[idx].local_store))
-                    busy = 1;
+        const uint64_t deadline = ps3_sync_deadline_us(250000);
+        for (int i = 0; i < 8 && i < (int)g->num_threads; i++) {
+            uint32_t idx = g->thread_indices[i];
+            if (idx >= MAX_SPU_THREADS) continue;
+            spu_thread_t* st = &s_spu_threads[idx];
+            if (!st->in_use || !(st->sctx || st->local_store)) continue;
+            for (;;) {
+                const uint32_t seq = __atomic_load_n(&st->state_seq, __ATOMIC_ACQUIRE);
+                if (!__atomic_load_n(&st->running, __ATOMIC_ACQUIRE)) break;
+                if (!ps3_futex_wait(&st->state_seq, seq, deadline)) {
+                    busy = __atomic_load_n(&st->running, __ATOMIC_ACQUIRE) != 0;
+                    break;
+                }
             }
-            if (!busy || GetTickCount64() - t0 >= 250) break;
-            Sleep(1);
+            if (busy) break;
         }
         if (busy) {
             fprintf(stderr, "[SPU] group_destroy id=0x%X: a thread is still running "
@@ -1136,60 +1147,6 @@ static int64_t sys_spu_thread_write_spu_mb_handler(ppu_context* ctx)
     if (t->live_ctx || t->sctx) {
         extern void spu_ch_wake(spu_context* c);
         spu_context* c = t->live_ctx ? (spu_context*)t->live_ctx : t->sctx;
-
-        /* Back-pressure. The inbound mailbox is a single slot and
-         * spu_channel_write overwrites unconditionally, so a PPU thread writing
-         * faster than the worker drains silently destroyed commands: this title
-         * managed 42,562 writes against 32 replies. Hardware reports a FULL
-         * mailbox instead and the caller retries -- which the game already does,
-         * in exactly the tight loop that made the flood visible. Report busy and
-         * drop nothing.
-         *
-         * Still wake the worker: it is the only thing that can drain the slot,
-         * and a missed wake here would turn back-pressure into a livelock. */
-        /* Full mailbox: WAIT for the worker to drain it, do not reject.
-         *
-         * The slot is single-entry and spu_channel_write overwrites, so a write
-         * arriving while the previous command is unread would destroy it. The
-         * first attempt at fixing that returned CELL_EBUSY, on the theory that
-         * the caller retries -- and one code path does, spinning thousands of
-         * times and burning CPU the renderer needs. But another path does NOT
-         * retry: it writes once, takes the error as "sent", and goes straight to
-         * sys_event_queue_receive. That deadlocks outright -- the worker waits
-         * for a command that was refused while the PPU waits for its reply.
-         *
-         * Waiting fixes both: no command is ever dropped, and a PPU thread that
-         * would otherwise spin sleeps instead. Real hardware has a 4-deep inbox,
-         * so this blocks far more often than it should -- a proper FIFO would be
-         * the faithful fix.
-         *
-         * ponytail: bounded 250 ms so a wedged worker degrades to the old EBUSY
-         * instead of hanging the PPU thread forever. */
-        if (spu_channel_has_data(&c->ch_in_mbox)) {
-            spu_ch_wake(c);                       /* only it can drain the slot */
-            int waited = 0;
-            while (spu_channel_has_data(&c->ch_in_mbox) && waited < 250) {
-#ifdef _WIN32
-                Sleep(1);
-#else
-                { struct timespec ts = {0, 1000000}; nanosleep(&ts, 0); }
-#endif
-                waited++;
-            }
-            if (spu_channel_has_data(&c->ch_in_mbox)) {
-                static int _n = 0;
-                if (PS3_LOG_FIRST(_n, 8))
-                    fprintf(stderr, "[SPU] write_spu_mb tid=0x%X val=0x%08X -> BUSY after "
-                            "%d ms (mailbox still holds 0x%08X)\n",
-                            tid, val, waited, c->ch_in_mbox.value);
-                ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_EBUSY;
-                return (int64_t)(int32_t)CELL_EBUSY;
-            }
-            { static int _n = 0;
-              if (PS3_LOG_FIRST(_n, 8))
-                  fprintf(stderr, "[SPU] write_spu_mb tid=0x%X: waited %d ms for the "
-                          "mailbox to drain\n", tid, waited); }
-        }
 
         { static int _n = 0;
           if (PS3_LOG_FIRST(_n, 32))
@@ -1563,7 +1520,10 @@ uint32_t spu_thread_get_group_id(uint32_t tid)
 void spu_thread_publish_ctx(uint32_t tid, void* c)
 {
     spu_thread_t* t = spu_find_thread(tid);
-    if (t) t->live_ctx = c;
+    if (t) {
+        t->live_ctx = c;
+        spu_thread_signal(t);
+    }
 }
 
 /* Public: consume the pending inbound-mailbox command for a SPU thread, if any.
@@ -2008,10 +1968,6 @@ static int64_t sys_spu_thread_stub(ppu_context* ctx)
  *
  * On hardware and in RPCS3 this call SLEEPS until an event is queued. We have no
  * USB devices and no event source, so no event will ever arrive.
- * ponytail: sleep-and-return rather than a real wait queue -- it parks the thread
- * at ~50 Hz instead of blocking forever, so nothing can wedge on shutdown, and
- * the guest simply loops. Give it a real queue if a title ever needs USB events
- * (a pad through the USB stack rather than cellPad, say).
  */
 static int64_t sys_usbd_receive_event_handler(ppu_context* ctx)
 {
@@ -2023,11 +1979,8 @@ static int64_t sys_usbd_receive_event_handler(ppu_context* ctx)
     if (a1) { vm_write_be32(a1, 0); vm_write_be32(a1 + 4, 0); }
     if (a2) { vm_write_be32(a2, 0); vm_write_be32(a2 + 4, 0); }
     if (a3) { vm_write_be32(a3, 0); vm_write_be32(a3 + 4, 0); }
-#ifdef _WIN32
-    Sleep(20);
-#else
-    { struct timespec ts = {0, 20*1000*1000}; nanosleep(&ts, 0); }
-#endif
+    static volatile uint32_t s_no_usb_event;
+    for (;;) ps3_futex_wait(&s_no_usb_event, 0u, 0);
     return CELL_OK;
 }
 

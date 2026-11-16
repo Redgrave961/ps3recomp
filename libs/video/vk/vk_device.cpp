@@ -42,6 +42,10 @@ const ext_entry k_extensions[] = {
       sizeof(VkPhysicalDeviceDynamicRenderingUnusedAttachmentsFeaturesEXT), &vk_caps::unused_attachments },
     { VK_KHR_MAINTENANCE_5_EXTENSION_NAME, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR,
       sizeof(VkPhysicalDeviceMaintenance5FeaturesKHR), &vk_caps::maintenance5 },
+    { VK_KHR_PRESENT_MODE_FIFO_LATEST_READY_EXTENSION_NAME, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_MODE_FIFO_LATEST_READY_FEATURES_KHR,
+      sizeof(VkPhysicalDevicePresentModeFifoLatestReadyFeaturesKHR), &vk_caps::fifo_latest_ready },
+    { VK_EXT_PRESENT_MODE_FIFO_LATEST_READY_EXTENSION_NAME, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_MODE_FIFO_LATEST_READY_FEATURES_KHR,
+      sizeof(VkPhysicalDevicePresentModeFifoLatestReadyFeaturesKHR), &vk_caps::fifo_latest_ready },
     { VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME, VkStructureType(0), 0, &vk_caps::host_memory },
     { VK_EXT_MEMORY_BUDGET_EXTENSION_NAME, VkStructureType(0), 0, &vk_caps::memory_budget },
 };
@@ -195,6 +199,9 @@ bool vk_device_create(vk_device& d, VkSurfaceKHR surface)
     std::vector<std::pair<bool vk_caps::*, const void*>> gated;
     for (const ext_entry& e : k_extensions) {
         if (!has_extension(available, e.name)) continue;
+        if (!std::strcmp(e.name, VK_EXT_PRESENT_MODE_FIFO_LATEST_READY_EXTENSION_NAME) &&
+            has_extension(available, VK_KHR_PRESENT_MODE_FIFO_LATEST_READY_EXTENSION_NAME))
+            continue;
         enable.push_back(e.name);
         if (e.size) {
             void* s = chain_add(d, e.stype, e.size);
@@ -251,10 +258,10 @@ bool vk_device_create(vk_device& d, VkSurfaceKHR surface)
     VK_TRY(vmaCreateAllocator(&ai, &d.vma));
 
     std::fprintf(stderr, "[vk] %s, Vulkan %u.%u.%u: push descriptors %d, dynamic state 3 %d, vertex input %d, "
-                         "pipeline library %d, shader object %d, local read %d, host memory %d\n",
+                         "pipeline library %d, shader object %d, local read %d, host memory %d, fifo latest ready %d\n",
                  d.props.deviceName, VK_API_VERSION_MAJOR(d.props.apiVersion), VK_API_VERSION_MINOR(d.props.apiVersion),
                  VK_API_VERSION_PATCH(d.props.apiVersion), d.caps.push_descriptor, d.caps.dynamic_state3, d.caps.vertex_input,
-                 d.caps.pipeline_library, d.caps.shader_object, d.caps.local_read, d.caps.host_memory);
+                 d.caps.pipeline_library, d.caps.shader_object, d.caps.local_read, d.caps.host_memory, d.caps.fifo_latest_ready);
     return true;
 }
 
@@ -264,5 +271,11 @@ void vk_device_destroy(vk_device& d)
     if (d.dev) vkDestroyDevice(d.dev, nullptr);
     if (d.messenger) vkDestroyDebugUtilsMessengerEXT(d.instance, d.messenger, nullptr);
     if (d.instance) vkDestroyInstance(d.instance, nullptr);
-    d = vk_device{};
+    d.instance = VK_NULL_HANDLE;
+    d.messenger = VK_NULL_HANDLE;
+    d.gpu = VK_NULL_HANDLE;
+    d.dev = VK_NULL_HANDLE;
+    d.queue = VK_NULL_HANDLE;
+    d.vma = nullptr;
+    d.chain.clear();
 }

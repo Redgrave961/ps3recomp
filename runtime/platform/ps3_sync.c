@@ -1,0 +1,273 @@
+#include "ps3_sync.h"
+
+#include <stddef.h>
+
+#if defined(_WIN32)
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
+#  include <intrin.h>
+#  define PS3_SYNC_PAUSE() _mm_pause()
+#  ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#    define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#  endif
+#elif defined(__linux__)
+#  include <errno.h>
+#  include <linux/futex.h>
+#  include <sys/syscall.h>
+#  include <time.h>
+#  include <unistd.h>
+#else
+#  include "win32_compat.h"
+#  include <time.h>
+#endif
+
+#if !defined(PS3_SYNC_PAUSE)
+#  if defined(__x86_64__) || defined(__i386__)
+#    define PS3_SYNC_PAUSE() __builtin_ia32_pause()
+#  elif defined(__aarch64__)
+#    define PS3_SYNC_PAUSE() __asm__ __volatile__("yield" ::: "memory")
+#  else
+#    define PS3_SYNC_PAUSE() ((void)0)
+#  endif
+#endif
+
+extern int32_t ppu_thread_priority(uint64_t tid);
+
+#if defined(_WIN32)
+static uint64_t s_qpc_freq;
+
+uint64_t ps3_sync_now_ns(void)
+{
+    if (!s_qpc_freq) {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        s_qpc_freq = (uint64_t)f.QuadPart;
+    }
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    const uint64_t t = (uint64_t)c.QuadPart;
+    return (t / s_qpc_freq) * 1000000000ull + (t % s_qpc_freq) * 1000000000ull / s_qpc_freq;
+}
+#else
+uint64_t ps3_sync_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+#endif
+
+uint64_t ps3_sync_deadline_us(uint64_t timeout_us)
+{
+    if (!timeout_us || timeout_us >= (1ull << 52)) return 0;
+    return ps3_sync_now_ns() + timeout_us * 1000ull;
+}
+
+int ps3_futex_wait(volatile uint32_t* addr, uint32_t expected, uint64_t deadline_ns)
+{
+#if defined(_WIN32)
+    for (;;) {
+        DWORD ms = INFINITE;
+        if (deadline_ns) {
+            const uint64_t now = ps3_sync_now_ns();
+            if (now >= deadline_ns) return 0;
+            const uint64_t left = (deadline_ns - now + 999999ull) / 1000000ull;
+            ms = left >= (uint64_t)INFINITE ? INFINITE - 1 : (DWORD)left;
+        }
+        if (WaitOnAddress(addr, &expected, sizeof expected, ms)) return 1;
+        if (*addr != expected) return 1;
+    }
+#elif defined(__linux__)
+    if (!deadline_ns) {
+        syscall(SYS_futex, addr, FUTEX_WAIT_PRIVATE, expected, NULL, NULL, 0);
+        return 1;
+    }
+    struct timespec ts;
+    ts.tv_sec  = (time_t)(deadline_ns / 1000000000ull);
+    ts.tv_nsec = (long)(deadline_ns % 1000000000ull);
+    if (syscall(SYS_futex, addr, FUTEX_WAIT_BITSET_PRIVATE, expected, &ts, NULL,
+                FUTEX_BITSET_MATCH_ANY) == -1 && errno == ETIMEDOUT)
+        return 0;
+    return 1;
+#else
+    for (;;) {
+        DWORD ms = INFINITE;
+        if (deadline_ns) {
+            const uint64_t now = ps3_sync_now_ns();
+            if (now >= deadline_ns) return 0;
+            const uint64_t left = (deadline_ns - now + 999999ull) / 1000000ull;
+            ms = left >= (uint64_t)INFINITE ? INFINITE - 1 : (DWORD)left;
+        }
+        if (WaitOnAddress(addr, &expected, sizeof expected, ms)) return 1;
+        if (*addr != expected) return 1;
+    }
+#endif
+}
+
+void ps3_futex_wake_one(volatile uint32_t* addr)
+{
+#if defined(_WIN32)
+    WakeByAddressSingle((PVOID)addr);
+#elif defined(__linux__)
+    syscall(SYS_futex, addr, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0);
+#else
+    WakeByAddressSingle((PVOID)addr);
+#endif
+}
+
+void ps3_futex_wake_all(volatile uint32_t* addr)
+{
+#if defined(_WIN32)
+    WakeByAddressAll((PVOID)addr);
+#elif defined(__linux__)
+    syscall(SYS_futex, addr, FUTEX_WAKE_PRIVATE, 0x7FFFFFFF, NULL, NULL, 0);
+#else
+    WakeByAddressAll((PVOID)addr);
+#endif
+}
+
+void ps3_sleep_us(uint64_t us)
+{
+    if (!us) return;
+#if defined(_WIN32)
+    static __declspec(thread) HANDLE t_timer;
+    if (!t_timer) t_timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    if (t_timer) {
+        LARGE_INTEGER due;
+        due.QuadPart = -(LONGLONG)(us * 10ull);
+        if (SetWaitableTimerEx(t_timer, &due, 0, NULL, NULL, NULL, 0)) {
+            WaitForSingleObject(t_timer, INFINITE);
+            return;
+        }
+    }
+    Sleep((DWORD)((us + 999) / 1000));
+#elif defined(__linux__)
+    const uint64_t deadline = ps3_sync_now_ns() + us * 1000ull;
+    struct timespec ts;
+    ts.tv_sec  = (time_t)(deadline / 1000000000ull);
+    ts.tv_nsec = (long)(deadline % 1000000000ull);
+    while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) != 0) {}
+#else
+    struct timespec ts = { (time_t)(us / 1000000ull), (long)(us % 1000000ull) * 1000L };
+    while (nanosleep(&ts, &ts) != 0) {}
+#endif
+}
+
+void ps3_lock_slow(ps3_lock* l, unsigned spin)
+{
+    for (unsigned i = 0; i < spin; i++) {
+        PS3_SYNC_PAUSE();
+        if (__atomic_load_n(&l->v, __ATOMIC_RELAXED) == 0) {
+            uint32_t z = 0;
+            if (__atomic_compare_exchange_n(&l->v, &z, 1u, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+                return;
+        }
+    }
+    while (__atomic_exchange_n(&l->v, 2u, __ATOMIC_ACQUIRE) != 0)
+        ps3_futex_wait(&l->v, 2u, 0);
+}
+
+void ps3_waiter_init(ps3_waiter* w, uint64_t tid, uintptr_t key)
+{
+    w->next = NULL;
+    w->key = key;
+    w->tid = tid;
+    w->prio = ppu_thread_priority(tid);
+    w->done = 0;
+    w->result = 0;
+    w->arg[0] = w->arg[1] = w->arg[2] = w->arg[3] = 0;
+}
+
+void ps3_waitq_push(ps3_waitq* q, ps3_waiter* w)
+{
+    w->next = NULL;
+    if (q->tail) q->tail->next = w; else q->head = w;
+    q->tail = w;
+}
+
+static void waitq_unlink(ps3_waitq* q, ps3_waiter* prev, ps3_waiter* w)
+{
+    if (prev) prev->next = w->next; else q->head = w->next;
+    if (q->tail == w) q->tail = prev;
+    w->next = NULL;
+}
+
+int ps3_waitq_remove(ps3_waitq* q, ps3_waiter* w)
+{
+    for (ps3_waiter *p = NULL, *it = q->head; it; p = it, it = it->next) {
+        if (it == w) { waitq_unlink(q, p, it); return 1; }
+    }
+    return 0;
+}
+
+ps3_waiter* ps3_waitq_pop(ps3_waitq* q, uint32_t protocol, uintptr_t key)
+{
+    ps3_waiter *best = NULL, *best_prev = NULL;
+    for (ps3_waiter *p = NULL, *it = q->head; it; p = it, it = it->next) {
+        if (key && it->key != key) continue;
+        if (!best || (protocol == PS3_SYNC_PRIORITY && it->prio < best->prio)) {
+            best = it; best_prev = p;
+            if (protocol != PS3_SYNC_PRIORITY) break;
+        }
+    }
+    if (best) waitq_unlink(q, best_prev, best);
+    return best;
+}
+
+ps3_waiter* ps3_waitq_pop_tid(ps3_waitq* q, uintptr_t key, uint64_t tid)
+{
+    for (ps3_waiter *p = NULL, *it = q->head; it; p = it, it = it->next) {
+        if ((!key || it->key == key) && it->tid == tid) { waitq_unlink(q, p, it); return it; }
+    }
+    return NULL;
+}
+
+int ps3_waitq_has(const ps3_waitq* q, uintptr_t key)
+{
+    for (const ps3_waiter* it = q->head; it; it = it->next)
+        if (!key || it->key == key) return 1;
+    return 0;
+}
+
+void ps3_waiter_wake(ps3_waiter* w, int64_t result)
+{
+    w->result = result;
+    __atomic_store_n(&w->done, 1u, __ATOMIC_RELEASE);
+    ps3_futex_wake_one(&w->done);
+}
+
+int ps3_waiter_sleep(ps3_waiter* w, uint64_t deadline_ns)
+{
+    while (!__atomic_load_n(&w->done, __ATOMIC_ACQUIRE)) {
+        if (!ps3_futex_wait(&w->done, 0u, deadline_ns))
+            return __atomic_load_n(&w->done, __ATOMIC_ACQUIRE) != 0;
+    }
+    return 1;
+}
+
+#define PS3_PARK_BUCKETS 256u
+
+typedef struct { ps3_park_bucket b; char pad[64 - sizeof(ps3_park_bucket) % 64]; } park_slot;
+static park_slot s_park[PS3_PARK_BUCKETS];
+
+ps3_park_bucket* ps3_park_bucket_of(uintptr_t key)
+{
+    uint64_t x = (uint64_t)key * 0x9E3779B97F4A7C15ull;
+    return &s_park[(x >> 56) & (PS3_PARK_BUCKETS - 1)].b;
+}
+
+void ps3_park_lock2(ps3_park_bucket* a, ps3_park_bucket* b)
+{
+    if (a == b) { ps3_lock_acquire(&a->lock); return; }
+    if (a > b) { ps3_park_bucket* t = a; a = b; b = t; }
+    ps3_lock_acquire(&a->lock);
+    ps3_lock_acquire(&b->lock);
+}
+
+void ps3_park_unlock2(ps3_park_bucket* a, ps3_park_bucket* b)
+{
+    ps3_lock_release(&a->lock);
+    if (a != b) ps3_lock_release(&b->lock);
+}

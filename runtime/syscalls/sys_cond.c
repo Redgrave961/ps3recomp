@@ -1,245 +1,189 @@
-/* ps3recomp - Kernel condition variables.
- *
- * The kernel commits a waiter before releasing its guest mutex. A host CV
- * alone does not retain a signal delivered between syscall entry and parking.
- * Keep explicit wait records under a separate lock; signals never need the
- * guest mutex, and a later waiter cannot steal an earlier waiter's wakeup.
+/*
+ * ps3recomp - Kernel condition variables.
  */
 #include "sys_cond.h"
-#include "sys_ppu_thread.h"   /* ppu_thread_note_block */
-#include "sys_timer.h"        /* lv2_usec_deadline: QPC deadline for timed waits */
+#include "sys_ppu_thread.h"
 #include "../memory/vm.h"
 #include <string.h>
-#include <stdlib.h>
-#include <stdio.h>
-
-struct sys_cond_waiter {
-    struct sys_cond_waiter* next;
-    int signalled;
-};
 
 sys_cond_info g_sys_conds[SYS_COND_MAX];
-uint32_t g_cond_id_addr[SYS_COND_MAX + 1];
 
-#ifdef _WIN32
-static SRWLOCK s_table_lock = SRWLOCK_INIT;
-static void table_lock(void) { AcquireSRWLockExclusive(&s_table_lock); }
-static void table_unlock(void) { ReleaseSRWLockExclusive(&s_table_lock); }
-static void cond_lock(sys_cond_info* c) { EnterCriticalSection(&c->signal_lock); }
-static void cond_unlock(sys_cond_info* c) { LeaveCriticalSection(&c->signal_lock); }
-static void cond_wake(sys_cond_info* c) { WakeAllConditionVariable(&c->cv); }
-static void guest_lock(sys_mutex_info* m) { EnterCriticalSection(&m->cs); }
-static void guest_unlock(sys_mutex_info* m) { LeaveCriticalSection(&m->cs); }
+static ps3_lock s_cond_table_lock;
 
-/* Milliseconds left to a lv2_usec_deadline() deadline, rounded UP (a timed wait
- * must not return before the guest's timeout); 0 once it has passed. */
-static DWORD cond_ms_until(int64_t deadline)
+static uint32_t cond_protocol(const sys_cond_info* c)
 {
-    LARGE_INTEGER f, now;
-    QueryPerformanceFrequency(&f);
-    QueryPerformanceCounter(&now);
-    if (now.QuadPart >= deadline) return 0;
-    const uint64_t left = (uint64_t)(deadline - now.QuadPart), q = (uint64_t)f.QuadPart;
-    const uint64_t ms = (left / q) * 1000ull + ((left % q) * 1000ull + q - 1) / q;
-    return ms >= (uint64_t)INFINITE ? (DWORD)(INFINITE - 1) : (DWORD)ms;
+    return c->mutex->protocol == SYS_SYNC_FIFO ? PS3_SYNC_FIFO : PS3_SYNC_PRIORITY;
 }
-#else
-static pthread_mutex_t s_table_lock = PTHREAD_MUTEX_INITIALIZER;
-static void table_lock(void) { pthread_mutex_lock(&s_table_lock); }
-static void table_unlock(void) { pthread_mutex_unlock(&s_table_lock); }
-static void cond_lock(sys_cond_info* c) { pthread_mutex_lock(&c->signal_lock); }
-static void cond_unlock(sys_cond_info* c) { pthread_mutex_unlock(&c->signal_lock); }
-static void cond_wake(sys_cond_info* c) { pthread_cond_broadcast(&c->cv); }
-static void guest_lock(sys_mutex_info* m) { pthread_mutex_lock(&m->mtx); }
-static void guest_unlock(sys_mutex_info* m) { pthread_mutex_unlock(&m->mtx); }
-#endif
 
-/* Lock ordering is table -> condition. No caller holds the condition lock
- * while acquiring a guest mutex. Native locks survive slot recycling. */
-static sys_cond_info* acquire_cond(uint32_t id)
+static sys_cond_info* cond_get(uint32_t id)
 {
     if (!id || id > SYS_COND_MAX) return NULL;
-    table_lock();
     sys_cond_info* c = &g_sys_conds[id - 1];
-    if (!c->active) { table_unlock(); return NULL; }
-    cond_lock(c);
-    table_unlock();
-    return c;
+    return __atomic_load_n(&c->active, __ATOMIC_ACQUIRE) ? c : NULL;
 }
 
 int64_t sys_cond_create(ppu_context* ctx)
 {
-    uint32_t out = LV2_ARG_PTR(ctx, 0);
-    uint32_t mid = LV2_ARG_U32(ctx, 1);
-    uint32_t attr = LV2_ARG_PTR(ctx, 2);
-    if (!mid || mid > SYS_MUTEX_MAX || !g_sys_mutexes[mid - 1].active)
-        return (int32_t)CELL_ESRCH;
-    table_lock();
+    const uint32_t out  = LV2_ARG_PTR(ctx, 0);
+    const uint32_t mid  = LV2_ARG_U32(ctx, 1);
+    const uint32_t attr = LV2_ARG_PTR(ctx, 2);
+    sys_mutex_info* m = lv2_mutex_get(mid);
+    if (!m) return (int32_t)CELL_ESRCH;
+
+    ps3_lock_acquire(&s_cond_table_lock);
     for (unsigned i = 0; i < SYS_COND_MAX; ++i) {
         sys_cond_info* c = &g_sys_conds[i];
         if (c->active) continue;
-        if (!c->initialized) {
-#ifdef _WIN32
-            InitializeCriticalSection(&c->signal_lock);
-            InitializeConditionVariable(&c->cv);
-#else
-            int rc = pthread_mutex_init(&c->signal_lock, NULL);
-            if (rc) { table_unlock(); return (int32_t)CELL_EAGAIN; }
-            rc = pthread_cond_init(&c->cv, NULL);
-            if (rc) {
-                pthread_mutex_destroy(&c->signal_lock);
-                table_unlock(); return (int32_t)CELL_EAGAIN;
-            }
-#endif
-            c->initialized = 1;
-        }
+        memset((char*)c + sizeof c->lock, 0, sizeof *c - sizeof c->lock);
         c->mutex_id = mid;
-        c->waiters = NULL;
-        memset(c->name, 0, sizeof(c->name));
-        /* sys_cond_attribute_t: pshared, flags, ipc_key u64 @0x08, name[8]
-         * @0x10. Offset 8 copied the ipc_key into the log name. */
+        c->mutex = m;
         if (attr) memcpy(c->name, (uint8_t*)vm_to_host(attr) + 0x10, 8);
-        c->active = 1;
-        g_cond_id_addr[i + 1] = out;
+        ps3_lock_acquire(&m->lock);
+        m->cond_count++;
+        ps3_lock_release(&m->lock);
+        __atomic_store_n(&c->active, 1, __ATOMIC_RELEASE);
+        ps3_lock_release(&s_cond_table_lock);
         if (out) {
             uint8_t* p = vm_to_host(out);
-            uint32_t id = i + 1;
+            const uint32_t id = i + 1;
             p[0] = (uint8_t)(id >> 24); p[1] = (uint8_t)(id >> 16);
-            p[2] = (uint8_t)(id >> 8); p[3] = (uint8_t)id;
+            p[2] = (uint8_t)(id >> 8);  p[3] = (uint8_t)id;
         }
-        if (getenv("PS3_SYNCLOG")) {
-            char name[9]; memcpy(name, c->name, 8); name[8] = 0;
-            fprintf(stderr, "[SYNC] cond_create id=%u name='%s' mutex=%u id_at=0x%08X lr=0x%08X\n",
-                    i + 1, name, mid, out, (uint32_t)ctx->lr);
-        }
-        table_unlock();
         return CELL_OK;
     }
-    table_unlock();
+    ps3_lock_release(&s_cond_table_lock);
     return (int32_t)CELL_EAGAIN;
 }
 
 int64_t sys_cond_destroy(ppu_context* ctx)
 {
-    uint32_t id = LV2_ARG_U32(ctx, 0);
-    if (!id || id > SYS_COND_MAX) return (int32_t)CELL_ESRCH;
-    table_lock();
-    sys_cond_info* c = &g_sys_conds[id - 1];
-    if (!c->active) { table_unlock(); return (int32_t)CELL_ESRCH; }
-    cond_lock(c);
-    int32_t result = CELL_OK;
-    if (c->waiters) result = (int32_t)CELL_EBUSY;
-    else { c->active = 0; g_cond_id_addr[id] = 0; }
-    cond_unlock(c);
-    table_unlock();
-    return result;
+    sys_cond_info* c = cond_get(LV2_ARG_U32(ctx, 0));
+    if (!c) return (int32_t)CELL_ESRCH;
+    ps3_lock_acquire(&s_cond_table_lock);
+    ps3_lock_acquire(&c->lock);
+    int32_t rc = CELL_OK;
+    if (!c->active) rc = (int32_t)CELL_ESRCH;
+    else if (c->q.head) rc = (int32_t)CELL_EBUSY;
+    else {
+        __atomic_store_n(&c->active, 0, __ATOMIC_RELEASE);
+        ps3_lock_acquire(&c->mutex->lock);
+        c->mutex->cond_count--;
+        ps3_lock_release(&c->mutex->lock);
+    }
+    ps3_lock_release(&c->lock);
+    ps3_lock_release(&s_cond_table_lock);
+    return rc;
 }
 
 int64_t sys_cond_wait(ppu_context* ctx)
 {
-    ppu_thread_note_block(ctx->thread_id);   /* PS3_PRIO_START */
-    uint64_t timeout = LV2_ARG_U64(ctx, 1);
-
-    if (timeout > ((1ull << 48) - 1)) timeout = (1ull << 48) - 1;
-#ifdef _WIN32
-    /* The QPC deadline below multiplies by the counter frequency in 64 bits;
-     * past 2^40 us (12.7 days) that wraps, and nobody waits that long and
-     * returns: treat it as infinite. */
-    if (timeout > (1ull << 40)) timeout = 0;
-#endif
-    sys_cond_info* c = acquire_cond(LV2_ARG_U32(ctx, 0));
+    sys_cond_info* c = cond_get(LV2_ARG_U32(ctx, 0));
+    const uint64_t timeout = LV2_ARG_U64(ctx, 1);
     if (!c) return (int32_t)CELL_ESRCH;
-    sys_mutex_info* m = &g_sys_mutexes[c->mutex_id - 1];
-    if (!m->active) { cond_unlock(c); return (int32_t)CELL_ESRCH; }
-    if (m->owner_tid != ctx->thread_id || m->lock_count <= 0) {
-        cond_unlock(c); return (int32_t)CELL_EPERM;
-    }
-    struct sys_cond_waiter waiter = {NULL, 0};
-    struct sys_cond_waiter** tail = &c->waiters;
-    while (*tail) tail = &(*tail)->next;
-    *tail = &waiter;
-    int depth = m->lock_count;
-    m->owner_tid = 0;
-    m->lock_count = 0;
-    for (int i = 0; i < depth; ++i) guest_unlock(m);
+    sys_mutex_info* m = c->mutex;
+    const uint32_t self = (uint32_t)ctx->thread_id;
+    if (lv2_mutex_owner(m) != self) return (int32_t)CELL_EPERM;
 
-    int32_t result = CELL_OK;
-#ifdef _WIN32
-    /* The timeout runs on the QPC. GetTickCount64 advances in system-timer
-     * ticks (up to 15.6 ms), so measuring a 1 ms timeout with it came back up
-     * to a tick late. The slice handed to the condition variable is rounded up
-     * to whole milliseconds, so a wait never ends before the guest's timeout. */
-    const int64_t deadline = timeout ? lv2_usec_deadline(timeout) : 0;
-    while (!waiter.signalled) {
-        DWORD ms = INFINITE;
-        if (timeout) {
-            ms = cond_ms_until(deadline);
-            if (ms == 0) { result = (int32_t)CELL_ETIMEDOUT; break; }
-        }
-        BOOL ok = SleepConditionVariableCS(&c->cv, &c->signal_lock, ms);
-        if (!ok && GetLastError() != ERROR_TIMEOUT && !waiter.signalled) {
-            result = (int32_t)CELL_EFAULT; break;
-        }
+    ppu_thread_note_block(ctx->thread_id);
+    ps3_waiter w;
+    ps3_waiter_init(&w, ctx->thread_id, 0);
+    w.arg[0] = m->lock_count;
+    const uint64_t deadline = ps3_sync_deadline_us(timeout);
+
+    ps3_lock_acquire(&c->lock);
+    if (!c->active) {
+        ps3_lock_release(&c->lock);
+        return (int32_t)CELL_ESRCH;
     }
-#else
-    struct timespec deadline;
-    if (timeout) {
-        clock_gettime(CLOCK_REALTIME, &deadline);
-        deadline.tv_sec += (time_t)(timeout / 1000000);
-        deadline.tv_nsec += (long)((timeout % 1000000) * 1000);
-        if (deadline.tv_nsec >= 1000000000L) {
-            deadline.tv_sec++; deadline.tv_nsec -= 1000000000L;
-        }
-    }
-    while (!waiter.signalled) {
-        int rc = timeout ? pthread_cond_timedwait(&c->cv, &c->signal_lock, &deadline)
-                         : pthread_cond_wait(&c->cv, &c->signal_lock);
-        if (rc && !waiter.signalled) {
-            result = (int32_t)(rc == ETIMEDOUT ? CELL_ETIMEDOUT : CELL_EFAULT);
-            break;
-        }
-    }
-#endif
-    struct sys_cond_waiter** link = &c->waiters;
-    while (*link != &waiter) link = &(*link)->next;
-    *link = waiter.next;
-    cond_unlock(c);
-    /* Re-acquiring counts as waiting on the mutex (sys_mutex_destroy). */
-    __atomic_add_fetch(&m->waiters, 1, __ATOMIC_SEQ_CST);
-    for (int i = 0; i < depth; ++i) guest_lock(m);
-    __atomic_sub_fetch(&m->waiters, 1, __ATOMIC_SEQ_CST);
-    m->owner_tid = ctx->thread_id;
-    m->lock_count = depth;
-    return result;
+    ps3_waitq_push(&c->q, &w);
+    ps3_lock_release(&c->lock);
+
+    m->lock_count = 0;
+    lv2_mutex_release(m, self);
+
+    if (ps3_waiter_sleep(&w, deadline)) return CELL_OK;
+
+    ps3_lock_acquire(&c->lock);
+    ps3_lock_acquire(&m->lock);
+    const int timed_out = ps3_waitq_remove(&c->q, &w);
+    const int owned = timed_out && lv2_mutex_try_own(m, &w);
+    ps3_lock_release(&m->lock);
+    ps3_lock_release(&c->lock);
+    if (!owned) ps3_waiter_sleep(&w, 0);
+    return timed_out ? (int32_t)CELL_ETIMEDOUT : CELL_OK;
 }
 
-static int64_t signal_cond(uint32_t id, int all)
+static void hand_to_mutex(sys_mutex_info* m, ps3_waiter* w, ps3_waiter** wake)
 {
-    sys_cond_info* c = acquire_cond(id);
-    if (!c) return (int32_t)CELL_ESRCH;
-    int selected = 0;
-    for (struct sys_cond_waiter* w = c->waiters; w; w = w->next) {
-        if (w->signalled) continue;
-        w->signalled = 1;
-        selected = 1;
-        if (!all) break;
+    if (lv2_mutex_try_own(m, w)) {
+        w->next = *wake;
+        *wake = w;
     }
-    /* Broadcast the host CV: only selected records return to the guest.
-     * Waking an arbitrary host waiter could leave the selected one asleep. */
-    if (selected) cond_wake(c);
-    cond_unlock(c);
+}
+
+static void wake_list(ps3_waiter* w)
+{
+    while (w) {
+        ps3_waiter* next = w->next;
+        ps3_waiter_wake(w, CELL_OK);
+        w = next;
+    }
+}
+
+int64_t sys_cond_signal(ppu_context* ctx)
+{
+    sys_cond_info* c = cond_get(LV2_ARG_U32(ctx, 0));
+    if (!c) return (int32_t)CELL_ESRCH;
+    ps3_waiter* wake = NULL;
+    ps3_lock_acquire(&c->lock);
+    ps3_waiter* w = ps3_waitq_pop(&c->q, cond_protocol(c), 0);
+    if (w) {
+        ps3_lock_acquire(&c->mutex->lock);
+        hand_to_mutex(c->mutex, w, &wake);
+        ps3_lock_release(&c->mutex->lock);
+    }
+    ps3_lock_release(&c->lock);
+    wake_list(wake);
     return CELL_OK;
 }
 
-int64_t sys_cond_signal(ppu_context* ctx) { return signal_cond(LV2_ARG_U32(ctx, 0), 0); }
-int64_t sys_cond_signal_all(ppu_context* ctx) { return signal_cond(LV2_ARG_U32(ctx, 0), 1); }
+int64_t sys_cond_signal_all(ppu_context* ctx)
+{
+    sys_cond_info* c = cond_get(LV2_ARG_U32(ctx, 0));
+    if (!c) return (int32_t)CELL_ESRCH;
+    ps3_waiter* wake = NULL;
+    ps3_lock_acquire(&c->lock);
+    if (c->q.head) {
+        ps3_lock_acquire(&c->mutex->lock);
+        for (ps3_waiter* w; (w = ps3_waitq_pop(&c->q, PS3_SYNC_PRIORITY, 0)) != NULL;)
+            hand_to_mutex(c->mutex, w, &wake);
+        ps3_lock_release(&c->mutex->lock);
+    }
+    ps3_lock_release(&c->lock);
+    wake_list(wake);
+    return CELL_OK;
+}
 
-/* Preserve upstream's current broadcast fallback for signal_to. */
-int64_t sys_cond_signal_to(ppu_context* ctx) { return signal_cond(LV2_ARG_U32(ctx, 0), 1); }
+int64_t sys_cond_signal_to(ppu_context* ctx)
+{
+    sys_cond_info* c = cond_get(LV2_ARG_U32(ctx, 0));
+    const uint32_t tid = LV2_ARG_U32(ctx, 1);
+    if (!c || !ppu_thread_exists(tid)) return (int32_t)CELL_ESRCH;
+    ps3_waiter* wake = NULL;
+    ps3_lock_acquire(&c->lock);
+    ps3_waiter* w = ps3_waitq_pop_tid(&c->q, 0, tid);
+    if (w) {
+        ps3_lock_acquire(&c->mutex->lock);
+        hand_to_mutex(c->mutex, w, &wake);
+        ps3_lock_release(&c->mutex->lock);
+    }
+    ps3_lock_release(&c->lock);
+    wake_list(wake);
+    return w ? CELL_OK : (int32_t)CELL_EPERM;
+}
 
 void sys_cond_init(lv2_syscall_table* tbl)
 {
-    /* Static storage starts empty. Registration must not memset live locks. */
     lv2_syscall_register(tbl, SYS_COND_CREATE, sys_cond_create);
     lv2_syscall_register(tbl, SYS_COND_DESTROY, sys_cond_destroy);
     lv2_syscall_register(tbl, SYS_COND_WAIT, sys_cond_wait);

@@ -37,7 +37,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>      /* nanosleep, in the POSIX half of spu_intr.inc */
+#include "../platform/ps3_sync.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -248,6 +248,12 @@ static inline long raw_cas(volatile long* p, long v, long c)
 #define RAW_CAS(p, v, c)  raw_cas((p), (v), (c))
 #endif
 
+static void raw_spu_stopped(raw_spu* s)
+{
+    RAW_XCHG(&s->started, 0);
+    ps3_futex_wake_all((volatile uint32_t*)&s->started);
+}
+
 static void raw_spu_run(raw_spu* s)
 {
     ps3_thread_name("raw spu");
@@ -268,7 +274,7 @@ static void raw_spu_run(raw_spu* s)
         fflush(stderr);
         spu_coh_unregister(c);
         spu_mfc_release(c);
-        RAW_XCHG(&s->started, 0);
+        raw_spu_stopped(s);
         return;
     }
 
@@ -285,7 +291,7 @@ static void raw_spu_run(raw_spu* s)
     s->int_stat |= 0x2u;
     if (s->int_stat & s->int_mask) ps3_intr_raise(s->intrtag);
     publish(s);
-    RAW_XCHG(&s->started, 0);
+    raw_spu_stopped(s);
 
     fprintf(stderr, "[spu-raw] spu%u stopped: halted=%d pc=0x%05X lr=0x%05X "
                     "steps=%llu stop_code=0x%X outmbox(n=%u v=0x%08X) "
@@ -314,14 +320,8 @@ static void raw_spu_stop(raw_spu* s)
     if (!s->started) { c->status = SPU_STATUS_STOPPED; return; }
     c->stop_request = 1;
     spu_ch_wake(c);
-    for (int i = 0; i < 20000 && s->started; i++) {   /* up to ~4 s */
-        spu_ch_wake(c);
-#ifdef _WIN32
-        Sleep(1);
-#else
-        { struct timespec ts = {0, 200 * 1000}; nanosleep(&ts, 0); }
-#endif
-    }
+    const uint64_t deadline = ps3_sync_deadline_us(4000000);
+    while (s->started && ps3_futex_wait((volatile uint32_t*)&s->started, 1u, deadline)) {}
     if (s->started)
         fprintf(stderr, "[spu-raw] spu%u did not stop on RunCntl = 0 (pc=0x%05X): "
                         "it is not reaching a channel operation\n",
@@ -626,6 +626,7 @@ int spu_raw_reg_load(uint32_t ea, uint32_t* out)
 
     if (off == SPU_RAW_OUT_MBOX) {
         uint32_t v = spu_channel_read(&s->ctx->ch_out_mbox);
+        spu_ch_wake(s->ctx);
         publish(s);
         if (dbg())
             fprintf(stderr, "[spu-raw] R spu%u OUT_MBOX -> 0x%08X\n",
@@ -695,16 +696,10 @@ static int64_t sc_raw_spu_create_interrupt_tag(ppu_context* ctx)
 static int64_t sc_raw_spu_set_int_mask(ppu_context* ctx)
 {
     uint32_t n = (uint32_t)ctx->gpr[3];
-    if (n < SPU_RAW_COUNT) s_spu[n].int_mask = (uint32_t)ctx->gpr[5];
-    /* SPU_DBG_MBOX=1: the mask the guest actually enables, plus each SPU's
-     * outbound-mailbox depth on a timer. The image-1 SPUs signal the PPU with
-     * a PLAIN `wrch SPU_WrOutMbox` (LS 0x11D4), which sets int_stat bit 0x10 --
-     * so if the guest only enables 0x1|0x2 that write raises nothing and the PPU
-     * has to poll. If it stopped polling, the message sits unread and the SPUs
-     * spin. This prints enough to tell those apart. */
-    { static int _d = -1; if (_d < 0) _d = getenv("SPU_DBG_MBOX") ? 1 : 0;
-      if (_d) fprintf(stderr, "[spu-mask] spu%u class=%llu mask=0x%llX\n",
-              n, (unsigned long long)ctx->gpr[4], (unsigned long long)ctx->gpr[5]); }
+    if (n < SPU_RAW_COUNT) {
+        s_spu[n].int_mask = (uint32_t)ctx->gpr[5];
+        ps3_intr_raise(s_spu[n].intrtag);
+    }
     return CELL_OK;
 }
 

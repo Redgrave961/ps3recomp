@@ -633,7 +633,11 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
         if (ctx->ls != ctx->ls_store)
             while (ctx->ch_out_mbox.count >= SPU_MBOX_DEPTH && ctx->status != SPU_STATUS_STOPPED) {
                 spu_honour_stop_request(ctx);
-                Sleep(0);
+                AcquireSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
+                if (ctx->ch_out_mbox.count >= SPU_MBOX_DEPTH && !ctx->stop_request)
+                    SleepConditionVariableSRW((CONDITION_VARIABLE*)&ctx->ch_wait_cv,
+                                              (SRWLOCK*)&ctx->ch_wait_lock, INFINITE, 0);
+                ReleaseSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
             }
         spu_channel_write(&ctx->ch_out_mbox, v);
         /* Plain mailbox data is consumed by the following interrupt request. */
@@ -681,33 +685,13 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
  * per-SPU CV until a producer (mailbox/signal write, event raise) calls
  * spu_ch_wake -- never fabricating a value. Under SPU_LOCKSTEP the wait
  * releases the run token first (block_begin) so a peer SPU that must post the
- * awaited data is never blocked on this ctx. A 10 ms re-poll is the missed-wake
- * safety net. The producers (mailbox/signal writes, the MFC
+ * awaited data is never blocked on this ctx. The producers (mailbox/signal writes, the MFC
  * tag-status and lock-line-lost event raises) all wake, and a read that returns
  * instead of stalling is not what the SPU does -- the SPURS kernel idles in
  * `rdch SPU_RdEventStat` waiting for its lock line to change, and returning at
  * once turns every idle kernel into a getllar busy-loop through the lock-line
  * lock that starves the SPU and PPU threads doing work.
  * ===========================================================================*/
-/* Would rdch complete right now? Plain reads + the 10 ms re-poll cover cross-
- * thread visibility (x86 TSO + the wait syscall's barrier); the s43 atomics are
- * a later refinement. */
-/* MFC_LLR_LOST_EVENT (0x400) -- the only producer for it.
- *
- * The SPU "wait until another processor touches this variable" idiom is: GETLLAR
- * the 128-byte line, set the event mask to Lr, then block in
- * `rdch SPU_RdEventStat` until the reservation is lost. Nothing ever raised that
- * bit, so an SPU using it waited forever -- ps1_netemu's GPU core (SPU 4) parks
- * at pc=0x0A5E8 with evmask=0x400 exactly here while the PPU spins waiting on the
- * SPU. Deadlock, and the reason the PS1 core never starts.
- *
- * Losing a reservation means the reserved line changed, and GETLLAR already
- * snapshots it, so compare against that snapshot rather than hooking every store.
- * ponytail: polled, not store-hooked -- one 128-byte memcmp per 10 ms poll on an
- * already-blocked SPU, and nothing at all on the PPU store path. The ceiling is
- * one poll of wake latency, and an A-B-A write that restores the same bytes
- * between polls is missed; hook the writers if either ever matters.
- */
 static void spu_resv_lost_poll(spu_context* ctx)
 {
     if (!(ctx->event_mask & 0x400u) || !ctx->resv_valid) return;
@@ -784,28 +768,16 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
 
     ctx->status = SPU_STATUS_WAITING_CHANNEL;
     yz_lockstep_block_begin(ctx);          /* release the run token before the OS wait */
-    {
-        unsigned long long start = GetTickCount64(), next_hb = 2000;
-        while (!spu_ch_ready(ctx, channel)) {
-            if (ctx->stop_request) {
-                yz_lockstep_block_end(ctx);
-                spu_honour_stop_request(ctx);
-            }
-            AcquireSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
-            if (!spu_ch_ready(ctx, channel))
-                SleepConditionVariableSRW((CONDITION_VARIABLE*)&ctx->ch_wait_cv,
-                                          (SRWLOCK*)&ctx->ch_wait_lock, 10, 0);
-            ReleaseSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
-            unsigned long long waited = GetTickCount64() - start;
-            if (waited >= next_hb && ps3_log_verbose()) {
-                fprintf(stderr, "[ch-wait] spu=%X pc=0x%05X ch=%u waited=%llums evstat=0x%X evmask=0x%X resv[valid=%d ea=0x%08X]\n",
-                        ctx->spu_id, ctx->pc & SPU_LS_MASK, channel, waited,
-                        ctx->event_status, ctx->event_mask,
-                        ctx->resv_valid, ctx->resv_ea);
-                fflush(stderr);
-                next_hb = ((waited / 2000) + 1) * 2000;
-            }
+    while (!spu_ch_ready(ctx, channel)) {
+        if (ctx->stop_request) {
+            yz_lockstep_block_end(ctx);
+            spu_honour_stop_request(ctx);
         }
+        AcquireSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
+        if (!spu_ch_ready(ctx, channel) && !ctx->stop_request)
+            SleepConditionVariableSRW((CONDITION_VARIABLE*)&ctx->ch_wait_cv,
+                                      (SRWLOCK*)&ctx->ch_wait_lock, INFINITE, 0);
+        ReleaseSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
     }
     yz_lockstep_block_end(ctx);            /* rejoin the rotation, reacquire the token */
     if (ft_t0) spu_ft_wait_span(ctx, channel, ft_t0);

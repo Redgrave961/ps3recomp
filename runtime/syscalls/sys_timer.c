@@ -148,146 +148,8 @@ static void write_be64(uint32_t addr, uint64_t val)
 int64_t sys_timer_usleep(ppu_context* ctx)
 {
     uint64_t usec = LV2_ARG_U64(ctx, 0);
-    ppu_thread_note_block(ctx->thread_id);   /* PS3_PRIO_START */
-    { extern unsigned long long ps3_qpc_us(void);
-      static int n=0; if (PS3_LOG_FIRST(n, 60))
-        fprintf(stderr, "[WAIT] t=%lluus timer_usleep(%llu us) lr=0x%08llX cia=0x%08llX\n", ps3_qpc_us(),
-        (unsigned long long)usec, (unsigned long long)ctx->lr, (unsigned long long)ctx->cia); }
-    /* PS3_POLLTOP=<seconds>: name the usleep poll sites.
-     *
-     * A title that is "hung" is usually not blocked on anything -- every thread
-     * is spinning on sys_timer_usleep waiting for a flag, and [BLOCKSUM] only
-     * says "syscall 141, 12s". This histograms the callers over a window and
-     * prints the top ones, so the answer is a guest address rather than a
-     * count. Keyed on ctx->lr: a host-stack backtrace through lifted code has
-     * no unwind tables and invents chains (see the Guitar Hero III writeup),
-     * and lr is the only guest chain that survives.
-     *
-     * Deliberately unlocked: the counts are a diagnostic, and a lost increment
-     * under a race cannot change which site is at the top of a 30k-per-second
-     * poll. */
-    { static long s_pt = -1;
-      if (s_pt < 0) { const char* e = getenv("PS3_POLLTOP");
-                      s_pt = e ? (long)strtoul(e, 0, 10) : 0;
-                      if (s_pt < 0) s_pt = 0; }
-      if (s_pt > 0) {
-        enum { PT_MAX = 128 };
-        static uint32_t pt_lr[PT_MAX]; static uint32_t pt_n[PT_MAX];
-        static uint64_t pt_us[PT_MAX]; static int pt_used = 0;
-        static uint32_t pt_tid[PT_MAX];
-        static unsigned long long pt_win = 0;
-        uint32_t lr = (uint32_t)ctx->lr;
-        int i = 0;
-        for (; i < pt_used; i++) if (pt_lr[i] == lr) break;
-        if (i == pt_used && pt_used < PT_MAX) {
-            pt_lr[pt_used] = lr;
-            /* The thread matters as much as the site: "who is waiting" is the
-             * half that says whether a poll is the engine idling or the main
-             * thread stuck. */
-            pt_tid[pt_used] = (uint32_t)ctx->thread_id;
-            pt_used++;
-        }
-        if (i < PT_MAX) { pt_n[i]++; pt_us[i] += usec; }
-        { extern unsigned long long ps3_qpc_us(void);
-          unsigned long long now = ps3_qpc_us();
-          if (!pt_win) pt_win = now;
-          else if (now - pt_win >= (unsigned long long)s_pt * 1000000ull) {
-            fprintf(stderr, "--- usleep poll sites (last %lds) ---\n", s_pt);
-            for (int k = 0; k < 8; k++) {
-              int best = -1;
-              for (int j = 0; j < pt_used; j++)
-                if (pt_n[j] && (best < 0 || pt_n[j] > pt_n[best])) best = j;
-              if (best < 0) break;
-              fprintf(stderr, "  %8u calls  %6llums slept  tid=%-3u lr=0x%08X\n",
-                      pt_n[best], (unsigned long long)(pt_us[best] / 1000),
-                      pt_tid[best], pt_lr[best]);
-              pt_n[best] = 0;
-            }
-            fflush(stderr);
-            for (int j = 0; j < pt_used; j++) { pt_n[j] = 0; pt_us[j] = 0; }
-            pt_win = now;
-          } } } }
-
-    /* PS3_WAIT_OBJ=<lr-hex>: when a usleep spin is reached from this return
-     * address, dump the registers and the object they point at. A poll loop
-     * tells you WHERE it is spinning; this tells you WHAT it is spinning on,
-     * which is the part you actually need to find who never releases it. */
-    { static long s_wo = -1;
-      if (s_wo < 0) { const char* e = getenv("PS3_WAIT_OBJ");
-                      s_wo = e ? (long)strtoul(e, 0, 16) : 0; }
-      if (s_wo && (uint32_t)ctx->lr == (uint32_t)s_wo) {
-        static int _n = 0;
-        if (PS3_LOG_FIRST(_n, 8)) {
-          /* Dump the words at EVERY plausible object register, not just r29.
-           * Which register holds the object is per-title -- r29 was right for
-           * the title this was written for and is a spin COUNTER in Guitar
-           * Hero III, where the object is in r30/r31. Printing one guess makes
-           * the tool silently report the wrong memory as "the thing it waits
-           * on", which is worse than printing nothing. */
-          fprintf(stderr, "[wait-obj] lr=0x%08X sleep=%lluus", (uint32_t)ctx->lr,
-                  (unsigned long long)usec);
-          static const int regs[] = { 28, 29, 30, 31, 3 };
-          for (unsigned ri = 0; ri < sizeof regs / sizeof regs[0]; ri++) {
-            const int r = regs[ri];
-            const uint32_t o = (uint32_t)ctx->gpr[r];
-            fprintf(stderr, "  r%d=0x%08X", r, o);
-            /* Only deref something that looks like a guest pointer: a small
-             * integer is a count, and dumping "memory at 4" is noise. */
-            if (vm_base && o >= 0x10000u) {
-              fprintf(stderr, "[");
-              for (int w = 0; w < 4; w++) {
-                const uint8_t* q = vm_base + o + (unsigned)w * 4u;
-                uint32_t v = ((uint32_t)q[0] << 24) | ((uint32_t)q[1] << 16) |
-                             ((uint32_t)q[2] << 8)  | (uint32_t)q[3];
-                fprintf(stderr, "%s%08X", w ? " " : "", v);
-              }
-              fprintf(stderr, "]");
-            }
-          }
-          fprintf(stderr, "\n"); fflush(stderr);
-        } } }
-
-#ifdef _WIN32
-    /* Use high-resolution sleep via waitable timer for better precision */
-    if (usec >= 1000) {
-        HANDLE timer = CreateWaitableTimerW(NULL, TRUE, NULL);
-        if (timer) {
-            LARGE_INTEGER due;
-            due.QuadPart = -((LONGLONG)usec * 10); /* 100ns units, negative = relative */
-            SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE);
-            WaitForSingleObject(timer, INFINITE);
-            CloseHandle(timer);
-        } else {
-            Sleep((DWORD)(usec / 1000));
-        }
-    } else if (usec > 0) {
-        /* Sub-millisecond sleep. Sleep()/waitable timers round up to the
-         * ~0.5-1 ms scheduler quantum, far too coarse for a guest that relies
-         * on accurate microsecond pacing -- a short usleep() spin waiting on
-         * another thread to make progress otherwise collapses to a single yield
-         * and busy-spins at full speed (so the wait is effectively a no-op).
-         * Busy-wait to a precise QPC deadline, yielding inside the spin
-         * (SwitchToThread) so a sibling host thread the guest may be waiting on
-         * still gets the core. Mirrors RPCS3's "Usleep Only" TSC busy-tail. */
-        ensure_qpc_init();
-        LARGE_INTEGER qpc_start, qpc_now;
-        QueryPerformanceCounter(&qpc_start);
-        const int64_t qpc_deadline = qpc_start.QuadPart +
-            (int64_t)((usec * (uint64_t)s_qpc_freq.QuadPart) / 1000000ULL);
-        do {
-            SwitchToThread();
-            QueryPerformanceCounter(&qpc_now);
-        } while (qpc_now.QuadPart < qpc_deadline);
-    }
-#else
-    if (usec > 0) {
-        struct timespec ts;
-        ts.tv_sec  = (time_t)(usec / 1000000);
-        ts.tv_nsec = (long)((usec % 1000000) * 1000);
-        nanosleep(&ts, NULL);
-    }
-#endif
-
+    ppu_thread_note_block(ctx->thread_id);
+    ps3_sleep_us(usec);
     return CELL_OK;
 }
 
@@ -478,10 +340,6 @@ static void timer_send_event(sys_timer_info* t)
     if (t->event_queue_id <= 0 || t->event_queue_id > SYS_EVENT_QUEUE_MAX)
         return;
 
-    sys_event_queue_info* q = &g_sys_event_queues[t->event_queue_id - 1];
-    if (!q->active)
-        return;
-
     sys_event_t evt;
     evt.source = t->source;
     /* lv2 (and RPCS3) deliver the connect's data1/data2 and, in data3, the
@@ -495,29 +353,7 @@ static void timer_send_event(sys_timer_info* t)
     evt.data3  = t->next_expire;
     t->next_expire += t->period_usec;
 
-    /* Push event (ignore if queue full) */
-#ifdef _WIN32
-    EnterCriticalSection(&q->lock);
-#else
-    pthread_mutex_lock(&q->lock);
-#endif
-
-    if (q->count < q->capacity) {
-        q->buffer[q->tail] = evt;
-        q->tail = (q->tail + 1) % q->capacity;
-        q->count++;
-#ifdef _WIN32
-        WakeConditionVariable(&q->not_empty);
-#else
-        pthread_cond_signal(&q->not_empty);
-#endif
-    }
-
-#ifdef _WIN32
-    LeaveCriticalSection(&q->lock);
-#else
-    pthread_mutex_unlock(&q->lock);
-#endif
+    sys_event_queue_push_by_id((uint32_t)t->event_queue_id, evt.source, evt.data1, evt.data2, evt.data3);
 }
 
 /* ---------------------------------------------------------------------------

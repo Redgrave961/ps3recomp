@@ -110,7 +110,10 @@ bool renderer::open(vk_device& d, VkSemaphore timeline, uint64_t* submitted, con
 void renderer::close()
 {
     if (!m_d) return;
-    vkDeviceWaitIdle(m_d->dev);
+    {
+        std::lock_guard<std::mutex> hold(m_d->queue_lock);
+        vkQueueWaitIdle(m_d->queue);
+    }
     for (auto& s : m_surfaces) destroy_image(s->img);
     for (auto& s : m_retired) destroy_image(s->img);
     for (auto& g : m_garbage) destroy_image(g.second);
@@ -204,7 +207,10 @@ void renderer::submit(VkSemaphore wait, VkPipelineStageFlags2 wait_stage, VkSema
     si.pCommandBufferInfos = &cb;
     si.signalSemaphoreInfoCount = signal ? 2u : 1u;
     si.pSignalSemaphoreInfos = signals;
-    vkQueueSubmit2(m_d->queue, 1, &si, VK_NULL_HANDLE);
+    {
+        std::lock_guard<std::mutex> hold(m_d->queue_lock);
+        vkQueueSubmit2(m_d->queue, 1, &si, VK_NULL_HANDLE);
+    }
     m_submissions[m_submission].done = value;
     m_submission = (m_submission + 1u) % (u32)m_submissions.size();
     m_recording = false;
@@ -229,6 +235,7 @@ void renderer::flush()
 bool renderer::create_image(image& img, VkFormat format, u32 width, u32 height, VkImageUsageFlags usage, VkImageAspectFlags aspect)
 {
     VkImageCreateInfo ii{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+    ii.flags = aspect == VK_IMAGE_ASPECT_COLOR_BIT ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
     ii.imageType = VK_IMAGE_TYPE_2D;
     ii.format = format;
     ii.extent = { width, height, 1 };

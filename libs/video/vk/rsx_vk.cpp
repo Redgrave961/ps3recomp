@@ -1,9 +1,11 @@
 #ifdef _WIN32
 #define VK_USE_PLATFORM_WIN32_KHR
 #include <windows.h>
+#include <dxgi1_6.h>
 #else
 #define VK_USE_PLATFORM_XLIB_KHR
 #define VK_USE_PLATFORM_WAYLAND_KHR
+#include <time.h>
 #endif
 #include "rsx_vk.h"
 #include "vk_device.h"
@@ -11,10 +13,10 @@
 
 #include <SDL3/SDL.h>
 
-
 #include <algorithm>
-#include <chrono>
 #include <atomic>
+#include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
@@ -24,9 +26,32 @@
 
 namespace {
 
-constexpr uint32_t k_frames = 3;
+constexpr uint32_t k_slots = 3;
+constexpr uint32_t k_present_frames = 3;
+constexpr int64_t k_frame_ns = 1001000000ll / 60ll;
+constexpr int64_t k_present_lead_ns = 1500000;
+constexpr uint32_t k_samples = 120;
 
-struct frame {
+enum class pacing { measuring, vrr, locked, free };
+
+int64_t now_ns()
+{
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+struct slot {
+    VkImage image = VK_NULL_HANDLE;
+    VmaAllocation mem = nullptr;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint64_t rendered = 0;
+    uint64_t released = 0;
+    int64_t stamp = 0;
+};
+
+struct present_frame {
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
     VkSemaphore acquired = VK_NULL_HANDLE;
     uint64_t done = 0;
 };
@@ -40,6 +65,16 @@ struct swapchain {
     std::vector<VkSemaphore> ready;
 };
 
+#ifdef _WIN32
+struct display_clock {
+    std::mutex lock;
+    IDXGIFactory1* factory = nullptr;
+    IDXGIOutput* output = nullptr;
+    HMONITOR monitor = nullptr;
+    uint32_t divider = 0;
+};
+#endif
+
 struct state {
     std::string title;
     std::mutex lock;
@@ -49,17 +84,241 @@ struct state {
     std::atomic<uint32_t> pixel_w{ 0 };
     std::atomic<uint32_t> pixel_h{ 0 };
     std::atomic<bool> resized{ false };
+    std::atomic<bool> display_changed{ false };
+    std::atomic<float> refresh{ 0.f };
+
     vk_device d;
     VkSurfaceKHR surface = VK_NULL_HANDLE;
     swapchain sc;
-    frame frames[k_frames];
-    uint32_t frame_index = 0;
     VkSemaphore timeline = VK_NULL_HANDLE;
     uint64_t submitted = 0;
     vk::renderer r;
+
+    slot slots[k_slots];
+    uint32_t next_slot = 0;
+    std::mutex queue_lock;
+    std::condition_variable queue_cv;
+    int pending = -1;
+    int64_t pending_stamp = 0;
+
+    VkSemaphore present_timeline = VK_NULL_HANDLE;
+    std::atomic<uint64_t> presented{ 0 };
+    present_frame frames[k_present_frames];
+    uint32_t frame_index = 0;
+    std::atomic<pacing> mode{ pacing::measuring };
+    std::atomic<uint32_t> generation{ 0 };
+    int64_t next_deadline = 0;
+#ifdef _WIN32
+    display_clock clock;
+#endif
 };
 
 state g;
+
+bool stats_on()
+{
+    static const bool on = [] { const char* e = std::getenv("PS3_VK_STATS"); return e && *e && *e != '0'; }();
+    return on;
+}
+
+double since_start()
+{
+    static const int64_t t0 = now_ns();
+    return (double)(now_ns() - t0) / 1e9;
+}
+
+void mark(const char* what)
+{
+    if (stats_on()) std::fprintf(stderr, "[vk] %.3f s %s\n", since_start(), what);
+}
+
+const char* pacing_name(pacing p)
+{
+    switch (p) {
+    case pacing::vrr: return "variable refresh: exact 59.94 Hz";
+    case pacing::locked: return "locked to display refresh";
+    case pacing::free: return "59.94 Hz clock, newest frame each refresh";
+    default: return "measuring the display";
+    }
+}
+
+void sleep_until(int64_t deadline)
+{
+    const int64_t left = deadline - now_ns();
+    if (left <= 0) return;
+#ifdef _WIN32
+    static thread_local HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    LARGE_INTEGER due;
+    due.QuadPart = -(left / 100);
+    if (due.QuadPart && timer && SetWaitableTimerEx(timer, &due, 0, nullptr, nullptr, nullptr, 0)) WaitForSingleObject(timer, INFINITE);
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    const int64_t target = (int64_t)ts.tv_sec * 1000000000ll + ts.tv_nsec + left;
+    ts.tv_sec = (time_t)(target / 1000000000ll);
+    ts.tv_nsec = (long)(target % 1000000000ll);
+    while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, nullptr) != 0) {}
+#endif
+}
+
+#ifdef _WIN32
+int display_vblank(void*)
+{
+    IDXGIOutput* out;
+    uint32_t divider;
+    {
+        std::lock_guard<std::mutex> hold(g.clock.lock);
+        out = g.clock.output;
+        divider = g.clock.divider;
+        if (out) out->AddRef();
+    }
+    if (!out || !divider) {
+        if (out) out->Release();
+        return 0;
+    }
+    const int64_t t0 = now_ns();
+    bool ok = true;
+    for (uint32_t i = 0; i < divider && ok; i++) ok = SUCCEEDED(out->WaitForVBlank());
+    out->Release();
+    const int64_t elapsed = now_ns() - t0;
+    static uint32_t off_beat;
+    const float hz = g.refresh.load();
+    const int64_t expected = hz > 0.f ? (int64_t)(1e9 * divider / hz) : k_frame_ns;
+    if (ok && std::llabs(elapsed - expected) > expected / 4) {
+        if (++off_beat >= 8) {
+            off_beat = 0;
+            g.display_changed = true;
+            g.queue_cv.notify_one();
+            return 0;
+        }
+    } else {
+        off_beat = 0;
+    }
+    return ok && elapsed > k_frame_ns / 2;
+}
+
+void clock_bind_output()
+{
+    HWND hwnd = static_cast<HWND>(SDL_GetPointerProperty(SDL_GetWindowProperties(g.window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr));
+    const HMONITOR monitor = hwnd ? MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) : nullptr;
+    std::lock_guard<std::mutex> hold(g.clock.lock);
+    if (monitor == g.clock.monitor && g.clock.output) return;
+    if (g.clock.output) g.clock.output->Release();
+    g.clock.output = nullptr;
+    g.clock.monitor = monitor;
+    if (!g.clock.factory && FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&g.clock.factory)))) return;
+    IDXGIAdapter1* adapter = nullptr;
+    for (UINT a = 0; !g.clock.output && g.clock.factory->EnumAdapters1(a, &adapter) != DXGI_ERROR_NOT_FOUND; a++) {
+        IDXGIOutput* out = nullptr;
+        for (UINT o = 0; adapter->EnumOutputs(o, &out) != DXGI_ERROR_NOT_FOUND; o++) {
+            DXGI_OUTPUT_DESC desc;
+            if (SUCCEEDED(out->GetDesc(&desc)) && desc.Monitor == monitor) {
+                g.clock.output = out;
+                break;
+            }
+            out->Release();
+        }
+        adapter->Release();
+    }
+}
+#endif
+
+uint32_t refresh_divider()
+{
+    const float hz = g.refresh.load();
+    if (hz < 50.f) return 0;
+    const uint32_t k = (uint32_t)std::lround(hz / 60.f);
+    if (!k) return 0;
+    const float per = hz / (float)k;
+    return per > 59.0f && per < 60.6f ? k : 0;
+}
+
+void set_pacing(pacing p)
+{
+    if (p == g.mode) return;
+    g.mode = p;
+#ifdef _WIN32
+    if (p == pacing::locked) {
+        clock_bind_output();
+        {
+            std::lock_guard<std::mutex> hold(g.clock.lock);
+            g.clock.divider = refresh_divider();
+        }
+        rsx_core_set_vblank_clock(display_vblank, nullptr);
+    } else {
+        rsx_core_set_vblank_clock(nullptr, nullptr);
+    }
+#endif
+    g.resized = true;
+    std::fprintf(stderr, "[vk] pacing: %s (%.2f Hz display)\n", pacing_name(p), g.refresh.load());
+}
+
+pacing fallback_pacing()
+{
+#ifdef _WIN32
+    if (refresh_divider()) return pacing::locked;
+#endif
+    return pacing::free;
+}
+
+#ifdef _WIN32
+void measure_display(uint32_t generation)
+{
+    const uint64_t start = g.presented.load();
+    const int64_t give_up = now_ns() + 3000000000ll;
+    while (g.presented.load() < start + 30u && now_ns() < give_up) {
+        if (generation != g.generation.load()) return;
+        sleep_until(now_ns() + 50000000ll);
+    }
+    if (generation != g.generation.load()) return;
+    clock_bind_output();
+    IDXGIOutput* out;
+    {
+        std::lock_guard<std::mutex> hold(g.clock.lock);
+        out = g.clock.output;
+        if (out) out->AddRef();
+    }
+    pacing result = fallback_pacing();
+    if (out) {
+        int64_t intervals[48];
+        uint32_t n = 0;
+        int64_t last = 0;
+        for (uint32_t i = 0; i < 49 && SUCCEEDED(out->WaitForVBlank()); i++) {
+            const int64_t t = now_ns();
+            if (last) intervals[n++] = t - last;
+            last = t;
+        }
+        out->Release();
+        if (n >= 24) {
+            std::sort(intervals, intervals + n);
+            const int64_t median = intervals[n / 2];
+            if (g.refresh.load() > 75.f && std::llabs(median - k_frame_ns) < 2500000) result = pacing::vrr;
+        }
+    }
+    if (generation == g.generation.load()) {
+        set_pacing(result);
+        g.queue_cv.notify_one();
+    }
+}
+#endif
+
+void restart_measurement()
+{
+    const uint32_t generation = ++g.generation;
+#ifdef _WIN32
+    if (g.mode == pacing::measuring) set_pacing(fallback_pacing());
+    std::thread(measure_display, generation).detach();
+#else
+    (void)generation;
+    set_pacing(pacing::free);
+#endif
+}
+
+void read_refresh()
+{
+    const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(g.window));
+    g.refresh = mode ? mode->refresh_rate : 0.f;
+}
 
 VkSurfaceFormatKHR pick_format()
 {
@@ -70,8 +329,7 @@ VkSurfaceFormatKHR pick_format()
     for (VkFormat want : { VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM })
         for (const VkSurfaceFormatKHR& f : list)
             if (f.format == want && f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) return f;
-    if (list.empty() || list[0].format == VK_FORMAT_UNDEFINED)
-        return { VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR };
+    if (list.empty() || list[0].format == VK_FORMAT_UNDEFINED) return { VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR };
     return list[0];
 }
 
@@ -81,8 +339,9 @@ VkPresentModeKHR pick_mode()
     vkGetPhysicalDeviceSurfacePresentModesKHR(g.d.gpu, g.surface, &n, nullptr);
     std::vector<VkPresentModeKHR> list(n);
     vkGetPhysicalDeviceSurfacePresentModesKHR(g.d.gpu, g.surface, &n, list.data());
-    for (VkPresentModeKHR want : { VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR })
-        if (std::find(list.begin(), list.end(), want) != list.end()) return want;
+    auto has = [&](VkPresentModeKHR m) { return std::find(list.begin(), list.end(), m) != list.end(); };
+    if (g.mode == pacing::vrr || g.mode == pacing::measuring) return VK_PRESENT_MODE_FIFO_KHR;
+    if (g.d.caps.fifo_latest_ready && has(VK_PRESENT_MODE_FIFO_LATEST_READY_KHR)) return VK_PRESENT_MODE_FIFO_LATEST_READY_KHR;
     return VK_PRESENT_MODE_FIFO_KHR;
 }
 
@@ -97,10 +356,8 @@ bool swapchain_build()
     }
     g.sc.extent = extent;
     if (!extent.width || !extent.height) return true;
-    if (g.sc.format.format == VK_FORMAT_UNDEFINED) {
-        g.sc.format = pick_format();
-        g.sc.mode = pick_mode();
-    }
+    if (g.sc.format.format == VK_FORMAT_UNDEFINED) g.sc.format = pick_format();
+    g.sc.mode = pick_mode();
     uint32_t count = std::max(caps.minImageCount + 1u, 3u);
     if (caps.maxImageCount) count = std::min(count, caps.maxImageCount);
     VkSwapchainCreateInfoKHR ci{ VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR };
@@ -136,13 +393,38 @@ bool swapchain_build()
     return true;
 }
 
-bool frames_build()
+bool timeline_create(VkSemaphore& out)
 {
     VkSemaphoreTypeCreateInfo ti{ VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO };
     ti.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
-    VkSemaphoreCreateInfo tci{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &ti };
-    VK_TRY(vkCreateSemaphore(g.d.dev, &tci, nullptr, &g.timeline));
-    for (frame& f : g.frames) {
+    VkSemaphoreCreateInfo ci{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &ti };
+    VK_TRY(vkCreateSemaphore(g.d.dev, &ci, nullptr, &out));
+    return true;
+}
+
+void timeline_wait(VkSemaphore s, uint64_t value)
+{
+    if (!value) return;
+    VkSemaphoreWaitInfo wi{ VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
+    wi.semaphoreCount = 1;
+    wi.pSemaphores = &s;
+    wi.pValues = &value;
+    vkWaitSemaphores(g.d.dev, &wi, UINT64_MAX);
+}
+
+bool presenter_build()
+{
+    if (!timeline_create(g.timeline) || !timeline_create(g.present_timeline)) return false;
+    for (present_frame& f : g.frames) {
+        VkCommandPoolCreateInfo pi{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+        pi.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+        pi.queueFamilyIndex = g.d.family;
+        VK_TRY(vkCreateCommandPool(g.d.dev, &pi, nullptr, &f.pool));
+        VkCommandBufferAllocateInfo ai{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+        ai.commandPool = f.pool;
+        ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        ai.commandBufferCount = 1;
+        VK_TRY(vkAllocateCommandBuffers(g.d.dev, &ai, &f.cmd));
         VkSemaphoreCreateInfo si{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
         VK_TRY(vkCreateSemaphore(g.d.dev, &si, nullptr, &f.acquired));
     }
@@ -176,21 +458,186 @@ bool create_surface()
 #endif
 }
 
-double since_start()
+void record_present(VkCommandBuffer cmd, const slot& s, VkImage target)
 {
-    static const auto t0 = std::chrono::steady_clock::now();
-    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    constexpr VkPipelineStageFlags2 xfer = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+    VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &bi);
+    VkImageMemoryBarrier2 b{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+    b.srcStageMask = xfer;
+    b.dstStageMask = xfer;
+    b.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = target;
+    b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    VkDependencyInfo di{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+    di.imageMemoryBarrierCount = 1;
+    di.pImageMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cmd, &di);
+
+    const VkExtent2D out = g.sc.extent;
+    const float scale = std::min((float)out.width / (float)s.width, (float)out.height / (float)s.height);
+    const int32_t dw = std::max(1, (int32_t)std::lround((float)s.width * scale));
+    const int32_t dh = std::max(1, (int32_t)std::lround((float)s.height * scale));
+    const int32_t x0 = ((int32_t)out.width - dw) / 2, y0 = ((int32_t)out.height - dh) / 2;
+    if (dw != (int32_t)out.width || dh != (int32_t)out.height) {
+        const VkClearColorValue black{};
+        const VkImageSubresourceRange whole{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        vkCmdClearColorImage(cmd, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &whole);
+        b.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        vkCmdPipelineBarrier2(cmd, &di);
+    }
+    VkImageBlit region{};
+    region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    region.srcOffsets[1] = { (int32_t)s.width, (int32_t)s.height, 1 };
+    region.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    region.dstOffsets[0] = { x0, y0, 0 };
+    region.dstOffsets[1] = { x0 + dw, y0 + dh, 1 };
+    vkCmdBlitImage(cmd, s.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region,
+                   VK_FILTER_LINEAR);
+    b.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    b.dstStageMask = VK_PIPELINE_STAGE_2_NONE;
+    b.dstAccessMask = 0;
+    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    vkCmdPipelineBarrier2(cmd, &di);
+    vkEndCommandBuffer(cmd);
 }
 
-bool stats_on()
+void rebuild_swapchain()
 {
-    static const bool on = [] { const char* e = std::getenv("PS3_VK_STATS"); return e && *e && *e != '0'; }();
-    return on;
+    {
+        std::lock_guard<std::mutex> hold(g.d.queue_lock);
+        vkQueueWaitIdle(g.d.queue);
+    }
+    if (!swapchain_build()) std::fprintf(stderr, "[vk] swapchain rebuild failed\n");
 }
 
-void mark(const char* what)
+void present_slot(uint32_t i)
 {
-    if (stats_on()) std::fprintf(stderr, "[vk] %.3f s %s\n", since_start(), what);
+    slot& s = g.slots[i];
+    if (!g.sc.extent.width || !g.sc.extent.height) {
+        s.released = 0;
+        return;
+    }
+    present_frame& f = g.frames[g.frame_index];
+    timeline_wait(g.present_timeline, f.done);
+    uint32_t index = 0;
+    const VkResult a = vkAcquireNextImageKHR(g.d.dev, g.sc.handle, 100000000ull, f.acquired, VK_NULL_HANDLE, &index);
+    if (a == VK_TIMEOUT || a == VK_NOT_READY) {
+        s.released = 0;
+        return;
+    }
+    if (a != VK_SUCCESS && a != VK_SUBOPTIMAL_KHR) {
+        g.resized = true;
+        s.released = 0;
+        return;
+    }
+    if (a == VK_SUBOPTIMAL_KHR) g.resized = true;
+    vkResetCommandPool(g.d.dev, f.pool, 0);
+    record_present(f.cmd, s, g.sc.images[index]);
+
+    if (g.mode == pacing::vrr) {
+        const int64_t target = std::max(s.stamp + k_present_lead_ns, g.next_deadline);
+        if (target - now_ns() < k_frame_ns) sleep_until(target);
+        g.next_deadline = std::max(target, now_ns()) + k_frame_ns - k_frame_ns / 8;
+    }
+
+    const uint64_t value = g.presented.load() + 1u;
+    VkSemaphoreSubmitInfo waits[2] = { { VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO }, { VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO } };
+    waits[0].semaphore = f.acquired;
+    waits[0].stageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+    waits[1].semaphore = g.timeline;
+    waits[1].value = s.rendered;
+    waits[1].stageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+    VkSemaphoreSubmitInfo signals[2] = { { VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO }, { VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO } };
+    signals[0].semaphore = g.sc.ready[index];
+    signals[0].stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    signals[1].semaphore = g.present_timeline;
+    signals[1].value = value;
+    signals[1].stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    VkCommandBufferSubmitInfo cb{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+    cb.commandBuffer = f.cmd;
+    VkSubmitInfo2 si{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+    si.waitSemaphoreInfoCount = 2;
+    si.pWaitSemaphoreInfos = waits;
+    si.commandBufferInfoCount = 1;
+    si.pCommandBufferInfos = &cb;
+    si.signalSemaphoreInfoCount = 2;
+    si.pSignalSemaphoreInfos = signals;
+
+    VkPresentInfoKHR pi{ VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
+
+    pi.waitSemaphoreCount = 1;
+    pi.pWaitSemaphores = &g.sc.ready[index];
+    pi.swapchainCount = 1;
+    pi.pSwapchains = &g.sc.handle;
+    pi.pImageIndices = &index;
+    VkResult r;
+    {
+        std::lock_guard<std::mutex> hold(g.d.queue_lock);
+        vkQueueSubmit2(g.d.queue, 1, &si, VK_NULL_HANDLE);
+        r = vkQueuePresentKHR(g.d.queue, &pi);
+    }
+    g.presented = value;
+    f.done = value;
+    s.released = value;
+    g.frame_index = (g.frame_index + 1u) % k_present_frames;
+    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) g.resized = true;
+    else if (r != VK_SUCCESS) std::fprintf(stderr, "[vk] present failed: %d\n", (int)r);
+
+    static bool first = true;
+    if (first) {
+        first = false;
+        mark("first present");
+    }
+}
+
+void present_main()
+{
+    for (;;) {
+        int i;
+        {
+            std::unique_lock<std::mutex> hold(g.queue_lock);
+            g.queue_cv.wait(hold, [] { return g.pending >= 0 || g.resized.load() || g.display_changed.load(); });
+            i = g.pending;
+            g.pending = -1;
+        }
+        if (g.display_changed.exchange(false)) {
+            read_refresh();
+            restart_measurement();
+        }
+        if (g.resized.exchange(false)) rebuild_swapchain();
+        if (i >= 0) present_slot((uint32_t)i);
+    }
+}
+
+bool slot_reserve(slot& s, uint32_t w, uint32_t h)
+{
+    if (s.image && s.width == w && s.height == h) return true;
+    timeline_wait(g.present_timeline, g.presented.load());
+    if (s.image) vmaDestroyImage(g.d.vma, s.image, s.mem);
+    s.image = VK_NULL_HANDLE;
+    VkImageCreateInfo ii{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+    ii.imageType = VK_IMAGE_TYPE_2D;
+    ii.format = VK_FORMAT_B8G8R8A8_UNORM;
+    ii.extent = { w, h, 1 };
+    ii.mipLevels = 1;
+    ii.arrayLayers = 1;
+    ii.samples = VK_SAMPLE_COUNT_1_BIT;
+    ii.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    VmaAllocationCreateInfo ai{};
+    ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    VK_TRY(vmaCreateImage(g.d.vma, &ii, &ai, &s.image, &s.mem, nullptr));
+    s.width = w;
+    s.height = h;
+    s.released = 0;
+    return true;
 }
 
 bool vulkan_open()
@@ -210,8 +657,11 @@ bool vulkan_open()
     }
     if (!vk_device_create(g.d, g.surface)) return false;
     mark("device");
-    if (!frames_build()) return false;
+    if (!presenter_build()) return false;
     mark("renderer");
+    read_refresh();
+    restart_measurement();
+    g.resized = false;
     if (!swapchain_build()) return false;
     mark("swapchain");
     return true;
@@ -223,8 +673,10 @@ void window_main()
     since_start();
     if (SDL_InitSubSystem(SDL_INIT_VIDEO)) {
         mark("sdl video");
-        g.window = SDL_CreateWindow(g.title.c_str(), 1280, 720,
-                                    SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+        const char* windowed = std::getenv("PS3_WINDOWED");
+        const SDL_WindowFlags flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY |
+                                      ((windowed && *windowed && *windowed != '0') ? 0 : SDL_WINDOW_FULLSCREEN);
+        g.window = SDL_CreateWindow(g.title.c_str(), 1280, 720, flags);
         if (g.window) {
             int w = 0, h = 0;
             SDL_GetWindowSizeInPixels(g.window, &w, &h);
@@ -234,6 +686,7 @@ void window_main()
         }
     }
     if (ok < 0 && !g.d.dev) std::fprintf(stderr, "[vk] window: %s\n", SDL_GetError());
+    if (ok > 0) std::thread(present_main).detach();
     {
         std::lock_guard<std::mutex> hold(g.lock);
         g.status = ok;
@@ -250,6 +703,15 @@ void window_main()
             g.pixel_w = (uint32_t)e.window.data1;
             g.pixel_h = (uint32_t)e.window.data2;
             g.resized = true;
+            g.queue_cv.notify_one();
+            break;
+        case SDL_EVENT_WINDOW_DISPLAY_CHANGED:
+        case SDL_EVENT_DISPLAY_CURRENT_MODE_CHANGED:
+        case SDL_EVENT_WINDOW_FOCUS_GAINED:
+        case SDL_EVENT_WINDOW_ENTER_FULLSCREEN:
+        case SDL_EVENT_WINDOW_LEAVE_FULLSCREEN:
+            g.display_changed = true;
+            g.queue_cv.notify_one();
             break;
         case SDL_EVENT_KEY_DOWN:
             if (!e.key.repeat && (e.key.key == SDLK_F11 || (e.key.key == SDLK_RETURN && (e.key.mod & SDL_KMOD_ALT))))
@@ -259,57 +721,6 @@ void window_main()
             break;
         }
     }
-}
-
-void blit(VkCommandBuffer cmd, vk::image& src, VkImage target, uint32_t w, uint32_t h)
-{
-    constexpr VkPipelineStageFlags2 xfer = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
-    vk::renderer::barrier(cmd, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
-    VkImageMemoryBarrier2 b{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
-    b.srcStageMask = xfer;
-    b.dstStageMask = xfer;
-    b.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-    b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b.image = target;
-    b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-    VkDependencyInfo di{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-    di.imageMemoryBarrierCount = 1;
-    di.pImageMemoryBarriers = &b;
-    vkCmdPipelineBarrier2(cmd, &di);
-
-    const VkClearColorValue black{};
-    const VkImageSubresourceRange whole{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-    vkCmdClearColorImage(cmd, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &whole);
-    b.srcStageMask = xfer;
-    b.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    vkCmdPipelineBarrier2(cmd, &di);
-
-    const VkExtent2D out = g.sc.extent;
-    const float scale = std::min((float)out.width / (float)w, (float)out.height / (float)h);
-    const int32_t dw = std::max(1, (int32_t)((float)w * scale + 0.5f));
-    const int32_t dh = std::max(1, (int32_t)((float)h * scale + 0.5f));
-    const int32_t x0 = ((int32_t)out.width - dw) / 2;
-    const int32_t y0 = ((int32_t)out.height - dh) / 2;
-    VkImageBlit region{};
-    region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-    region.srcOffsets[1] = { (int32_t)w, (int32_t)h, 1 };
-    region.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-    region.dstOffsets[0] = { x0, y0, 0 };
-    region.dstOffsets[1] = { x0 + dw, y0 + dh, 1 };
-    vkCmdBlitImage(cmd, src.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region,
-                   VK_FILTER_LINEAR);
-
-    b.srcStageMask = xfer;
-    b.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-    b.dstStageMask = VK_PIPELINE_STAGE_2_NONE;
-    b.dstAccessMask = 0;
-    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-    vkCmdPipelineBarrier2(cmd, &di);
 }
 
 int vk_open(void*)
@@ -346,82 +757,84 @@ void vk_wrote(void*, u32 ea, u32 size)
 
 void vk_present(void*, u32, const rsx_display_buffer* db)
 {
-    if (g.resized.exchange(false)) {
-        g.r.flush();
-        vkDeviceWaitIdle(g.d.dev);
-        if (!swapchain_build()) return;
-    }
+    const int64_t stamp = now_ns();
     const uint32_t w = db->width, h = db->height, pitch = db->pitch;
+    static uint32_t last_w, last_h, last_p;
+    if (w != last_w || h != last_h || pitch != last_p) {
+        last_w = w;
+        last_h = h;
+        last_p = pitch;
+        std::fprintf(stderr, "[vk] display buffer %ux%u pitch %u offset 0x%08X\n", w, h, pitch, db->offset);
+    }
     const u32 ea = (w && h && pitch >= w * 4u) ? rsx_address(RSX_DMA_LOCAL, db->offset, pitch * h) : 0u;
-    if (!g.sc.extent.width || !g.sc.extent.height || !ea) {
+    if (!ea) {
         g.r.flush();
         return;
     }
 
-    frame& f = g.frames[g.frame_index];
-    VkSemaphoreWaitInfo wi{ VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
-    wi.semaphoreCount = 1;
-    wi.pSemaphores = &g.timeline;
-    wi.pValues = &f.done;
-    vkWaitSemaphores(g.d.dev, &wi, UINT64_MAX);
-
-    uint32_t index = 0;
-    VkResult r = vkAcquireNextImageKHR(g.d.dev, g.sc.handle, UINT64_MAX, f.acquired, VK_NULL_HANDLE, &index);
-    if (r == VK_ERROR_OUT_OF_DATE_KHR) {
-        g.resized = true;
+    const uint32_t i = g.next_slot;
+    g.next_slot = (g.next_slot + 1u) % k_slots;
+    {
+        std::lock_guard<std::mutex> hold(g.queue_lock);
+        if (g.pending == (int)i) g.pending = -1;
+    }
+    slot& s = g.slots[i];
+    timeline_wait(g.present_timeline, s.released);
+    if (!slot_reserve(s, w, h)) {
         g.r.flush();
         return;
     }
-    if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
-        g.r.flush();
-        return;
-    }
-    if (r == VK_SUBOPTIMAL_KHR) g.resized = true;
 
     vk::image* src = nullptr;
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     g.r.present_source(ea, w, h, pitch, src, cmd);
-    if (src) {
-        blit(cmd, *src, g.sc.images[index], w, h);
-    } else {
-        VkImageMemoryBarrier2 b{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
-        b.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
-        b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        b.image = g.sc.images[index];
-        b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-        VkDependencyInfo di{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-        di.imageMemoryBarrierCount = 1;
-        di.pImageMemoryBarriers = &b;
-        vkCmdPipelineBarrier2(cmd, &di);
+    if (!src) {
+        g.r.flush();
+        return;
     }
-    g.r.submit(f.acquired, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, g.sc.ready[index]);
-    f.done = g.submitted;
+    vk::renderer::barrier(cmd, *src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+    VkImageMemoryBarrier2 b{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+    b.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+    b.dstStageMask = VK_PIPELINE_STAGE_2_BLIT_BIT;
+    b.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = s.image;
+    b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    VkDependencyInfo di{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+    di.imageMemoryBarrierCount = 1;
+    di.pImageMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cmd, &di);
+    VkImageBlit region{};
+    region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    region.srcOffsets[1] = { (int32_t)w, (int32_t)h, 1 };
+    region.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    region.dstOffsets[1] = { (int32_t)w, (int32_t)h, 1 };
+    vkCmdBlitImage(cmd, src->handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region,
+                   VK_FILTER_NEAREST);
+    b.srcStageMask = VK_PIPELINE_STAGE_2_BLIT_BIT;
+    b.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+    b.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    vkCmdPipelineBarrier2(cmd, &di);
+    g.r.submit(VK_NULL_HANDLE, 0, VK_NULL_HANDLE);
+    s.rendered = g.submitted;
+    s.stamp = stamp;
+    {
+        std::lock_guard<std::mutex> hold(g.queue_lock);
+        g.pending = (int)i;
+    }
+    g.queue_cv.notify_one();
 
-    VkPresentInfoKHR pi{ VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
-    pi.waitSemaphoreCount = 1;
-    pi.pWaitSemaphores = &g.sc.ready[index];
-    pi.swapchainCount = 1;
-    pi.pSwapchains = &g.sc.handle;
-    pi.pImageIndices = &index;
-    r = vkQueuePresentKHR(g.d.queue, &pi);
-    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) g.resized = true;
-    g.frame_index = (g.frame_index + 1u) % k_frames;
-    static bool first = true;
-    if (first) {
-        first = false;
-        mark("first present");
-    }
-    static const bool report = [] { const char* e = std::getenv("PS3_VK_STATS"); return e && *e && *e != '0'; }();
-    static uint64_t presents = 0;
-    if (report && ++presents % 120u == 0) {
-        const auto& s = g.r.stats;
-        std::fprintf(stderr, "[vk] presents %llu draws %llu clears %llu skip fb/shader/pipe %llu/%llu/%llu uploads %llu present surface/memory %llu/%llu\n",
-                     (unsigned long long)presents, (unsigned long long)s.draws, (unsigned long long)s.clears, (unsigned long long)s.skipped_fb,
-                     (unsigned long long)s.skipped_shader, (unsigned long long)s.skipped_pipeline, (unsigned long long)s.uploads,
-                     (unsigned long long)s.present_surface, (unsigned long long)s.present_memory);
+    static uint64_t presents;
+    if (stats_on() && ++presents % 600u == 0) {
+        const auto& st = g.r.stats;
+        std::fprintf(stderr, "[vk] frames %llu draws %llu clears %llu uploads %llu, %s\n", (unsigned long long)presents,
+                     (unsigned long long)st.draws, (unsigned long long)st.clears, (unsigned long long)st.uploads, pacing_name(g.mode));
     }
 }
 

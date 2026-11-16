@@ -14,6 +14,22 @@ namespace vk {
 namespace {
 
 constexpr u32 k_page_shift = 12;
+
+u32 texel_bytes(VkFormat f)
+{
+    switch (f) {
+    case VK_FORMAT_R8_UNORM: case VK_FORMAT_R8_SNORM: case VK_FORMAT_R8_SRGB: return 1;
+    case VK_FORMAT_R8G8_UNORM: case VK_FORMAT_R8G8_SNORM: case VK_FORMAT_R8G8_SRGB: case VK_FORMAT_R5G6B5_UNORM_PACK16:
+    case VK_FORMAT_A1R5G5B5_UNORM_PACK16: case VK_FORMAT_R5G5B5A1_UNORM_PACK16: case VK_FORMAT_R4G4B4A4_UNORM_PACK16:
+    case VK_FORMAT_R16_UNORM: case VK_FORMAT_R16_SNORM: case VK_FORMAT_R16_SFLOAT: return 2;
+    case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_B8G8R8A8_SRGB: case VK_FORMAT_B8G8R8A8_SNORM: case VK_FORMAT_R8G8B8A8_UNORM:
+    case VK_FORMAT_R8G8B8A8_SRGB: case VK_FORMAT_R8G8B8A8_SNORM: case VK_FORMAT_R32_SFLOAT: case VK_FORMAT_R16G16_UNORM:
+    case VK_FORMAT_R16G16_SNORM: case VK_FORMAT_R16G16_SFLOAT: return 4;
+    case VK_FORMAT_R16G16B16A16_SFLOAT: return 8;
+    case VK_FORMAT_R32G32B32A32_SFLOAT: return 16;
+    default: return 0;
+    }
+}
 constexpr u32 k_local_scan_bytes = RSX_LOCAL_SIZE_MAX;
 
 uint64_t mix(uint64_t h, uint64_t v)
@@ -187,19 +203,26 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
     const VkImageViewType type = d.cube ? VK_IMAGE_VIEW_TYPE_CUBE : d.dimension == 3 ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D;
     VkCommandBuffer c = cmd();
 
+    static const bool trace = std::getenv("PS3_VK_TEXTRACE") != nullptr;
     for (auto& p : m_surfaces) {
         surface* s = p.get();
-        if (s->ea != ea || s->state != SURFACE_VALID || d.cube || d.dimension == 3) continue;
+        if (s->ea != ea) continue;
+        if (trace && (s->state != SURFACE_VALID || s->depth != d.depth || (!s->depth && texel_bytes(s->img.format) != texel_bytes(d.format))))
+            std::fprintf(stderr, "[vk] surface 0x%08X skipped: state %d depth %d/%d format %d/%d gcm %02X\n", ea, s->state, s->depth, d.depth, s->img.format, d.format, d.gcm_format);
+        if (s->state != SURFACE_VALID || d.cube || d.dimension == 3) continue;
         if (s->depth != d.depth) continue;
-        if (!s->depth && s->img.format != d.format) continue;
+        if (!s->depth && (d.compressed || texel_bytes(s->img.format) == 0 || texel_bytes(s->img.format) != texel_bytes(d.format))) continue;
         bool bound = s == m_fb.depth;
         for (surface* f : m_fb.color) bound |= f == s;
-        if (bound) return false;
+        if (bound) {
+            if (trace) std::fprintf(stderr, "[vk] surface 0x%08X sampled while bound\n", ea);
+            return false;
+        }
         end_rendering();
         barrier(c, s->img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                 VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
         const VkImageAspectFlags aspect = s->depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
-        const VkImageView view = view_for(s->img, VK_IMAGE_VIEW_TYPE_2D, s->img.format, aspect, d.swizzle);
+        const VkImageView view = view_for(s->img, VK_IMAGE_VIEW_TYPE_2D, s->depth ? s->img.format : d.format, aspect, d.swizzle);
         if (!view) return false;
         out = { sampler, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
         return true;
@@ -240,7 +263,6 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
 
     if (upload) {
         stats.uploads++;
-        static const bool trace = std::getenv("PS3_VK_TEXTRACE") != nullptr;
         if (trace) std::fprintf(stderr, "[vk] upload 0x%08X size %u fmt %02X %ux%u new %d\n", ea, d.guest_size, d.gcm_format, d.width, d.height, it == m_textures.end());
         const uint64_t bytes = rsx::texture_staging_size(d);
         vk_slice slice = m_ring.alloc(bytes, 16);

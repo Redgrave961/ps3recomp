@@ -252,6 +252,15 @@ static void rsx_sleep_until(HANDLE timer, u64 target)
 static HANDLE rsx_timer_create(void) { return NULL; }
 #endif
 
+static rsx_vblank_clock s_clock;
+static void* s_clock_user;
+
+void rsx_core_set_vblank_clock(rsx_vblank_clock clock, void* user)
+{
+    __atomic_store_n(&s_clock_user, user, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_clock, clock, __ATOMIC_RELEASE);
+}
+
 static DWORD WINAPI rsx_vblank_thread(LPVOID unused)
 {
     (void)unused;
@@ -259,11 +268,21 @@ static DWORD WINAPI rsx_vblank_thread(LPVOID unused)
     const u64 group = rsx_tick_freq() * 1001ull / 1000ull;
     u64 base = rsx_ticks();
     for (u32 n = 1;; n++) {
-        if (n > RSX_VBLANK_GROUP) {
-            base += group;
-            n = 1;
+        const rsx_vblank_clock clock = __atomic_load_n(&s_clock, __ATOMIC_ACQUIRE);
+        if (clock && clock(__atomic_load_n(&s_clock_user, __ATOMIC_ACQUIRE))) {
+            base = rsx_ticks();
+            n = 0;
+        } else {
+            if (n > RSX_VBLANK_GROUP) {
+                base += group;
+                n = 1;
+            }
+            if (base + group * n / RSX_VBLANK_GROUP + group < rsx_ticks()) {
+                base = rsx_ticks();
+                n = 1;
+            }
+            rsx_sleep_until(timer, base + group * n / RSX_VBLANK_GROUP);
         }
-        rsx_sleep_until(timer, base + group * n / RSX_VBLANK_GROUP);
         AcquireSRWLockExclusive(&s.vblank_lock);
         s.vblank_count++;
         s.last_vblank_time = rsx_core_system_time();
@@ -502,12 +521,10 @@ static void rsx_park(u32 seen)
     const u32 word = rsx_load(ea);
     rsx_publish_get();
     rsx_flush();
-    for (u32 spin = 0;; spin++) {
+    for (;;) {
         rsx_service_immediate();
         if (rsx_load(ea) != word || __atomic_load_n(&s.bell, __ATOMIC_ACQUIRE) != seen) return;
-        if (spin < 64u) YieldProcessor();
-        else if (spin < 1024u) SwitchToThread();
-        else Sleep(1);
+        WaitOnAddress((volatile VOID*)&s.bell, &seen, sizeof seen, 1);
     }
 }
 

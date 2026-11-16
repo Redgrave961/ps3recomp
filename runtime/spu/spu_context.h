@@ -12,6 +12,7 @@
 
 #include "../../include/ps3emu/ps3types.h"
 #include "../../include/ps3emu/log_first.h"
+#include "../platform/ps3_sync.h"
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
@@ -140,7 +141,7 @@ typedef struct spu_channel {
     uint32_t count;   /* number of valid entries, 0..SPU_CHANNEL_CAP */
     uint32_t q[SPU_CHANNEL_CAP];
     uint32_t head;
-    volatile long lock;  /* spu_channel_write/read: producer and consumer are different host threads */
+    ps3_lock lock;
 } spu_channel;
 
 /* ---------------------------------------------------------------------------
@@ -580,14 +581,8 @@ static inline u128 spu_make_preferred_u32(uint32_t val)
  * on 0 with a word still queued, and the PPU waited forever for a reply to a
  * command the SPU never saw. The reader could also see the new count before
  * the new value. Plain reads of `count` elsewhere stay lock-free. */
-#if defined(_MSC_VER) && !defined(__clang__)
-#include <intrin.h>
-#define SPU_CH_LOCK(ch)   while (_InterlockedExchange(&(ch)->lock, 1)) _mm_pause()
-#define SPU_CH_UNLOCK(ch) _InterlockedExchange(&(ch)->lock, 0)
-#else
-#define SPU_CH_LOCK(ch)   while (__atomic_exchange_n(&(ch)->lock, 1, __ATOMIC_ACQUIRE)) {}
-#define SPU_CH_UNLOCK(ch) __atomic_store_n(&(ch)->lock, 0, __ATOMIC_RELEASE)
-#endif
+#define SPU_CH_LOCK(ch)   ps3_lock_acquire(&(ch)->lock)
+#define SPU_CH_UNLOCK(ch) ps3_lock_release(&(ch)->lock)
 
 static inline void spu_channel_write(spu_channel* ch, uint32_t val)
 {
