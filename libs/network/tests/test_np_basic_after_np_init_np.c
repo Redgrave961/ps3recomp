@@ -16,4 +16,5 @@ void spu_lockline_unlock(void) {}
 int np_psnr_enabled(void) { return 0; }
 const char* np_psnr_online_id(void) { return "PS3Player"; }
 s32 cellSysutilQueueGuestCallbackArgs(u32 opd, const u64 args[8]) { (void)opd; (void)args; return 0; }
-void edat_add_klicensee(const uint8_t klic[16]) { (void)klic; }   /* sceNpDrmIsAvailable (#274) */
+int npdrm_license_available(const char* p, const uint8_t* k) { (void)p; (void)k; return 0; }
+void sys_fs_translate_path(const char* g, char* h, int n) { (void)g; if (n > 0) h[0] = 0; }

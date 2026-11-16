@@ -24,7 +24,6 @@
 #include "sys_memory.h"
 #include "sys_vm.h"
 #include "sys_fs.h"
-extern void sys_rsx_init(lv2_syscall_table* tbl);   /* libs/video/sys_rsx.c */
 extern void sys_raw_spu_init(lv2_syscall_table* tbl);   /* runtime/spu/spu_raw.c */
 extern void spu_raw_note_image(uint32_t src_ea, uint32_t entry);
 
@@ -2572,11 +2571,6 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
 
     /* Filesystem */
     sys_fs_init(tbl);
-
-    /* RSX (libs/video/sys_rsx.c). Only a guest that talks to RSX through the
-     * kernel needs these -- a title that imports cellGcmSys never issues one.
-     * PS3 firmware modules link libgcm statically and go straight here. */
-    sys_rsx_init(tbl);
 
     /* Raw SPUs (runtime/spu/spu_raw.c). Registered AFTER the SPU-thread block
      * below would be wrong -- 150..154 and 160/161 are raw-SPU numbers and the

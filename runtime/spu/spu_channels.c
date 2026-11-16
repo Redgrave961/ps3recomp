@@ -171,12 +171,8 @@ int (*g_spu_user_event_hook)(spu_context*, uint32_t) = NULL;
 void (*g_spu_out_mbox_hook)(uint32_t group_id, uint32_t spu_id,
                             int is_intr, uint32_t value) = 0;
 
-/* Every MFC PUT an SPU completes, if anyone is listening. Installed by the GCM
- * layer (libs/video/cellGcmSys.c), which needs it to find the RSX pushbuffer:
- * a title whose SPUs build the command stream never tells libgcm where that
- * stream is, so the only evidence is the DMA that writes it. NULL until
- * installed, so a title with no SPU-built FIFO pays nothing. */
-void (*g_spu_put_hook)(uint32_t ea, uint32_t size) = 0;
+void (*g_rsx_window_write)(void) = 0;
+
 
 void spu_halt(spu_context* ctx)
 {
@@ -947,6 +943,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         ctx->resv_valid = 0;                           /* reservation consumed */
         spu_lockline_unlock();
         if (ctx->atomic_stat == 0) {
+            spu_rsx_window_check(ea, MFC_ATOMIC_LINE);
             spu_taskset_line_committed(ea & ~127u);
             if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
         }
@@ -966,6 +963,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         spu_coh_notify_write(ea);
         ctx->resv_valid = 0; ctx->atomic_stat = 2;   /* PUTLLUC complete */
         spu_lockline_unlock();
+        spu_rsx_window_check(ea, MFC_ATOMIC_LINE);
         spu_taskset_line_committed(ea & ~127u);
         if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
         return 1;

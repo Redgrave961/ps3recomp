@@ -21,17 +21,25 @@
  * lwmutex exclusion) and the POSIX shims elsewhere -- Sleep, DWORD, QPC. */
 #include "../platform/win32_compat.h"
 #include "../memory/vm.h"   /* VM_HLE_INJECT_BASE -- not platform-specific */
-#ifndef _WIN32
 /* sys_timer.h: not included, its lv2 headers redefine ppu_context. */
-extern "C" uint64_t host_monotonic_ns(void);
-#endif
+extern "C" uint64_t ppu_timebase_now(void);
+#define PS3_TIMEBASE_FREQ 79800000ULL
 #include "ps3emu/log_first.h"
 
 extern "C" uint8_t* vm_base;
 extern "C" void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
 extern "C" void ps3_hle_register_fast(uint32_t nid, int (*fn)(ppu_context*));
 extern "C" uint32_t vm_read32(uint64_t a);
-extern "C" uint64_t vm_read64(uint64_t a);
+
+static unsigned int hle_scratch_alloc(unsigned int size, unsigned int align)
+{
+    static unsigned int bump = 0x0F800000u;
+    if (align < 16) align = 16;
+    bump = (bump + align - 1) & ~(align - 1);
+    unsigned int a = bump;
+    bump += (size + 15u) & ~15u;
+    return a;
+}extern "C" uint64_t vm_read64(uint64_t a);
 extern "C" void     vm_write32(uint64_t a, uint32_t v);
 extern "C" void     vm_write64(uint64_t a, uint64_t v);
 
@@ -70,16 +78,8 @@ static void sys_initialize_tls(ppu_context* ctx)
  * and every frontend animation timed off it crawled. */
 static void sys_time_get_system_time(ppu_context* ctx)
 {
-#ifdef _WIN32
-    static LARGE_INTEGER s_freq, s_base;
-    if (!s_freq.QuadPart) { QueryPerformanceFrequency(&s_freq); QueryPerformanceCounter(&s_base); }
-    LARGE_INTEGER now; QueryPerformanceCounter(&now);
-    ctx->gpr[3] = (uint64_t)((now.QuadPart - s_base.QuadPart) * 1000000ull / (uint64_t)s_freq.QuadPart);
-#else
-    /* The same host clock as the timebase (sys_timer.h), so guest code that
-     * mixes mftb and this stays consistent. */
-    ctx->gpr[3] = host_monotonic_ns() / 1000ull;
-#endif
+    const uint64_t tb = ppu_timebase_now();
+    ctx->gpr[3] = tb / PS3_TIMEBASE_FREQ * 1000000ull + tb % PS3_TIMEBASE_FREQ * 1000000ull / PS3_TIMEBASE_FREQ;
 }
 
 /* sys_process_is_stack(u32 addr) -> 1 if addr is in the stack region. We model
@@ -161,10 +161,9 @@ static void sys_lwmutex_create(ppu_context* ctx)
  * race-free). Keyed by guest address in an open-addressed table. */
 #define LWM_HASH 65536u
 static struct LwmSlot { volatile long addr; HANDLE sem; volatile long state;
-    volatile long holder; volatile long long acq_us; volatile long long acq_fences;
+    volatile long holder; volatile long long acq_us;
     volatile unsigned long long acq_cpu_us; } g_lwm[LWM_HASH];
-extern "C" { extern volatile long long g_gcm_ref_pub_count;    /* cellGcmSys.c */
-             unsigned long long ppu_thread_cpu_us(unsigned tid);   /* sys_ppu_thread.c */
+extern "C" { unsigned long long ppu_thread_cpu_us(unsigned tid);   /* sys_ppu_thread.c */
              unsigned ppu_thread_prof_pc(unsigned tid); }
 static volatile long g_lwm_tab_lock = 0;
 /* PS3_LWMUTEX_TRACE=1: reconstruct the lwmutex lock-convoy that stalls LBP's loader.
@@ -299,7 +298,7 @@ static void sys_lwmutex_lock(ppu_context* ctx)
             if (g_nd_inpump || _b <= 40) fprintf(stderr, "[LWM-GOT] tid=%llu lwm=0x%08X\n", (unsigned long long)ctx->thread_id, lwm);
         }
     }
-    if (lwm_trace()) { struct LwmSlot* sl = lwm_find(lwm); if (sl) { sl->holder = (long)self; sl->acq_us = lwm_now_us(); sl->acq_fences = g_gcm_ref_pub_count; sl->acq_cpu_us = ppu_thread_cpu_us(self); } }
+    if (lwm_trace()) { struct LwmSlot* sl = lwm_find(lwm); if (sl) { sl->holder = (long)self; sl->acq_us = lwm_now_us(); sl->acq_cpu_us = ppu_thread_cpu_us(self); } }
     vm_write32(lwm + LWM_OWNER, self);
     vm_write32(lwm + LWM_RECUR, 1);
     ctx->gpr[3] = 0;   // CELL_OK
@@ -346,7 +345,7 @@ static void sys_lwmutex_trylock(ppu_context* ctx)
          * that poll with trylock and check for EBUSY treat it as a hard failure. */
         if (!lwm_try(sl0)) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000Au; return; }
     }
-    if (lwm_trace()) { struct LwmSlot* sl = lwm_find(lwm); if (sl) { sl->holder = (long)self; sl->acq_us = lwm_now_us(); sl->acq_fences = g_gcm_ref_pub_count; sl->acq_cpu_us = ppu_thread_cpu_us(self); } }
+    if (lwm_trace()) { struct LwmSlot* sl = lwm_find(lwm); if (sl) { sl->holder = (long)self; sl->acq_us = lwm_now_us(); sl->acq_cpu_us = ppu_thread_cpu_us(self); } }
     vm_write32(lwm + LWM_OWNER, self);
     vm_write32(lwm + LWM_RECUR, 1);
     ctx->gpr[3] = 0;
@@ -365,11 +364,10 @@ static void sys_lwmutex_unlock(ppu_context* ctx)
     if (lwm_trace()) { struct LwmSlot* sl = lwm_find(lwm);
         if (sl && sl->holder) { long long held = lwm_now_us() - sl->acq_us;
             if (held > 100000) {
-                long long fences = g_gcm_ref_pub_count - sl->acq_fences;
                 unsigned long long cpu_now = ppu_thread_cpu_us((unsigned)sl->holder);
                 long long cpu_delta = (cpu_now && sl->acq_cpu_us) ? (long long)(cpu_now - sl->acq_cpu_us) : -1;
-                fprintf(stderr, "[LWM-CONVOY] tid=%ld RELEASES lwm=0x%08X after holding %lldus (LONG HOLD) fences=%lld cpu=%lldus (%.0f%% cpu-bound) last-hle-from=0x%08X\n",
-                    sl->holder, lwm, held, fences, cpu_delta,
+                fprintf(stderr, "[LWM-CONVOY] tid=%ld RELEASES lwm=0x%08X after holding %lldus (LONG HOLD) cpu=%lldus (%.0f%% cpu-bound) last-hle-from=0x%08X\n",
+                    sl->holder, lwm, held, cpu_delta,
                     cpu_delta >= 0 ? 100.0 * (double)cpu_delta / (double)held : -1.0,
                     ppu_thread_prof_pc((unsigned)sl->holder));
                 /* Name the critical section: the unlocker IS the holder, so its
@@ -532,61 +530,6 @@ extern "C" int64_t sys_ppu_thread_exit(ppu_context* ctx);
 static void hle_ppu_thread_create(ppu_context* ctx) { ctx->gpr[3] = sys_ppu_thread_create(ctx); }
 static void hle_ppu_thread_exit(ppu_context* ctx)   { ctx->gpr[3] = sys_ppu_thread_exit(ctx); }
 
-/* _cellGcmInitBody (NID 0x15BAE46B) -- the GCM init every PS3 game calls via the
- * cellGcmInit() SDK macro. cellGcmSys.c provides the layout-correct core
- * (cellGcmSetupContext) but needs the owning vm to allocate the guest
- * CellGcmContextData and write the game's context-out pointer; supply those as
- * callbacks. Without this the game's GCM context stays null -> null deref. */
-typedef unsigned int (*CellGcmGuestAlloc)(unsigned int, unsigned int);
-typedef void (*CellGcmGuestWrite32)(unsigned int, unsigned int);
-extern "C" unsigned int cellGcmSetupContext(unsigned int ctx_out_addr,
-    unsigned int cmdSize, unsigned int ioSize, unsigned int ioAddress,
-    CellGcmGuestAlloc galloc, CellGcmGuestWrite32 gwrite32);
-
-static unsigned int gcm_guest_alloc(unsigned int size, unsigned int align)
-{
-    /* Bump from a small scratch region below the main stack (0x0FF00000) and
-     * above the TLS image -- a few control structs, never freed. */
-    static unsigned int bump = 0x0F800000u;
-    if (align < 16) align = 16;
-    bump = (bump + align - 1) & ~(align - 1);
-    unsigned int a = bump;
-    bump += (size + 15u) & ~15u;
-    return a;
-}
-static void gcm_guest_write32(unsigned int addr, unsigned int val) { vm_write32(addr, val); }
-
-/* FIFO command-buffer-full callback. cellGcmSetupContext points the guest
- * context's callback OPD at GCM_FIFO_CALLBACK_SENTINEL_EA; the title's inline
- * gcmReserve calls context->callback(context, count) on ring wrap, which the
- * indirect dispatcher routes here. r3 = guest context EA.
- *
- * Derived from VM_HLE_INJECT_BASE, the same base libs/video/cellGcmSys.c
- * builds the OPD from. This was a second hardcoded copy of the address, and
- * moving the injected block out of guest-allocatable memory updated only one
- * of them: the OPD then pointed at an EA with no registered function, the
- * garbage-vcall guard no-opped the callback, the FIFO never recycled and the
- * title stopped flipping. One definition, one place. */
-#define GCM_FIFO_CALLBACK_SENTINEL_EA (VM_HLE_INJECT_BASE + 0x2F00u)
-extern "C" void cellGcm_fifo_recycle(unsigned int ctx_ea);
-extern "C" void ppu_register_function(uint64_t addr, void (*fn)(ppu_context*));
-static void hle_gcm_callback(ppu_context* ctx)
-{
-    cellGcm_fifo_recycle((unsigned int)ctx->gpr[3]);   /* r3 = context EA */
-    ctx->gpr[3] = 0;                                   /* CELL_OK */
-}
-
-static void hle_cellGcmInitBody(ppu_context* ctx)
-{
-    uint32_t ctx_out = (uint32_t)ctx->gpr[3];
-    uint32_t cmdSize = (uint32_t)ctx->gpr[4];
-    uint32_t ioSize  = (uint32_t)ctx->gpr[5];
-    uint32_t ioAddr  = (uint32_t)ctx->gpr[6];
-    fprintf(stderr, "[HLE] _cellGcmInitBody(ctx_out=0x%08X, cmdSize=0x%X, ioSize=0x%X, ioAddr=0x%X)\n",
-            ctx_out, cmdSize, ioSize, ioAddr);
-    cellGcmSetupContext(ctx_out, cmdSize, ioSize, ioAddr, gcm_guest_alloc, gcm_guest_write32);
-    ctx->gpr[3] = 0;   /* CELL_OK */
-}
 
 /* --- sys_net offline model ---------------------------------------------
  * LBP's net-services tick (sub_11A864) drains its UDP socket with
@@ -605,7 +548,7 @@ extern "C" void avconf_register_ctx(void);     /* libs/misc/cellAvconfExt.c */
 static uint32_t g_net_errno_ea = 0;
 static void hle_net_errno_loc(ppu_context* ctx)
 {
-    if (!g_net_errno_ea) g_net_errno_ea = gcm_guest_alloc(4, 4);
+    if (!g_net_errno_ea) g_net_errno_ea = hle_scratch_alloc(4, 4);
     vm_write32(g_net_errno_ea, SYS_NET_EWOULDBLOCK_V);
     ctx->gpr[3] = g_net_errno_ea;
 }
@@ -922,13 +865,12 @@ static void sys_spinlock_unlock(ppu_context* ctx)
 
 extern "C" void ppu_sysprx_register(void)
 {
-    ps3_hle_register_ctx(0x15BAE46Bu, "_cellGcmInitBody", hle_cellGcmInitBody);
     ps3_hle_register_ctx(0xEBE5F72Fu, "_sys_spu_image_import", hle_sys_spu_image_import);
 
     /* PS3_NET_ONLINE: real host sockets (libs/network/sysNet.c). Registered
      * first because the first registration of a NID wins, so these shadow the
      * offline model below; without the variable nothing changes. */
-    if (getenv("PS3_NET_ONLINE")) ps3_net_host_register(gcm_guest_alloc);
+    if (getenv("PS3_NET_ONLINE")) ps3_net_host_register(hle_scratch_alloc);
     /* sceNpScore ranking calls take up to 15 arguments: the ones past r10
      * come off the stack, so they need the full context. */
     np_score_register_ctx();
@@ -955,9 +897,6 @@ extern "C" void ppu_sysprx_register(void)
     ps3_hle_register_ctx(0x71F4C717u, "netGetHostByName",       hle_net_zero);   /* NULL: DNS down */
     ps3_hle_register_ctx(0xB68D5625u, "netFinalizeNetwork",     hle_net_zero);
     ps3_hle_register_ctx(0xFDB8F926u, "netFreethreadContext",   hle_net_zero);
-    /* Route the GCM command-buffer-full callback (invoked indirectly via the
-     * context OPD) into cellGcm_fifo_recycle so the FIFO ring recycles on wrap. */
-    ppu_register_function(GCM_FIFO_CALLBACK_SENTINEL_EA, hle_gcm_callback);
     ps3_hle_register_ctx(ps3_compute_nid("sys_initialize_tls"),       "sys_initialize_tls",       sys_initialize_tls);
     ps3_hle_register_ctx(ps3_compute_nid("sys_time_get_system_time"), "sys_time_get_system_time", sys_time_get_system_time);
     ps3_hle_register_ctx(ps3_compute_nid("sys_process_is_stack"),     "sys_process_is_stack",     sys_process_is_stack);

@@ -16,6 +16,7 @@
 #include "rsx_primitives.h"
 #include "rsx_restart_cuts.h"
 #include "rsx_tiling.h"
+#include "rsx_core.h"
 #include "rsx_vertex_formats.h"
 #include "rsx_vp_decompiler.h"
 
@@ -28,12 +29,8 @@
 /* Guest memory and the RSX offset resolvers, declared the way every backend
  * that reads guest data declares them (rsx_vertex_fetch.h). */
 extern u8* vm_base;
-u32 cellGcmResolveLocated(int local, u32 offset);
-/* cellGcmSys.c: the display buffers registered before the engine came up. */
-void cellGcm_replay_display_buffers_to_engine(void);
 /* Non-zero only when the offset's page is in the IO table, so a caller can
  * tell IO-mapped main memory from "assume VRAM". */
-u32 cellGcmResolveIO(u32 offset);
 /* The guest VM's OOB guard: the size a host backed, or 0 for "the whole 32-bit
  * space is backed and no check is needed" (runtime/memory/vm.h). */
 extern u32 ppu_vm_size;
@@ -279,7 +276,7 @@ static const u8* eng_guest_ptr(void* user, u32 location, u32 offset,
     if (!min_bytes || min_bytes > (256u << 20)) return NULL;
     if (s_guest_reader) return s_guest_reader(s_guest_user, location, offset, min_bytes);
     if (!vm_base) return NULL;
-    const u32 ea = cellGcmResolveLocated(location == RSX_LOCATION_LOCAL, offset);
+    const u32 ea = rsx_location_ea(location == RSX_LOCATION_LOCAL, offset);
     if (!ea) return NULL;
     if (ppu_vm_size && (u64)ea + min_bytes > ppu_vm_size) return NULL;
     return vm_base + ea;
@@ -703,7 +700,7 @@ static const void* eng_surface_seed(u32 location, u32 offset, u32 w, u32 h,
      * checked: the DMA context says which space the offset is in, and the IO
      * table says the page is really mapped. */
     if (location != RSX_LOCATION_MAIN ||
-        (!s_guest_reader && !cellGcmResolveIO(offset))) return NULL;
+        (!s_guest_reader && !rsx_io_to_ea(offset))) return NULL;
     rsx_tex_layout tl;
     /* A8R8G8B8 with the LN bit: a surface is linear, never swizzled. */
     rsx_texture_layout(0x85u | 0x20u, w, h, &tl);
@@ -3710,8 +3707,11 @@ int rsx_draw_engine_init(u32 width, u32 height)
     sink.flip             = sink_flip;
     rsx_dispatch_init(&g.rsx, &sink);
     g.ready = 1;
-    /* Display buffers the title registered before the backend came up. */
-    cellGcm_replay_display_buffers_to_engine();
+    for (u32 i = 0; i < 8u; i++) {
+        rsx_display_buffer b;
+        if (rsx_core_display_buffer(i, &b))
+            rsx_draw_engine_set_display_buffer(i, 0, b.offset, b.pitch, b.width, b.height);
+    }
     fprintf(stderr, "[rsx engine] register-file draw engine up (%ux%u)\n",
             g.width, g.height);
     return 0;

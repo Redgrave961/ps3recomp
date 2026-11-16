@@ -5,10 +5,10 @@
  * recompiled program's entry point:
  *
  *   lifted code (ppu_recomp.c) + loader (ppu_loader.cpp) + HLE bridge
- *   (ppu_hle.cpp + generated NID table) + HLE libs (cellGcmSys, rsx_commands)
+ *   (ppu_hle.cpp + generated NID table) + HLE libs
  *
  * It loads the PPU ELF named on the command line, registers the lifted
- * functions and the HLE NID handlers, starts the frame clock, then dispatches
+ * functions and the HLE NID handlers, then dispatches
  * the entry OPD. Execution runs real guest code until it reaches a function
  * outside the lifted subset (logged by the unlifted stub), an unimplemented
  * firmware import (logged by ps3_hle_call), or an lv2 syscall (logged by
@@ -21,6 +21,7 @@
  * tests/smoke/, which is the same harness with a synthetic program in it and
  * is what proves this path runs at all on POSIX.
  */
+#include "../../../libs/video/rsx_core.h"
 #include <stdarg.h>
 #include "ppu_recomp.h"
 #include "ps3emu/milestone.h"   /* ps3_ms / ps3_ms_kv -- boot milestone log */
@@ -254,146 +255,18 @@ extern "C" uint32_t ppu_vm_size;   /* defined in ppu_loader.cpp (OOB guard) */
 extern "C" void lv2_init_syscalls(void);   /* runtime/syscalls/lv2_register.c */
 extern "C" void np_psnr_setup(const char* username, const char* server);  /* libs/network/np_psnr.c */
 
-/* Guest-callback dispatch + RSX vblank/flip driver.
- *
- * g_ps3_guest_caller (defined NULL by libs/system/cellSysutil.c) is the hook the
- * HLE runtime uses to call back into recompiled code -- cellSysutil events and
- * the GCM vblank/flip handlers. ppu_guest_call (ppu_loader.cpp) does the OPD ->
- * dispatch. On real hardware the RSX fires a vblank interrupt ~60x/s that drives
- * the game's frame loop; with no RSX we synthesize it from a host timer thread
- * calling cellGcmTickVBlank()/TickFlip(), which invoke the registered handlers.
- * Without this the game inits, registers its handlers, and then waits forever
- * for a vblank that never comes. */
+/* Guest-callback dispatch. g_ps3_guest_caller (defined NULL by
+ * libs/system/cellSysutil.c) is the hook the HLE runtime uses to call back into
+ * recompiled code; ppu_guest_call (ppu_loader.cpp) does the OPD -> dispatch. */
 typedef void (*ps3_guest_caller_fn)(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t,
                                     uint64_t, uint64_t, uint64_t, uint64_t);
 extern "C" ps3_guest_caller_fn g_ps3_guest_caller;        /* libs/system/cellSysutil.c */
 extern "C" uint64_t ppu_guest_call(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t,
                                    uint64_t, uint64_t, uint64_t, uint64_t);
-extern "C" void cellGcmTickVBlank(void);
-extern "C" void cellGcmTickFlip(void);
-extern "C" int  cellGcm_take_flip_pending(void);  /* hoisted to file scope: clang-cl rejects block-scope extern "C" */
-
 static void harness_guest_caller(uint32_t opd, uint64_t a0, uint64_t a1,
                                  uint64_t a2, uint64_t a3, uint64_t a4,
                                  uint64_t a5, uint64_t a6, uint64_t a7)
 { ppu_guest_call(opd, a0, a1, a2, a3, a4, a5, a6, a7); }
-
-/* RSX present backend. D3D12 on Windows, Metal on Apple, and the null
- * backend's headless software path anywhere else -- the same selection
- * runtime/host/host_posix.c makes, so the ticker below is backend-agnostic
- * and a POSIX host gets a frame clock instead of no clock at all. */
-#if defined(_WIN32)
-extern "C" int  rsx_d3d12_backend_init(uint32_t w, uint32_t h, const char* title);
-extern "C" void rsx_d3d12_backend_present(void);
-extern "C" int  rsx_d3d12_backend_pump_messages(void);
-#  define rsx_backend_init    rsx_d3d12_backend_init
-#  define rsx_backend_present rsx_d3d12_backend_present
-#  define rsx_backend_pump    rsx_d3d12_backend_pump_messages
-#elif defined(__APPLE__)
-extern "C" int  rsx_metal_backend_init(uint32_t w, uint32_t h, const char* title);
-extern "C" void rsx_metal_backend_present(void);
-extern "C" int  rsx_metal_backend_pump_messages(void);
-#  define rsx_backend_init    rsx_metal_backend_init
-#  define rsx_backend_present rsx_metal_backend_present
-#  define rsx_backend_pump    rsx_metal_backend_pump_messages
-#else
-extern "C" int  rsx_null_backend_init(uint32_t w, uint32_t h, const char* title);
-extern "C" void rsx_null_backend_present(void);
-extern "C" int  rsx_null_backend_pump_messages(void);
-#  define rsx_backend_init    rsx_null_backend_init
-#  define rsx_backend_present rsx_null_backend_present
-#  define rsx_backend_pump    rsx_null_backend_pump_messages
-#endif
-extern "C" void cellGcm_rsx_process_fifo(void);   /* cellGcmSys.c: drain get->put */
-extern "C" void cellGcm_fifo_kick_wait(unsigned ms); /* idle wait, woken by a kick */
-extern "C" unsigned cellGcm_flip_request_count(void);
-extern "C" unsigned cellGcmGetCurrentDisplayBufferId(void);
-extern "C" int sys_event_queue_inject(unsigned int, unsigned long long, unsigned long long, unsigned long long, unsigned long long);
-
-/* Live NV4097->D3D12 engine (libs/video/rsx_live_draw.c, from caner /
- * canersaka's Yakuza: Dead Souls port). Opt-in with RSX_LIVE_DRAW=1: the null
- * backend opens the window, the engine binds its swap chain to that HWND and
- * owns presentation, so rsx_d3d12_backend is left out entirely rather than run
- * alongside it. Unset, every path below is exactly what it was. */
-extern "C" int   rsx_live_draw_enabled(void);
-extern "C" int   rsx_live_draw_init(void* hwnd, uint32_t w, uint32_t h,
-                                    const uint8_t* (*guest_ptr)(void*, uint32_t,
-                                                                uint32_t, uint32_t),
-                                    void* user);
-extern "C" void  rsx_live_draw_present(uint32_t buffer_id);
-extern "C" uint32_t rsx_live_draw_get_frames(void);
-extern "C" uint32_t rsx_live_draw_get_last_draws(void);
-extern "C" int   rsx_null_backend_init(uint32_t w, uint32_t h, const char* title);
-extern "C" int   rsx_null_backend_pump_messages(void);
-extern "C" void* rsx_null_backend_get_hwnd(void);
-extern "C" void  rsx_null_backend_suppress_present(int on);
-extern "C" uint32_t cellGcmResolveLocated(int local, uint32_t offset);
-extern "C" uint32_t cellGcmResolveIO(uint32_t offset);
-
-static int s_rsx_live = 0;   /* live engine selected AND up */
-
-/* Resolve (location, offset) to host memory for the engine. location 0 is RSX
- * local VRAM, 1 is main/IO memory; the engine promises its callers the whole
- * min_bytes span is readable, so validate the interval, not just its start.
- * The location comes straight from the RSX DMA context selector and is
- * authoritative -- cellGcmResolveOffset()'s heuristic prefers VRAM for any page
- * the guest ever derived from a local EA, which maps a title's MAIN-memory
- * textures into local memory where they read as garbage (caner hit exactly
- * that in the Yakuza port; the geometry came out flat white). */
-static const uint8_t* rsx_live_guest_ptr(void* user, uint32_t location,
-                                         uint32_t offset, uint32_t min_bytes)
-{
-    (void)user;
-    if (!vm_base) return nullptr;
-    uint32_t ea;
-    if (location == 0) {
-        ea = cellGcmResolveLocated(1, offset);          /* RSX local VRAM */
-    } else {
-        ea = cellGcmResolveIO(offset);                  /* main, via the IO table */
-        if (!ea) ea = cellGcmResolveLocated(0, offset); /* unmapped: old behaviour */
-    }
-    if (!ea || ea == 0xFFFFFFFFu ||
-        (uint64_t)ea + min_bytes > 0x100000000ull) return nullptr;
-    return (const uint8_t*)vm_base + ea;
-}
-
-/* Present / pump through whichever backend is live. */
-static void rsx_present_frame(void)
-{
-    /* Present the buffer the guest actually flipped to, not buffer 0.
-     *
-     * rsx_live_draw_present() looks up the surface registered for the display
-     * buffer it is given, so hardcoding 0 presented buffer 0's surface for
-     * EVERY flip. A double-buffered title flips 0,1,0,1..., so half its frames
-     * showed the previous image instead of the one just drawn -- content
-     * appearing and vanishing at ~30 Hz, and black wherever buffer 0 had not
-     * been drawn yet. The Simpsons Arcade Game flips 0,1 alternately and that
-     * is exactly what it looked like.
-     *
-     * cellGcmGetCurrentDisplayBufferId() is set by cellGcmSetFlipCommand,
-     * which the FIFO walker calls on this same thread before setting the
-     * pending flag we are responding to, so it is current here. */
-    if (s_rsx_live) rsx_live_draw_present(cellGcmGetCurrentDisplayBufferId());
-    else            rsx_backend_present();   /* platform backend: D3D12 / Metal / null */
-}
-static int rsx_pump_messages(void)
-{ return s_rsx_live ? rsx_null_backend_pump_messages() : rsx_backend_pump(); }
-extern "C" void ps3_host_quit(const char* why);   /* libs/system/cellSysutil.c: REQUEST_EXITGAME, then exit 0 */
-
-/* Frames handed to the backend at a guest FLIP boundary -- one per frame the
- * guest actually finished, which is the number a port means by "is anything
- * reaching the screen". The presents the ticker makes before the guest's first
- * flip (so a fresh window is not left white through a long boot) are
- * deliberately not counted: they carry no guest frame. */
-static volatile LONG g_frames_presented = 0;
-extern "C" unsigned ppu_boot_frames_presented(void) { return (unsigned)g_frames_presented; }
-static void present_guest_frame(void)
-{
-    rsx_present_frame();
-    /* The ticker increments, a guest thread reads: interlocked rather than a
-     * volatile ++, which is neither atomic nor a fence on arm64. */
-    InterlockedIncrement(&g_frames_presented);
-}
 
 /* ---- Guest-PC sampling profiler (PS3_GUEST_PROF=1) -----------------------
  * Samples every guest thread's ctx.cia every ~5ms and dumps the top sites
@@ -443,138 +316,6 @@ static DWORD WINAPI guest_prof_thread(LPVOID)
             nsites = 0; total = 0; t0 = now;
         }
     }
-}
-
-extern "C" const char* cellGame_get_title(void);   /* PARAM.SFO TITLE, for the caption */
-
-static DWORD WINAPI vblank_ticker(LPVOID)
-{
-    /* Window caption: $PS3_TITLE wins, else the TITLE field PARAM.SFO already
-     * gave cellGame, else a neutral name. It used to fall back to a specific
-     * other title, so every port announced itself as that game. */
-    const char* _title = getenv("PS3_TITLE");
-    if (!_title || !*_title) {
-        const char* sfo = cellGame_get_title();
-        if (sfo && *sfo && strcmp(sfo, "Unknown Title") != 0) _title = sfo;
-    }
-    if (!_title || !*_title) _title = "ps3recomp";
-    /* The live engine's RT-as-backbuffer rescue only treats a surface as the
-     * backbuffer when its clip EQUALS the backend size, so a title that renders
-     * into something other than 1280x720 must say so: RSX_W / RSX_H. */
-    uint32_t rsx_w = 1280, rsx_h = 720;
-    if (const char* e = getenv("RSX_W")) rsx_w = (uint32_t)strtoul(e, 0, 0);
-    if (const char* e = getenv("RSX_H")) rsx_h = (uint32_t)strtoul(e, 0, 0);
-    int rsx_ok;
-    if (rsx_live_draw_enabled()) {
-        rsx_ok = (rsx_null_backend_init(rsx_w, rsx_h, _title) == 0);
-        if (rsx_ok && rsx_live_draw_init(rsx_null_backend_get_hwnd(), rsx_w, rsx_h,
-                                         rsx_live_guest_ptr, nullptr) == 0) {
-            s_rsx_live = 1;
-            rsx_null_backend_suppress_present(1);
-            fprintf(stderr, "[rsx] live-draw engine up (D3D12); GDI present suppressed\n");
-        } else {
-            fprintf(stderr, "[rsx] live-draw init FAILED -- falling back to the D3D12 backend\n");
-            rsx_ok = (rsx_backend_init(rsx_w, rsx_h, _title) == 0);
-        }
-    } else {
-        rsx_ok = (rsx_backend_init(rsx_w, rsx_h, _title) == 0);
-    }
-    fprintf(stderr, "[rsx] backend init %s\n", rsx_ok ? "OK -- window open" : "FAILED");
-    unsigned last_flip = 0;
-    /* The game's frame pacing (vblank/flip handlers -> display frame counter) must
-     * advance at ~60Hz regardless of how long present() blocks. On a hidden/occluded
-     * window DXGI Present throttles hard, which previously stalled these ticks and
-     * paced the game's main loop to ~0.5fps. Drive the ticks off REAL elapsed time
-     * and catch up in a bounded burst so present latency never slows the game. */
-    ULONGLONG next_tick = GetTickCount64();
-    for (;;) {
-        /* Was Sleep(4). The FIFO kick event existed, was signalled on a dry
-         * fence queue, and had no waiter -- so a guest starved for `get` or a
-         * fence still paid the whole tick. Waiting on it keeps the same 4 ms
-         * ceiling when nothing kicks, and drains on demand when something
-         * does. */
-        cellGcm_fifo_kick_wait(4);
-        ULONGLONG now = GetTickCount64();
-        int fired = 0;
-        while ((long long)(now - next_tick) >= 0 && fired < 240) {
-            cellGcmTickVBlank();
-            cellGcmTickFlip();
-            /* Present a pending flip BEFORE draining further: the flip fires
-             * at a get==put frame boundary (guest thread), so the batch held
-             * right now is exactly the completed frame. Presenting on a raw
-             * flip-count change after the drain raced the guest's next-frame
-             * writes and showed empty or mixed batches. */
-            {
-                if (rsx_ok && cellGcm_take_flip_pending()) {
-                    present_guest_frame();
-                    last_flip = cellGcm_flip_request_count();
-                }
-            }
-            /* Drain the game's GCM FIFO every tick -- this writes the RSX sync-fence
-             * labels (e.g. @0x03000410) that the game's per-frame logic blocks on.
-             * Doing it here (not after present) keeps those fences advancing at 60Hz
-             * even when present() throttles on a hidden/occluded window. */
-            if (rsx_ok) cellGcm_rsx_process_fifo();
-            next_tick += 16;                 /* ~60 Hz */
-            fired++;
-        }
-        if (fired >= 240) next_tick = now;   /* fell too far behind -> resync */
-        /* Drain at the outer ~4ms cadence too (not just the 16ms tick):
-         * titles fence EVERY render pass on an RSX label the drain writes;
-         * at 16ms per fence wave's six passes paced the guest to ~7 fps.
-         * The real RSX writes those fences in microseconds. */
-        if (rsx_ok) {
-            if (cellGcm_take_flip_pending()) {
-                present_guest_frame();
-                last_flip = cellGcm_flip_request_count();
-            }
-            cellGcm_rsx_process_fifo();
-        }
-        /* YDKJ_INJECT_Q3: the main thread polls q3 (load/state-complete) each frame but
-         * it's never posted (producer signals a condvar, never enqueues). Inject a q3
-         * event periodically to test whether delivering the completion advances the
-         * game's state machine to instantiate + display the (force-parsed) menu movie. */
-        if (getenv("YDKJ_INJECT_Q3")) {
-            static int s_q3=0; const char* qe=getenv("YDKJ_INJECT_Q3"); uint32_t qid=(uint32_t)strtoul(qe,0,0); if(qid==0||qid==1) qid=3;
-            if(++s_q3 % 8 == 0){ int r=sys_event_queue_inject(qid, 0x1234, 0, 0, 0);
-              static int _n=0; if(_n++<12) fprintf(stderr,"[INJQ3] injected q%u event rc=%d\n",qid,r); } }
-        if (rsx_ok) {
-            if (rsx_pump_messages() != 0) {
-                rsx_ok = 0;
-                /* The window was closed (or ESC pressed): quit as the console's Quit Game does -- every
-                 * registered sysutil callback gets CELL_SYSUTIL_REQUEST_EXITGAME, so the title can finish a
-                 * save and exit -- instead of leaving the guest running with no window. Once only. */
-                ps3_host_quit("window closed");
-            }
-            if (getenv("YDKJ_PACETRACE")) {
-                static ULONGLONG s_win=0; static int s_pf=0, s_pres=0; static ULONGLONG s_presms=0;
-                s_pf += fired; s_pres++;
-                ULONGLONG t0=GetTickCount64(); rsx_present_frame(); ULONGLONG t1=GetTickCount64();
-                s_presms += (t1-t0);
-                if (s_win==0) s_win=now;
-                if (now - s_win >= 1000) {
-                    fprintf(stderr,"[PACE] process_fifo=%d/s  present=%d/s  present_total=%llums/s (avg %llums)\n",
-                            s_pf, s_pres, s_presms, s_pres? s_presms/s_pres:0);
-                    s_pf=0; s_pres=0; s_presms=0; s_win=now;
-                }
-            } else {
-                /* Present only on a guest flip (frame boundary). A fixed-clock
-                 * present can catch the drain mid-frame -- notably while the
-                 * guest is blocked in the FIFO-wrap recycle callback -- and
-                 * flash a partial frame (clear + a few draws). Before the
-                 * first flip present freely so the window isn't stuck white
-                 * during boot. */
-                unsigned fc = cellGcm_flip_request_count();
-                if (fc != last_flip || fc == 0) {
-                    if (fc) present_guest_frame(); else rsx_present_frame();
-                    last_flip = fc;
-                } else if (fc == 0) {
-                    rsx_backend_present();
-                }
-            }
-        }
-    }
-    return 0;
 }
 
 extern "C" uint32_t    g_last_hle_nid;
@@ -987,7 +728,7 @@ static DWORD WINAPI debug_console(LPVOID param)
                        g_last_hle_name ? g_last_hle_name : "", 10);
         } else if (!strcmp(verb, "stat")) {
             dbg_printf("  uptime   %.1f s%c", (GetTickCount() - t0) / 1000.0, 10);
-            dbg_printf("  flips    %u%c", cellGcm_flip_request_count(), 10);
+            dbg_printf("  flips    %u%c", rsx_core_frames_presented(), 10);
             dbg_printf("  last HLE 0x%08X (%s)%c", g_last_hle_nid,
                        g_last_hle_name ? g_last_hle_name : "", 10);
             dbg_printf("  vm_base  %s%c", vm_base ? "live" : "not mapped", 10);
@@ -1185,14 +926,7 @@ int main(int argc, char** argv)
     ps3_ms("boot:init_done");
     fprintf(stderr,"[boot-dbg] after lv2_init_syscalls\n"); fflush(stderr);
 
-    /* Install the guest-callback hook and start the synthetic RSX vblank driver
-     * so the game's frame loop advances (it no-ops until the game registers its
-     * vblank/flip handlers during init). */
     g_ps3_guest_caller = harness_guest_caller;
-    /* CreateThread is a pthread wrapper off Windows (win32_compat.h), so the
-     * frame clock now runs everywhere. Without it a POSIX host never ticks
-     * vblank or drains the FIFO, and the guest waits on fences forever. */
-    CreateThread(NULL, 4u * 1024 * 1024, vblank_ticker, NULL, 0, NULL);
     if (getenv("PS3_GUEST_PROF"))
         CreateThread(NULL, 0, guest_prof_thread, NULL, 0, NULL);
 #ifdef _WIN32

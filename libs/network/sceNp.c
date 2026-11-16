@@ -13,7 +13,7 @@
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 #include "np_psnr.h"
 #include "../system/cellSysutil.h"
-#include "../filesystem/edat.h"
+#include "../filesystem/npdrm.h"
 
 
 /* ---------------------------------------------------------------------------
@@ -399,28 +399,16 @@ s32 sceNpScoreTerm(void)
     return CELL_OK;
 }
 
-/* ---------------------------------------------------------------------------
- * NPDRM
- *
- * On hardware sceNpDrmIsAvailable[2](klicensee, path) checks the licence for an
- * NPDRM file and leaves the klicensee with the kernel, so later cellFsOpen calls
- * on EDATs return plaintext. Free (license type 3) and disc-bound game data use a
- * title-specific klicensee that only the game knows; record it for the EDAT
- * reader (libs/filesystem/edat.c), which verifies it against each file's
- * dev_hash before using it. The two calls differ only in licence-check details
- * that do not apply here.
- * -----------------------------------------------------------------------*/
+void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size);
 
 static s32 np_drm_is_available(const u8* k_licensee, const char* drm_path)
 {
-    const u8* k = GUEST_PTR(k_licensee, const u8*);
     const char* path = GUEST_PTR(drm_path, const char*);
-    /* A NULL klicensee is legal for content that needs none; nothing to record. */
-    if (k) edat_add_klicensee(k);
-    fprintf(stderr, "[sceNp] DRM availability check: %s\n", path ? path : "(null)");
-    return CELL_OK;
+    if (!path) return (s32)NPDRM_ERROR_INVALID_PARAM;
+    char host[1024];
+    sys_fs_translate_path(path, host, (int)sizeof host);
+    return (s32)npdrm_license_available(host, GUEST_PTR(k_licensee, const u8*));
 }
-
 s32 sceNpDrmIsAvailable(const u8* k_licensee, const char* drm_path)
 {
     return np_drm_is_available(k_licensee, drm_path);

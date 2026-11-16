@@ -35,7 +35,12 @@ void ydkj_host_bt(const char* tag) { (void)tag; }
 void ps3_hle_register_ctx(uint32_t, const char*, void (*)(ppu_context*)) {}
 }
 ps3_guest_caller_fn g_ps3_guest_caller = nullptr;
-const char* edat_resolve(const char* host_path, char* buf, size_t cap) { (void)buf; (void)cap; return host_path; }
+#include "../../../libs/filesystem/npdrm.h"
+int npdrm_is_npd(FILE* f) { (void)f; return 0; }
+npdrm_file* npdrm_open(FILE* f, const char* n) { (void)f; (void)n; return 0; }
+int64_t npdrm_read(npdrm_file* d, uint64_t o, void* p, uint64_t n) { (void)d; (void)o; (void)p; (void)n; return -1; }
+uint64_t npdrm_size(const npdrm_file* d) { (void)d; return 0; }
+void npdrm_close(npdrm_file* d) { (void)d; }
 
 static uint32_t rd32(uint32_t a) { uint32_t v; memcpy(&v, vm_base + a, 4); return __builtin_bswap32(v); }
 static uint64_t rd64(uint32_t a) { uint64_t v; memcpy(&v, vm_base + a, 8); return __builtin_bswap64(v); }

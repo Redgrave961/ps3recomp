@@ -623,8 +623,6 @@ static void samp_report(void)
  * guest histogram says nothing about where it loops. */
 static DWORD s_samp_boot_tid;
 static int   s_samp_main = -1;
-static int   s_samp_drain = -1;
-extern "C" volatile unsigned long g_gcm_drain_tid;
 
 static uint32_t samp_stack_guest(HANDLE h, const CONTEXT* c)
 {
@@ -701,11 +699,6 @@ static DWORD WINAPI samp_thread(LPVOID p)
         ? OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, s_samp_boot_tid) : NULL;
     DWORD one_tid = s_samp_main > 0 ? s_samp_boot_tid : 0;
     for (;;) {
-        if (s_samp_drain > 0 && g_gcm_drain_tid && g_gcm_drain_tid != one_tid) {
-            if (main_h) CloseHandle(main_h);
-            one_tid = (DWORD)g_gcm_drain_tid;
-            main_h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, one_tid);
-        }
         if (main_h) {
             if (SuspendThread(main_h) != (DWORD)-1) {
                 CONTEXT c; c.ContextFlags = CONTEXT_CONTROL;
@@ -739,11 +732,6 @@ static DWORD WINAPI samp_thread(LPVOID p)
             if (Thread32First(snap, &te)) do {
                 if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
                 if (s_samp_main > 0 && te.th32ThreadID != s_samp_boot_tid) continue;
-                /* PS3_SAMPLE_DRAIN=1: only the thread that last walked the
-                 * RSX FIFO (cellGcm_rsx_process_fifo records it), so the RVA
-                 * histogram is the drain's own cost, not the spin loops of
-                 * every SPU thread. */
-                if (s_samp_drain > 0 && te.th32ThreadID != g_gcm_drain_tid) continue;
                 HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT,
                                       FALSE, te.th32ThreadID);
                 if (!h) continue;
@@ -829,7 +817,6 @@ void ps3_sampler_start(void)
     unsigned ms = (unsigned)atoi(e); if (!ms) ms = 5;
     s_samp_boot_tid = GetCurrentThreadId();
     s_samp_main = getenv("PS3_SAMPLE_MAIN") ? 1 : 0;
-    s_samp_drain = getenv("PS3_SAMPLE_DRAIN") ? 1 : 0;
     /* Self-check: does .pdata actually describe the lifted bodies? If not, the
      * exact attribution mode misses ALL guest code by construction and its "0
      * guest samples" means nothing. Print it rather than assume either way. */
@@ -1752,18 +1739,6 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; ppu_rwatch
       if(_fa==-2){ const char* e=getenv("PPU_FORCE_READ_ADDR"); _fa=e?(int64_t)strtoul(e,0,16):-1;
                    const char* ev=getenv("PPU_FORCE_READ_VAL"); _fv=ev?(uint32_t)strtoul(ev,0,16):0; }
       if (_fa>=0 && (uint32_t)a==(uint32_t)_fa) return _fv; }
-    /* GCM_REFPOLL: read-driven RSX fence publication. A spin-read of the ref
-     * register (GCM_CONTROL+8 = 0x03002008) advances one queued fence (paced
-     * <=1/ms), so cellGcmFinish makes progress even when the 60 Hz present
-     * ticker is starved during heavy boot load (fixes the [finspin] crawl).
-     * Publish BEFORE the read so this poll observes the freshly-advanced ref. */
-    /* Default ON (GCM_REFPOLL=0 disables): with only the 60 Hz ticker
-     * publishing, LBP's asset loading -- thousands of fence-waits -- crawled
-     * at ~28 fences/s (minutes-to-hours of [finspin]); read-driven pacing
-     * publishes at up to 1/ms and the loading progresses ~35x faster. */
-    if ((uint32_t)a == (VM_HLE_INJECT_BASE + 0x2008u)) { static int _rp=-1;
-        if(_rp<0){ const char* e=getenv("GCM_REFPOLL"); _rp=(e&&*e=='0')?0:1; }
-        if(_rp){ extern void cellGcm_ref_on_poll(void); cellGcm_ref_on_poll(); } }
     uint32_t v; memcpy(&v, vm_base + (uint32_t)a, 4);
     g_last_rd_addr = (uint32_t)a; g_last_rd_val = __builtin_bswap32(v);
 #ifdef _WIN32
@@ -2048,6 +2023,21 @@ extern "C" void ppu_ww_note_atomic(uint32_t ea, uint32_t val, int width, void* r
 {
     barrier_watch_hit(ea, val, width, ra);
 }
+
+extern "C" void (*g_rsx_window_write)(void);
+static inline void ppu_window_note(uint32_t a)
+{
+    void (*notify)(void) = g_rsx_window_write;
+    if (notify && a - ppu_hle_inject_base < 0x10000u) notify();
+}
+
+extern "C" void ppu_store_block(uint64_t ea, const void* src, uint32_t n)
+{
+    const uint32_t a = (uint32_t)ea;
+    if (vm_oob(a, n) || vm_null_store(a, 0, n, __builtin_return_address(0))) return;
+    VM_WRITE_COH(a, src, n);
+    ppu_window_note(a);
+}
 void vm_write8 (uint64_t a, uint8_t  v) { barrier_watch_hit((uint32_t)a, v, 1, __builtin_return_address(0)); if (vm_oob((uint32_t)a,1) || vm_null_store((uint32_t)a, v, 1, __builtin_return_address(0))) return;
 #ifdef _WIN32
     /* PT detector: does this byte-write turn its word into the hunted truncated value? */
@@ -2057,9 +2047,9 @@ void vm_write8 (uint64_t a, uint8_t  v) { barrier_watch_hit((uint32_t)a, v, 1, _
         if(nw==(uint32_t)g_pt_val && cur!=(uint32_t)g_pt_val) pt_record(wa);
         else if(((uint32_t)a&3)==0 && v!=0) pt_restore(wa); /* MSB byte set non-zero = restored */ } }
 #endif
-    VM_WRITE_COH(a, &v, 1); }
+    VM_WRITE_COH(a, &v, 1); ppu_window_note((uint32_t)a); }
 void vm_write16(uint64_t a, uint16_t v) { barrier_watch_hit((uint32_t)a, v, 2, __builtin_return_address(0)); if (vm_oob((uint32_t)a,2) || vm_null_store((uint32_t)a, v, 2, __builtin_return_address(0))) return;
-    v = __builtin_bswap16(v); VM_WRITE_COH(a, &v, 2); }
+    v = __builtin_bswap16(v); VM_WRITE_COH(a, &v, 2); ppu_window_note((uint32_t)a); }
 void vm_write32(uint64_t a, uint32_t v) { barrier_watch_hit((uint32_t)a, v, 4, __builtin_return_address(0)); if (vm_oob((uint32_t)a,4) || vm_null_store((uint32_t)a, v, 4, __builtin_return_address(0))) return;
 #ifdef _WIN32
     /* PT restore: a full-word store of a valid pointer (high byte set) to a
@@ -2067,7 +2057,7 @@ void vm_write32(uint64_t a, uint32_t v) { barrier_watch_hit((uint32_t)a, v, 4, _
     if (g_pt_val>=0 && (v>>24)!=0) pt_restore((uint32_t)a);
 #endif
     { uint32_t _v = v;
-      v = __builtin_bswap32(v); VM_WRITE_COH(a, &v, 4);
+      v = __builtin_bswap32(v); VM_WRITE_COH(a, &v, 4); ppu_window_note((uint32_t)a);
       /* Raw SPU problem state: run control, mailboxes and signal notification
        * have side effects. The plain store above still happens -- the registers
        * are guest memory and the PPU reads most of them straight back. */
@@ -2081,7 +2071,7 @@ void vm_write64(uint64_t a, uint64_t v) {
     barrier_watch_hit((uint32_t)a,     (uint32_t)(v >> 32), 4, __builtin_return_address(0));
     barrier_watch_hit((uint32_t)a + 4, (uint32_t)v,         4, __builtin_return_address(0));
     if (vm_oob((uint32_t)a,8) || vm_null_store((uint32_t)a, (uint32_t)(v >> 32), 8, __builtin_return_address(0))) return;
-    v = __builtin_bswap64(v); VM_WRITE_COH(a, &v, 8); }
+    v = __builtin_bswap64(v); VM_WRITE_COH(a, &v, 8); ppu_window_note((uint32_t)a); }
 }
 
 /* ---- malloc allocation tracker (PS3_ALLOCTAG) -------------------------------
@@ -3223,18 +3213,6 @@ extern "C" int64_t sys_mmapper_search_map_address(uint32_t start, uint32_t size,
  * rest are dispatched to the real lv2 table, and only genuinely-unregistered
  * numbers fall through to the return-CELL_OK stub. */
 extern "C" void ppu_prof_stamp(void* ctx, unsigned lr);
-/* cellGcmSys.c, when linked. ppu_hle.cpp already holds a weak reference, and
- * under COFF a second weak declaration emits a second fallback definition, so
- * every port failed to link. On Windows use the linker's own default instead. */
-#if defined(_MSC_VER)   /* MSVC and clang-cl: link.exe/lld-link */
-extern "C" void ppu_gcm_pump(void);
-extern "C" void ppu_gcm_pump_absent(void) {}
-#pragma comment(linker, "/alternatename:ppu_gcm_pump=ppu_gcm_pump_absent")
-#define PPU_GCM_PUMP_LINKED 1
-#else
-extern "C" __attribute__((weak)) void ppu_gcm_pump(void);
-#define PPU_GCM_PUMP_LINKED (ppu_gcm_pump != nullptr)
-#endif
 /* In-flight lv2 syscall per guest thread; 0 = not in a syscall. See the guard
  * in lv2_syscall() below. */
 #define PS3_SC_INFLIGHT_MAX 64
@@ -3251,15 +3229,6 @@ extern "C" void lv2_syscall(ppu_context* ctx)
           const char* e = getenv("PPU_GUARD_EA");
           if (e && *e) ppu_guard_page((uint32_t)strtoul(e, 0, 16)); } }
     uint64_t num = ctx->gpr[11];
-    /* Deliver pending GCM vblank/flip/user callbacks at the timer sleeps too,
-     * not only at HLE imports (ppu_hle.cpp): on hardware they fire
-     * asynchronously, and a guest thread that polls with usleep alone would
-     * otherwise never see the handler it is waiting for. inFAMOUS 2 defers its
-     * FIFO put to the flip handler (0x13AC88 stores it at obj+72, 0x13AC34
-     * writes it) and then spins in 0x13ACE8 on the ref register with
-     * sys_timer_usleep only; it used to be rescued by another thread's HLE
-     * call, and hung once that thread had nothing left to poll. */
-    if ((num == 141 || num == 142) && PPU_GCM_PUMP_LINKED) ppu_gcm_pump();
     /* Milestone: which lv2 calls this title makes, in first-occurrence order.
      * Formatting the key each time is noise next to the profiler stamp below,
      * which resolves a host return address to a guest function. */

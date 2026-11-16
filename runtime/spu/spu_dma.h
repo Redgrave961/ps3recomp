@@ -30,6 +30,14 @@ extern "C" {
 #endif
 
 extern uint8_t* vm_base;
+extern uint32_t ppu_hle_inject_base;
+extern void (*g_rsx_window_write)(void);
+
+static inline void spu_rsx_window_check(uint32_t ea, uint32_t size)
+{
+    void (*notify)(void) = g_rsx_window_write;
+    if (notify && ea < ppu_hle_inject_base + 0x10000u && (uint64_t)ea + size > ppu_hle_inject_base) notify();
+}
 
 /* Guard against a guest DMA whose effective address lands in reserved-but-
  * uncommitted guest memory (the 4 GB VM is MEM_RESERVE; only main mem / RSX /
@@ -734,15 +742,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                 }
             }
         }
-        /* Tell whoever is listening where this PUT landed.
-         *
-         * A title whose SPUs build the RSX command stream never tells libgcm
-         * where that stream is -- it hands the RSX a `put` offset and nothing
-         * else -- so the DMA that writes it is the only evidence of which
-         * buffer the RSX is actually bound to. The GCM layer installs this to
-         * find the pushbuffer; NULL for every title that does not. */
-        { extern void (*g_spu_put_hook)(uint32_t ea, uint32_t size);
-          if (g_spu_put_hook) g_spu_put_hook((uint32_t)ea, size); }
+        spu_rsx_window_check((uint32_t)ea, size);
         /* Bink sync-area watch (armed by the PPU barrier probe): log SPU PUTs
          * that touch the per-SPU lane counters. */
         { extern uint32_t g_barrier_sync_watch;

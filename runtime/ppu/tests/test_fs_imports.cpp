@@ -29,7 +29,12 @@ void ydkj_host_bt(const char* tag) { (void)tag; }
 /* ps3_dev_flash_path (runtime/platform), which host_path calls for /dev_flash: the real one, it needs nothing. */
 #include "../../platform/ps3_dev_flash.c"
 ps3_guest_caller_fn g_ps3_guest_caller = nullptr;
-const char* edat_resolve(const char* host_path, char* buf, size_t cap) { (void)buf; (void)cap; return host_path; }
+#include "../../../libs/filesystem/npdrm.h"
+int npdrm_is_npd(FILE* f) { (void)f; return 0; }
+npdrm_file* npdrm_open(FILE* f, const char* n) { (void)f; (void)n; return 0; }
+int64_t npdrm_read(npdrm_file* d, uint64_t o, void* p, uint64_t n) { (void)d; (void)o; (void)p; (void)n; return -1; }
+uint64_t npdrm_size(const npdrm_file* d) { (void)d; return 0; }
+void npdrm_close(npdrm_file* d) { (void)d; }
 
 struct Reg { uint32_t nid; const char* name; void (*fn)(ppu_context*); };
 static std::vector<Reg> g_regs;

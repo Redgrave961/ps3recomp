@@ -40,41 +40,10 @@ file(GLOB_RECURSE HLE_SOURCES
     "libs/font/*.c"
     "libs/misc/*.c"
     "libs/hardware/*.c"
-    "runtime/diag/*.c"      # yz_frontier_trace, used by the live draw engine
 )
 # Exclude test harnesses (e.g. libs/video/tests/*): they define their own main().
 list(FILTER HLE_SOURCES EXCLUDE REGEX "/tests/")
 
-# The Vulkan RSX backend is opt-in while it grows (stage V0: clear + present).
-# It loads libvulkan at run time, so building needs only the Vulkan headers --
-# no target-architecture libvulkan, which keeps cross-compiling simple.
-option(PS3RECOMP_RSX_VULKAN "Build the Vulkan RSX backend (Linux)" OFF)
-list(FILTER HLE_SOURCES EXCLUDE REGEX "rsx_vulkan_backend\\.c$")
-if(PS3RECOMP_RSX_VULKAN)
-    if(WIN32 OR APPLE)
-        message(FATAL_ERROR "PS3RECOMP_RSX_VULKAN is Linux-only for now")
-    endif()
-    find_path(PS3RECOMP_VULKAN_INCLUDE_DIR vulkan/vulkan.h)
-    if(NOT PS3RECOMP_VULKAN_INCLUDE_DIR)
-        message(FATAL_ERROR "Vulkan headers not found. Debian/Ubuntu: "
-            "libvulkan-dev, Fedora: vulkan-headers -- or pass "
-            "-DPS3RECOMP_VULKAN_INCLUDE_DIR=<dir containing vulkan/vulkan.h>")
-    endif()
-    list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_vulkan_backend.c")
-    # HLSL -> SPIR-V for guest programs: a stub unless glslang is found below.
-    list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_spirv.cpp")
-endif()
-
-# The Metal backend is Objective-C and Apple-only, so it is added explicitly
-# rather than globbed. It needs no platform #ifdef of its own as a result.
-if(APPLE)
-    enable_language(OBJC)
-    list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_metal_backend.m")
-endif()
-# The HLSL -> MSL translator is C++ (it drives glslang's C++ API) and compiles
-# to a stub wherever the shader tools are absent, so it is part of the
-# library everywhere. See the "Guest shaders on Metal" section below.
-list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_msl.cpp")
 # cellAtrac decodes with FFmpeg's ATRAC3plus decoder as extracted by PPSSPP
 # (LGPL-2.1, kept separate in third_party/at3_standalone -- see its README).
 # PS3RECOMP_ATRAC_LGPL=OFF swaps the decoder for a stub that fails every open, which keeps the library and any
@@ -143,6 +112,7 @@ if(WIN32)
         ws2_32      # Winsock for network modules
         ole32       # COM for WASAPI audio
         bcrypt      # BCryptGenRandom for SSL RNG
+        synchronization
     )
     if(PS3RECOMP_PAD_SDL)
         find_package(SDL3 CONFIG REQUIRED)
@@ -172,28 +142,6 @@ else()
     target_link_libraries(ps3recomp_runtime PRIVATE Threads::Threads)
 endif()
 
-if(APPLE)
-    target_link_libraries(ps3recomp_runtime PUBLIC
-        "-framework Metal"
-        "-framework QuartzCore"
-        "-framework Foundation"
-        "-framework AppKit"
-        "-framework ApplicationServices"
-    )
-    set_source_files_properties(
-        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_metal_backend.m"
-        PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
-    message(STATUS "  Metal:        RSX backend enabled (rsx_metal_backend.m)")
-endif()
-
-if(PS3RECOMP_RSX_VULKAN)
-    target_include_directories(ps3recomp_runtime PRIVATE "${PS3RECOMP_VULKAN_INCLUDE_DIR}")
-    # PUBLIC: ps3recomp_host selects its backend on this definition.
-    target_compile_definitions(ps3recomp_runtime PUBLIC PS3RECOMP_RSX_VULKAN)
-    target_link_libraries(ps3recomp_runtime PUBLIC ${CMAKE_DL_LIBS})
-    message(STATUS "  Vulkan:       RSX backend enabled (rsx_vulkan_backend.c, headers in ${PS3RECOMP_VULKAN_INCLUDE_DIR})")
-endif()
-
 # cellVdec decodes H.264 / MPEG-2 through FFmpeg when this is on. libavcodec
 # is loaded at run time (dlopen / LoadLibrary), never linked, so building needs
 # only the FFmpeg headers, and a binary run where FFmpeg is absent -- or with
@@ -211,126 +159,6 @@ if(PS3RECOMP_FFMPEG_RUNTIME)
     target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_FFMPEG_RUNTIME)
     target_link_libraries(ps3recomp_runtime PUBLIC ${CMAKE_DL_LIBS})
     message(STATUS "  FFmpeg:       run-time loaded (headers in ${PS3RECOMP_FFMPEG_INCLUDE_DIR})")
-endif()
-
-# ---------------------------------------------------------------------------
-# Guest shaders on Metal: HLSL -> SPIR-V -> MSL
-# ---------------------------------------------------------------------------
-# The RSX decompilers emit HLSL for the D3D12 backend. Metal cannot compile
-# that, so libs/video/rsx_shader_msl.cpp lowers it with glslang (HLSL ->
-# SPIR-V) and spirv-cross (SPIR-V -> MSL). Both are optional: without them the
-# module compiles to a stub, rsx_hlsl_to_msl_available() says so, and the
-# Metal backend stays on its fixed-function path. The translation has no GPU
-# in it, so it is built and tested on Linux as well -- that is where the
-# decompilers' HLSL meets glslang's front end on every push.
-#
-#   macOS:  brew install glslang spirv-cross
-#   Debian: apt install glslang-dev glslang-tools spirv-tools \
-#                       libspirv-cross-c-shared-dev
-#           (glslang-tools only because the packaged CMake config declares
-#           the standalone binary as an imported target and fails to load
-#           without it)
-set(PS3RECOMP_MSL_TRANSLATION OFF)
-if(UNIX)
-    find_package(glslang CONFIG QUIET)
-
-    # spirv-cross's C API. Debian ships it as a shared library and Homebrew as
-    # a static one, under different pkg-config names -- and pkg-config itself
-    # is not a given on a Mac, so fall back to a plain header + library search.
-    set(SPVC_OK OFF)
-    find_package(PkgConfig QUIET)
-    if(PkgConfig_FOUND)
-        pkg_check_modules(SPVC QUIET spirv-cross-c-shared)
-        if(NOT SPVC_FOUND)
-            pkg_check_modules(SPVC QUIET spirv-cross-c)
-        endif()
-        if(SPVC_FOUND)
-            set(SPVC_INC     ${SPVC_INCLUDE_DIRS})
-            set(SPVC_LIBS    ${SPVC_LINK_LIBRARIES})
-            set(SPVC_LIBDIRS ${SPVC_LIBRARY_DIRS})
-            set(SPVC_OK ON)
-        endif()
-    endif()
-    if(NOT SPVC_OK)
-        find_path(SPVC_INC_DIR spirv_cross_c.h PATH_SUFFIXES spirv_cross)
-        find_library(SPVC_LIB NAMES spirv-cross-c-shared spirv-cross-c)
-        if(SPVC_INC_DIR AND SPVC_LIB)
-            set(SPVC_INC  ${SPVC_INC_DIR})
-            set(SPVC_LIBS ${SPVC_LIB})
-            get_filename_component(SPVC_LIBDIRS "${SPVC_LIB}" DIRECTORY)
-            set(SPVC_OK ON)
-        endif()
-    endif()
-
-    if(glslang_FOUND AND SPVC_OK
-       AND TARGET glslang::glslang AND TARGET glslang::SPIRV)
-        add_library(ps3recomp_msl_translation INTERFACE)
-        target_compile_definitions(ps3recomp_msl_translation INTERFACE
-            PS3RECOMP_HAVE_MSL_TRANSLATION=1)
-        target_include_directories(ps3recomp_msl_translation INTERFACE ${SPVC_INC})
-        target_link_libraries(ps3recomp_msl_translation INTERFACE
-            glslang::glslang glslang::SPIRV ${SPVC_LIBS})
-        if(TARGET glslang::glslang-default-resource-limits)
-            target_link_libraries(ps3recomp_msl_translation INTERFACE
-                glslang::glslang-default-resource-limits)
-        endif()
-        # A static spirv-cross C API (Homebrew's) needs the backends it was
-        # built from, and neither pkg-config nor the library name says so:
-        # pick up the static siblings next to it. The shared one carries
-        # its own.
-        if(SPVC_LIBS MATCHES "\\.a$")
-            foreach(part msl glsl hlsl cpp reflect util core)
-                find_library(SPVC_PART_${part} NAMES spirv-cross-${part}
-                    HINTS ${SPVC_LIBDIRS} NO_DEFAULT_PATH)
-                if(SPVC_PART_${part})
-                    target_link_libraries(ps3recomp_msl_translation INTERFACE
-                        ${SPVC_PART_${part}})
-                endif()
-            endforeach()
-        endif()
-        # The translator's identity in the MSL translation cache: a hash of its
-        # sources, so a rebuild that changes nothing keeps the cached files and
-        # an edit to the translator retires them. (Its build time did the
-        # latter too, and threw the whole cache away on every rebuild.)
-        set(_msl_sources libs/video/rsx_shader_msl.cpp libs/video/rsx_shader_msl.h)
-        set(_msl_text "")
-        foreach(f IN LISTS _msl_sources)
-            file(SHA256 "${CMAKE_CURRENT_SOURCE_DIR}/${f}" _h)
-            string(APPEND _msl_text "${_h}")
-        endforeach()
-        string(SHA256 _msl_id "${_msl_text}")
-        string(SUBSTRING "${_msl_id}" 0 23 _msl_id)
-        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_msl_sources})
-        target_compile_definitions(ps3recomp_msl_translation INTERFACE
-            "PS3RECOMP_MSL_TRANSLATOR_ID=\"${_msl_id}\"")
-        target_link_libraries(ps3recomp_runtime PRIVATE ps3recomp_msl_translation)
-        set(PS3RECOMP_MSL_TRANSLATION ON)
-        message(STATUS "  Shaders:      guest programs translated to MSL (glslang ${glslang_VERSION}, ${SPVC_LIBS})")
-    else()
-        message(STATUS "  Shaders:      glslang/spirv-cross not found; Metal backend stays fixed-function")
-    endif()
-endif()
-
-# Guest shaders on Vulkan: HLSL -> SPIR-V. glslang only -- Vulkan consumes
-# SPIR-V, so spirv-cross is not needed. Without glslang
-# libs/video/rsx_shader_spirv.cpp is a stub and the Vulkan backend stays on
-# its fixed-function path.
-if(PS3RECOMP_RSX_VULKAN)
-    if(glslang_FOUND AND TARGET glslang::glslang AND TARGET glslang::SPIRV)
-        set_source_files_properties(
-            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_spirv.cpp"
-            PROPERTIES COMPILE_DEFINITIONS PS3RECOMP_HAVE_SPIRV_TRANSLATION=1)
-        target_link_libraries(ps3recomp_runtime PRIVATE glslang::glslang glslang::SPIRV)
-        if(TARGET glslang::glslang-default-resource-limits)
-            target_link_libraries(ps3recomp_runtime PRIVATE
-                glslang::glslang-default-resource-limits)
-        endif()
-        set(PS3RECOMP_SPIRV_TRANSLATION ON)
-        message(STATUS "  Vulkan:       guest programs available (glslang ${glslang_VERSION}); "
-                       "opt in with PS3RECOMP_VK_GUEST_PROGRAMS=1")
-    else()
-        message(STATUS "  Vulkan:       glslang not found; guest programs unavailable")
-    endif()
 endif()
 
 # ---------------------------------------------------------------------------
@@ -520,7 +348,6 @@ if(PS3RECOMP_BUILD_TESTS)
     target_include_directories(test_vertex_current_color PRIVATE include libs/video)
     add_test(NAME vertex_current_color COMMAND test_vertex_current_color)
 
-
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
         add_test(NAME spinlock_word_width
@@ -566,141 +393,6 @@ endif()
 
 # ---------------------------------------------------------------------------
 # POSIX host harness
-# ---------------------------------------------------------------------------
-# Drives the cellGcm -> RSX -> backend bridge with no lifted game, so a backend
-# can be brought up and regression-tested without a game binary or a recompiler
-# run. Builds on any POSIX host: it picks Metal on Apple and the null backend's
-# headless software path everywhere else, so Linux -- which has no real backend
-# yet -- can still run the whole guest command stream end to end in CI.
-if(UNIX)
-    add_executable(ps3recomp_host
-        runtime/host/host_posix.c
-        runtime/host/host_stubs.c
-    )
-    target_link_libraries(ps3recomp_host PRIVATE ps3recomp_runtime)
-    if(NOT WIN32)
-        # glibc keeps the math functions in a separate library; MSVC does not.
-        target_link_libraries(ps3recomp_host PRIVATE m)
-    endif()
-    target_include_directories(ps3recomp_host PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
-        "${CMAKE_CURRENT_SOURCE_DIR}/include"
-    )
-    # The runtime carries C++ (and, with translation on, spirv-cross), so the
-    # C++ driver must do the final link or the standard library goes missing.
-    set_target_properties(ps3recomp_host PROPERTIES LINKER_LANGUAGE CXX)
-
-    # Guest shader translation, decompilers -> HLSL -> MSL, with no GPU: the
-    # regression net for the Metal backend's shader path on every platform.
-    if(PS3RECOMP_MSL_TRANSLATION)
-        add_executable(test_shader_msl
-            libs/video/tests/test_shader_msl.c
-            libs/video/rsx_shader_msl.cpp
-            libs/video/rsx_vp_decompiler.c
-            libs/video/rsx_fp_decompiler.c
-        )
-        target_include_directories(test_shader_msl PRIVATE
-            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
-            "${CMAKE_CURRENT_SOURCE_DIR}/include"
-        )
-        target_link_libraries(test_shader_msl PRIVATE ps3recomp_msl_translation)
-
-        # The polygon offset through the engine and the Metal backend on the
-        # GPU; the guest programs need the translation above.
-        if(APPLE)
-            add_executable(test_metal_poly_offset
-                libs/video/tests/test_metal_poly_offset.m
-                libs/video/rsx_tiling.c
-                libs/video/rsx_shader_msl.cpp
-                libs/video/rsx_dispatch.c
-                libs/video/rsx_vertex_compact.c
-                libs/video/rsx_texture_layout.c
-                libs/video/rsx_vp_decompiler.c
-                libs/video/rsx_fp_decompiler.c
-            )
-            set_source_files_properties(
-                "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/tests/test_metal_poly_offset.m"
-                PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
-            target_include_directories(test_metal_poly_offset PRIVATE
-                "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
-                "${CMAKE_CURRENT_SOURCE_DIR}/include"
-            )
-            target_link_libraries(test_metal_poly_offset PRIVATE
-                ps3recomp_msl_translation
-                "-framework Metal" "-framework QuartzCore" "-framework AppKit")
-            # Only what the engine and the backend reach; the rest of the
-            # runtime is not linked in.
-            target_link_options(test_metal_poly_offset PRIVATE "-Wl,-dead_strip")
-
-            # The depth-bounds test, which Metal does not have, emulated in
-            # the fragment program; the same way.
-            add_executable(test_metal_depth_bounds
-                libs/video/tests/test_metal_depth_bounds.m
-                libs/video/rsx_shader_msl.cpp
-                libs/video/rsx_dispatch.c
-                libs/video/rsx_vertex_compact.c
-                libs/video/rsx_texture_layout.c
-                libs/video/rsx_vp_decompiler.c
-                libs/video/rsx_fp_decompiler.c
-                libs/video/rsx_tiling.c
-            )
-            set_source_files_properties(
-                "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/tests/test_metal_depth_bounds.m"
-                PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
-            target_include_directories(test_metal_depth_bounds PRIVATE
-                "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
-                "${CMAKE_CURRENT_SOURCE_DIR}/include"
-            )
-            target_link_libraries(test_metal_depth_bounds PRIVATE
-                ps3recomp_msl_translation
-                "-framework Metal" "-framework QuartzCore" "-framework AppKit")
-            target_link_options(test_metal_depth_bounds PRIVATE "-Wl,-dead_strip")
-
-            # SET_ZMIN_MAX_CONTROL's depth clamp, the same way.
-            add_executable(test_metal_depth_clamp
-                libs/video/tests/test_metal_depth_clamp.m
-                libs/video/rsx_shader_msl.cpp
-                libs/video/rsx_dispatch.c
-                libs/video/rsx_vertex_compact.c
-                libs/video/rsx_texture_layout.c
-                libs/video/rsx_vp_decompiler.c
-                libs/video/rsx_fp_decompiler.c
-                libs/video/rsx_tiling.c
-            )
-            set_source_files_properties(
-                "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/tests/test_metal_depth_clamp.m"
-                PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
-            target_include_directories(test_metal_depth_clamp PRIVATE
-                "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
-                "${CMAKE_CURRENT_SOURCE_DIR}/include"
-            )
-            target_link_libraries(test_metal_depth_clamp PRIVATE
-                ps3recomp_msl_translation
-                "-framework Metal" "-framework QuartzCore" "-framework AppKit")
-            target_link_options(test_metal_depth_clamp PRIVATE "-Wl,-dead_strip")
-        endif()
-    endif()
-
-    # The HLSL -> SPIR-V translation cache, memory and disk. Needs glslang
-    # only, no GPU.
-    if(PS3RECOMP_SPIRV_TRANSLATION)
-        add_executable(test_shader_spirv
-            libs/video/tests/test_shader_spirv.c
-            libs/video/rsx_shader_spirv.cpp
-        )
-        target_include_directories(test_shader_spirv PRIVATE
-            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
-            "${CMAKE_CURRENT_SOURCE_DIR}/include"
-        )
-        target_link_libraries(test_shader_spirv PRIVATE glslang::glslang glslang::SPIRV)
-        if(TARGET glslang::glslang-default-resource-limits)
-            target_link_libraries(test_shader_spirv PRIVATE
-                glslang::glslang-default-resource-limits)
-        endif()
-        set_target_properties(test_shader_spirv PROPERTIES LINKER_LANGUAGE CXX)
-    endif()
-endif()
-
 # ---------------------------------------------------------------------------
 # PPU boot smoke title
 # ---------------------------------------------------------------------------

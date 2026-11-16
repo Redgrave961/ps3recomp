@@ -31,7 +31,9 @@
 #define PS3RECOMP_RSX_SHADER_SPIRV_H
 
 #include "ps3emu/ps3types.h"
-#include "rsx_shader_msl.h"   /* RSX_SHADER_STAGE_VERTEX / _FRAGMENT */
+
+#define RSX_SHADER_STAGE_VERTEX   0
+#define RSX_SHADER_STAGE_FRAGMENT 1
 
 #ifdef __cplusplus
 extern "C" {

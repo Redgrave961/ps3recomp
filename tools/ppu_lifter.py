@@ -151,15 +151,9 @@ extern uint8_t* vm_base;
 #define VM_RAW_LD(T, ea) ({ const uint8_t* _p = vm_base + (uint32_t)(ea); T _v; \
     if (!((uintptr_t)_p & (sizeof(T) - 1))) _v = __atomic_load_n((const T*)_p, __ATOMIC_RELAXED); \
     else memcpy(&_v, _p, sizeof(T)); _v; })
-#define VM_RAW_ST(T, ea, val) do { uint8_t* _p = vm_base + (uint32_t)(ea); T _v = (val); \
-    if (!((uintptr_t)_p & (sizeof(T) - 1))) __atomic_store_n((T*)_p, _v, __ATOMIC_RELAXED); \
-    else memcpy(_p, &_v, sizeof(T)); } while (0)
 static inline void vm_raw_ld16(void* dst, uint64_t ea) {   /* quadword-aligned */
     uint64_t lo = VM_RAW_LD(uint64_t, ea), hi = VM_RAW_LD(uint64_t, ea + 8);
     memcpy(dst, &lo, 8); memcpy((uint8_t*)dst + 8, &hi, 8); }
-static inline void vm_raw_st16(uint64_t ea, const void* src) {
-    uint64_t lo, hi; memcpy(&lo, src, 8); memcpy(&hi, (const uint8_t*)src + 8, 8);
-    VM_RAW_ST(uint64_t, ea, lo); VM_RAW_ST(uint64_t, ea + 8, hi); }
 extern int      vm_inline_ok;
 extern int      vm_inline_st_ok;
 extern uint32_t ppu_vm_size;
@@ -174,6 +168,7 @@ extern uint32_t ppu_hle_inject_base;
 extern uint32_t             g_barrier_sync_watch;
 extern uint32_t             g_null_sweep_hi;
 extern const unsigned char* g_spu_coh_bits;   /* SPU-reserved lines, NULL until the first */
+void ppu_store_block(uint64_t ea, const void* src, uint32_t n);
 #ifdef __cplusplus
 }
 #endif
@@ -188,10 +183,9 @@ extern const unsigned char* g_spu_coh_bits;   /* SPU-reserved lines, NULL until 
  * The copy holds the inline range as one span from 0x10000: not the null
  * page, not the raw SPU windows from 0xE0000000, nothing past the end of the
  * mapping, and a span of 0 while a diagnostic is armed. An access then takes
- * one compare. The range is the old checks' or narrower. The one address
- * they also turned away, the gcm ref-poll word, is only special to vm_read32,
- * so only the 32-bit load still tests it. */
-typedef struct ppu_mm { uint8_t* vb; int64_t ld_span, st_span; uint32_t poll; } ppu_mm;
+ * one compare. Stores into the 64 KB GCM window go out of line, where the RSX
+ * is told about them. */
+typedef struct ppu_mm { uint8_t* vb; int64_t ld_span, st_span; uint32_t gcm; } ppu_mm;
 static inline ppu_mm ppu_mm_take(void)
 {
     const uint32_t hi = (ppu_vm_size != 0 && ppu_vm_size < 0xE0000000u) ? ppu_vm_size : 0xE0000000u;
@@ -200,7 +194,7 @@ static inline ppu_mm ppu_mm_take(void)
     m.vb = vm_base;
     m.ld_span = vm_inline_ok ? span : 0;
     m.st_span = (vm_inline_ok && vm_inline_st_ok) ? span : 0;
-    m.poll = ppu_hle_inject_base + 0x2008u;   /* the gcm ref-poll word: vm_read32 */
+    m.gcm = ppu_hle_inject_base;
     return m;
 }
 /* [ea, ea + n) inside [0x10000, 0x10000 + span). Below 0x10000 the 32-bit
@@ -217,6 +211,7 @@ static inline int vm_mm_ok(const ppu_mm* m, uint32_t ea, uint32_t n)
 static inline int vm_mm_st_ok(const ppu_mm* m, uint32_t ea, uint32_t n)
 {
     if (!__builtin_expect(vm_mm_in(m->st_span, ea, n), 1) ||
+        __builtin_expect((uint32_t)(ea - m->gcm) < 0x10000u, 0) ||
         __builtin_expect((g_barrier_sync_watch | g_null_sweep_hi) != 0, 0))
         return 0;
     const unsigned char* bits = g_spu_coh_bits;
@@ -242,7 +237,7 @@ static inline uint16_t vm_read16_mm(const ppu_mm* m, uint64_t a)
 static inline uint32_t vm_read32_mm(const ppu_mm* m, uint64_t a)
 {
     const uint32_t ea = (uint32_t)a;
-    if (__builtin_expect(vm_mm_ok(m, ea, 4), 1) && __builtin_expect(ea != m->poll, 1)) {   /* aligned: single-copy atomic, as on Cell */
+    if (__builtin_expect(vm_mm_ok(m, ea, 4), 1)) {   /* aligned: single-copy atomic, as on Cell */
         uint32_t v;
         if (!(ea & 3u)) v = __atomic_load_n((const uint32_t*)(m->vb + ea), __ATOMIC_RELAXED);
         else memcpy(&v, m->vb + ea, 4);
@@ -294,6 +289,25 @@ static inline void vm_write64_mm(const ppu_mm* m, uint64_t a, uint64_t v)
         else memcpy(m->vb + ea, &be, 8);
         return; }
     vm_write64(a, v);
+}
+static inline void vm_write_raw_mm(const ppu_mm* m, uint64_t a, const void* src, uint32_t n)
+{
+    const uint32_t ea = (uint32_t)a;
+    if (__builtin_expect(vm_mm_st_ok(m, ea, n), 1)) { memcpy(m->vb + ea, src, n); return; }
+    ppu_store_block(a, src, n);
+}
+static inline void vm_write128_mm(const ppu_mm* m, uint64_t a, const void* src)
+{
+    const uint32_t ea = (uint32_t)a;
+    if (__builtin_expect(vm_mm_st_ok(m, ea, 16), 1)) {
+        uint64_t lo, hi;
+        memcpy(&lo, src, 8);
+        memcpy(&hi, (const uint8_t*)src + 8, 8);
+        __atomic_store_n((uint64_t*)(m->vb + ea), lo, __ATOMIC_RELAXED);
+        __atomic_store_n((uint64_t*)(m->vb + ea + 8), hi, __ATOMIC_RELAXED);
+        return;
+    }
+    ppu_store_block(a, src, 16);
 }
 /* Outside a lifted function: a fresh copy per access. */
 static inline uint8_t  vm_read8_inl (uint64_t a) { const ppu_mm m = ppu_mm_take(); return vm_read8_mm(&m, a); }
@@ -623,6 +637,8 @@ extern "C" PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*);
 #define vm_write8(a, v)  vm_write8_mm(&_mm, a, v)
 #define vm_write16(a, v) vm_write16_mm(&_mm, a, v)
 #define vm_write32(a, v) vm_write32_mm(&_mm, a, v)
+#define vm_write_raw(a, s, n) vm_write_raw_mm(&_mm, a, s, n)
+#define vm_write128(a, s) vm_write128_mm(&_mm, a, s)
 #define vm_write64(a, v) vm_write64_mm(&_mm, a, v)
 #endif
 
@@ -2763,12 +2779,12 @@ class PPULifter:
             vs = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
             ra, rb = _reg_idx(ops[1]), _reg_idx(ops[2])
             if mn.startswith("stvl"):
-                loop = "for (uint32_t i = 0; i < 16u - sh; i++) m[sh + i] = s[i];"
+                store = "vm_write_raw(q + sh, s, 16u - sh);"
             else:
-                loop = "for (uint32_t i = 16u - sh; i < 16u; i++) m[i - (16u - sh)] = s[i];"
+                store = "if (sh) vm_write_raw(q, s + (16u - sh), sh);"
             return (f"{{ uint64_t ea = {_xea(ra, rb)}; uint32_t sh = (uint32_t)(ea & 0xF); "
-                    f"uint8_t* m = vm_base + (uint32_t)(ea & ~0xFULL); "
-                    f"const uint8_t* s = (const uint8_t*)&ctx->vr[{vs}]; {loop} }}")
+                    f"uint64_t q = ea & ~0xFULL; "
+                    f"const uint8_t* s = (const uint8_t*)&ctx->vr[{vs}]; {store} }}")
 
         if mn == "lwaux":
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
@@ -2778,7 +2794,7 @@ class PPULifter:
         if mn == "stdbrx":
             rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             return (f"{{ uint64_t ea = {_xea(ra, rb)}; uint64_t raw = ctx->gpr[{rs}]; "
-                    f"VM_RAW_ST(uint64_t, ea, raw); }}")   # host LE = byte-reversed
+                    f"vm_write_raw(ea, &raw, 8); }}")   # host LE = byte-reversed
 
         # ------- String word load/store -------
         # NB bytes (lswi: NB field, 0 = 32; lswx: XER[25:31]) move between memory
@@ -2815,7 +2831,7 @@ class PPULifter:
             rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
                     f"uint32_t raw = (uint32_t)ctx->gpr[{rs}]; "
-                    f"VM_RAW_ST(uint32_t, ea, raw); }}")
+                    f"vm_write_raw(ea, &raw, 4); }}")
 
         if mn == "lhbrx":
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
@@ -2836,7 +2852,7 @@ class PPULifter:
             rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
                     f"uint16_t raw = (uint16_t)ctx->gpr[{rs}]; "
-                    f"VM_RAW_ST(uint16_t, ea, raw); }}")
+                    f"vm_write_raw(ea, &raw, 2); }}")
 
         # ------- Load algebraic -------
         if mn == "lwax":
@@ -2872,8 +2888,8 @@ class PPULifter:
         if mn == "dcbz":
             ra = _reg_idx(ops[0])
             rb = _reg_idx(ops[1])
-            return (f"{{ uint64_t ea = ({_xea(ra,rb)}) & ~0x7FULL; "
-                    f"memset(vm_base + (uint32_t)ea, 0, 128); }}")
+            return (f"{{ static const uint8_t zero[128] = {{0}}; uint64_t ea = ({_xea(ra,rb)}) & ~0x7FULL; "
+                    f"vm_write_raw(ea, zero, 128); }}")
 
         if mn in ("dcbt", "dcbtst", "dcbf", "dcbst", "dcba", "icbi"):
             return f"/* {mn}: cache hint, no-op */;"
@@ -2971,7 +2987,7 @@ class PPULifter:
             ra = _reg_idx(ops[1])
             rb = _reg_idx(ops[2])
             return (f"{{ uint64_t ea = ({_xea(ra,rb)}) & ~0xFULL; "
-                    f"vm_raw_st16(ea, &ctx->vr[{vs}]); }}")
+                    f"vm_write128(ea, &ctx->vr[{vs}]); }}")
 
         # Cell unaligned vector loads (CBEA / AltiVec): lvlx loads bytes
         # [EA&15 .. 15] of the aligned quadword left-justified into vD and
@@ -3020,7 +3036,7 @@ class PPULifter:
             return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
                     f"ea &= ~{size - 1}ULL; "
                     f"{{ uint{size*8}_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[{vs}] + (ea & 15), {size}); "
-                    f"VM_RAW_ST(uint{size*8}_t, ea, _e); }} }}")
+                    f"vm_write_raw(ea, &_e, {size}); }} }}")
 
         if mn == "lvsl" or mn == "lvsr":
             vd = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])

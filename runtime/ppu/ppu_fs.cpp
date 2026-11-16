@@ -15,10 +15,9 @@
  */
 #define PPU_NO_INLINE_STORES   /* declares its own out-of-line vm_write32/64 below */
 #include "ppu_recomp.h"      /* ppu_context */
-#include "../../libs/filesystem/edat.h"
+#include "../../libs/filesystem/npdrm.h"
 #include "ps3emu/nid.h"      /* ps3_compute_nid */
 #include "ps3emu/guest_call.h" /* ps3_invoke_guest: AIO completion is a guest OPD */
-#include "sdata_decrypt.h"   /* SDATA/EDAT (NPD) decryption for cellFsSdataOpen */
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -92,6 +91,7 @@ extern "C" const char* ppu_vfs_root = ".";
 /* 0x8001002B. This was -2147418111 = 0x80010001, which is CELL_EAGAIN ("try
  * again"), not EIO: a title that retries on EAGAIN spun on a hard I/O failure. */
 #define CELL_FS_EIO          (-2147418069)
+#define CELL_FS_EFSSPECIFIC  (-2147418056)
 #define CELL_FS_EBADF        (-2147418070)   /* 0x8001002A: not an open fd */
 #define CELL_FS_EMFILE       (-2147418068)   /* 0x8001002C: fd table full */
 #define CELL_FS_EINVAL       (-2147418110)   /* 0x80010002 */
@@ -214,6 +214,9 @@ static void host_path(char* out, size_t cap, const char* guest)
 /* ---- fd / dir handle tables ---- */
 #define FS_MAX 256
 static FILE* g_files[FS_MAX];
+static npdrm_file* g_drm[FS_MAX];
+static uint64_t g_drm_pos[FS_MAX];
+static std::mutex g_drm_lock;
 static uint8_t g_fd_usm[FS_MAX];
 static char    g_fd_path[FS_MAX][192];   /* guest path per fd (diagnostics) */   /* 1 if this fd is an open .usm movie (read tracker) */
 static DIR*  g_dirs[FS_MAX];
@@ -259,6 +262,20 @@ static int fd_alloc_dir(DIR* d)
         if (!g_files[i] && !g_dirs[i]) { __atomic_store_n(&g_dirs[i], d, __ATOMIC_RELEASE); return i; }
     return -1;
 }
+static int64_t fs_drm_read(int fd, uint64_t offset, void* dst, uint64_t size)
+{
+    std::lock_guard<std::mutex> hold(g_drm_lock);
+    return npdrm_read(g_drm[fd], offset, dst, size);
+}
+
+static int fs_open_npd(FILE* f, npdrm_file** drm)
+{
+    *drm = nullptr;
+    if (!npdrm_is_npd(f)) return 0;
+    *drm = npdrm_open(f, nullptr);
+    return *drm ? 0 : -1;
+}
+
 static FILE* fd_file(int fd)
 {
     return fd >= 0 && fd < FS_MAX ? __atomic_load_n(&g_files[fd], __ATOMIC_ACQUIRE) : nullptr;
@@ -276,12 +293,6 @@ static void cellFsOpen(ppu_context* ctx)
     uint32_t flags  = (uint32_t)ctx->gpr[4];
     uint32_t fd_ptr = (uint32_t)ctx->gpr[5];
     host_path(hpath, sizeof hpath, gpath);
-
-    /* NPDRM: see the note in sys_fs.c -- an EDAT is decrypted once into a cache
-     * file and that is opened in its place. */
-    { char dec_path[1200];
-      const char* use = edat_resolve(hpath, dec_path, sizeof dec_path);
-      if (use != hpath) snprintf(hpath, sizeof hpath, "%s", use); }
 
     /* fopen() mode strings can't express the PS3/POSIX open semantics (e.g.
      * O_WRONLY without create+truncate, or O_CREAT without O_TRUNC), so build
@@ -323,8 +334,15 @@ static void cellFsOpen(ppu_context* ctx)
         close(hfd);
         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return;
     }
+    npdrm_file* drm = nullptr;
+    if (acc != CELL_FS_O_WRONLY && acc != CELL_FS_O_RDWR && fs_open_npd(f, &drm) < 0) {
+        fclose(f);
+        ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EFSSPECIFIC; return;
+    }
     int fd = fd_alloc_file(f);
-    if (fd < 0) { fclose(f); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EMFILE; return; }
+    if (fd < 0) { if (drm) npdrm_close(drm); else fclose(f); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EMFILE; return; }
+    g_drm[fd] = drm;
+    g_drm_pos[fd] = 0;
     if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
     g_fd_usm[fd] = (strstr(gpath, ".usm") != nullptr) ? 1 : 0;
     /* FS_CALLER=1: name the guest function that opened each file. A title whose
@@ -352,90 +370,21 @@ static void cellFsOpen(ppu_context* ctx)
     ctx->gpr[3] = CELL_OK;
 }
 
-/* cellFsSdataOpen(path, flags, fd*, arg*, size): opens a PS3 SDATA/EDAT
- * encrypted-data file and returns an fd whose reads yield the DECRYPTED
- * plaintext. LBP 1.30 stores its SPU job code modules inside patch.sdat (an
- * FSHb container, zlib-compressed C0DEC0DE modules) and opens it via this call;
- * leaving it faked (default CELL_OK, no handle) meant the container was never
- * read -> zero job modules loaded -> every SPU physics job dispatched into an
- * empty code buffer -> the loading freeze.
- *
- * Our run env's PS3_HDD0_ROOT (RPCS3 dev_hdd0) already holds patch.sdat in
- * DECRYPTED form (magic "FSHb", not "NPD"), so we just open it read-only --
- * no EDAT decryption needed. (A title supplying a still-encrypted NPD .sdat
- * would need the SDATA block cipher; not required here.) The license `arg`
- * (gpr[6]) and its size (gpr[7]) are ignored. */
 static void cellFsSdataOpen(ppu_context* ctx)
 {
     char gpath[1024], hpath[1100];
     guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
     uint32_t fd_ptr = (uint32_t)ctx->gpr[5];
     host_path(hpath, sizeof hpath, gpath);
-
-    /* Same NPDRM step cellFsOpen does: an encrypted container is decrypted once
-     * into a cache file and that is opened in its place. This used to be a
-     * second, weaker decryptor local to this function (sdata_decrypt below),
-     * which handled the self-keyed SDATA form only and refused every real EDAT
-     * -- so a title whose data file was EDAT rather than SDATA got "success
-     * without a handle" here while the very same file opened fine through
-     * cellFsOpen. One decryptor, reached from both doors. */
-    { char dec_path[1200];
-      const char* use = edat_resolve(hpath, dec_path, sizeof dec_path);
-      if (use != hpath) snprintf(hpath, sizeof hpath, "%s", use); }
-
-    int hfd = open(hpath, O_RDONLY | O_BINARY, 0666);
-    if (hfd < 0) {
-        fprintf(stderr, "[fs] SdataOpen FAIL '%s' -> '%s'\n", gpath, hpath);
-        ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return;
-    }
-    FILE* f = fdopen(hfd, "rb");
-    if (!f) { close(hfd); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
-    /* If the file IS still NPD-encrypted, we can't serve it plaintext here --
-     * warn loudly rather than hand back ciphertext the title will choke on.
-     * Use portable fread/fseek (POSIX read()/ssize_t aren't available under the
-     * exe's compiler). */
-    unsigned char magic[4] = {0};
-    size_t got = fread(magic, 1, 4, f);
-    fseek(f, 0, SEEK_SET);
-    if (got == 4 && magic[0]=='N' && magic[1]=='P' && magic[2]=='D') {
-        /* NPD-encrypted SDATA: decrypt it in full and serve the plaintext from
-         * an anonymous tmpfile so the title's reads see the real container. */
-        fseek(f, 0, SEEK_END); long enc_sz = ftell(f); fseek(f, 0, SEEK_SET);
-        uint8_t* enc = (enc_sz > 0) ? (uint8_t*)malloc((size_t)enc_sz) : nullptr;
-        size_t rd = enc ? fread(enc, 1, (size_t)enc_sz, f) : 0;
-        fclose(f);
-        size_t dec_sz = 0;
-        uint8_t* dec = (enc && rd == (size_t)enc_sz) ? sdata_decrypt(enc, rd, &dec_sz) : nullptr;
-        free(enc);
-        if (!dec) {
-            fprintf(stderr, "[fs] SdataOpen '%s' NPD decrypt FAILED (unsupported "
-                    "EDAT/needs license); returning success without a handle\n", gpath);
-            ctx->gpr[3] = CELL_OK; return;   /* don't feed the title ciphertext */
-        }
-        char dmagic[4] = {0};
-        if (dec_sz >= 4) memcpy(dmagic, dec, 4);
-        FILE* tf = tmpfile();
-        if (!tf || fwrite(dec, 1, dec_sz, tf) != dec_sz) {
-            if (tf) fclose(tf); free(dec);
-            ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return;
-        }
-        free(dec);
-        rewind(tf);
-        int fd = fd_alloc_file(tf);
-        if (fd < 0) { fclose(tf); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EMFILE; return; }
-        if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
-        fprintf(stderr, "[fs] SdataOpen '%s' -> fd %d (NPD decrypted, 0x%zX bytes, magic '%c%c%c%c')\n",
-                gpath, fd, dec_sz,
-                dmagic[0]?dmagic[0]:'?', dmagic[1]?dmagic[1]:'?',
-                dmagic[2]?dmagic[2]:'?', dmagic[3]?dmagic[3]:'?');
-        ctx->gpr[3] = CELL_OK;
-        return;
-    }
+    FILE* f = fopen(hpath, "rb");
+    if (!f) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return; }
+    npdrm_file* drm = nullptr;
+    if (fs_open_npd(f, &drm) < 0) { fclose(f); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EFSSPECIFIC; return; }
     int fd = fd_alloc_file(f);
-    if (fd < 0) { fclose(f); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EMFILE; return; }
+    if (fd < 0) { if (drm) npdrm_close(drm); else fclose(f); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EMFILE; return; }
+    g_drm[fd] = drm;
+    g_drm_pos[fd] = 0;
     if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
-    fprintf(stderr, "[fs] SdataOpen '%s' -> fd %d (magic %c%c%c%c)\n", gpath, fd,
-            magic[0]?magic[0]:'?', magic[1]?magic[1]:'?', magic[2]?magic[2]:'?', magic[3]?magic[3]:'?');
     ctx->gpr[3] = CELL_OK;
 }
 
@@ -445,16 +394,20 @@ static void cellFsClose(ppu_context* ctx)
     if (ps3_env_once("FS_CALLER")) { char w[64]="?"; ppu_guest_caller(w,sizeof w);
         fprintf(stderr, "[fs] close fd=%d  (by %s)\n", fd, w); }
     FILE* f = nullptr;
+    npdrm_file* drm = nullptr;
     if (fd >= 0 && fd < FS_MAX) {
         std::lock_guard<std::mutex> hold(g_fd_lock);
         f = g_files[fd];
+        drm = g_drm[fd];
+        g_drm[fd] = nullptr;
         if (f) {
             if (g_fd_usm[fd] && ps3_env_once("PS3_FSLOG_READS")) fprintf(stderr, "[USMRD] CLOSE usm fd=%d\n", fd);
             __atomic_store_n(&g_files[fd], (FILE*)nullptr, __ATOMIC_RELEASE);
             g_fd_usm[fd] = 0; g_fd_dir[fd] = 0;
         }
     }
-    if (f) fclose(f);
+    if (drm) npdrm_close(drm);
+    else if (f) fclose(f);
     ctx->gpr[3] = CELL_OK;
 }
 
@@ -488,6 +441,16 @@ static void cellFsRead(ppu_context* ctx)
     uint32_t nread_ptr = (uint32_t)ctx->gpr[6];
     FILE* f = fd_file(fd);
     if (!f) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EBADF; return; }
+    if (g_drm[fd]) {
+        if (ppu_vm_size && (uint64_t)buf + nbytes > ppu_vm_size) nbytes = ppu_vm_size - buf;
+        fs_prefault(buf, nbytes);
+        const int64_t got = fs_drm_read(fd, g_drm_pos[fd], vm_base + buf, nbytes);
+        if (got < 0) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+        g_drm_pos[fd] += (uint64_t)got;
+        if (nread_ptr) vm_write64(nread_ptr, (uint64_t)got);
+        ctx->gpr[3] = CELL_OK;
+        return;
+    }
     uint64_t raw_nbytes = ctx->gpr[5];
     long fpos_before = ftell(f);
     if (ppu_vm_size && (uint64_t)buf + nbytes > ppu_vm_size) nbytes = ppu_vm_size - buf;
@@ -650,6 +613,14 @@ static void cellFsLseek(ppu_context* ctx)
      * stream then reports the OS position, which is past the buffered data,
      * so the old position is put back explicitly. */
     if (wh > CELL_FS_SEEK_END) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EINVAL; return; }
+    if (npdrm_file* drm = g_drm[fd]) {
+        const int64_t base = wh == CELL_FS_SEEK_END ? (int64_t)npdrm_size(drm) : wh == CELL_FS_SEEK_CUR ? (int64_t)g_drm_pos[fd] : 0;
+        if (base + off < 0) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EINVAL; return; }
+        g_drm_pos[fd] = (uint64_t)(base + off);
+        if (pos_ptr) vm_write64(pos_ptr, g_drm_pos[fd]);
+        ctx->gpr[3] = CELL_OK;
+        return;
+    }
     int worigin = (wh == CELL_FS_SEEK_END) ? SEEK_END : (wh == CELL_FS_SEEK_CUR) ? SEEK_CUR : SEEK_SET;
     const int64_t before = FS_TELL64(f);
     if (FS_SEEK64(f, off, worigin) != 0) {
@@ -713,10 +684,15 @@ static void cellFsFstat(ppu_context* ctx)
     if (!f) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EBADF; return; }
     if (ps3_env_once("FS_CALLER")) { char w[64]="?"; ppu_guest_caller(w,sizeof w);
         fprintf(stderr, "[fs] fstat fd=%d  (by %s)\n", fd, w); }
-    int64_t cur = FS_TELL64(f);
-    FS_SEEK64(f, 0, SEEK_END);
-    int64_t sz = FS_TELL64(f);
-    FS_SEEK64(f, cur, SEEK_SET);
+    int64_t sz;
+    if (g_drm[fd]) {
+        sz = (int64_t)npdrm_size(g_drm[fd]);
+    } else {
+        int64_t cur = FS_TELL64(f);
+        FS_SEEK64(f, 0, SEEK_END);
+        sz = FS_TELL64(f);
+        FS_SEEK64(f, cur, SEEK_SET);
+    }
     /* FS_FSTAT_CAP=<bytes>: DIAGNOSTIC. Report a smaller size than the file
      * has. You Don't Know Jack reads a 100 KB archive whole but only probes
      * (open/fstat/close) its 500 KB and 2.4 MB ones; if that branch is driven
@@ -1007,6 +983,11 @@ static void cellFsAioRead(ppu_context* ctx)
     if (FILE* f = fd_file(fd)) {
         if (ppu_vm_size && (uint64_t)buf + size > ppu_vm_size) size = ppu_vm_size - buf;
         fs_prefault(buf, size);
+        if (g_drm[fd]) {
+            const int64_t got = fs_drm_read(fd, offset, vm_base + buf, size);
+            n = got < 0 ? 0 : (size_t)got;
+            err = got < 0 ? CELL_FS_EIO : CELL_OK;
+        } else {
         /* AIO reads are absolute: they must not move the fd's own position,
          * and the guest issues them from several threads at once (FIOS media
          * threads, audio streamers) on the same fd as its plain reads. A bare
@@ -1021,6 +1002,7 @@ static void cellFsAioRead(ppu_context* ctx)
         if (pos >= 0) HOST_FSEEK64(f, pos);
         HOST_UNLOCKFILE(f);
         err = CELL_OK;
+        }
     }
     if (ps3_env_once("PS3_FSLOG"))
         fprintf(stderr, "[fs] aio read id=%d fd=%d off=%llu size=%llu -> %zu\n",

@@ -33,7 +33,8 @@ s32 cellSysutilQueueGuestCallbackArgs(u32 opd, const u64 args[8])
     for (int i = 0; i < 8; i++) queued_args[i] = args[i];
     return 0;
 }
-void edat_add_klicensee(const uint8_t klic[16]) { (void)klic; }
+int npdrm_license_available(const char* p, const uint8_t* k) { (void)p; (void)k; return 0; }
+void sys_fs_translate_path(const char* g, char* h, int n) { (void)g; if (n > 0) h[0] = 0; }
 
 #define NPID   0x1000u
 #define SVC    0x1100u

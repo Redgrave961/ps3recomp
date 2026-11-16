@@ -53,7 +53,6 @@ long long sys_ppu_thread_init() { return 0; }
 long long sys_process_exit() { return 0; }
 long long sys_process_getpid() { return 0; }
 long long sys_raw_spu_init() { return 0; }
-long long sys_rsx_init() { return 0; }
 long long sys_rwlock_init() { return 0; }
 long long sys_semaphore_init() { return 0; }
 long long sys_timer_init() { return 0; }

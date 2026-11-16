@@ -342,6 +342,41 @@ uint64_t ppu_thread_register_main(void)
     return 1;
 }
 
+ppu_context* ppu_thread_adopt(const char* name, uint32_t stack_size, int32_t priority)
+{
+    table_lock();
+    const int slot = find_free_slot();
+    const uint32_t stack_addr = slot < 0 ? 0 : vm_stack_allocate(&g_vm_stack_alloc, stack_size);
+    if (!stack_addr) {
+        table_unlock();
+        return NULL;
+    }
+    ppu_thread_info* t = &g_ppu_threads[slot];
+    memset(t, 0, sizeof(*t));
+    ppu_context_init(&t->ctx);
+    ppu_set_stack(&t->ctx, (uint64_t)stack_addr, (uint64_t)stack_size);
+    t->ctx.thread_id = (uint64_t)(slot + 1);
+    t->state = PPU_THREAD_STATE_RUNNING;
+    t->priority = priority;
+    t->stack_addr = stack_addr;
+    t->stack_size = stack_size;
+    strncpy(t->name, name, sizeof(t->name) - 1);
+#ifdef _WIN32
+    t->host_tid = GetCurrentThreadId();
+    t->finish_event = CreateEventA(NULL, TRUE, FALSE, NULL);
+#else
+    t->host_thread = pthread_self();
+    pthread_mutex_init(&t->finish_mutex, NULL);
+    pthread_cond_init(&t->finish_cond, NULL);
+#endif
+    table_unlock();
+    ps3_ft_name((uint32_t)slot + 1u, t->name);
+    ps3_thread_name("ppu %s", t->name);
+    ps3_tprof_thread('P', (uint32_t)slot + 1u);
+    { extern void ppu_resv_register(ppu_context*); ppu_resv_register(&t->ctx); }
+    { extern PPU_THREAD_LOCAL ppu_context* g_active_ctx; g_active_ctx = &t->ctx; }
+    return &t->ctx;
+}
 /* The ELF entry path may follow a host bootstrap which already claimed slot
  * zero. Apply its process priority in either case, before guest dispatch. The
  * legacy no-argument registration API remains available for other harnesses. */

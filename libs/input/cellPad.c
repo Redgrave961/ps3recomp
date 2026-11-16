@@ -20,17 +20,17 @@
 #include "../../runtime/platform/win32_compat.h"   /* GetTickCount64 on POSIX */
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host */
 #include "ps3emu/log_first.h"
+#include "../video/rsx_core.h"
 
 /* PAD_CLOCK=flips: PAD_SCRIPT and PAD_STICK times count guest flips instead of
  * wall-clock seconds. A loaded machine runs a title at a third of its usual
  * frame rate, and a wall-clock schedule then presses START on the logos; a
  * flip schedule replays the same screens however slow the run is. */
-extern u32 cellGcm_flip_request_count(void);
 static double pad_clock(unsigned long long t0_ms)
 {
     static int flips = -1;
     if (flips < 0) { const char* e = getenv("PAD_CLOCK"); flips = e && !strcmp(e, "flips"); }
-    return flips ? (double)cellGcm_flip_request_count()
+    return flips ? (double)rsx_core_frames_presented()
                  : (double)(GetTickCount64() - t0_ms) / 1000.0;
 }
 

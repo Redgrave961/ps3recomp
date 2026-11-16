@@ -82,6 +82,17 @@ uint64_t ppu_timebase_now(void)
 #endif
 }
 
+unsigned long long ps3_qpc_us(void)
+{
+    const uint64_t tb = ppu_timebase_now();
+    return tb / PS3_TIMEBASE_FREQ * 1000000ull + tb % PS3_TIMEBASE_FREQ * 1000000ull / PS3_TIMEBASE_FREQ;
+}
+
+unsigned long long ps3_ms_now(void)
+{
+    return ps3_qpc_us() / 1000ull;
+}
+
 #ifndef _WIN32
 uint64_t host_monotonic_ns(void)
 {

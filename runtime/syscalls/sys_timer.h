@@ -31,6 +31,8 @@ extern "C" {
 /* The guest mftb/mftbu clock: one global monotonic counter, host time scaled
  * to the PS3 timebase. Called from every lifted mftb site (ppu_lifter.py). */
 uint64_t ppu_timebase_now(void);
+unsigned long long ps3_qpc_us(void);
+unsigned long long ps3_ms_now(void);
 
 #ifndef _WIN32
 /* Nanoseconds on the host monotonic clock that every guest clock derives from

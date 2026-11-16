@@ -97,6 +97,7 @@ int64_t sys_ppu_thread_create(ppu_context* ctx);
  * Call before the first sys_ppu_thread_create so no created thread aliases
  * main (thread_id 0 broke every owner-tracking sync primitive). */
 uint64_t ppu_thread_register_main(void);
+ppu_context* ppu_thread_adopt(const char* name, uint32_t stack_size, int32_t priority);
 
 /* The blocking syscalls call this on entry: thread `tid` is about to wait, where lv2 would schedule another thread.
  * With PS3_PRIO_START=1, sys_ppu_thread_create waits for it on a thread it has just made at a higher priority than
