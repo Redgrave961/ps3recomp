@@ -442,19 +442,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
      * policy computing a lock-line address from an incomplete instance context).
      * Same rationale as the DMA EA guard: a bad guest atomic must not segfault
      * the host. GETLLAR returns a zeroed line (no reservation); PUTLLC fails. */
-    if (!mfc_ea_range_committed(ea, MFC_ATOMIC_LINE)) {
-        static int s_w = 0;
-        if (PS3_LOG_FIRST(s_w, 16))
-            fprintf(stderr, "[spu-atomic] cmd=0x%X ea=0x%08X pc=0x%05X img=%d uncommitted -- skipped\n",
-                    cmd, ea, (uint32_t)ctx->pc & SPU_LS_MASK, ctx->image_id);
-        if (cmd == MFC_GETLLAR_CMD) {
-            memset(ls, 0, MFC_ATOMIC_LINE);
-            ctx->resv_ea = ea; ctx->resv_valid = 0; ctx->atomic_stat = 4;
-        } else {
-            ctx->atomic_stat = 1;   /* PUTLLC failure (line "moved") */
-        }
-        return 1;
-    }
+    if (!mfc_ea_valid(ea, MFC_ATOMIC_LINE)) mfc_fault(ctx, "atomic address", cmd, 0, ea, MFC_ATOMIC_LINE);
 
     switch (cmd) {
     case MFC_GETLLAR_CMD:

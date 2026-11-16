@@ -931,13 +931,6 @@ extern "C" void ppu_report_guest_lrs(void)
         fprintf(stderr, "[WATCHDOG]   guest-tid %-3u lr=0x%08X  r3=0x%08X sp=0x%08X\n",
                 (unsigned)c->thread_id, (uint32_t)c->lr,
                 (uint32_t)c->gpr[3], (uint32_t)c->gpr[1]);
-        /* With BCTRL_RING armed, follow it with that thread's recent INDIRECT
-         * targets. lr cannot see those (bctrl does not write it), so for a
-         * thread looping on a vtable call the ring is the only record of where
-         * it has actually been -- and the two together distinguish "grinding
-         * through varied work" from "retrying one target". */
-        { extern void ppu_dump_bctrl_ring(uint32_t, const char*);
-          if (getenv("BCTRL_RING")) ppu_dump_bctrl_ring((uint32_t)c->thread_id, "watchdog"); }
     }
     fflush(stderr);
 }
@@ -1475,22 +1468,6 @@ static inline int vm_null_store(uint32_t a, uint32_t v, int width, void* ra)
  * Big-endian guest memory accessors (PPU is big-endian; vm_base holds the
  * guest image in its native byte order).
  * -----------------------------------------------------------------------*/
-/* Stack of currently-executing indirect-call (vtable) targets on this thread, so a
- * write hook can name the virtual method that is running when it writes a value. */
-static PPU_THREAD_LOCAL uint32_t g_vcall_stk[128];
-static PPU_THREAD_LOCAL int      g_vcall_sp = 0;
-/* Nesting depth of ps3_indirect_call on this host thread (the recursion guard
- * in ps3_indirect_call_impl). A host coroutine that runs guest code and ends by
- * switching away from inside an indirect call never unwinds its frames, so one
- * count per thread only grows: every such coroutine leaks its depth, and once
- * the sum passes the cap the guard skips every indirect call on that thread.
- * A coroutine layer keeps one count per coroutine by saving *slot when it
- * switches away and restoring it when it switches back; threads that never
- * switch keep using their thread-local count. The vcall stack pointer leaks
- * the same way. */
-static PPU_THREAD_LOCAL int      g_dispatch_depth = 0;
-extern "C" int* ps3_ppu_dispatch_depth_slot(void) { return &g_dispatch_depth; }
-extern "C" int* ps3_ppu_vcall_sp_slot(void) { return &g_vcall_sp; }
 
 /* Every guest store commits through this: on a line no SPU has reserved (all of
  * them, until SPU code runs) it is the plain memcpy it replaced. */
@@ -2007,539 +1984,52 @@ extern "C" void ppu_dump_guest_stack(ppu_context* ctx, const char* tag)
     fprintf(stderr, "%s\n", gs);
 }
 
-/* Indirect call (bctrl/bctr): CTR holds the already-OPD-resolved code address. */
-/* Per-thread ring of recent indirect-call targets (BCTRL_RING=1). */
-#define BCTRL_RING_N 512
-static uint32_t g_bctrl_ring[16][BCTRL_RING_N];
-static uint32_t g_bctrl_pos[16];
-
-extern "C" void ppu_dump_bctrl_ring(uint32_t thread_id, const char* tag)
-{
-    unsigned t = (unsigned)thread_id & 15;
-    uint32_t n = g_bctrl_pos[t] < BCTRL_RING_N ? g_bctrl_pos[t] : BCTRL_RING_N;
-    if (!n) return;
-    /* Its own file when BCTRL_RING names one. A 512-entry line on stderr
-     * interleaves with everything else the runtime and the guest are printing
-     * from other threads, and a spliced ring is worse than no ring -- the first
-     * use of this tool produced a diff that had a [surfsz] log line embedded in
-     * the middle of it. */
-    static FILE* out = NULL; static int tried = 0;
-    if (!tried) { tried = 1;
-        const char* e = getenv("BCTRL_RING");
-        if (e && *e && e[1]) out = fopen(e, "w");   /* "1" means stderr */
-    }
-    FILE* f = out ? out : stderr;
-    fprintf(f, "[BCTRL:%s] tid=%u last %u indirect targets:", tag, t, n);
-    for (uint32_t i = 0; i < n; i++) {
-        uint32_t idx = (g_bctrl_pos[t] - n + i) & (BCTRL_RING_N - 1);
-        fprintf(f, " %08X", g_bctrl_ring[t][idx]);
-    }
-    fputc(10, f);
-    fflush(f);
-}
-
-/* PPU_CSCHECK=1: every indirect call must hand back r1, r2 and r14..r31 as it
- * found them (the ABI's non-volatile set; r2 is restored by the caller's TOC
- * reload, so it is left out). A lifted function that does not -- a switch
- * whose dispatcher was lifted as a tail call, a split function whose second
- * half restores from the wrong frame -- hands its caller garbage in a register
- * the caller trusts, and the damage surfaces far away as a "vtable used as an
- * object" or a double-allocated heap block. Reports the target once each. */
-static void ps3_indirect_call_impl(ppu_context* ctx);
-/* The impl declares these at block scope; outside an extern "C" function that
- * would give them C++ linkage, so pin it here. */
-extern "C" uint32_t ps3_hle_count(void);
-/* PS3_ICALL_GATE=<file>: while <file> exists, histogram indirect-call targets
- * (per guest thread) and how often each returned r3 == 0; the table prints
- * when the file goes away. A script CFunc polled every frame and always
- * answering false is how a stalled script sequence shows up. */
-static void icall_hist(ppu_context* ctx, uint32_t tgt, int phase)
-{
-    static const char* gate = (const char*)-1;
-    if (gate == (const char*)-1) gate = getenv("PS3_ICALL_GATE");
-    if (!gate) return;
-    enum { N = 4096 };
-    static uint32_t key[N], tid[N], cnt[N], zero[N]; static SRWLOCK lk = SRWLOCK_INIT;
-    static volatile LONG open_ = 0; static DWORD last = 0;
-    if (phase == 0) {
-        DWORD now = GetTickCount();
-        if (now - last > 100) {
-            last = now;
-            const int o = GetFileAttributesA(gate) != INVALID_FILE_ATTRIBUTES;
-            if (!o && open_) {
-                AcquireSRWLockExclusive(&lk);
-                open_ = 0;
-                for (int r = 0; r < 1500; r++) {
-                    uint32_t b = 0; int bi = -1;
-                    for (int i = 0; i < N; i++) if (cnt[i] > b) { b = cnt[i]; bi = i; }
-                    if (bi < 0) break;
-                    fprintf(stderr, "[icall] tid=%u target=0x%08X calls=%u ret0=%u\n",
-                            tid[bi], key[bi], cnt[bi], zero[bi]);
-                    cnt[bi] = 0;
-                }
-                memset(key, 0, sizeof key); memset(cnt, 0, sizeof cnt); memset(zero, 0, sizeof zero);
-                ReleaseSRWLockExclusive(&lk);
-            } else if (o) open_ = 1;
-        }
-        return;
-    }
-    if (!open_) return;
-    const uint32_t t = (uint32_t)ctx->thread_id, z = (uint32_t)ctx->gpr[3] == 0;
-    /* PS3_ICALL_TRACE=<tid>: also log every call on that guest thread, in order. */
-    { static int tt = -2; if (tt == -2) { const char* e = getenv("PS3_ICALL_TRACE"); tt = e ? atoi(e) : -1; }
-      if (tt >= 0 && (uint32_t)tt == t) fprintf(stderr, "[ict] %08X %u\n", tgt, (uint32_t)ctx->gpr[3]); }
-    AcquireSRWLockExclusive(&lk);
-    for (uint32_t i = (tgt * 2654435761u + t) % N, n = 0; n < N; n++, i = (i + 1) % N) {
-        if (key[i] == tgt && tid[i] == t) { cnt[i]++; zero[i] += z; break; }
-        if (!cnt[i]) { key[i] = tgt; tid[i] = t; cnt[i] = 1; zero[i] = z; break; }
-    }
-    ReleaseSRWLockExclusive(&lk);
-}
-
-/* ps3_indirect_call_to: dispatch to an explicit guest target with CTR left as
- * the guest had it (b<cond>lrl branches through LR; CTR must not change). */
 static PPU_THREAD_LOCAL uint32_t g_icall_target;
 static PPU_THREAD_LOCAL int      g_icall_target_set;
-extern "C" void ps3_indirect_call(ppu_context* ctx);
+
+[[noreturn]] static void ppu_bad_call(ppu_context* ctx, uint32_t addr, const char* what)
+{
+    char who[64];
+    ppu_guest_caller(who, sizeof who);
+    fprintf(stderr, "\n[ppu] FATAL: %s 0x%08X is not lifted code (from %s, tid=%llu lr=0x%08X)\n", what, addr, who,
+            (unsigned long long)ctx->thread_id, (uint32_t)ctx->lr);
+    for (int r = 0; r < 32; r += 8)
+        fprintf(stderr, "[ppu]   r%-2d: %08X %08X %08X %08X %08X %08X %08X %08X\n", r, (uint32_t)ctx->gpr[r], (uint32_t)ctx->gpr[r + 1],
+                (uint32_t)ctx->gpr[r + 2], (uint32_t)ctx->gpr[r + 3], (uint32_t)ctx->gpr[r + 4], (uint32_t)ctx->gpr[r + 5],
+                (uint32_t)ctx->gpr[r + 6], (uint32_t)ctx->gpr[r + 7]);
+    for (int r = 9; r <= 12; r++) {
+        const uint32_t p = (uint32_t)ctx->gpr[r];
+        if (p && (!ppu_vm_size || p + 16 <= ppu_vm_size))
+            fprintf(stderr, "[ppu]   [r%d=0x%08X] %08X %08X %08X %08X\n", r, p, vm_read32(p), vm_read32(p + 4), vm_read32(p + 8),
+                    vm_read32(p + 12));
+    }
+    ppu_dump_guest_stack(ctx, "bad-call");
+    fflush(stderr);
+    _Exit(3);
+}
+
+extern "C" void ps3_indirect_call(ppu_context* ctx)
+{
+    uint32_t addr = (uint32_t)ctx->ctr;
+    if (g_icall_target_set) {
+        addr = g_icall_target;
+        g_icall_target_set = 0;
+    }
+    const ppu_fn fn = ppu_lookup_icall(addr);
+    if (!fn) ppu_bad_call(ctx, addr, "indirect call to");
+    fn(ctx);
+    while (g_trampoline_fn) {
+        void (*tf)(void*) = g_trampoline_fn;
+        g_trampoline_fn = 0;
+        tf(ctx);
+    }
+}
+
 extern "C" void ps3_indirect_call_to(ppu_context* ctx, uint32_t target)
 {
     g_icall_target = target;
     g_icall_target_set = 1;
     ps3_indirect_call(ctx);
-}
-
-extern "C" void ps3_indirect_call(ppu_context* ctx)
-{
-    static int on = -1;
-    if (on < 0) on = getenv("PPU_CSCHECK") ? 1 : 0;
-    { static int hg = -1; if (hg < 0) hg = getenv("PS3_ICALL_GATE") ? 1 : 0;
-      if (hg) { const uint32_t tgt = (uint32_t)ctx->ctr; icall_hist(ctx, tgt, 0);
-                ps3_indirect_call_impl(ctx); icall_hist(ctx, tgt, 1); return; } }
-    if (!on) { ps3_indirect_call_impl(ctx); return; }
-    uint64_t save[19]; uint32_t tgt = (uint32_t)ctx->ctr;
-    save[0] = ctx->gpr[1];
-    for (int r = 14; r < 32; r++) save[r - 13] = ctx->gpr[r];
-    ps3_indirect_call_impl(ctx);
-    if (ctx->gpr[1] != save[0] || memcmp(&ctx->gpr[14], &save[1], 18 * sizeof(uint64_t))) {
-        static uint32_t seen[256]; static unsigned n;
-        for (unsigned i = 0; i < n; i++) if (seen[i] == tgt) return;
-        if (n < 256) seen[n++] = tgt;
-        char buf[400]; int p = snprintf(buf, sizeof buf, "[cscheck] target 0x%08X changed:", tgt);
-        if (ctx->gpr[1] != save[0]) p += snprintf(buf + p, sizeof buf - p, " r1 %08X->%08X",
-                                                  (uint32_t)save[0], (uint32_t)ctx->gpr[1]);
-        for (int r = 14; r < 32 && p < (int)sizeof buf - 40; r++)
-            if (ctx->gpr[r] != save[r - 13])
-                p += snprintf(buf + p, sizeof buf - p, " r%d %08X->%08X", r,
-                              (uint32_t)save[r - 13], (uint32_t)ctx->gpr[r]);
-        fprintf(stderr, "%s\n", buf);
-    }
-}
-
-static void ps3_indirect_call_impl(ppu_context* ctx)
-{
-    g_active_ctx = ctx;
-    /* BCTRL_RING=1: keep the last N indirect-call targets per thread, and let
-     * anything that can name a moment dump them. A render path built out of
-     * function pointers and vtables -- a scene graph -- cannot be mapped from
-     * the disassembly, because nothing calls it with a `bl`. Diffing this ring
-     * between the last frame a title drew and the first it did not is the only
-     * way to see which way the dispatch went. */
-    { static int on = -1;
-      if (on < 0) on = getenv("BCTRL_RING") ? 1 : 0;
-      if (on) {
-          unsigned t = (unsigned)ctx->thread_id & 15;
-          g_bctrl_ring[t][g_bctrl_pos[t] & (BCTRL_RING_N - 1)] = (uint32_t)ctx->ctr;
-          g_bctrl_pos[t]++;
-      } }
-#ifdef _WIN32
-    { static int64_t tw=-2; if(tw==-2){const char*e=getenv("PPU_TOCWATCH"); tw=e?(int64_t)strtoul(e,0,16):-1;}
-      if(tw>=0 && (uint32_t)ctx->gpr[2]==(uint32_t)tw){ static int _n=0; if(PS3_LOG_FIRST(_n, 4)){
-        char* mb=(char*)GetModuleHandleA(0); void* bt[24]; unsigned short fr=RtlCaptureStackBackTrace(0,24,bt,0);
-        char ln[800]; int p=snprintf(ln,sizeof ln,"[TOCWATCH] r2=0x%08X ctr=0x%08X bt:",(uint32_t)ctx->gpr[2],(uint32_t)ctx->ctr);
-        for(int i=0;i<fr;i++) p+=snprintf(ln+p,sizeof(ln)-p," %llX",(unsigned long long)((char*)bt[i]-mb));
-        fprintf(stderr,"%s\n",ln); } } }
-#endif
-    uint32_t addr = (uint32_t)ctx->ctr;
-    if (g_icall_target_set) { addr = g_icall_target; g_icall_target_set = 0; }
-    /* PS3_CALLTRACE=N: log the first N indirect calls (target + r3/r4) --
-     * generic visibility into vtable/callback dispatch (e.g. which job body a
-     * JobManager worker runs). */
-    { static int64_t ctr_n=-2; if(ctr_n==-2){const char*e=getenv("PS3_CALLTRACE"); ctr_n=e?atoi(e):0;}
-      /* PS3_CALLTRACE_LR=<hex>: only calls returning to this guest address.
-       * An unfiltered trace is far too heavy to reach a late failure -- it
-       * changes the timing enough that the run never gets there. */
-      static int64_t only_lr = -2;
-      if (only_lr == -2) { const char* e = getenv("PS3_CALLTRACE_LR");
-                           only_lr = e ? (int64_t)strtoul(e, 0, 16) : -1; }
-      /* PS3_CALLTRACE_R5=<n>: only calls with this selector in r5. Some lifted
-       * bctrl sites never set ctx->lr (the lifter uses a host call there), so
-       * filtering by return address silently matches nothing -- an argument
-       * value is the reliable handle on a specific call. */
-      /* PS3_CALLTRACE_FROM=<guest fn hex>: only calls made from inside this
-       * lifted function, resolved off the host stack. The most reliable handle
-       * when neither lr nor an argument is distinctive. */
-      /* PS3_CALLTRACE_TO=<hex>: only calls whose TARGET is this address --
-       * the way to catch an entry point that has no direct callers. */
-      static int64_t only_to = -2;
-      if (only_to == -2) { const char* e = getenv("PS3_CALLTRACE_TO");
-                           only_to = e ? (int64_t)strtoul(e, 0, 16) : -1; }
-      if (only_to >= 0 && addr != (uint32_t)only_to) goto skip_calltrace;
-      static int64_t only_from = -2;
-      if (only_from == -2) { const char* e = getenv("PS3_CALLTRACE_FROM");
-                             only_from = e ? (int64_t)strtoul(e, 0, 16) : -1; }
-      char cf[64];
-      if (only_from >= 0) {
-          ppu_guest_caller(cf, sizeof cf);
-          char want[32]; snprintf(want, sizeof want, "func_%08X", (uint32_t)only_from);
-          if (strncmp(cf, want, strlen(want)) != 0) goto skip_calltrace;
-      }
-      static int64_t only_r5 = -2;
-      if (only_r5 == -2) { const char* e = getenv("PS3_CALLTRACE_R5");
-                           only_r5 = e ? strtol(e, 0, 0) : -1; }
-      if (only_r5 >= 0 && (int64_t)(int32_t)ctx->gpr[5] != only_r5) { /* skip */ } else
-      if (only_lr >= 0 && (uint32_t)ctx->lr != (uint32_t)only_lr) { /* skip */ } else
-      if(ctr_n>0){ ctr_n--;
-        /* Name the CALLER too: for an indirect call the interesting question
-         * is usually who dispatched it, not just where it landed. flOw calls
-         * setScreenRenderTarget(this, NULL) exactly once and the caller is the
-         * only way to find where that null config came from. */
-        char _fromw[64]; ppu_guest_caller(_fromw, sizeof _fromw);
-        fprintf(stderr,"[CALL] -> 0x%08X r3=0x%08X r4=0x%08X r5=%lld lr=0x%08X from=%s tid=%llu\n",
-                addr,(uint32_t)ctx->gpr[3],(uint32_t)ctx->gpr[4],
-                (long long)(int32_t)ctx->gpr[5], (uint32_t)ctx->lr, _fromw,
-                (unsigned long long)ctx->thread_id);
-        /* r28-r31 usually hold the caller's object pointers; for a virtual
-         * call with a null argument they are the only handle on WHICH object
-         * supplied it. */
-        fprintf(stderr,"[CALL]    r28=0x%08X r29=0x%08X r30=0x%08X r31=0x%08X\n",
-                (uint32_t)ctx->gpr[28],(uint32_t)ctx->gpr[29],
-                (uint32_t)ctx->gpr[30],(uint32_t)ctx->gpr[31]); } }
-      skip_calltrace: ;
-    /* Null / return-to-OS sentinel: a bctr to address 0 means the guest
-     * unwound to the initial frame (or a not-yet-populated function pointer).
-     * Don't treat it as an unresolved call -- just return to the caller. */
-    if (addr == 0) {
-        /* Say so. A bctrl to 0 is nearly always a function-pointer table slot
-         * that was never populated, and returning quietly turns it into an
-         * infinite loop when the caller retries -- which is what it does. This
-         * had no report of any kind, so the failure presented as "a thread is
-         * busy in guest code" with nothing to grep for; Guitar Hero III spends
-         * its whole boot doing it. Same standing as [null-read]: on by default
-         * because a null call is always a bug, capped so it cannot flood, and
-         * PS3_NULL_CALL=0 turns it off.
-         *
-         * lr is the last DIRECT call site, not this one (bctrl does not write
-         * lr), so it names the neighbourhood rather than the instruction --
-         * still the fastest way to the right function. */
-        { static int s_nc = -1;
-          if (s_nc < 0) { const char* e = getenv("PS3_NULL_CALL");
-                          s_nc = (e && *e == '0') ? 0 : 1; }
-          /* Cap PER THREAD. A global cap lets one noisy thread exhaust it and
-           * silently hide every other thread's null calls -- the same trap the
-           * BRANCH-TO-0 log already fixed per image. Guitar Hero III's FMOD
-           * stream thread burned all 8 slots and hid the MAIN thread's, which
-           * is the one that matters. */
-          if (s_nc) { enum { NC_T = 64, NC_PER = 4 };
-              static long s_nt[NC_T];
-              unsigned ti = (unsigned)ctx->thread_id < NC_T
-                            ? (unsigned)ctx->thread_id : 0;
-              long s_n = s_nt[ti];
-              s_nt[ti] = s_n + 1;
-              if (s_n < NC_PER)
-                  /* r12 is NOT reliable here: a vtable bctrl loads ctr from
-                   * the OPD directly and never writes r12, so it prints stale
-                   * garbage. Dump the scratch registers the call sequence
-                   * actually used -- for a C++ virtual call r11/r9/r10 still
-                   * hold object/vtable/OPD, which is enough to see WHICH link
-                   * of the chain read as zero. */
-                  fprintf(stderr, "[null-call] guest called a NULL function pointer"
-                                  " (near lr=0x%08X, tid=%u)"
-                                  " r3=%08X r9=%08X r10=%08X r11=%08X r12=%08X\n",
-                          (uint32_t)ctx->lr, (unsigned)ctx->thread_id,
-                          (uint32_t)ctx->gpr[3],  (uint32_t)ctx->gpr[9],
-                          (uint32_t)ctx->gpr[10], (uint32_t)ctx->gpr[11],
-                          (uint32_t)ctx->gpr[12]);
-              /* ...and who made it, once per thread: lr only names the last
-               * direct call, which is usually the lwmutex around the real one. */
-              if (s_n == 0) ppu_dump_guest_stack(ctx, "nc");
-              else if (s_n == NC_PER)
-                  fprintf(stderr, "[null-call] tid=%u: further null calls not shown\n",
-                          (unsigned)ctx->thread_id);
-              if (s_n <= NC_PER) fflush(stderr); } }
-        {
-        /* Returning silently leaves r3 HOLDING THE FIRST ARGUMENT, so the guest
-         * reads its own input back as the return value and reports a nonsense
-         * error code. Tokyo Jungle: cellAudioSetNotifyEventQueue(key=0x23A0)
-         * "failed" with status 0x23A0 -- the key itself. Say so."*/
-        static int n = 0;
-        if (PS3_LOG_FIRST(n, 400))
-        { char who[64]; ppu_guest_caller(who, sizeof who);
-          if (n <= 400) {
-            /* The lifted import thunk leaves the OPD address it loaded in r12,
-             * so we can tell a zero SLOT from a zeroed OPD -- i.e. whether the
-             * import was never resolved or was resolved and later clobbered. */
-            uint32_t opd = (uint32_t)ctx->gpr[12];
-            uint32_t o0 = (opd && vm_base) ? __builtin_bswap32(*(volatile uint32_t*)(vm_base+opd)) : 0;
-            fprintf(stderr, "[ppu] bctr to NULL from %s r12(opd)=0x%08X opd[0]=0x%08X "
-                    "(r3=0x%08X r4=0x%08X "
-                    "tid=%llu) -- returning with r3 untouched\n", who, opd, o0,
-                    (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4],
-                    (unsigned long long)ctx->thread_id); } }
-        return;
-        }
-    }
-
-    ppu_fn fn = ppu_lookup_icall(addr);
-    if (fn) {
-        /* Recursion-depth guard: a malformed/cyclic jump table (or a tail-call
-         * chain that never converges) can dispatch recursively without bound
-         * and blow the host stack. Cap the depth, log once, then unwind. */
-        int& s_depth = g_dispatch_depth;
-        if (s_depth > 4000) {
-            static int warned = 0;
-            if (PS3_LOG_FIRST(warned, 8))
-                fprintf(stderr, "[ppu] recursion cap @0x%08X depth=%d -- skipping\n", addr, s_depth);
-            return;
-        }
-        s_depth++;
-        if (g_vcall_sp < 128) g_vcall_stk[g_vcall_sp] = addr;
-        g_vcall_sp++;
-        fn(ctx);
-        while (g_trampoline_fn) {
-            void (*tf)(void*) = g_trampoline_fn;
-            g_trampoline_fn = 0;
-            tf(ctx);
-        }
-        if (g_vcall_sp > 0) g_vcall_sp--;
-        s_depth--;
-        return;
-    }
-    /* Garbage virtual-call guard: a call target that resolves to no registered
-     * function AND lands in the data/string-pool range (0x10000000..0x30000000 is
-     * mapped data/SPURS/heap, never valid PPU code -- game .text is <0x10000000,
-     * libsre is >=0x30000000) means the `this` object was uninitialised/stale and
-     * its vtable slot held string/data bytes. Calling it is meaningless; the
-     * correct C++ semantics for "method on an empty/invalid object" is a no-op
-     * returning null. Treat it as such (r3=0) so the caller's loop makes progress
-     * instead of spinning forever on the same bogus pointer. */
-    {
-        uint32_t tgt = (uint32_t)ctx->ctr;
-        /* A valid PPU function entry is 4-byte aligned and lies in game .text
-         * (0x10000..0xFFFFFFF) or the loaded-PRX region (0x30000000..0x3FFFFFFF).
-         * Anything else — the mapped data/heap range, a MISALIGNED address (never
-         * a real entry), a too-low or above-PRX address — means the vtable slot
-         * held non-code (NULL/string/stale). Calling it is meaningless; C++ "method
-         * on an absent/optional slot" is a no-op returning null. */
-        if (tgt >= 0x10000000u && tgt < 0x30000000u) {
-            static int _gn = 0;
-            if (PS3_LOG_FIRST(_gn, 12)) fprintf(stderr, "[ppu] garbage vcall -> 0x%08X this=0x%08X (uninit/stale object) -- no-op, r3=0\n", tgt, (uint32_t)ctx->gpr[3]);
-            ctx->gpr[3] = 0;
-            return;
-        }
-    }
-    /* Stuck-loop guard: a divergence (e.g. an object with a null function
-     * pointer) can make the game spin on the same unresolved target forever.
-     * Detect a long run of identical unresolved targets and bail so the run
-     * stays fast and the log readable. */
-    static uint32_t last = 0xFFFFFFFFu; static uint32_t streak = 0;
-    static uint32_t stuckmax = 0; if (!stuckmax) { const char* e=getenv("PPU_STUCKMAX"); stuckmax = e?(uint32_t)strtoul(e,0,0):2000u; }
-    uint32_t cur = (uint32_t)ctx->ctr;
-    if (cur == last) {
-        if (++streak == stuckmax) {
-            fprintf(stderr, "[ppu] FATAL: stuck calling 0x%08X (%u times) -- aborting run\n", cur, streak);
-            /* The target alone rarely says why. Dump the descriptor the guest
-             * dereferenced (r9/r11/r12 are where the ELFv1 idiom keeps it) and
-             * the words at the target, so a garbage OPD is distinguishable from
-             * a real one pointing at an unlifted address. */
-            for (int _r = 9; _r <= 12; _r++) {
-                uint32_t a_ = (uint32_t)ctx->gpr[_r];
-                if (!a_ || (ppu_vm_size && a_ + 16 > ppu_vm_size)) continue;
-                fprintf(stderr, "[ppu]   r%d=0x%08X -> %08X %08X %08X %08X\n", _r, a_,
-                        vm_read32(a_), vm_read32(a_+4), vm_read32(a_+8), vm_read32(a_+12));
-            }
-            if (!ppu_vm_size || cur + 16 <= ppu_vm_size)
-                fprintf(stderr, "[ppu]   [target]=0x%08X -> %08X %08X %08X %08X\n", cur,
-                        vm_read32(cur), vm_read32(cur+4), vm_read32(cur+8), vm_read32(cur+12));
-            fprintf(stderr, "[ppu]   tid=%llu lr=0x%08X r2=0x%08X r3=0x%08X r31=0x%08X\n",
-                    (unsigned long long)ctx->thread_id, (uint32_t)ctx->lr, (uint32_t)ctx->gpr[2],
-                    (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[31]);
-            ppu_log_host_chain("stuck-caller");
-            ppu_dump_guest_stack(ctx, "stuck-caller");
-            fflush(stderr); exit(3);
-        }
-        return;   /* don't spam the log on a tight retry loop */
-    }
-    last = cur; streak = 0;
-    fprintf(stderr, "[ppu] unresolved indirect call -> 0x%08X (tid=%llu lr=0x%08X)\n",
-            (uint32_t)ctx->ctr, (unsigned long long)ctx->thread_id, (uint32_t)ctx->lr);
-    /* With no NID table the very first one of these is the expected outcome
-     * rather than a mystery, so name the cause instead of the symptom. */
-    { extern uint32_t ps3_hle_count(void);
-      static int said = 0;
-      if (!said && ps3_hle_count() == 0) {
-          said = 1;
-          fprintf(stderr,
-              "       ^ no HLE handlers are registered, so this is almost certainly\n"
-              "         a firmware import rather than guest code. Run\n"
-              "         tools/gen_hle_nids.py and build its output into the port.\n");
-      }
-      /* The other half of the same mistake, and it survives a correct NID
-       * table: a lift done without --hle-stubs keeps every import trampoline as
-       * literal code, so `bl <stub>` runs `li r12,0; oris r12,r12,hi;
-       * lwz r12,lo(r12)` against an import table no host loader ever patched,
-       * and branches to the word it read -- the next trampoline's own first
-       * instruction, 0x39800000 (`li r12,0`). An instruction word as a call
-       * target is the signature, and registered handlers do not make it go away. */
-      else if (!said && (uint32_t)ctx->ctr == 0x39800000u) {
-          said = 1;
-          fprintf(stderr,
-              "       ^ 0x39800000 is the instruction `li r12,0`, not an address: this call\n"
-              "         went through a firmware import trampoline that was lifted literally.\n"
-              "         Re-lift with --hle-stubs so import stubs dispatch to HLE:\n"
-              "           python tools/ppu_loader.py EBOOT.elf -o out/\n"
-              "           python tools/ppu_lifter.py EBOOT.elf --functions out/EBOOT.functions.json \\\n"
-              "                  --hle-stubs out/EBOOT.imports.json -o src/recomp/\n");
-      } }
-    static int dumped = 0;
-    if (dumped < 3) {
-        dumped++;
-        { void* ra = __builtin_return_address(0); HMODULE m=NULL;
-          GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,(LPCSTR)ra,&m);
-          fprintf(stderr, "      host_ra=%p rva=0x%llX (llvm-symbolizer --obj=AsuraRecomp.exe)\n",
-                ra, (unsigned long long)((uintptr_t)ra-(uintptr_t)m)); }
-        { void* bt[32]; unsigned short fr=RtlCaptureStackBackTrace(0,32,bt,0);
-          char* mb=(char*)GetModuleHandleA(0); char line[900]; int p=snprintf(line,sizeof line,"      UNRES-bt rva:");
-          for(int i=0;i<fr;i++) p+=snprintf(line+p,sizeof(line)-p," %llX",(unsigned long long)((char*)bt[i]-mb));
-          fprintf(stderr,"%s\n",line);
-          /* Resolve each backtrace host address to the guest func_00XXXXXX that
-           * contains it: find the function_table entry whose host pointer is the
-           * largest one <= the frame address. No debug symbols needed. */
-          char gl[900]; int gp=snprintf(gl,sizeof gl,"      UNRES-guest:");
-          for(int i=0;i<fr && i<8;i++){
-              uintptr_t tgt=(uintptr_t)bt[i]; uint32_t bestGuest=0; uintptr_t bestHost=0;
-              for(uint64_t k=0;k<function_table_count;k++){
-                  uintptr_t h=(uintptr_t)function_table[k].func;
-                  if(h<=tgt && h>bestHost){ bestHost=h; bestGuest=function_table[k].addr; }
-              }
-              /* Same bound as the watchdog: an offset larger than any real lifted
-               * function means the address is not in lifted code at all, and the
-               * "nearest symbol below" answer is worse than admitting ignorance.
-               * Unbounded, this printed confident wrong frames (func_0070A69C+0x86C
-               * for a host CRT address) that cost real debugging time. */
-              if(bestGuest && tgt-bestHost > 0x10000u) bestGuest=0;
-              if(bestGuest) gp+=snprintf(gl+gp,sizeof(gl)-gp," func_%08X+0x%llX",bestGuest,(unsigned long long)(tgt-bestHost));
-              else gp+=snprintf(gl+gp,sizeof(gl)-gp," ?");
-          }
-          fprintf(stderr,"%s\n",gl); }
-        fprintf(stderr, "      cia=0x%08X lr=0x%08X r2=0x%08X r3=0x%08X r11=0x%08X r12=0x%08X\n",
-                (uint32_t)ctx->cia, (uint32_t)ctx->lr, (uint32_t)ctx->gpr[2], (uint32_t)ctx->gpr[3],
-                (uint32_t)ctx->gpr[11], (uint32_t)ctx->gpr[12]);
-        for (int r = 0; r < 32; r += 8)
-            fprintf(stderr, "      r%-2d: %08X %08X %08X %08X %08X %08X %08X %08X\n", r,
-                (uint32_t)ctx->gpr[r+0],(uint32_t)ctx->gpr[r+1],(uint32_t)ctx->gpr[r+2],(uint32_t)ctx->gpr[r+3],
-                (uint32_t)ctx->gpr[r+4],(uint32_t)ctx->gpr[r+5],(uint32_t)ctx->gpr[r+6],(uint32_t)ctx->gpr[r+7]);
-        /* Walk the C++ vtable->OPD chain from the `this` pointer (r3) so we can
-         * see where each link points (heap object vs game image vs garbage) and
-         * pinpoint how the garbage code field (e.g. 0xC708C708) got there. */
-        if (vm_base) {
-            auto g32 = [](uint32_t ea)->uint32_t {
-                return __builtin_bswap32(*(volatile uint32_t*)(vm_base + ea));
-            };
-            uint32_t obj = (uint32_t)ctx->gpr[3];
-            uint32_t vt  = g32(obj);
-            uint32_t opd = g32(vt);
-            fprintf(stderr, "      CHAIN obj=%08X  *(obj)=vtable=%08X  *(vtable)[0]=opd=%08X  *(opd)=code=%08X  *(opd+4)=toc=%08X\n",
-                    obj, vt, opd, g32(opd), g32(opd + 4));
-            fprintf(stderr, "      obj[0..7]: %08X %08X %08X %08X %08X %08X %08X %08X\n",
-                    g32(obj+0),g32(obj+4),g32(obj+8),g32(obj+12),g32(obj+16),g32(obj+20),g32(obj+24),g32(obj+28));
-            fprintf(stderr, "      vtable[0..7]: %08X %08X %08X %08X %08X %08X %08X %08X\n",
-                    g32(vt+0),g32(vt+4),g32(vt+8),g32(vt+12),g32(vt+16),g32(vt+20),g32(vt+24),g32(vt+28));
-            /* Root-cause probe for the mis-constructed MI object: the singleton
-             * @0x542E60 and the .bss pool @0x587AC8 (func_00182DD8's allocator).
-             * If the pool is 0 the sub-object allocs fail -> base vtable -> this
-             * crash. Also show whether obj matches the singleton. */
-            fprintf(stderr, "      PROBE singleton[0x542E60]=%08X  pool[0x587AC8]=%08X  poolstruct[0x587A00..]=%08X %08X %08X\n",
-                    g32(0x542E60), g32(0x587AC8), g32(0x587A00), g32(0x587AC0), g32(0x587AC4));
-            /* Guest-stack backtrace: the host RtlCaptureStackBackTrace mis-resolves
-             * lifted frames (small helpers alias earlier symbols). Walk the PPC
-             * back-chain (sp=[sp]) and resolve each saved LR ([frame+0x10]) against
-             * the guest function_table -- guest addresses are reliable. This pins
-             * the real caller that made the 0xC708C708 virtual call. */
-            {
-                uint32_t sp = (uint32_t)ctx->gpr[1];
-                /* Raw stack dump (16 words) so we can see the frame layout. */
-                { char rd[500]; int rp = snprintf(rd, sizeof rd, "      STACK@%08X:", sp);
-                  for (int i = 0; i < 16 && sp + i*4 < 0x10000000u; i++)
-                      rp += snprintf(rd+rp, sizeof(rd)-rp, " %08X", g32(sp + i*4));
-                  fprintf(stderr, "%s\n", rd); }
-                /* Scan the stack for saved return addresses: any word that lands
-                 * INSIDE a lifted function (addr > func start, i.e. a call site,
-                 * not a data/vtable pointer to a func start). Reliable w/o a valid
-                 * back-chain -- finds the real caller chain to the 0xC708C708 vcall. */
-                char gb[1400]; int gp = snprintf(gb, sizeof gb, "      GUEST-STACK(scan):");
-                uint32_t last = 0;
-                for (int i = 0; i < 700 && gp < 1300; i++) {
-                    uint32_t w = g32(sp + i*4);
-                    if (w < 0x10000 || w >= ppu_code_hi()) continue;
-                    uint32_t bg = 0;
-                    for (uint64_t k = 0; k < function_table_count; k++) {
-                        uint32_t a = function_table[k].addr;
-                        if (a <= w && a > bg) bg = a;
-                    }
-                    /* offset>0 (interior = return addr) and modest (<0x4000) */
-                    if (bg && (w - bg) > 0 && (w - bg) < 0x4000 && w != last) {
-                        gp += snprintf(gb+gp, sizeof(gb)-gp, " %08X:func_%08X+0x%X", sp+i*4, bg, w - bg);
-                        last = w;
-                    }
-                }
-                fprintf(stderr, "%s\n", gb);
-                /* Find which GPR held the OPD pointer: the crashing vcall did
-                 * r0=[rN]; ctr=r0, so some gpr[k] satisfies [gpr[k]]==ctr. That
-                 * pins the exact garbage descriptor address + lets us see the
-                 * structure it lives in (heap object? vtable slot? which one). */
-                uint32_t bad = (uint32_t)ctx->ctr;
-                for (int k = 0; k < 32; k++) {
-                    uint32_t rk = (uint32_t)ctx->gpr[k];
-                    if (rk < 0x8000 || rk >= 0x10000000u) continue;
-                    /* scan a window around the register for the garbage word:
-                     * catches r0=[rX+imm] loads (the vcall's OPD-ptr source). */
-                    for (int off = -0x40; off < 0x200; off += 4) {
-                        uint32_t a = rk + off;
-                        if (a < 0x8000 || a >= 0x10000000u) continue;
-                        if (g32(a) == bad) {
-                            fprintf(stderr, "      BADWORD @0x%08X = 0x%08X  (r%d=0x%08X %+d)\n",
-                                    a, bad, k, rk, off);
-                            char sd[520]; int sp2=snprintf(sd,sizeof sd,"      CTX@%08X-0x20:",a);
-                            for (int i=-8;i<16;i++) sp2+=snprintf(sd+sp2,sizeof(sd)-sp2," %08X",g32(a+i*4));
-                            fprintf(stderr,"%s\n",sd);
-                            off = 0x200;  /* one hit per register is enough */
-                        }
-                    }
-                }
-                /* One-shot full-RAM scan: find EVERY guest address holding the
-                 * garbage value -> pinpoints where the leaked (truncated host)
-                 * pointer is stored, so we can identify the struct + leaky HLE. */
-                { static int once = 0; if (!once) { once = 1;
-                    /* scan main RAM + the 0x40000000 object-heap region (where the
-                     * crash 'this'=0x400240A8 lives) + the 0x30000000 libsre region. */
-                    const uint32_t ranges[][2] = {
-                        {0x00010000u, 0x0FF00000u}, {0x30000000u, 0x30200000u},
-                        {0x40000000u, 0x40400000u}, {0x0F800000u, 0x10000000u} };
-                    char ram[1400]; int rp = snprintf(ram, sizeof ram, "      RAMSCAN 0x%08X at:", bad);
-                    int hits = 0;
-                    for (int R = 0; R < 4 && rp < 1300; R++)
-                        for (uint32_t a = ranges[R][0]; a < ranges[R][1] && rp < 1300; a += 4) {
-                            if (g32(a) == bad) {
-                                rp += snprintf(ram+rp, sizeof(ram)-rp, " %08X", a);
-                                if (++hits >= 60) { R = 4; break; }
-                            }
-                        }
-                    rp += snprintf(ram+rp, sizeof(ram)-rp, "  (total=%d)", hits);
-                    fprintf(stderr, "%s\n", ram);
-                } }
-            }
-        }
-    }
 }
 
 /* Called when lifted code branches to a function that wasn't in this lift
@@ -2650,12 +2140,11 @@ extern "C" void lv2_syscall(ppu_context* ctx)
         uint32_t buf  = (uint32_t)ctx->gpr[4];
         uint32_t len  = (uint32_t)ctx->gpr[5];
         uint32_t pwl  = (uint32_t)ctx->gpr[6];
-        uint32_t wlen = len;
-        if (wlen > 0x4000u) {   /* guard against garbage len (divergence dumps memory) */
-            static int n = 0;
-            if (n < 20) { fprintf(stderr, "[tty] suspicious len=%u (buf=0x%08X) clamped\n", len, buf); n++; }
-            wlen = 0x4000u;
+        if (len && (!buf || (uint64_t)buf + len > 0x100000000ull)) {
+            ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000D;
+            return;
         }
+        uint32_t wlen = len;
         /* Collapse a repeating line. A title that logs an error from inside a
          * retry loop prints it thousands of times a second, and every one of
          * those is an unbuffered fwrite+fflush on the guest thread -- our
@@ -3124,21 +2613,6 @@ extern "C" void ppu_install_thread_trampoline(void)
  * stack, and return r3. Used by the HLE runtime to deliver callbacks into
  * recompiled code (cellSysutil events, GCM vblank/flip handlers, ...) -- the
  * mechanism behind g_ps3_guest_caller (ps3emu/guest_call.h). */
-/* OPD fixups: some title OPDs (the GCM flip/vblank handlers at 0x530D70/78/80)
- * have their code word clobbered in guest memory at runtime (read back as the TOC
- * base 0x544370). A lib captures the real {code,toc} at registration and records
- * it here so ppu_guest_call resolves the clobbered OPD to the real handler. */
-struct PpuOpdFixup { uint32_t opd, code, toc; };
-static PpuOpdFixup s_opd_fixups[16];
-static int s_opd_fixup_n = 0;
-extern "C" void ppu_register_opd_fixup(uint32_t opd, uint32_t code, uint32_t toc)
-{
-    if (!opd || !code) return;
-    for (int i = 0; i < s_opd_fixup_n; i++)
-        if (s_opd_fixups[i].opd == opd) { s_opd_fixups[i].code = code; s_opd_fixups[i].toc = toc; return; }
-    if (s_opd_fixup_n < 16) { s_opd_fixups[s_opd_fixup_n].opd = opd;
-        s_opd_fixups[s_opd_fixup_n].code = code; s_opd_fixups[s_opd_fixup_n].toc = toc; s_opd_fixup_n++; }
-}
 
 /* The guest stack an HLE -> guest callback runs on.
  *
@@ -3217,21 +2691,13 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
     uint32_t code = 0, toc = 0;
     ppu_opd_resolve(opd_addr, &code, &toc);
     ppu_fn fn = ppu_lookup(code);
-    if (!fn) {  /* OPD code clobbered? fall back to a captured fixup */
-        for (int i = 0; i < s_opd_fixup_n; i++)
-            if (s_opd_fixups[i].opd == opd_addr) {
-                code = s_opd_fixups[i].code; toc = s_opd_fixups[i].toc;
-                fn = ppu_lookup(code); break; }
-    }
     if (!fn) {
-        /* Print the descriptor bytes too: "code 0x00000000" alone cannot
-         * distinguish a CLOBBERED OPD from one the loader never populated,
-         * and those need opposite fixes. */
-        fprintf(stderr, "[ppu] guest_call: OPD 0x%08X -> code 0x%08X not registered"
-                        " (opd: %08X %08X %08X %08X)\n",
-                opd_addr, code, vm_read32(opd_addr), vm_read32(opd_addr + 4),
-                vm_read32(opd_addr + 8), vm_read32(opd_addr + 12));
-        return 0; }
+        fprintf(stderr, "\n[ppu] FATAL: guest callback OPD 0x%08X -> code 0x%08X is not lifted code (opd %08X %08X)\n", opd_addr, code,
+                vm_read32(opd_addr), vm_read32(opd_addr + 4));
+        if (g_active_ctx) ppu_dump_guest_stack(g_active_ctx, "bad-callback");
+        fflush(stderr);
+        _Exit(3);
+    }
 
     ppu_context ctx;
     memset(&ctx, 0, sizeof(ctx));

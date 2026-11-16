@@ -22,7 +22,6 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
-#include <stdio.h>
 #include "../platform/win32_compat.h"
 
 #ifdef __cplusplus
@@ -39,46 +38,23 @@ static inline void spu_rsx_window_check(uint32_t ea, uint32_t size)
     if (notify && ea < ppu_hle_inject_base + 0x10000u && (uint64_t)ea + size > ppu_hle_inject_base) notify();
 }
 
-/* Guard against a guest DMA whose effective address lands in reserved-but-
- * uncommitted guest memory (the 4 GB VM is MEM_RESERVE; only main mem / RSX /
- * SPU / lv2-heap / stack pages are committed). A garbage EA must be treated
- * as a failed DMA, NOT crash the host emulator with an access violation.
- * Queries the page state and demand-commits on first touch; the whole
- * [ea, ea+size) range must be committed and accessible.
- * Returns 1 if the range is safe to memcpy. */
-static inline int mfc_ea_range_committed(uint64_t ea, uint32_t size)
+static inline int mfc_ea_valid(uint64_t ea, uint32_t size)
 {
-    /* The VM reserves the full 32-bit guest space but only commits specific
-     * regions (main mem, stack, RSX). A DMA to an uncommitted page must
-     * commit it on demand rather than crash. A bitmap caches the per-64K-page
-     * committed state so the steady-state cost is two bit tests; only a first
-     * touch per page pays the VirtualQuery syscall. */
-    uint32_t e = (uint32_t)ea;
-    if (size == 0) return 0;
-    if ((uint64_t)e + (uint64_t)size > 0x100000000ull) return 0;   /* past 4 GB */
-    if (!vm_base) return 0;
-    /* Committed-page bitmap as a self-healing CACHE of VirtualQuery. The
-     * demand-commit fault handler seeds it, but regions the host commits
-     * directly (never faulting) start unseeded. On a miss, fall back to ONE VirtualQuery and remember
-     * the answer: first touch per 64K page pays the syscall, steady state is
-     * two bit tests. (The all-syscall version was 94 CPU-s per 50 s run.) */
-    { extern uint8_t g_vm_page_bitmap[65536 / 8];
-      uint32_t last = e + size - 1;
-      uint32_t pg[2] = { e >> 16, last >> 16 };
-      for (int i = 0; i < (pg[0] == pg[1] ? 1 : 2); i++) {
-          if ((g_vm_page_bitmap[pg[i] >> 3] >> (pg[i] & 7)) & 1) continue;
-          MEMORY_BASIC_INFORMATION mbi;
-          uint8_t* p = vm_base + ((uintptr_t)pg[i] << 16);
-          if (VirtualQuery(p, &mbi, sizeof mbi) == 0) return 0;
-          if (mbi.State != MEM_COMMIT) {
-              if (!VirtualAlloc(p, 0x10000, MEM_COMMIT, PAGE_READWRITE)) return 0;
-          } else if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) {
-              return 0;
-          }
-          g_vm_page_bitmap[pg[i] >> 3] |= (uint8_t)(1u << (pg[i] & 7));
-      }
-    }
-    return 1;
+    return ea >= 0x10000u && ea + size <= 0x100000000ull;
+}
+
+static inline int mfc_aligned(uint32_t lsa, uint64_t ea, uint32_t size)
+{
+    if (size >= 16) return size <= 0x4000u && !(size & 15u) && !((lsa | (uint32_t)ea) & 15u);
+    return !(size & (size - 1u)) && !((lsa | (uint32_t)ea) & (size - 1u)) && !((lsa ^ (uint32_t)ea) & 15u);
+}
+
+static inline void mfc_fault(const spu_context* spu, const char* what, uint32_t cmd, uint32_t lsa, uint64_t ea, uint32_t size)
+{
+    fprintf(stderr, "\n[mfc] FATAL: %s: img=%d pc=0x%05X cmd=0x%X lsa=0x%05X ea=0x%08llX size=%u\n", what, spu->image_id,
+            (uint32_t)spu->pc & SPU_LS_MASK, cmd, lsa, (unsigned long long)ea, size);
+    fflush(stderr);
+    _Exit(3);
 }
 
 /* MFC queue depth */
@@ -183,12 +159,8 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
          * (table 7-6); currently support whole 128-byte blocks, up to 16 KiB.
          * Reject other forms visibly instead of applying ordinary LS DMA
          * validation or claiming an unsupported command completed. */
-        if (!size || size > MFC_MAX_DMA_SIZE || (size & 127u) || (ea & 127u) ||
-            (ea >> 32) || !mfc_ea_range_committed(ea, size)) {
-            fprintf(stderr, "[mfc] REJECTED SDCRZ range: ea=0x%016llX size=%u\n",
-                    (unsigned long long)ea, size);
-            return -1;
-        }
+        if (!size || size > MFC_MAX_DMA_SIZE || (size & 127u) || (ea & 127u) || !mfc_ea_valid(ea, size))
+            mfc_fault(spu, "SDCRZ range", cmd, 0, ea, size);
         /* Storage controls impose a barrier in their tag group. Ordinary
          * transfers finish synchronously, but a stalled list does not. This
          * engine cannot execute SDCRZ ahead of that still-pending transfer. */
@@ -209,60 +181,11 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
         spu_lockline_unlock();
         return 0;
     }
-    /* Malformed transfers are REJECTED, as the hardware MFC does. The rules
-     * are the ones the SDK's own dma.h asserts: a non-zero size, at most
-     * 16 KB, a multiple of 16 once >= 16 bytes, and LSA/EA sharing 16-byte
-     * alignment. Real hardware raises an MFC alignment exception and does
-     * NOT move the data; performing it anyway lets one bad descriptor spray
-     * the guest image. YDKJ issues exactly one such PUT -- 16 KB from a
-     * 4-byte-aligned EA of 0x00542004, straight over the title's own data --
-     * and every later call through the clobbered OPDs reports
-     * "code 0x00000000 not registered". */
-    {
-          /* A PUT into the null page is the same class of accident: lv2 reserves
-           * the low 64 KB and no title DMAs there on purpose, so an EA that
-           * small means the descriptor field holding the real destination came
-           * through as zero. GETs from low EAs stay allowed: they only read
-           * garbage. */
-          int malformed = (size == 0) || (size > 0x4000)
-                       || (size >= 16 && (size & 15))
-                       || (((lsa ^ (uint32_t)ea) & 15) != 0)
-                       || (mfc_is_put(cmd) && (uint32_t)ea < 0x10000u);
-          if (malformed) {
-              static int _n = 0;
-              if (PS3_LOG_FIRST(_n, 8))
-                  fprintf(stderr, "[mfc] REJECTED malformed transfer: img=%d pc=0x%05X"
-                                  " cmd=0x%X lsa=0x%05X ea=0x%08X size=%u\n",
-                          spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK, cmd,
-                          lsa, (uint32_t)ea, size);
-              return 0;
-          } }
-    /* Validate size */
-    if (size == 0 || size > MFC_MAX_DMA_SIZE)
-        return -1;
-
-    /* Mask LSA to local store range */
+    if (!size) return 0;
+    if (!mfc_aligned(lsa, ea, size)) mfc_fault(spu, "DMA alignment", cmd, lsa, ea, size);
+    if (!mfc_ea_valid(ea, size)) mfc_fault(spu, "DMA address", cmd, lsa, ea, size);
     lsa &= SPU_LS_MASK;
-
-    /* Reject transfers that would overrun the 256 KB local store buffer (a real
-     * SPU MFC requires the LS range to be valid; an out-of-range lsa+size here
-     * would corrupt host heap past spu->ls). */
-    if ((uint64_t)lsa + (uint64_t)size > (uint64_t)SPU_LS_SIZE)
-        return -1;
-
-    /* Reject transfers whose main-memory range is not committed guest memory,
-     * so a garbage EA (e.g. from an incomplete SPURS context) is a failed DMA
-     * rather than a host segfault. */
-    if (!mfc_ea_range_committed(ea, size)) {
-        static int s_warned = 0;
-        if (PS3_LOG_FIRST(s_warned, 32))
-            fprintf(stderr, "[spu-dma] SKIP %s img=%d pc=0x%05X lsa=0x%05X ea=0x%08X "
-                    "size=%u%s (EA not committed -- bad/garbage DMA target)\n",
-                    mfc_is_get(cmd) ? "GET" : "PUT", spu->image_id,
-                    (uint32_t)spu->pc & SPU_LS_MASK, lsa, (uint32_t)ea, size,
-                    (size <= 8 && ((uint32_t)ea & (size - 1))) ? " MISALIGNED" : "");
-        return -1;
-    }
+    if (lsa + size > SPU_LS_SIZE) mfc_fault(spu, "DMA local store range", cmd, lsa, ea, size);
 
     uint8_t* ls_ptr = &spu->ls[lsa];
     uint8_t* ea_ptr = vm_base + (uint32_t)ea; /* PS3 uses 32-bit effective addresses for SPU DMA */
