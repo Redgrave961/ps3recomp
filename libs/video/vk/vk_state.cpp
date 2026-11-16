@@ -156,7 +156,7 @@ void fill_pipeline_state(const frontend& f, const vk_device& d, const draw_targe
 }
 
 void set_dynamic_state(VkCommandBuffer cmd, const frontend& f, const vk_device& d, const pipelines& p, const draw_target& t,
-                       uint32_t prim, bool restart)
+                       uint32_t prim, bool restart, const pipeline_key& key)
 {
     const float sx = (float)t.aa_u, sy = (float)t.aa_v;
     VkViewport vp{ 0.f, 0.f, (float)t.width * sx, (float)t.height * sy, 0.f, 1.f };
@@ -230,15 +230,9 @@ void set_dynamic_state(VkCommandBuffer cmd, const frontend& f, const vk_device& 
     vkCmdSetPrimitiveRestartEnable(cmd, restart && restart_capable(prim));
     vkCmdSetRasterizerDiscardEnable(cmd, VK_FALSE);
 
-    pipeline_key key{};
-    fill_pipeline_state(f, d, t, prim, key);
     if (p.dynamic_polygon_mode()) vkCmdSetPolygonModeEXT(cmd, (VkPolygonMode)key.polygon_mode);
     if (p.dynamic_depth_clamp()) vkCmdSetDepthClampEnableEXT(cmd, key.depth_clamp);
     if (p.dynamic_depth_clip()) vkCmdSetDepthClipEnableEXT(cmd, key.depth_clip);
-    if (p.dynamic_a2c()) {
-        vkCmdSetAlphaToCoverageEnableEXT(cmd, VK_FALSE);
-        vkCmdSetAlphaToOneEnableEXT(cmd, VK_FALSE);
-    }
     if (p.dynamic_provoking())
         vkCmdSetProvokingVertexModeEXT(cmd, key.provoking_last ? VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT : VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT);
     if (p.dynamic_blend()) {

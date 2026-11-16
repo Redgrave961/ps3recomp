@@ -511,7 +511,7 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
     VkCommandBuffer c = cmd();
     if (m_occlusion.enabled() && !m_occlusion.active()) m_occlusion.begin(c);
     vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
-    set_dynamic_state(c, *this, *m_d, m_pipelines, t, prim, restart && clause.kind == rsx::draw_kind::indexed);
+    set_dynamic_state(c, *this, *m_d, m_pipelines, t, prim, restart && clause.kind == rsx::draw_kind::indexed, key);
 
     VkDescriptorBufferInfo fp_consts{ fc.buffer, fc.offset, (VkDeviceSize)nconst * 16u };
     VkDescriptorBufferInfo fp_state{ fss.buffer, fss.offset, sizeof fs };

@@ -103,9 +103,12 @@ bool renderer::open(vk_device& d, VkSemaphore timeline, uint64_t* submitted, con
     }
     m_ubo_align = std::max<VkDeviceSize>(16, d.props.limits.minUniformBufferOffsetAlignment);
     m_ssbo_align = std::max<VkDeviceSize>(16, d.props.limits.minStorageBufferOffsetAlignment);
-    m_shaders.init(d);
-    return m_ring.create(d, 256ull << 20, timeline) && m_pipelines.create(d, cache_path) && create_dummies() &&
-           m_occlusion.create(d, timeline) && m_depth_pack.create(d);
+    m_shaders.init(d, m_pipelines);
+    if (!m_ring.create(d, 256ull << 20, timeline) || !m_pipelines.create(d, cache_path) || !create_dummies() ||
+        !m_occlusion.create(d, timeline) || !m_depth_pack.create(d))
+        return false;
+    m_pipelines.precompile(m_shaders);
+    return true;
 }
 
 void renderer::close()

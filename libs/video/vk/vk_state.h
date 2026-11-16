@@ -18,6 +18,6 @@ struct draw_target {
 
 void fill_pipeline_state(const rsx::frontend& f, const vk_device& d, const draw_target& t, uint32_t prim, pipeline_key& key);
 void set_dynamic_state(VkCommandBuffer cmd, const rsx::frontend& f, const vk_device& d, const pipelines& p, const draw_target& t,
-                       uint32_t prim, bool restart);
+                       uint32_t prim, bool restart, const pipeline_key& key);
 
 }
