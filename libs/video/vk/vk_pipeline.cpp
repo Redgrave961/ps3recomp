@@ -307,7 +307,7 @@ void pipelines::precompile(shader_cache& shaders)
                 std::memcpy(&key, r.a, sizeof key);
                 std::vector<uint32_t> program(RSX_SPV_VP_SLOTS * 4u);
                 std::memcpy(program.data(), r.b, r.bn);
-                shaders.vertex(program.data(), key, shader_cache::program_hash(program.data()), false);
+                shaders.vertex(program.data(), key, shader_cache::program_hash(program.data(), key.start), false);
             } else if (r.type == 'F' && r.an == sizeof(rsx_spv_fp_key) && r.bn % 4u == 0) {
                 rsx_spv_fp_key key;
                 std::memcpy(&key, r.a, sizeof key);

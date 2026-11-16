@@ -286,9 +286,9 @@ bool renderer::draw_setup()
         dirty |= rsx::D_VERTEX_PROGRAM;
     }
     if ((dirty & rsx::D_VERTEX_PROGRAM) || !m_vp) {
-        m_program_hash = shader_cache::hash(program, sizeof program, 0x5650u);
         rsx_spv_vp_key key{};
         key.start = r(rsx::M_TRANSFORM_PROGRAM_START);
+        m_program_hash = shader_cache::program_hash(program, key.start);
         key.output_mask = r(rsx::M_VERTEX_ATTRIB_OUTPUT_MASK);
         key.texture_dims = vdims;
 

@@ -33,7 +33,7 @@ public:
     const vertex_program* find_vertex(uint64_t hash);
     const fragment_program* find_fragment(uint64_t hash);
     static uint64_t hash(const void* data, size_t bytes, uint64_t seed);
-    static uint64_t program_hash(const uint32_t* program);
+    static uint64_t program_hash(const uint32_t* program, uint32_t start);
     static uint32_t fragment_extent(const uint32_t* ucode, uint32_t max_words);
 
 private:

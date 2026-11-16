@@ -28,9 +28,15 @@ uint64_t shader_cache::hash(const void* data, size_t bytes, uint64_t seed)
     return h;
 }
 
-uint64_t shader_cache::program_hash(const uint32_t* program)
+uint64_t shader_cache::program_hash(const uint32_t* program, uint32_t start)
 {
-    return hash(program, RSX_SPV_VP_SLOTS * 16u, 0x5650u);
+    uint8_t reach[RSX_SPV_VP_SLOTS];
+    const int dynamic = rsx_spv_vertex_reach(program, start, reach);
+    if (dynamic) return hash(program, RSX_SPV_VP_SLOTS * 16u, 0x5650u);
+    uint64_t h = 0x5650u ^ start;
+    for (uint32_t pc = 0; pc < RSX_SPV_VP_SLOTS; pc++)
+        if (reach[pc]) h = hash(program + pc * 4u, 16u, h ^ pc);
+    return h;
 }
 
 uint32_t shader_cache::fragment_extent(const uint32_t* ucode, uint32_t max_words)

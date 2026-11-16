@@ -706,6 +706,19 @@ static void vp_walk(vpc* c, u32 start)
     }
 }
 
+int rsx_spv_vertex_reach(const u32* ucode, u32 start, u8* reach)
+{
+    if (start >= VP_SLOTS) return -1;
+    vpc* c = (vpc*)calloc(1, sizeof(vpc));
+    if (!c) return -1;
+    c->uc = ucode;
+    vp_walk(c, start);
+    memcpy(reach, c->reach, VP_SLOTS);
+    const int dynamic = c->has_bra;
+    free(c);
+    return dynamic;
+}
+
 static void vp_prescan(vpc* c)
 {
     for (u32 pc = 0; pc < VP_SLOTS; pc++) {
