@@ -186,7 +186,6 @@ private:
     std::vector<u32> m_page_stamp;
     u32 m_stamp = 1;
     u64 m_epoch = 1;
-    u64 m_scanned_epoch = 0;
     std::vector<rsx::texture_copy> m_copies;
 
 public:

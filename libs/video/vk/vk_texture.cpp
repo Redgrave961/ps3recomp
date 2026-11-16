@@ -30,7 +30,6 @@ u32 texel_bytes(VkFormat f)
     default: return 0;
     }
 }
-constexpr u32 k_local_scan_bytes = RSX_LOCAL_SIZE_MAX;
 
 uint64_t mix(uint64_t h, uint64_t v)
 {
@@ -84,11 +83,8 @@ bool renderer::memory_changed(u32 ea, u32 size, u32 stamp)
             if (count < pages.size()) return true;
         }
     };
-    if (m_scanned_epoch != m_epoch) {
-        m_scanned_epoch = m_epoch;
-        scan(RSX_LOCAL_BASE, std::min<u32>(k_local_scan_bytes, rsx_core_local_size()));
-    }
-    if (ea < RSX_LOCAL_BASE) scan(ea & ~((1u << k_page_shift) - 1u), ((ea & ((1u << k_page_shift) - 1u)) + size + (1u << k_page_shift) - 1u) & ~((1u << k_page_shift) - 1u));
+    const u32 mask = (1u << k_page_shift) - 1u;
+    if (!scan(ea & ~mask, ((ea & mask) + size + mask) & ~mask)) return true;
     for (uint64_t p = ea >> k_page_shift; p <= ((uint64_t)ea + size - 1u) >> k_page_shift; p++)
         if (m_page_stamp[p] > stamp) return true;
     return false;
