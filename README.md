@@ -228,8 +228,8 @@ HLE implementations of the PS3 system libraries, written for this project. RPCS3
 | **Kernel Filesystem** | sys_fs (path mapping, real I/O) | ✅ Complete |
 | **Filesystem** | cellFs (real file I/O, dir ops, stat, path translation) | ✅ Complete |
 | **Save System** | cellSaveData (callback-driven, PARAM.SFO), cellGame | ✅ Complete |
-| **Input** | cellPad (XInput/SDL2), cellKb, cellMouse | ✅ Complete |
-| **Audio** | cellAudio (WASAPI/SDL2, mixing thread, multi-port) | ✅ Complete |
+| **Input** | cellPad (XInput/SDL3), cellKb, cellMouse | ✅ Complete |
+| **Audio** | cellAudio (WASAPI/SDL3, mixing thread, multi-port) | ✅ Complete |
 | **Video Output** | cellVideoOut (resolution config, 720p default) | ✅ Complete |
 | **Codecs** | cellPngDec, cellJpgDec, cellGifDec (stb_image) | ✅ Complete |
 | **Font** | cellFont (stb_truetype backend + fallback metrics) | ✅ Complete |
@@ -291,9 +291,9 @@ says what that platform can and cannot do yet.
 > **Prerequisites (building from source)**: Python 3.10+ (CI uses 3.12), CMake
 > 3.20+, Ninja, and a C17/C++20 compiler: clang-cl with Visual Studio 2022 on
 > Windows (plain MSVC builds the runtime library, but lifted game code needs
-> clang-cl), GCC or Clang on Linux, Apple Clang (Xcode) on macOS. SDL2 is
+> clang-cl), GCC or Clang on Linux, Apple Clang (Xcode) on macOS. SDL3 is
 > required on Linux and macOS. On macOS, install the command-line dependencies
-> with `brew install cmake ninja python@3.12 sdl2`. CI builds with the compilers on
+> with `brew install cmake ninja python@3.12 sdl3`. CI builds with the compilers on
 > GitHub's `windows-latest`, `ubuntu-latest` and `macos-14` runner images; no
 > older compiler version is tested.
 
@@ -396,7 +396,7 @@ Want to port a game? Start with the [Getting Started](#getting-started) section,
 
 - **RPCS3**: a behavioural reference for HLE modules and syscalls. We read what it does and then write our own. No RPCS3 (GPL) code belongs in this tree.
 - **Direct3D 12 / Metal / Vulkan**: RSX graphics translation. D3D12 is the backend that runs games in this tree today. Metal (macOS) and Vulkan (Linux, opt-in, see [docs/BUILDING.md](docs/BUILDING.md#the-vulkan-backend-linux-opt-in)) run guest shaders on the shared draw engine. CI draws with the headless null backend.
-- **SDL2**: input and audio off Windows. `cellPad` and `cellAudio` always use their SDL2 backends on non-Windows hosts, so SDL2 is required there; on Windows they use XInput and WASAPI. SDL2 does no windowing here; each graphics backend makes its own.
+- **SDL3**: input and audio off Windows. `cellPad` and `cellAudio` always use their SDL3 backends on non-Windows hosts, so SDL3 is required there; on Windows they use XInput and WASAPI. SDL3 does no windowing here; each graphics backend makes its own.
 - **FFmpeg** (optional, loaded at run time): video decode for cellVdec and ATRAC3plus for cellAtrac. It is never linked and never vendored.
 
 ## Contributing

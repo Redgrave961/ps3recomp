@@ -13,7 +13,7 @@
  *                          rsx_texture_decode(); depth test, no blend/stencil
  *   vtable guest programs  the same path running the decompilers' HLSL, with
  *                          whole mip chains and per-unit samplers
- *   optional window        SDL2 + swapchain; a present blits the frame into it
+ *   optional window        SDL3 + swapchain; a present blits the frame into it
  *   draw engine backend    rsx_draw_backend: targets, clears, present and
  *                          readback (E1), pipelines and draws (E2), textures,
  *                          surface views and samplers (E3), depth snapshots
@@ -53,10 +53,10 @@
 #include "vulkan/rsx_vk_fallback_vert.spv.h"
 #include "vulkan/rsx_vk_fallback_frag.spv.h"
 
-/* SDL2 is already required off Windows (cellPad, cellAudio); here it only
+/* SDL3 is already required off Windows (cellPad, cellAudio); here it only
  * opens the optional window. Same include style as those two. */
-#include <SDL2/SDL.h>
-#include <SDL2/SDL_vulkan.h>
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_vulkan.h>
 
 #include <dlfcn.h>
 #include <pthread.h>
@@ -1704,7 +1704,7 @@ static void vk_cb_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
 /* ---------------------------------------------------------------------------
  * Optional window: PS3RECOMP_VK_WINDOW=1
  *
- * An SDL2 window with a Vulkan swapchain. Rendering still targets the
+ * An SDL3 window with a Vulkan swapchain. Rendering still targets the
  * offscreen image, so readback and every test are unchanged; a present then
  * also blits that image into the next swapchain image. Any failure on this
  * path drops back to headless with a message instead of failing the run.
@@ -1746,17 +1746,16 @@ static void vk_window_drop(const char* why)
 static void vk_window_open(const char* title)
 {
     if (!vk_env_on("PS3RECOMP_VK_WINDOW")) return;
-    if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) {
+    if (!SDL_InitSubSystem(SDL_INIT_VIDEO)) {
         VK_LOG("window disabled, continuing headless: SDL video init failed: %s\n", SDL_GetError());
         return;
     }
     /* Resizable and maximizable; F11 or Alt+Enter switches to borderless fullscreen and back. The frame keeps its
      * aspect ratio inside whatever size the window has (vk_window_fit). */
-    Uint32 flags = SDL_WINDOW_VULKAN | SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE;
+    SDL_WindowFlags flags = SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE;
     /* PS3RECOMP_FULLSCREEN=1 (--fullscreen), the same for every backend; PS3RECOMP_VK_FULLSCREEN is the older name. */
-    if (vk_env_on("PS3RECOMP_FULLSCREEN") || vk_env_on("PS3RECOMP_VK_FULLSCREEN")) flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
+    if (vk_env_on("PS3RECOMP_FULLSCREEN") || vk_env_on("PS3RECOMP_VK_FULLSCREEN")) flags |= SDL_WINDOW_FULLSCREEN;
     s_vk.window = SDL_CreateWindow(title && title[0] ? title : "ps3recomp",
-                                   SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                    (int)s_vk.width, (int)s_vk.height, flags);
     s_vk.windowed = 1;          /* so vk_window_drop also shuts SDL video down */
     if (!s_vk.window) {
@@ -1766,15 +1765,16 @@ static void vk_window_open(const char* title)
         return;
     }
     SDL_SetWindowMinimumSize(s_vk.window, 320, 180);
-    if (flags & SDL_WINDOW_FULLSCREEN_DESKTOP) SDL_ShowCursor(SDL_DISABLE);
-    unsigned n = 0;
-    if (!SDL_Vulkan_GetInstanceExtensions(s_vk.window, &n, NULL) || n == 0 || n > 16 ||
-        !SDL_Vulkan_GetInstanceExtensions(s_vk.window, &n, s_vk.inst_exts)) {
+    if (flags & SDL_WINDOW_FULLSCREEN) SDL_HideCursor();
+    Uint32 n = 0;
+    const char* const* exts = SDL_Vulkan_GetInstanceExtensions(&n);
+    if (!exts || n == 0 || n > 16) {
         char why[256];
         snprintf(why, sizeof why, "no Vulkan surface extensions (%s)", SDL_GetError());
         vk_window_drop(why);
         return;
     }
+    for (Uint32 i = 0; i < n; i++) s_vk.inst_exts[i] = exts[i];
     s_vk.inst_ext_count = n;
     const char* hold = getenv("PS3RECOMP_VK_HOLD");
     s_vk.hold_seconds = hold ? atof(hold) : 0.0;
@@ -1820,7 +1820,7 @@ static int vk_create_swapchain(void)
     VkExtent2D ext = caps.currentExtent;
     if (ext.width == 0xFFFFFFFFu) {
         int w = 0, hh = 0;
-        SDL_Vulkan_GetDrawableSize(s_vk.window, &w, &hh);
+        SDL_GetWindowSizeInPixels(s_vk.window, &w, &hh);
         ext.width = (u32)w; ext.height = (u32)hh;
         if (ext.width  < caps.minImageExtent.width)  ext.width  = caps.minImageExtent.width;
         if (ext.height < caps.minImageExtent.height) ext.height = caps.minImageExtent.height;
@@ -1888,7 +1888,7 @@ static int vk_window_hidden(void)
 {
     int w = 0, h = 0;
     if (SDL_GetWindowFlags(s_vk.window) & SDL_WINDOW_MINIMIZED) return 1;
-    SDL_Vulkan_GetDrawableSize(s_vk.window, &w, &h);
+    SDL_GetWindowSizeInPixels(s_vk.window, &w, &h);
     return w <= 0 || h <= 0;
 }
 
@@ -3965,7 +3965,7 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     if (s_vk.windowed) {
         if (vk_load_wsi_instance_functions()) {
             vk_window_drop("the driver has no surface functions");
-        } else if (!SDL_Vulkan_CreateSurface(s_vk.window, s_vk.instance, &s_vk.surface)) {
+        } else if (!SDL_Vulkan_CreateSurface(s_vk.window, s_vk.instance, NULL, &s_vk.surface)) {
             char why[256];
             snprintf(why, sizeof why, "SDL_Vulkan_CreateSurface failed: %s", SDL_GetError());
             vk_window_drop(why);
@@ -4111,8 +4111,8 @@ void rsx_vulkan_backend_shutdown(void)
     if (s_vk.windowed && s_vk.swapchain && s_vk.presented && s_vk.hold_seconds > 0.0) {
         VK_LOG("holding the last frame on screen for %.1f s "
                "(Esc or closing the window ends it early)\n", s_vk.hold_seconds);
-        const Uint32 end = SDL_GetTicks() + (Uint32)(s_vk.hold_seconds * 1000.0);
-        while (s_vk.windowed && !SDL_TICKS_PASSED(SDL_GetTicks(), end)) {
+        const Uint64 end = SDL_GetTicks() + (Uint64)(s_vk.hold_seconds * 1000.0);
+        while (s_vk.windowed && SDL_GetTicks() < end) {
             if (rsx_vulkan_backend_pump_messages() != 0) break;
             vk_present_window();         /* FIFO: paced by the display */
         }
@@ -4160,19 +4160,19 @@ int rsx_vulkan_backend_pump_messages(void)
     int quit = 0;
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
-        if (e.type == SDL_QUIT) quit = 1;
-        else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) quit = 1;
-        else if (e.type == SDL_KEYDOWN && !e.key.repeat && s_vk.window &&
-                 (e.key.keysym.sym == SDLK_F11 ||
-                  (e.key.keysym.sym == SDLK_RETURN && (e.key.keysym.mod & KMOD_ALT)))) {
+        if (e.type == SDL_EVENT_QUIT || e.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) quit = 1;
+        else if (e.type == SDL_EVENT_KEY_DOWN && e.key.key == SDLK_ESCAPE) quit = 1;
+        else if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat && s_vk.window &&
+                 (e.key.key == SDLK_F11 ||
+                  (e.key.key == SDLK_RETURN && (e.key.mod & SDL_KMOD_ALT)))) {
             /* Borderless fullscreen on the window's display, and back. */
-            const int full = (SDL_GetWindowFlags(s_vk.window) & SDL_WINDOW_FULLSCREEN_DESKTOP) != 0;
-            if (SDL_SetWindowFullscreen(s_vk.window, full ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP) == 0)
-                SDL_ShowCursor(full ? SDL_ENABLE : SDL_DISABLE);
+            const bool full = (SDL_GetWindowFlags(s_vk.window) & SDL_WINDOW_FULLSCREEN) != 0;
+            if (SDL_SetWindowFullscreen(s_vk.window, !full)) {
+                if (full) SDL_ShowCursor(); else SDL_HideCursor();
+            }
             s_vk_resized = 1;
-        } else if (e.type == SDL_WINDOWEVENT &&
-                   (e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED || e.window.event == SDL_WINDOWEVENT_RESTORED ||
-                    e.window.event == SDL_WINDOWEVENT_MAXIMIZED)) {
+        } else if (e.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED || e.type == SDL_EVENT_WINDOW_RESTORED ||
+                   e.type == SDL_EVENT_WINDOW_MAXIMIZED) {
             s_vk_resized = 1;
         }
     }

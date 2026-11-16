@@ -26,22 +26,22 @@ u32 cellGcm_flip_request_count(void){return 0;}
 
 static int device,attached;
 static u16 device_buttons;
-void SDL_GameControllerUpdate(void){}
-SDL_bool SDL_IsGameController(int n){(void)n;return SDL_FALSE;}
-SDL_bool SDL_GameControllerGetAttached(SDL_GameController* gc)
-{return gc==(SDL_GameController*)&device && attached;}
-void SDL_GameControllerClose(SDL_GameController* gc){(void)gc;}
-int SDL_GameControllerRumble(SDL_GameController* gc,Uint16 lo,Uint16 hi,Uint32 ms)
-{(void)gc;(void)lo;(void)hi;(void)ms;return 0;}
-Uint8 SDL_GameControllerGetButton(SDL_GameController* gc,SDL_GameControllerButton b)
+void SDL_UpdateGamepads(void){}
+SDL_JoystickID* SDL_GetGamepads(int* count){if(count)*count=0;return SDL_calloc(1,sizeof(SDL_JoystickID));}
+bool SDL_GamepadConnected(SDL_Gamepad* gp)
+{return gp==(SDL_Gamepad*)&device && attached;}
+void SDL_CloseGamepad(SDL_Gamepad* gp){(void)gp;}
+bool SDL_RumbleGamepad(SDL_Gamepad* gp,Uint16 lo,Uint16 hi,Uint32 ms)
+{(void)gp;(void)lo;(void)hi;(void)ms;return true;}
+bool SDL_GetGamepadButton(SDL_Gamepad* gp,SDL_GamepadButton b)
 {
-    (void)gc;
-    if(b==SDL_CONTROLLER_BUTTON_B)return !!(device_buttons&CELL_PAD_CTRL_CIRCLE);
-    if(b==SDL_CONTROLLER_BUTTON_A)return !!(device_buttons&CELL_PAD_CTRL_CROSS);
-    return 0;
+    (void)gp;
+    if(b==SDL_GAMEPAD_BUTTON_EAST)return !!(device_buttons&CELL_PAD_CTRL_CIRCLE);
+    if(b==SDL_GAMEPAD_BUTTON_SOUTH)return !!(device_buttons&CELL_PAD_CTRL_CROSS);
+    return false;
 }
-Sint16 SDL_GameControllerGetAxis(SDL_GameController* gc,SDL_GameControllerAxis a)
-{(void)gc;return a==SDL_CONTROLLER_AXIS_TRIGGERLEFT||a==SDL_CONTROLLER_AXIS_TRIGGERRIGHT?0:1;}
+Sint16 SDL_GetGamepadAxis(SDL_Gamepad* gp,SDL_GamepadAxis a)
+{(void)gp;return a==SDL_GAMEPAD_AXIS_LEFT_TRIGGER||a==SDL_GAMEPAD_AXIS_RIGHT_TRIGGER?0:1;}
 
 static CellPadData* guest=(CellPadData*)(uintptr_t)0x100;
 static void publish(const char* path,const char* text)
@@ -97,7 +97,7 @@ int main(int argc,char** argv)
         for(unsigned n=0;n<100;n++)assert(read_pad(1)==0);
         held_reports(2,CELL_PAD_CTRL_CROSS,0);
     }else if(!strcmp(mode,"physical")){
-        s_sdl_controllers[0]=(SDL_GameController*)&device;attached=1;
+        s_sdl_controllers[0]=(SDL_Gamepad*)&device;attached=1;
         device_buttons=CELL_PAD_CTRL_CIRCLE;
         publish(path,"0x4000 2\n");assert(read_pad(0)==0);
         held_reports(2,CELL_PAD_CTRL_CROSS|CELL_PAD_CTRL_CIRCLE,CELL_PAD_CTRL_CIRCLE);

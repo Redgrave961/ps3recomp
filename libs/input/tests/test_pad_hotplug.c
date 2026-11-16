@@ -4,14 +4,12 @@
  * port, also when nobody delivered its device event; the ports report the
  * change once (CELL_PAD_STATUS_ASSIGN_CHANGES), and no rumble is left over.
  *
- *   clang -std=gnu17 -I include $(sdl2-config --cflags) -I "$(sdl2-config --prefix)/include" \
- *         libs/input/tests/test_pad_hotplug.c $(sdl2-config --libs) -o /tmp/test_pad_hotplug && /tmp/test_pad_hotplug
+ *   clang -std=gnu17 -I include $(pkg-config --cflags sdl3) \
+ *         libs/input/tests/test_pad_hotplug.c $(pkg-config --libs sdl3) -o /tmp/test_pad_hotplug && /tmp/test_pad_hotplug
  *
  * No controller is opened: the test defines every SDL call the backend makes
- * (they take precedence over libSDL2's), over a fake device list that behaves
- * like Homebrew's SDL2 (sdl2-compat on SDL3): a device index resolves through
- * a list refreshed only by SDL_NumJoysticks, so code that never calls it
- * keeps seeing the switched-off controller.
+ * (they take precedence over libSDL3's), over a fake device list: SDL_GetGamepads
+ * returns the instance ids of the pads that are present.
  */
 #include "../cellPad.c"
 #include <assert.h>
@@ -34,14 +32,13 @@ typedef struct {
     int      id;           /* SDL instance id; a reconnect gets a new one */
     int      guid;         /* which physical pad */
     int      present;      /* in the system's device list */
-    uint32_t buttons;      /* SDL_GameControllerButton bits */
-    int      opens;        /* times SDL_GameControllerOpen returned it */
+    uint32_t buttons;      /* SDL_GamepadButton bits */
+    int      opens;        /* times SDL_OpenGamepad returned it */
     int      closed;       /* its handle was closed */
     unsigned rumble_lo, rumble_hi, rumble_calls;
 } FakePad;
 static FakePad s_fp[8];
 static int s_nfp;
-static int s_cached[8], s_ncached;   /* sdl2-compat's index list */
 static Uint32 s_events[64];
 static int s_nevents;
 
@@ -59,49 +56,51 @@ static FakePad* fake_by_id(int id)
     return NULL;
 }
 
-int SDL_NumJoysticks(void)
+SDL_JoystickID* SDL_GetGamepads(int* count)
 {
-    s_ncached = 0;
-    for (int i = 0; i < s_nfp; i++) if (s_fp[i].present) s_cached[s_ncached++] = s_fp[i].id;
-    return s_ncached;
+    SDL_JoystickID* ids = SDL_calloc((size_t)s_nfp + 1, sizeof *ids);
+    int n = 0;
+    for (int i = 0; i < s_nfp; i++) if (s_fp[i].present) ids[n++] = (SDL_JoystickID)s_fp[i].id;
+    if (count) *count = n;
+    return ids;
 }
-static FakePad* fake_at(int idx) { return idx >= 0 && idx < s_ncached ? fake_by_id(s_cached[idx]) : NULL; }
-SDL_bool SDL_IsGameController(int idx) { FakePad* p = fake_at(idx); return p && p->present ? SDL_TRUE : SDL_FALSE; }
-SDL_JoystickID SDL_JoystickGetDeviceInstanceID(int idx) { FakePad* p = fake_at(idx); return p ? p->id : -1; }
-SDL_JoystickGUID SDL_JoystickGetDeviceGUID(int idx)
+SDL_GUID SDL_GetGamepadGUIDForID(SDL_JoystickID id)
 {
-    SDL_JoystickGUID g; memset(&g, 0, sizeof g);
-    FakePad* p = fake_at(idx);
+    SDL_GUID g; memset(&g, 0, sizeof g);
+    FakePad* p = fake_by_id((int)id);
     if (p) g.data[0] = (Uint8)p->guid;
     return g;
 }
-const char* SDL_JoystickNameForIndex(int idx) { (void)idx; return "Fake DualSense"; }
-SDL_GameController* SDL_GameControllerOpen(int idx)
+SDL_Gamepad* SDL_OpenGamepad(SDL_JoystickID id)
 {
-    FakePad* p = fake_at(idx);
+    FakePad* p = fake_by_id((int)id);
     if (!p || !p->present) return NULL;
     p->opens++; p->closed = 0;
-    return (SDL_GameController*)p;
+    return (SDL_Gamepad*)p;
 }
-void SDL_GameControllerClose(SDL_GameController* gc) { ((FakePad*)gc)->closed = 1; }
-SDL_bool SDL_GameControllerGetAttached(SDL_GameController* gc) { return ((FakePad*)gc)->present ? SDL_TRUE : SDL_FALSE; }
-const char* SDL_GameControllerName(SDL_GameController* gc) { (void)gc; return "Fake DualSense"; }
-SDL_bool SDL_GameControllerHasRumble(SDL_GameController* gc) { (void)gc; return SDL_TRUE; }
-int SDL_GameControllerRumble(SDL_GameController* gc, Uint16 lo, Uint16 hi, Uint32 ms)
+void SDL_CloseGamepad(SDL_Gamepad* gp) { ((FakePad*)gp)->closed = 1; }
+bool SDL_GamepadConnected(SDL_Gamepad* gp) { return ((FakePad*)gp)->present != 0; }
+const char* SDL_GetGamepadName(SDL_Gamepad* gp) { (void)gp; return "Fake DualSense"; }
+SDL_PropertiesID SDL_GetGamepadProperties(SDL_Gamepad* gp) { (void)gp; return 1; }
+bool SDL_GetBooleanProperty(SDL_PropertiesID props, const char* name, bool default_value)
+{
+    return props == 1 && !strcmp(name, SDL_PROP_GAMEPAD_CAP_RUMBLE_BOOLEAN) ? true : default_value;
+}
+bool SDL_RumbleGamepad(SDL_Gamepad* gp, Uint16 lo, Uint16 hi, Uint32 ms)
 {
     (void)ms;
-    FakePad* p = (FakePad*)gc;
+    FakePad* p = (FakePad*)gp;
     assert(!p->closed);
     p->rumble_lo = lo; p->rumble_hi = hi; p->rumble_calls++;
-    return 0;
+    return true;
 }
-Uint8 SDL_GameControllerGetButton(SDL_GameController* gc, SDL_GameControllerButton b)
+bool SDL_GetGamepadButton(SDL_Gamepad* gp, SDL_GamepadButton b)
 {
-    return (Uint8)((((FakePad*)gc)->buttons >> b) & 1u);
+    return ((((FakePad*)gp)->buttons >> b) & 1u) != 0;
 }
-Sint16 SDL_GameControllerGetAxis(SDL_GameController* gc, SDL_GameControllerAxis a) { (void)gc; (void)a; return 0; }
-void SDL_GameControllerUpdate(void) {}
-int SDL_PeepEvents(SDL_Event* ev, int n, SDL_eventaction action, Uint32 lo, Uint32 hi)
+Sint16 SDL_GetGamepadAxis(SDL_Gamepad* gp, SDL_GamepadAxis a) { (void)gp; (void)a; return 0; }
+void SDL_UpdateGamepads(void) {}
+int SDL_PeepEvents(SDL_Event* ev, int n, SDL_EventAction action, Uint32 lo, Uint32 hi)
 {
     assert(action == SDL_GETEVENT);
     int got = 0, keep = 0;
@@ -116,8 +115,8 @@ int SDL_PeepEvents(SDL_Event* ev, int n, SDL_eventaction action, Uint32 lo, Uint
     s_nevents = keep;
     return got;
 }
-Uint32 SDL_WasInit(Uint32 flags) { (void)flags; return flags; }
-int SDL_InitSubSystem(Uint32 flags) { (void)flags; return 0; }
+SDL_InitFlags SDL_WasInit(SDL_InitFlags flags) { (void)flags; return flags; }
+bool SDL_InitSubSystem(SDL_InitFlags flags) { (void)flags; return true; }
 const char* SDL_GetError(void) { return "fake"; }
 
 /* ---- helpers ---------------------------------------------------------------- */
@@ -155,9 +154,9 @@ int main(void)
     /* A DualSense is on at start: port 0. */
     FakePad* a = fake_new(1, 0xA5);
     assert(cellPadInit(4) == CELL_OK);
-    assert(a->opens == 1 && s_sdl_controllers[0] == (SDL_GameController*)a);
+    assert(a->opens == 1 && s_sdl_controllers[0] == (SDL_Gamepad*)a);
     assert(info_status(0) == CELL_PAD_STATUS_CONNECTED);   /* what is there at start: no change flag */
-    a->buttons = 1u << SDL_CONTROLLER_BUTTON_A;
+    a->buttons = 1u << SDL_GAMEPAD_BUTTON_SOUTH;
     assert(data_digital2(0) & CROSS_BIT);
     a->buttons = 0;
 
@@ -170,10 +169,10 @@ int main(void)
 
     /* Switched off: SDL drops it (and says so with an event). */
     a->present = 0;
-    fake_event(SDL_CONTROLLERDEVICEREMOVED);
-    fake_event(SDL_JOYDEVICEREMOVED);
+    fake_event(SDL_EVENT_GAMEPAD_REMOVED);
+    fake_event(SDL_EVENT_JOYSTICK_REMOVED);
     poll_once();
-    assert(a->closed && s_sdl_controllers[0] == NULL && s_sdl_ids[0] == -1);
+    assert(a->closed && s_sdl_controllers[0] == NULL && s_sdl_ids[0] == 0);
     assert(s_rumble[0].lo == 0 && s_rumble[0].hi == 0 && s_rumble[0].sent_ms == 0);
     assert(info_status(0) == CELL_PAD_STATUS_CONNECTED);   /* port 0 is the virtual pad: still there */
     assert(s_nevents == 0);                                 /* the events were drained */
@@ -181,12 +180,12 @@ int main(void)
     /* Switched on again: the same pad, a new instance id. Port 0 again, motors
      * off, nothing of the old rumble renewed. */
     FakePad* a2 = fake_new(7, 0xA5);
-    fake_event(SDL_JOYDEVICEADDED);
-    fake_event(SDL_CONTROLLERDEVICEADDED);
+    fake_event(SDL_EVENT_JOYSTICK_ADDED);
+    fake_event(SDL_EVENT_GAMEPAD_ADDED);
     poll_once();
-    assert(a2->opens == 1 && s_sdl_controllers[0] == (SDL_GameController*)a2 && s_sdl_ids[0] == 7);
+    assert(a2->opens == 1 && s_sdl_controllers[0] == (SDL_Gamepad*)a2 && s_sdl_ids[0] == 7);
     assert(a2->rumble_calls == 1 && a2->rumble_lo == 0 && a2->rumble_hi == 0);
-    a2->buttons = 1u << SDL_CONTROLLER_BUTTON_A;
+    a2->buttons = 1u << SDL_GAMEPAD_BUTTON_SOUTH;
     assert(data_digital2(0) & CROSS_BIT);                   /* it plays again */
     a2->buttons = 0;
     usleep((PAD_RUMBLE_RENEW_MS + 50) * 1000);
@@ -198,36 +197,36 @@ int main(void)
     FakePad* b = fake_new(9, 0xB6);
     poll_once();
     if (!s_sdl_controllers[1]) { usleep((PAD_SDL_RESCAN_MS + 50) * 1000); poll_once(); }
-    assert(b->opens == 1 && s_sdl_controllers[1] == (SDL_GameController*)b);
+    assert(b->opens == 1 && s_sdl_controllers[1] == (SDL_Gamepad*)b);
     assert(a2->opens == 1);                                 /* the open one is not opened twice */
     assert(info_status(1) == (CELL_PAD_STATUS_CONNECTED | CELL_PAD_STATUS_ASSIGN_CHANGES));
     assert(info_status(1) == CELL_PAD_STATUS_CONNECTED);
-    b->buttons = 1u << SDL_CONTROLLER_BUTTON_B;
+    b->buttons = 1u << SDL_GAMEPAD_BUTTON_EAST;
     assert(data_digital2(1) & CIRCLE_BIT);
     b->buttons = 0;
 
     /* Both go off; the second one comes back first: it gets port 1 back, the
      * port its GUID had, not the lowest free one. */
     a2->present = 0; b->present = 0;
-    fake_event(SDL_CONTROLLERDEVICEREMOVED);
+    fake_event(SDL_EVENT_GAMEPAD_REMOVED);
     poll_once();
     assert(!s_sdl_controllers[0] && !s_sdl_controllers[1]);
     assert(info_status(1) == (CELL_PAD_STATUS_DISCONNECTED | CELL_PAD_STATUS_ASSIGN_CHANGES));
     assert(info_status(1) == CELL_PAD_STATUS_DISCONNECTED);
     FakePad* b2 = fake_new(11, 0xB6);
-    fake_event(SDL_CONTROLLERDEVICEADDED);
+    fake_event(SDL_EVENT_GAMEPAD_ADDED);
     poll_once();
-    assert(s_sdl_controllers[1] == (SDL_GameController*)b2 && !s_sdl_controllers[0]);
+    assert(s_sdl_controllers[1] == (SDL_Gamepad*)b2 && !s_sdl_controllers[0]);
     FakePad* a3 = fake_new(12, 0xA5);
-    fake_event(SDL_CONTROLLERDEVICEADDED);
+    fake_event(SDL_EVENT_GAMEPAD_ADDED);
     poll_once();
-    assert(s_sdl_controllers[0] == (SDL_GameController*)a3);
+    assert(s_sdl_controllers[0] == (SDL_Gamepad*)a3);
 
     /* A new pad with no history takes the lowest free port. */
     FakePad* c = fake_new(13, 0xC7);
-    fake_event(SDL_CONTROLLERDEVICEADDED);
+    fake_event(SDL_EVENT_GAMEPAD_ADDED);
     poll_once();
-    assert(s_sdl_controllers[2] == (SDL_GameController*)c);
+    assert(s_sdl_controllers[2] == (SDL_Gamepad*)c);
 
     assert(cellPadEnd() == CELL_OK);
     assert(a3->closed && b2->closed && c->closed);

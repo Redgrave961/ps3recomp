@@ -42,7 +42,7 @@
  * texture unit bound at a registered surface's offset then samples that surface
  * rather than guest memory, which is what render-to-texture is.
  *
- * Why Metal rather than SDL_Renderer: SDL2's renderer is a 2D sprite API with
+ * Why Metal rather than SDL_Renderer: SDL's renderer is a 2D sprite API with
  * no route to a custom vertex program, depth/stencil, MRT or render-to-texture,
  * so it cannot grow into the real pipeline.
  */

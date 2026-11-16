@@ -34,7 +34,7 @@ Porting a PS3 game with ps3recomp is a **per-game project**. Unlike emulation (w
 - Decryption keys or a fSELF version of the game binary
 - Python 3.10+ for the recompiler tools
 - CMake 3.20+, Ninja and a C17/C++20 compiler
-- SDL2 on Linux and macOS
+- SDL3 on Linux and macOS
 - RPCS3 as a reference (for testing and behavior verification)
 - Patience and debugging skills
 
@@ -503,7 +503,7 @@ cellAudio provides real audio output. Most games just need:
 
 ### Input
 
-cellPad provides real gamepad input via XInput (Windows) or SDL2.
+cellPad provides real gamepad input via XInput (Windows) or SDL3.
 
 **Button mapping (XInput → PS3):**
 | XInput | PS3 |

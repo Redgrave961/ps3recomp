@@ -31,13 +31,13 @@ Run existing game ports, compare behavior with RPCS3, and report discrepancies. 
 - **CMake 3.20+** — build system
 - **C17/C++20 compiler** — MSVC 19.x (VS 2019+), GCC 12+, or Clang 15+
 - **Ninja** — build tool used by the commands below
-- **SDL2** — required on Linux and macOS for input and audio
+- **SDL3** — required on Linux and macOS for input and audio
 - **Git** — version control
 
 On macOS, install the command-line dependencies with:
 
 ```bash
-brew install cmake ninja python@3.12 sdl2
+brew install cmake ninja python@3.12 sdl3
 ```
 
 ### Building from Source

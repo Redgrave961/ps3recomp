@@ -49,12 +49,12 @@ CI builds with the compilers on GitHub's `windows-latest`, `ubuntu-latest` and `
 **Linux:**
 - GCC or Clang
 - Development headers: `libpthread`, `libm`
-- SDL2 development package (`libsdl2-dev` on Debian/Ubuntu) for input/audio
+- SDL3 development package (`libsdl3-dev` on Debian/Ubuntu) for input/audio
 
 **macOS:**
 - Xcode or the Xcode Command Line Tools (Apple Clang)
-- CMake, Ninja, Python 3.12 and SDL2:
-  `brew install cmake ninja python@3.12 sdl2`
+- CMake, Ninja, Python 3.12 and SDL3:
+  `brew install cmake ninja python@3.12 sdl3`
 - Optional guest-shader translation: `brew install glslang spirv-cross`
 
 ---
@@ -285,7 +285,7 @@ NVIDIA's L4T driver (Vulkan 1.2, Tegra X1).
 | `PS3RECOMP_VK_DEVICE=<n>` | Use physical device *n* instead of the first non-CPU one |
 | `PS3RECOMP_VK_DUMP=<path>` | Write each presented frame to *path* as a binary PPM |
 | `PS3RECOMP_VK_DUMP_EVERY=<n>` | With a dump: write only every *n*th presented frame (default 1). A full-frame write per present slows a running title noticeably |
-| `PS3RECOMP_VK_WINDOW=1` | Also show frames in an SDL2 window; if it cannot, the run continues headless and says why |
+| `PS3RECOMP_VK_WINDOW=1` | Also show frames in an SDL3 window; if it cannot, the run continues headless and says why |
 | `PS3RECOMP_VK_FULLSCREEN=1` | With a window: borderless full screen |
 | `PS3RECOMP_VK_HOLD=<sec>` | With a window: keep the last frame up for that long before exiting |
 
@@ -448,7 +448,7 @@ that an NV4097 triangle covers the centre pixel. A green tick means the
 graphics bridge works, not merely that it compiled.
 
 ```bash
-brew install cmake ninja python@3.12 sdl2
+brew install cmake ninja python@3.12 sdl3
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --draw
@@ -612,11 +612,11 @@ target_link_libraries(my_game PRIVATE
 
 Both are single-header public domain libraries from [nothings/stb](https://github.com/nothings/stb).
 
-On Linux with SDL2:
+On Linux with SDL3:
 ```cmake
-find_package(SDL2 REQUIRED)
+find_package(SDL3 REQUIRED)
 target_link_libraries(my_game PRIVATE
-    SDL2::SDL2 pthread m
+    SDL3::SDL3 pthread m
 )
 ```
 
@@ -726,13 +726,13 @@ The `__attribute__((aligned(16)))` on `u128` in a struct may warn if the alignme
 
 Make sure `ws2_32` is in your link libraries. The CMake build does this automatically for `ps3recomp_runtime`, but if you're building separately you need to add it manually.
 
-### "cannot find -lSDL2"
+### "cannot find -lSDL3"
 
-Install SDL2 development package:
-- Ubuntu/Debian: `sudo apt install libsdl2-dev`
-- Fedora: `sudo dnf install SDL2-devel`
-- macOS: `brew install sdl2`
-- Windows: Download from libsdl.org, set `SDL2_DIR` in CMake
+Install SDL3 development package:
+- Ubuntu/Debian: `sudo apt install libsdl3-dev`
+- Fedora: `sudo dnf install SDL3-devel`
+- macOS: `brew install sdl3`
+- Windows: Download from libsdl.org, set `SDL3_DIR` in CMake
 
 ### Build takes too long
 

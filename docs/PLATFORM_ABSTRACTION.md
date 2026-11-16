@@ -254,9 +254,9 @@ Note: Windows `Sleep()` has millisecond granularity. For sub-millisecond sleeps,
 
 | Platform | Primary Backend | Fallback |
 |----------|----------------|----------|
-| Windows | WASAPI | SDL2 |
-| Linux | SDL2 | PulseAudio (potential future) |
-| macOS | SDL2 | CoreAudio (potential future) |
+| Windows | WASAPI | SDL3 |
+| Linux | SDL3 | PulseAudio (potential future) |
+| macOS | SDL3 | CoreAudio (potential future) |
 
 ### WASAPI (Windows)
 
@@ -272,19 +272,14 @@ IMMDevice* device;
 // renderClient->ReleaseBuffer(frames, 0)
 ```
 
-### SDL2 (Cross-platform)
+### SDL3 (Cross-platform)
 
 ```c
-SDL_AudioSpec spec = {
-    .freq = 48000,
-    .format = AUDIO_F32SYS,
-    .channels = 2,
-    .samples = 256,
-    .callback = audio_callback,
-    .userdata = &audio_state
-};
-SDL_AudioDeviceID dev = SDL_OpenAudioDevice(NULL, 0, &spec, &obtained, 0);
-SDL_PauseAudioDevice(dev, 0);  // Start playback
+SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, "256");
+const SDL_AudioSpec spec = { SDL_AUDIO_F32, 2, 48000 };
+SDL_AudioStream* stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
+SDL_ResumeAudioStreamDevice(stream);  // Start playback
+SDL_PutAudioStreamData(stream, samples, bytes);
 ```
 
 ---
@@ -295,8 +290,8 @@ SDL_PauseAudioDevice(dev, 0);  // Start playback
 
 | Platform | Primary Backend | Notes |
 |----------|----------------|-------|
-| Windows | XInput | Native Xbox controller support; DS3 via DS3 drivers |
-| Linux/macOS | SDL2 GameController | Supports DualShock 3/4, Xbox, Switch Pro, etc. |
+| Windows | XInput, or SDL3 with PS3RECOMP_PAD_SDL=ON | XInput: Xbox controllers; SDL3: DualSense/DualShock natively too |
+| Linux/macOS | SDL3 gamepad | Supports DualShock 3/4, Xbox, Switch Pro, etc. |
 
 ### XInput (Windows)
 
@@ -311,13 +306,13 @@ if (XInputGetState(port, &state) == ERROR_SUCCESS) {
 }
 ```
 
-### SDL2 GameController
+### SDL3 gamepad
 
 ```c
-SDL_GameController* gc = SDL_GameControllerOpen(index);
-if (gc) {
-    int16_t lx = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTX);
-    bool cross = SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_A);
+SDL_Gamepad* gp = SDL_OpenGamepad(instance_id);
+if (gp) {
+    int16_t lx = SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_LEFTX);
+    bool cross = SDL_GetGamepadButton(gp, SDL_GAMEPAD_BUTTON_SOUTH);
     // Map to PS3 pad data
 }
 ```

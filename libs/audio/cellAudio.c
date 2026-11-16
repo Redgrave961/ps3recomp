@@ -7,9 +7,9 @@
  *
  * Backend selection:
  *   - Windows default: WASAPI (via mmdeviceapi)
- *   - Everywhere else / if PS3RECOMP_AUDIO_USE_SDL2 defined: SDL2 audio
+ *   - Everywhere else / if PS3RECOMP_AUDIO_USE_SDL defined: SDL3 audio
  *
- * Define PS3RECOMP_AUDIO_USE_SDL2 to force SDL2 backend on Windows.
+ * Define PS3RECOMP_AUDIO_USE_SDL to use the SDL3 backend on Windows too.
  */
 
 #include "../../runtime/memory/vm.h"   /* vm_commit */
@@ -36,14 +36,14 @@ extern uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size);
  * Backend selection
  * -----------------------------------------------------------------------*/
 
-#if defined(PS3RECOMP_AUDIO_USE_SDL2)
-  #define AUDIO_BACKEND_SDL2    1
+#if defined(PS3RECOMP_AUDIO_USE_SDL)
+  #define AUDIO_BACKEND_SDL     1
   #define AUDIO_BACKEND_WASAPI  0
 #elif defined(_WIN32)
-  #define AUDIO_BACKEND_SDL2    0
+  #define AUDIO_BACKEND_SDL     0
   #define AUDIO_BACKEND_WASAPI  1
 #else
-  #define AUDIO_BACKEND_SDL2    1
+  #define AUDIO_BACKEND_SDL     1
   #define AUDIO_BACKEND_WASAPI  0
 #endif
 
@@ -83,8 +83,8 @@ extern uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size);
   #define IID_IAudioRenderClient   ps3r_IID_IAudioRenderClient
 #endif
 
-#if AUDIO_BACKEND_SDL2
-  #include <SDL2/SDL.h>
+#if AUDIO_BACKEND_SDL
+  #include <SDL3/SDL.h>
 #endif
 
 /* Portable threading */
@@ -165,72 +165,65 @@ static float s_mix_buffer[CELL_AUDIO_BLOCK_SAMPLES * 2];
  * Host audio output backend
  * -----------------------------------------------------------------------*/
 
-#if AUDIO_BACKEND_SDL2
+#if AUDIO_BACKEND_SDL
 
-static SDL_AudioDeviceID s_sdl_audio_dev = 0;
+static SDL_AudioStream* s_sdl_audio_stream = NULL;
 
 static int audio_backend_init(void)
 {
     if (SDL_WasInit(SDL_INIT_AUDIO) == 0) {
-        if (SDL_InitSubSystem(SDL_INIT_AUDIO) < 0) {
+        if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
             printf("[cellAudio] SDL audio init failed: %s\n", SDL_GetError());
             return -1;
         }
     }
 
-    SDL_AudioSpec want, have;
-    memset(&want, 0, sizeof(want));
-    want.freq     = CELL_AUDIO_SAMPLE_RATE;
-    want.format   = AUDIO_F32SYS;
-    want.channels = 2;
-    want.samples  = CELL_AUDIO_BLOCK_SAMPLES;
-    want.callback = NULL; /* We'll use SDL_QueueAudio */
-
-    s_sdl_audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
-    if (s_sdl_audio_dev == 0) {
-        printf("[cellAudio] SDL_OpenAudioDevice failed: %s\n", SDL_GetError());
+    char frames[16];
+    snprintf(frames, sizeof frames, "%d", CELL_AUDIO_BLOCK_SAMPLES);
+    SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, frames);
+    const SDL_AudioSpec spec = { SDL_AUDIO_F32, 2, CELL_AUDIO_SAMPLE_RATE };
+    s_sdl_audio_stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
+    if (!s_sdl_audio_stream) {
+        printf("[cellAudio] SDL_OpenAudioDeviceStream failed: %s\n", SDL_GetError());
         return -1;
     }
 
-    SDL_PauseAudioDevice(s_sdl_audio_dev, 0); /* Start playback */
+    SDL_ResumeAudioStreamDevice(s_sdl_audio_stream);
     return 0;
 }
 
 static void audio_backend_shutdown(void)
 {
-    if (s_sdl_audio_dev) {
-        SDL_CloseAudioDevice(s_sdl_audio_dev);
-        s_sdl_audio_dev = 0;
+    if (s_sdl_audio_stream) {
+        SDL_DestroyAudioStream(s_sdl_audio_stream);
+        s_sdl_audio_stream = NULL;
     }
 }
 
 static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
 {
-    if (s_sdl_audio_dev) {
-        SDL_QueueAudio(s_sdl_audio_dev, stereo_samples,
-                       num_samples * 2 * sizeof(float));
-    }
+    if (s_sdl_audio_stream)
+        SDL_PutAudioStreamData(s_sdl_audio_stream, stereo_samples,
+                               (int)(num_samples * 2 * sizeof(float)));
+}
+
+static u32 audio_backend_queued_samples(void)
+{
+    if (!s_sdl_audio_stream) return 0;
+    const int queued = SDL_GetAudioStreamQueued(s_sdl_audio_stream);
+    return queued > 0 ? (u32)queued / (2 * sizeof(float)) : 0;
 }
 
 /* SDL queues without bound: keep about four blocks ahead of the device. */
 static int audio_backend_room(void)
 {
-    if (!s_sdl_audio_dev) return -1;
-    return SDL_GetQueuedAudioSize(s_sdl_audio_dev) / (2 * sizeof(float)) <
-           CELL_AUDIO_BLOCK_SAMPLES * 4 ? CELL_AUDIO_BLOCK_SAMPLES : 0;
+    if (!s_sdl_audio_stream) return -1;
+    return audio_backend_queued_samples() < CELL_AUDIO_BLOCK_SAMPLES * 4 ? CELL_AUDIO_BLOCK_SAMPLES : 0;
 }
 
 static void audio_backend_wait(void) { SDL_Delay(1); }
 
-static u32 audio_backend_queued_samples(void)
-{
-    if (s_sdl_audio_dev) {
-        return SDL_GetQueuedAudioSize(s_sdl_audio_dev) / (2 * sizeof(float));
-    }
-    return 0;
-}
-
-#endif /* AUDIO_BACKEND_SDL2 */
+#endif /* AUDIO_BACKEND_SDL */
 
 #if AUDIO_BACKEND_WASAPI
 

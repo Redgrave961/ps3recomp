@@ -4,8 +4,8 @@
  * touching press mode; with it on, cellPadGetData's packet carries the sensor
  * block at its at-rest values.
  *
- *   clang -std=gnu17 -I include $(sdl2-config --cflags) -I "$(sdl2-config --prefix)/include" \
- *         libs/input/tests/test_pad_sensor_mode.c $(sdl2-config --libs) \
+ *   clang -std=gnu17 -I include $(pkg-config --cflags sdl3) \
+ *         libs/input/tests/test_pad_sensor_mode.c $(pkg-config --libs sdl3) \
  *         -o /tmp/test_pad_sensor_mode && /tmp/test_pad_sensor_mode
  */
 #include "../cellPad.c"

@@ -22,7 +22,7 @@ if(NOT DEFINED PS3RECOMP_TREE_ROOT)
 endif()
 
 # cellFiber.c is compiled directly rather than linked from the runtime
-# library, so this stays a fast standalone unit test with no HLE, RSX or SDL2
+# library, so this stays a fast standalone unit test with no HLE, RSX or SDL3
 # dependency -- the same arrangement tests/sync_stress uses for the lv2 sync
 # sources.
 add_executable(fiber_switch

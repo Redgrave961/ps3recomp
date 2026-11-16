@@ -1,12 +1,12 @@
 /* cellPadSetActDirect -> host rumble: the motor levels, the per-port state,
  * and the renewal from the pad poll that keeps a long rumble going.
  *
- *   clang -std=gnu17 -I include $(sdl2-config --cflags) -I "$(sdl2-config --prefix)/include" \
- *         libs/input/tests/test_pad_rumble.c $(sdl2-config --libs) -o /tmp/test_pad_rumble && /tmp/test_pad_rumble
+ *   clang -std=gnu17 -I include $(pkg-config --cflags sdl3) \
+ *         libs/input/tests/test_pad_rumble.c $(pkg-config --libs sdl3) -o /tmp/test_pad_rumble && /tmp/test_pad_rumble
  *
- * No controller is opened. The test defines the SDL game-controller calls the
- * SDL backend makes (they take precedence over libSDL2's), hands port 0 a fake
- * controller, and records what reaches SDL_GameControllerRumble.
+ * No controller is opened. The test defines the SDL gamepad calls the
+ * SDL backend makes (they take precedence over libSDL3's), hands port 0 a fake
+ * controller, and records what reaches SDL_RumbleGamepad.
  */
 #include "../cellPad.c"
 #include <assert.h>
@@ -28,18 +28,18 @@ static int s_fake_gc, s_gone_gc;
 static int s_calls;
 static Uint16 s_lo, s_hi;
 static Uint32 s_ms;
-int SDL_GameControllerRumble(SDL_GameController* gc, Uint16 lo, Uint16 hi, Uint32 ms)
+bool SDL_RumbleGamepad(SDL_Gamepad* gp, Uint16 lo, Uint16 hi, Uint32 ms)
 {
-    assert(gc == (SDL_GameController*)&s_fake_gc);
+    assert(gp == (SDL_Gamepad*)&s_fake_gc);
     s_calls++; s_lo = lo; s_hi = hi; s_ms = ms;
-    return 0;
+    return true;
 }
-void SDL_GameControllerUpdate(void) {}
-SDL_bool SDL_IsGameController(int i) { (void)i; return SDL_FALSE; }
-SDL_bool SDL_GameControllerGetAttached(SDL_GameController* gc) { return gc == (SDL_GameController*)&s_fake_gc; }
-Uint8 SDL_GameControllerGetButton(SDL_GameController* gc, SDL_GameControllerButton b) { (void)gc; (void)b; return 0; }
-Sint16 SDL_GameControllerGetAxis(SDL_GameController* gc, SDL_GameControllerAxis a) { (void)gc; (void)a; return 0; }
-void SDL_GameControllerClose(SDL_GameController* gc) { (void)gc; }
+void SDL_UpdateGamepads(void) {}
+SDL_JoystickID* SDL_GetGamepads(int* count) { if (count) *count = 0; return SDL_calloc(1, sizeof(SDL_JoystickID)); }
+bool SDL_GamepadConnected(SDL_Gamepad* gp) { return gp == (SDL_Gamepad*)&s_fake_gc; }
+bool SDL_GetGamepadButton(SDL_Gamepad* gp, SDL_GamepadButton b) { (void)gp; (void)b; return false; }
+Sint16 SDL_GetGamepadAxis(SDL_Gamepad* gp, SDL_GamepadAxis a) { (void)gp; (void)a; return 0; }
+void SDL_CloseGamepad(SDL_Gamepad* gp) { (void)gp; }
 
 static void test_levels(void)
 {
@@ -72,17 +72,17 @@ static void test_set_act_direct(void)
 
     /* A controller: the request goes out at full small-motor strength and
      * with a duration long enough to be renewed before it runs out. */
-    s_sdl_controllers[0] = (SDL_GameController*)&s_fake_gc;
+    s_sdl_controllers[0] = (SDL_Gamepad*)&s_fake_gc;
     set_act(0, 1, 0, CELL_OK);
     assert(s_calls == 1 && s_lo == 0 && s_hi == 65535);
     assert(s_ms == PAD_RUMBLE_HOLD_MS && PAD_RUMBLE_RENEW_MS < PAD_RUMBLE_HOLD_MS);
     assert(s_rumble[0].sent_ms != 0);
 
     /* The poll renews it once PAD_RUMBLE_RENEW_MS has passed, not before. */
-    pad_poll_sdl2();
+    pad_poll_sdl();
     assert(s_calls == 1);
     s_rumble[0].sent_ms -= PAD_RUMBLE_RENEW_MS;
-    pad_poll_sdl2();
+    pad_poll_sdl();
     assert(s_calls == 2 && s_lo == 0 && s_hi == 65535 && s_ms == PAD_RUMBLE_HOLD_MS);
     assert(pad_now_ms() - s_rumble[0].sent_ms < PAD_RUMBLE_RENEW_MS);
 
@@ -90,14 +90,14 @@ static void test_set_act_direct(void)
     set_act(0, 0, 0, CELL_OK);
     assert(s_calls == 3 && s_lo == 0 && s_hi == 0 && s_ms == 0);
     assert(s_rumble[0].sent_ms == 0);
-    pad_poll_sdl2();
+    pad_poll_sdl();
     assert(s_calls == 3);
 
     /* A controller that goes away drops its port's rumble. */
     set_act(0, 0, 255, CELL_OK);
     assert(s_calls == 4 && s_lo == 65535 && s_hi == 0);
-    s_sdl_controllers[0] = (SDL_GameController*)&s_gone_gc;   /* GetAttached says no */
-    pad_poll_sdl2();
+    s_sdl_controllers[0] = (SDL_Gamepad*)&s_gone_gc;   /* GetAttached says no */
+    pad_poll_sdl();
     assert(s_sdl_controllers[0] == NULL && s_rumble[0].lo == 0 && s_rumble[0].sent_ms == 0);
 
     /* Ports past the host's, bad arguments, a closed library. */

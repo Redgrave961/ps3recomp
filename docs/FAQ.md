@@ -35,8 +35,8 @@ Yes, under the same principles as all clean-room recompilation projects:
 ### What platforms are supported?
 
 - **Windows** — clang-cl, D3D12, XInput, WASAPI
-- **Linux** — GCC/Clang, SDL2, Vulkan (opt-in) or the headless null backend
-- **macOS arm64** — Apple Clang, Metal, SDL2
+- **Linux** — GCC/Clang, SDL3, Vulkan (opt-in) or the headless null backend
+- **macOS arm64** — Apple Clang, Metal, SDL3
 
 All three build and run their platform test suites on every pull request.
 Windows is the only host currently claimed to run a recompiled retail title

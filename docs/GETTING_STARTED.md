@@ -14,13 +14,13 @@ Step-by-step guide to recompiling your first PS3 game.
   - CI builds with the compilers on GitHub's `windows-latest`, `ubuntu-latest` and `macos-14` runner images; no older compiler version is tested.
 - **Python** 3.10+ (CI uses 3.12): Required for the recompiler tools
 - **Ninja**: Faster than Make/MSBuild and what the commands in this guide use
-- **SDL2** on Linux and macOS: Required for the input and audio backends
+- **SDL3** on Linux and macOS: Required for the input and audio backends
 
 On macOS, Homebrew supplies every command-line dependency not included with
 Xcode:
 
 ```bash
-brew install cmake ninja python@3.12 sdl2
+brew install cmake ninja python@3.12 sdl3
 ```
 
 Prefer not to build from source? Each [release](https://github.com/sp00nznet/ps3recomp/releases/latest) includes a prebuilt SDK bundle per platform (see the README's Downloads paragraph).
@@ -410,7 +410,7 @@ the loop waits on is never written (see `[HOTREAD]` above).
 ### Audio crackling or silence
 
 The `config.toml` settings are reference only: nothing reads that file yet.
-Windows uses WASAPI; Linux and macOS use SDL2. Check SDL's selected device and
+Windows uses WASAPI; Linux and macOS use SDL3. Check SDL's selected device and
 driver before changing guest-side audio code.
 
 ### Recompiler fails on indirect branches

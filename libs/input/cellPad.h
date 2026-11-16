@@ -2,7 +2,7 @@
  * ps3recomp - cellPad HLE
  *
  * Gamepad input: initialization, reading button/analog state.
- * Backend: XInput on Windows, SDL2 GameController elsewhere.
+ * Backend: XInput on Windows, SDL3 gamepad elsewhere.
  */
 
 #ifndef PS3RECOMP_CELL_PAD_H

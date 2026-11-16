@@ -137,40 +137,34 @@ target_include_directories(ps3recomp_runtime PRIVATE
 )
 
 # Platform-specific link libraries
-option(PS3RECOMP_PAD_SDL2 "Windows: SDL2 controller backend (native DualSense/DualShock over USB and Bluetooth) instead of XInput" OFF)
+option(PS3RECOMP_PAD_SDL "Windows: SDL3 controller backend (native DualSense/DualShock over USB and Bluetooth) instead of XInput" OFF)
 if(WIN32)
     target_link_libraries(ps3recomp_runtime PRIVATE
         ws2_32      # Winsock for network modules
         ole32       # COM for WASAPI audio
         bcrypt      # BCryptGenRandom for SSL RNG
     )
-    if(PS3RECOMP_PAD_SDL2)
-        find_package(SDL2 CONFIG REQUIRED)
-        target_link_libraries(ps3recomp_runtime PRIVATE
-            $<IF:$<TARGET_EXISTS:SDL2::SDL2>,SDL2::SDL2,SDL2::SDL2-static>)
-        target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_PAD_USE_SDL2)
-        message(STATUS "  SDL2:         controller backend")
+    if(PS3RECOMP_PAD_SDL)
+        find_package(SDL3 CONFIG REQUIRED)
+        target_link_libraries(ps3recomp_runtime PRIVATE SDL3::SDL3)
+        target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_PAD_USE_SDL)
+        message(STATUS "  SDL3:         controller backend")
     endif()
 else()
-    # cellPad and cellAudio select their SDL2 backends unconditionally off
-    # Windows (see PAD_BACKEND_SDL2 / AUDIO_BACKEND_SDL2), so SDL2 is required
-    # here -- docs/BUILDING.md already lists it as the Linux/macOS dependency.
-    find_package(SDL2 QUIET)
-    if(SDL2_FOUND)
-        if(TARGET SDL2::SDL2)
-            target_link_libraries(ps3recomp_runtime PRIVATE SDL2::SDL2)
-        else()
-            target_include_directories(ps3recomp_runtime PRIVATE ${SDL2_INCLUDE_DIRS})
-            target_link_libraries(ps3recomp_runtime PRIVATE ${SDL2_LIBRARIES})
-        endif()
-        message(STATUS "  SDL2:         found (input + audio backends enabled)")
+    # cellPad and cellAudio select their SDL3 backends unconditionally off
+    # Windows (see PAD_BACKEND_SDL / AUDIO_BACKEND_SDL), so SDL3 is required
+    # here -- docs/BUILDING.md lists it as the Linux/macOS dependency.
+    find_package(SDL3 CONFIG QUIET)
+    if(SDL3_FOUND)
+        target_link_libraries(ps3recomp_runtime PRIVATE SDL3::SDL3)
+        message(STATUS "  SDL3:         found (input + audio backends enabled)")
     else()
         message(FATAL_ERROR
-            "SDL2 not found. It provides the cellPad and cellAudio backends on "
+            "SDL3 not found. It provides the cellPad and cellAudio backends on "
             "non-Windows hosts.\n"
-            "  macOS:  brew install sdl2\n"
-            "  Debian: apt install libsdl2-dev\n"
-            "If SDL2 is installed in a non-standard prefix, pass "
+            "  macOS:  brew install sdl3\n"
+            "  Debian: apt install libsdl3-dev\n"
+            "If SDL3 is installed in a non-standard prefix, pass "
             "-DCMAKE_PREFIX_PATH=<prefix>.")
     endif()
 

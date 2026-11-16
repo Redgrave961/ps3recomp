@@ -4,14 +4,14 @@
  * SELECT, the left stick mirrors the d-pad -- while a window of the process has
  * the keyboard focus, and releases everything when it loses it.
  *
- *   clang -std=gnu17 -DPS3RECOMP_PAD_KEYBOARD_SDL -I include $(sdl2-config --cflags) \
- *         -I "$(sdl2-config --prefix)/include" libs/input/tests/test_pad_keyboard.c \
- *         $(sdl2-config --libs) -o /tmp/test_pad_keyboard && /tmp/test_pad_keyboard
+ *   clang -std=gnu17 -DPS3RECOMP_PAD_KEYBOARD_SDL -I include $(pkg-config --cflags sdl3) \
+ *         libs/input/tests/test_pad_keyboard.c \
+ *         $(pkg-config --libs sdl3) -o /tmp/test_pad_keyboard && /tmp/test_pad_keyboard
  *
  * PS3RECOMP_PAD_KEYBOARD_SDL makes macOS read the keyboard through SDL like
  * every other host that is not Windows, so the same table is tested everywhere.
  * No controller exists and no window either: the test defines the SDL calls the
- * backend makes (they take precedence over libSDL2's), with a keyboard state
+ * backend makes (they take precedence over libSDL3's), with a keyboard state
  * and a focus flag it sets itself.
  */
 #include "../cellPad.c"
@@ -31,20 +31,20 @@ void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
 
 /* ---- the fake SDL: no controller, a keyboard the test drives ----------------- */
-static Uint8 s_keys[SDL_NUM_SCANCODES];
-static int   s_focus;
+static bool s_keys[SDL_SCANCODE_COUNT];
+static int  s_focus;
 
-int SDL_NumJoysticks(void) { return 0; }
-int SDL_PeepEvents(SDL_Event* ev, int n, SDL_eventaction action, Uint32 lo, Uint32 hi)
+SDL_JoystickID* SDL_GetGamepads(int* count) { if (count) *count = 0; return SDL_calloc(1, sizeof(SDL_JoystickID)); }
+int SDL_PeepEvents(SDL_Event* ev, int n, SDL_EventAction action, Uint32 lo, Uint32 hi)
 {
     (void)ev; (void)n; (void)action; (void)lo; (void)hi;
     return 0;
 }
-Uint32 SDL_WasInit(Uint32 flags) { (void)flags; return flags; }
-int SDL_InitSubSystem(Uint32 flags) { (void)flags; return 0; }
+SDL_InitFlags SDL_WasInit(SDL_InitFlags flags) { (void)flags; return flags; }
+bool SDL_InitSubSystem(SDL_InitFlags flags) { (void)flags; return true; }
 const char* SDL_GetError(void) { return "fake"; }
-void SDL_GameControllerUpdate(void) {}
-const Uint8* SDL_GetKeyboardState(int* numkeys) { if (numkeys) *numkeys = SDL_NUM_SCANCODES; return s_keys; }
+void SDL_UpdateGamepads(void) {}
+const bool* SDL_GetKeyboardState(int* numkeys) { if (numkeys) *numkeys = SDL_SCANCODE_COUNT; return s_keys; }
 SDL_Window* SDL_GetKeyboardFocus(void) { return s_focus ? (SDL_Window*)&s_keys : NULL; }
 
 /* ---- helpers ---------------------------------------------------------------- */
