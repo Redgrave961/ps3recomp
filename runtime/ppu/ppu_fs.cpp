@@ -45,6 +45,8 @@
 #  define FS_TELL64(f)       ((int64_t)_ftelli64(f))
 typedef struct _stat64 fs_stat64_t;
 /* _stat64 rejects a trailing slash (MinGW's stat wrapper stripped it). */
+extern "C" unsigned long long ps3_ms_now(void);
+
 static int FS_STAT64(const char* p, fs_stat64_t* s)
 {
     char t[1100]; size_t n = strlen(p);
@@ -257,7 +259,7 @@ static void cellFsOpen(ppu_context* ctx)
     g_drm[fd] = drm;
     g_drm_pos[fd] = 0;
     if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
-    fprintf(stderr, "[fs] open '%s' -> fd %d\n", gpath, fd);
+    fprintf(stderr, "[fs] %llu ms open '%s' -> fd %d\n", ps3_ms_now(), gpath, fd);
     ctx->gpr[3] = CELL_OK;
 }
 

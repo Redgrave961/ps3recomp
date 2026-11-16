@@ -13,6 +13,7 @@
 
 
 #include <algorithm>
+#include <chrono>
 #include <atomic>
 #include <condition_variable>
 #include <cstdlib>
@@ -175,6 +176,23 @@ bool create_surface()
 #endif
 }
 
+double since_start()
+{
+    static const auto t0 = std::chrono::steady_clock::now();
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+}
+
+bool stats_on()
+{
+    static const bool on = [] { const char* e = std::getenv("PS3_VK_STATS"); return e && *e && *e != '0'; }();
+    return on;
+}
+
+void mark(const char* what)
+{
+    if (stats_on()) std::fprintf(stderr, "[vk] %.3f s %s\n", since_start(), what);
+}
+
 bool vulkan_open()
 {
 #ifdef _WIN32
@@ -183,18 +201,28 @@ bool vulkan_open()
     const bool wayland = SDL_GetPointerProperty(SDL_GetWindowProperties(g.window), SDL_PROP_WINDOW_WAYLAND_DISPLAY_POINTER, nullptr) != nullptr;
     const char* ext[] = { VK_KHR_SURFACE_EXTENSION_NAME, wayland ? VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME : VK_KHR_XLIB_SURFACE_EXTENSION_NAME };
 #endif
+    mark("window");
     if (!vk_instance_create(g.d, ext, 2)) return false;
+    mark("instance");
     if (!create_surface()) {
         std::fprintf(stderr, "[vk] surface creation failed\n");
         return false;
     }
-    return vk_device_create(g.d, g.surface) && frames_build() && swapchain_build();
+    if (!vk_device_create(g.d, g.surface)) return false;
+    mark("device");
+    if (!frames_build()) return false;
+    mark("renderer");
+    if (!swapchain_build()) return false;
+    mark("swapchain");
+    return true;
 }
 
 void window_main()
 {
     int ok = -1;
+    since_start();
     if (SDL_InitSubSystem(SDL_INIT_VIDEO)) {
+        mark("sdl video");
         g.window = SDL_CreateWindow(g.title.c_str(), 1280, 720,
                                     SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
         if (g.window) {
@@ -381,6 +409,11 @@ void vk_present(void*, u32, const rsx_display_buffer* db)
     r = vkQueuePresentKHR(g.d.queue, &pi);
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) g.resized = true;
     g.frame_index = (g.frame_index + 1u) % k_frames;
+    static bool first = true;
+    if (first) {
+        first = false;
+        mark("first present");
+    }
     static const bool report = [] { const char* e = std::getenv("PS3_VK_STATS"); return e && *e && *e != '0'; }();
     static uint64_t presents = 0;
     if (report && ++presents % 120u == 0) {
