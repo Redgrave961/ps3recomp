@@ -240,6 +240,8 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
 
     if (upload) {
         stats.uploads++;
+        static const bool trace = std::getenv("PS3_VK_TEXTRACE") != nullptr;
+        if (trace) std::fprintf(stderr, "[vk] upload 0x%08X size %u fmt %02X %ux%u new %d\n", ea, d.guest_size, d.gcm_format, d.width, d.height, it == m_textures.end());
         const uint64_t bytes = rsx::texture_staging_size(d);
         vk_slice slice = m_ring.alloc(bytes, 16);
         if (!slice.ptr) return false;
