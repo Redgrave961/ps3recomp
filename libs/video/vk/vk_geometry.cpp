@@ -42,34 +42,6 @@ index_result convert(uint32_t prim, const uint8_t* src, uint32_t count, bool res
     };
 
     switch (prim) {
-    case PRIM_POLYGON:
-    case PRIM_TRIANGLE_FAN: {
-        bool need_anchor = true;
-        T anchor = limit, last = limit;
-        for (uint32_t i = 0; i < count; i++) {
-            const T v = load_be<T>(src + (size_t)i * sizeof(T));
-            if (need_anchor) {
-                if (restart && v == ri) continue;
-                anchor = track(v);
-                need_anchor = false;
-                continue;
-            }
-            if (restart && v == ri) {
-                need_anchor = true;
-                last = limit;
-                continue;
-            }
-            if (last == limit) {
-                last = track(v);
-                continue;
-            }
-            dst[n++] = anchor;
-            dst[n++] = last;
-            dst[n++] = track(v);
-            last = v;
-        }
-        break;
-    }
     case PRIM_QUADS: {
         T quad[4];
         uint32_t k = 0;
@@ -126,8 +98,8 @@ VkPrimitiveTopology primitive_topology(uint32_t prim, bool& emulated)
     case PRIM_LINE_LOOP: emulated = true; return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
     case PRIM_LINE_STRIP: return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
     case PRIM_TRIANGLE_STRIP: case PRIM_QUAD_STRIP: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
-    case PRIM_TRIANGLE_FAN: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
-    case PRIM_QUADS: case PRIM_POLYGON: emulated = true; return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    case PRIM_TRIANGLE_FAN: case PRIM_POLYGON: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
+    case PRIM_QUADS: emulated = true; return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     default: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     }
 }
@@ -145,7 +117,6 @@ uint32_t expanded_index_count(uint32_t prim, uint32_t count)
 {
     switch (prim) {
     case PRIM_LINE_LOOP: return count + 1u;
-    case PRIM_POLYGON: case PRIM_TRIANGLE_FAN: return count >= 2u ? (count - 2u) * 3u : 0u;
     case PRIM_QUADS: return (6u * count) / 4u;
     default: return count;
     }
@@ -158,15 +129,7 @@ void generate_indices(uint32_t prim, uint32_t count, uint32_t* dst)
         for (uint32_t i = 0; i < count; i++) dst[i] = i;
         dst[count] = 0;
         return;
-    case PRIM_POLYGON:
-    case PRIM_TRIANGLE_FAN:
-        if (count < 3u) return;
-        for (uint32_t i = 0; i < count - 2u; i++) {
-            dst[3 * i] = 0;
-            dst[3 * i + 1] = i + 1u;
-            dst[3 * i + 2] = i + 2u;
-        }
-        return;
+
     case PRIM_QUADS:
         for (uint32_t i = 0; i < count / 4u; i++) {
             dst[6 * i] = 4 * i;
