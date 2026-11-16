@@ -789,13 +789,22 @@ int vk_open(void*)
     return g.status > 0 ? 0 : -1;
 }
 
+std::atomic<int64_t> g_render_ns{ 0 };
+
+struct render_timer {
+    const int64_t start = now_ns();
+    ~render_timer() { g_render_ns.fetch_add(now_ns() - start, std::memory_order_relaxed); }
+};
+
 void vk_methods(void*, u32 reg, u32 inc, const u32* be, u32 count)
 {
+    render_timer timer;
     g.r.methods(reg, inc, be, count);
 }
 
 void vk_flush(void*)
 {
+    render_timer timer;
     g.r.flush();
 }
 
@@ -951,8 +960,9 @@ void vk_present(void*, u32, const rsx_display_buffer* db)
     static uint64_t presents;
     if (stats_on() && ++presents % 600u == 0) {
         const auto& st = g.r.stats;
-        std::fprintf(stderr, "[vk] frames %llu draws %llu clears %llu uploads %llu, %s\n", (unsigned long long)presents,
-                     (unsigned long long)st.draws, (unsigned long long)st.clears, (unsigned long long)st.uploads, pacing_name(g.mode));
+        std::fprintf(stderr, "[vk] frames %llu draws %llu clears %llu uploads %llu, renderer cpu %.3f ms/frame, %s\n", (unsigned long long)presents,
+                     (unsigned long long)st.draws, (unsigned long long)st.clears, (unsigned long long)st.uploads,
+                     (double)g_render_ns.exchange(0) / 600.0 / 1e6, pacing_name(g.mode));
     }
 }
 
