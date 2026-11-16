@@ -1586,6 +1586,8 @@ extern "C" int* ps3_ppu_vcall_sp_slot(void) { return &g_vcall_sp; }
         }                                                                     \
     } while (0)
 
+extern "C" const char* cellGame_get_boot_path(void);
+
 extern "C" {
 /* PPU_RWATCH=<hex>[,len] -- see the note in vm_read8. */
 /* -2 until PPU_RWATCH is read, -1 when unset. File scope so the gate below is
@@ -4152,7 +4154,7 @@ extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
          * The old /dev_hdd0/NPUA80001 (another game's id) failed the compare ->
          * wrong boot branch -> init divergence/deadlock. $PS3_BOOT_PATH overrides. */
         const char* boot_path = getenv("PS3_BOOT_PATH");
-        if (!boot_path || !*boot_path) boot_path = "/dev_bdvd/PS3_GAME/USRDIR/EBOOT.BIN";
+        if (!boot_path || !*boot_path) boot_path = cellGame_get_boot_path();
 
         /* PS3_ARGV=<arg1>;<arg2>;... -- the arguments AFTER argv[0].
          *

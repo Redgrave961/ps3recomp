@@ -58,7 +58,7 @@ extern const char* ppu_vfs_root;   /* host dir that PS3 mount points map into */
  * path where the guest fell out of its entry function instead. */
 extern int     g_sys_process_exit_called;
 extern int32_t g_sys_process_exit_code;
-void     cellGame_init_from_paramsfo(const char* sfo_path);  /* libs/system/cellGame.c */
+void     cellGame_init_boot(const char* vfs_root);
 /* Optional hook: load real system PRX modules (libsre = cellSpurs/cellSync) into
  * guest RAM and register their exports. Weak default is a no-op; a title that
  * links a lifted PRX defines a strong version. Called after the lifted function
@@ -1164,30 +1164,7 @@ int main(int argc, char** argv)
      * their /dev_hdd0/game/<id> paths from, so saves landed in a directory
      * belonging to no title. Same shape as the live-draw engine before 1a050be:
      * a working facility with no caller in the shared harness. */
-    {
-        /* PARAM.SFO sits in a different place depending on how the VFS is rooted.
-         * A disc-style root has it under PS3_GAME/; a title whose content is
-         * opened by RELATIVE path needs the root AT USRDIR, and then PARAM.SFO is
-         * one level up instead. Only the first layout was tried, so rooting at
-         * USRDIR silently lost the title id and name -- which is how the window
-         * caption ended up on its hardcoded fallback. Try each and take the
-         * first that exists. */
-        static const char* const kSfoLayouts[] = {
-            "%s/PS3_GAME/PARAM.SFO",   /* vfs root = disc root      */
-            "%s/../PARAM.SFO",         /* vfs root = .../USRDIR     */
-            "%s/PARAM.SFO",            /* vfs root = the game dir   */
-        };
-        char sfo[1100];
-        int found = 0;
-        for (size_t i = 0; i < sizeof kSfoLayouts / sizeof kSfoLayouts[0]; i++) {
-            snprintf(sfo, sizeof sfo, kSfoLayouts[i], ppu_vfs_root);
-            FILE* f = fopen(sfo, "rb");
-            if (f) { fclose(f); found = 1; break; }
-        }
-        if (!found)
-            snprintf(sfo, sizeof sfo, "%s/PS3_GAME/PARAM.SFO", ppu_vfs_root);
-        cellGame_init_from_paramsfo(sfo);
-    }
+    cellGame_init_boot(ppu_vfs_root);
 
     fprintf(stderr,"[boot-dbg] before ppu_recomp_register\n"); fflush(stderr);
     ppu_recomp_register();   /* lifted function table -> address map */

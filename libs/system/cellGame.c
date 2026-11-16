@@ -340,6 +340,74 @@ void cellGame_init_from_paramsfo(const char* sfo_path)
     }
 }
 
+static int  s_is_patch = 0;
+static char s_boot_path[CELL_GAME_PATH_MAX] = "/dev_bdvd/PS3_GAME/USRDIR/EBOOT.BIN";
+
+static int file_exists(const char* path)
+{
+    HOST_STAT_T st;
+    if (HOST_STAT(path, &st) != 0)
+        return 0;
+#ifdef _WIN32
+    return (st.st_mode & _S_IFDIR) == 0;
+#else
+    return !S_ISDIR(st.st_mode);
+#endif
+}
+
+static void sfo_copy(const char* sfo_path, const char* key, char* dst, size_t cap)
+{
+    char tmp[256];
+    if (sfo_read_string(sfo_path, key, tmp, sizeof(tmp)) == 0 && tmp[0]) {
+        strncpy(dst, tmp, cap - 1);
+        dst[cap - 1] = '\0';
+    }
+}
+
+void cellGame_init_boot(const char* vfs_root)
+{
+    static const char* const layouts[] = {
+        "%s/PS3_GAME/PARAM.SFO",
+        "%s/../PARAM.SFO",
+        "%s/PARAM.SFO",
+    };
+    const size_t n_layouts = sizeof(layouts) / sizeof(layouts[0]);
+    char sfo[1100];
+    size_t i;
+    for (i = 0; i < n_layouts; i++) {
+        snprintf(sfo, sizeof(sfo), layouts[i], vfs_root);
+        if (file_exists(sfo))
+            break;
+    }
+    if (i == n_layouts)
+        snprintf(sfo, sizeof(sfo), layouts[0], vfs_root);
+    cellGame_init_from_paramsfo(sfo);
+
+    if (s_game_type != CELL_GAME_GAMETYPE_DISC)
+        return;
+
+    char patch_sfo[1100], patch_eboot[1100], tmp[256];
+    snprintf(patch_sfo, sizeof(patch_sfo), "%s/%s/PARAM.SFO", content_root(), s_title_id);
+    snprintf(patch_eboot, sizeof(patch_eboot), "%s/%s/USRDIR/EBOOT.BIN", content_root(), s_title_id);
+    if (!file_exists(patch_eboot))
+        return;
+    if (sfo_read_string(patch_sfo, "TITLE_ID", tmp, sizeof(tmp)) != 0 || strcmp(tmp, s_title_id) != 0)
+        return;
+    if (sfo_read_string(patch_sfo, "CATEGORY", tmp, sizeof(tmp)) != 0 || strcmp(tmp, "GD") != 0)
+        return;
+
+    s_is_patch = 1;
+    sfo_copy(patch_sfo, "TITLE", s_title, sizeof(s_title));
+    sfo_copy(patch_sfo, "VERSION", s_version, sizeof(s_version));
+    sfo_copy(patch_sfo, "PS3_SYSTEM_VER", s_system_ver, sizeof(s_system_ver));
+    sfo_copy(patch_sfo, "APP_VER", s_app_ver, sizeof(s_app_ver));
+    snprintf(s_boot_path, sizeof(s_boot_path), "/dev_hdd0/game/%s/USRDIR/EBOOT.BIN", s_title_id);
+    printf("[cellGame] update APP_VER %s installed at %s/%s; boot path %s\n",
+           s_app_ver, content_root(), s_title_id, s_boot_path);
+}
+
+const char* cellGame_get_boot_path(void) { return s_boot_path; }
+
 /* Central title-id accessor so other modules (cellSysutil etc.) don't hardcode it. */
 const char* cellGame_get_title_id(void) { return s_title_id; }
 /* The title id when the booted title is an HDD game (CATEGORY "HG"), else NULL:
@@ -387,7 +455,7 @@ s32 cellGameBootCheck(u32* type, u32* attributes, CellGameContentSize* size,
     uint32_t dir_ea  = (uint32_t)(uintptr_t)dirName;
 
     if (type_ea) vm_write32(type_ea, (uint32_t)s_game_type);
-    if (attr_ea) vm_write32(attr_ea, 0);
+    if (attr_ea) vm_write32(attr_ea, s_is_patch ? CELL_GAME_ATTRIBUTE_PATCH : 0);
 
     if (size_ea) {
         vm_write32(size_ea + 0, (u32)content_free_kb_reported());
