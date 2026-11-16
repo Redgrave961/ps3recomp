@@ -292,7 +292,7 @@ bool renderer::draw_setup()
         key.output_mask = r(rsx::M_VERTEX_ATTRIB_OUTPUT_MASK);
         key.texture_dims = vdims;
 
-        m_vp = m_shaders.vertex(program, key, m_program_hash);
+        m_vp = m_shaders.vertex(program, key, m_program_hash, true);
         dirty &= ~rsx::D_VERTEX_PROGRAM;
     }
     if (!m_vp) return false;
@@ -314,13 +314,8 @@ bool renderer::draw_setup()
     }
     for (u32 k = 0; k < 4; k++)
         if (m_fb.color_format[k] != VK_FORMAT_UNDEFINED) fk.output_mask |= 1u << k;
-    m_fp = m_shaders.fragment(ucode, RSX_SPV_FP_MAX_INSTRUCTIONS * 4u, fk);
-    if (!m_fp) {
-        static int n = 0;
-        if (n++ < 5) std::fprintf(stderr, "[vk] fragment program at 0x%08X rejected: %08X %08X %08X %08X\n", m_fp_ea, ucode[0], ucode[1], ucode[2], ucode[3]);
-        return false;
-    }
-    return true;
+    m_fp = m_shaders.fragment(ucode, RSX_SPV_FP_MAX_INSTRUCTIONS * 4u, fk, true);
+    return m_fp != nullptr;
 }
 
 void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
@@ -503,7 +498,7 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
     const VkPipeline pipe = m_pipelines.get(key, m_vp->code, m_fp->code);
     if (!pipe) {
         stats.skipped_pipeline++;
-        if (m_trace) std::fprintf(stderr, "[trace] %u dropped: no pipeline\n", id);
+        if (m_trace) std::fprintf(stderr, "[trace] %u skipped: pipeline compiling or failed\n", id);
         return;
     }
 

@@ -1,6 +1,7 @@
 #include "vk_shaders.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 
 namespace vk {
@@ -51,26 +52,35 @@ bool shader_cache::make_module(shader& s, const rsx_spv_blob& blob, VkShaderStag
 }
 
 template <typename T, typename Build>
-const T* shader_cache::resolve(std::unordered_map<uint64_t, std::unique_ptr<T>>& map, uint64_t h, Build&& build)
+const T* shader_cache::resolve(std::unordered_map<uint64_t, std::unique_ptr<T>>& map, uint64_t h, bool async, Build&& build)
 {
+    auto finish = [this, &map, h](std::unique_ptr<T> made) {
+        std::lock_guard<std::mutex> hold(m_lock);
+        const T* p = map.emplace(h, std::move(made)).first->second.get();
+        m_building.erase(h);
+        m_built.notify_all();
+        return p;
+    };
     {
         std::unique_lock<std::mutex> hold(m_lock);
+        if (auto it = map.find(h); it != map.end()) return it->second.get();
+        if (async) {
+            if (!m_building.insert(h).second) return nullptr;
+            m_pipes->work([finish, build = std::forward<Build>(build)]() mutable { finish(build()); });
+            return nullptr;
+        }
         m_built.wait(hold, [&] { return !m_building.count(h); });
         if (auto it = map.find(h); it != map.end()) return it->second.get();
         m_building.insert(h);
     }
-    std::unique_ptr<T> made = build();
-    std::lock_guard<std::mutex> hold(m_lock);
-    const T* p = map.emplace(h, std::move(made)).first->second.get();
-    m_building.erase(h);
-    m_built.notify_all();
-    return p;
+    return finish(build());
 }
 
-const vertex_program* shader_cache::vertex(const uint32_t* program, const rsx_spv_vp_key& key, uint64_t program_hash)
+const vertex_program* shader_cache::vertex(const uint32_t* program_in, const rsx_spv_vp_key& key, uint64_t program_hash, bool async)
 {
     const uint64_t h = hash(&key, sizeof key, program_hash);
-    return resolve(m_vertex, h, [&]() -> std::unique_ptr<vertex_program> {
+    return resolve(m_vertex, h, async, [this, h, key, words = std::vector<uint32_t>(program_in, program_in + RSX_SPV_VP_SLOTS * 4u)]() -> std::unique_ptr<vertex_program> {
+        const uint32_t* program = words.data();
         auto vp = std::make_unique<vertex_program>();
         vp->hash = h;
         rsx_spv_blob blob{};
@@ -85,10 +95,15 @@ const vertex_program* shader_cache::vertex(const uint32_t* program, const rsx_sp
     });
 }
 
-const fragment_program* shader_cache::fragment(const uint32_t* ucode, uint32_t max_words, const rsx_spv_fp_key& key)
+const fragment_program* shader_cache::fragment(const uint32_t* ucode, uint32_t max_words, const rsx_spv_fp_key& key, bool async)
 {
     const uint32_t end = fragment_extent(ucode, max_words);
-    if (!end) return nullptr;
+    if (!end) {
+        static std::atomic<int> reported{ 0 };
+        if (reported.fetch_add(1) < 8)
+            std::fprintf(stderr, "[vk] fragment program scan failed: %08X %08X %08X %08X\n", ucode[0], ucode[1], ucode[2], ucode[3]);
+        return nullptr;
+    }
     rsx_spv_fp_info scan{};
     rsx_spv_fragment_scan(ucode, end, &scan);
     thread_local std::vector<uint32_t> scratch;
@@ -96,17 +111,18 @@ const fragment_program* shader_cache::fragment(const uint32_t* ucode, uint32_t m
     for (uint32_t i = 0; i < scan.constant_count; i++)
         for (uint32_t w = 0; w < 4 && scan.constant_word[i] + w < end; w++) scratch[scan.constant_word[i] + w] = 0;
     const uint64_t h = hash(scratch.data(), scratch.size() * 4u, hash(&key, sizeof key, 0x46504650u));
-    return resolve(m_fragment, h, [&]() -> std::unique_ptr<fragment_program> {
+    return resolve(m_fragment, h, async, [this, h, key, words = scratch]() -> std::unique_ptr<fragment_program> {
+        const uint32_t end = (uint32_t)words.size();
         auto fp = std::make_unique<fragment_program>();
         fp->hash = h;
         rsx_spv_blob blob{};
-        const bool ok = rsx_spv_fragment(ucode, end, &key, &blob, &fp->info) == 0 && make_module(fp->code, blob, VK_SHADER_STAGE_FRAGMENT_BIT);
+        const bool ok = rsx_spv_fragment(words.data(), end, &key, &blob, &fp->info) == 0 && make_module(fp->code, blob, VK_SHADER_STAGE_FRAGMENT_BIT);
         rsx_spv_blob_free(&blob);
         if (!ok) {
             std::fprintf(stderr, "[vk] fragment program failed to translate\n");
             return nullptr;
         }
-        m_pipes->record_fragment(scratch.data(), end, key);
+        m_pipes->record_fragment(words.data(), end, key);
         return fp;
     });
 }

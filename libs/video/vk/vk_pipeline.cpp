@@ -292,13 +292,13 @@ void pipelines::precompile(shader_cache& shaders)
                 std::memcpy(&key, r.a, sizeof key);
                 std::vector<uint32_t> program(RSX_SPV_VP_SLOTS * 4u);
                 std::memcpy(program.data(), r.b, r.bn);
-                shaders.vertex(program.data(), key, shader_cache::program_hash(program.data()));
+                shaders.vertex(program.data(), key, shader_cache::program_hash(program.data()), false);
             } else if (r.type == 'F' && r.an == sizeof(rsx_spv_fp_key) && r.bn % 4u == 0) {
                 rsx_spv_fp_key key;
                 std::memcpy(&key, r.a, sizeof key);
                 std::vector<uint32_t> ucode(r.bn / 4u);
                 std::memcpy(ucode.data(), r.b, r.bn);
-                shaders.fragment(ucode.data(), (uint32_t)ucode.size(), key);
+                shaders.fragment(ucode.data(), (uint32_t)ucode.size(), key, false);
             }
         };
         run_all('V', shader_body);
@@ -519,10 +519,22 @@ VkPipeline pipelines::get(const pipeline_key& key, const shader& vs, const shade
         owner = inserted;
     }
     if (!owner) {
-        e->done.wait(false, std::memory_order_acquire);
+        if (!e->done.load(std::memory_order_acquire)) {
+            if (!g_replay) return VK_NULL_HANDLE;
+            e->done.wait(false, std::memory_order_acquire);
+        }
         return e->pipe.load(std::memory_order_acquire);
     }
     record('P', &k, sizeof k, nullptr, 0);
+    if (!m_libraries && !g_replay) {
+        work([this, k, v = vs, f = fs, e] {
+            const VkPipeline p = m_stopping.load(std::memory_order_relaxed) ? VK_NULL_HANDLE : monolithic(k, v, f);
+            e->pipe.store(p, std::memory_order_release);
+            e->done.store(true, std::memory_order_release);
+            e->done.notify_all();
+        });
+        return VK_NULL_HANDLE;
+    }
     const bool fast = m_libraries && !g_replay;
     const VkPipeline p = !m_libraries ? monolithic(k, vs, fs) : link(k, vs, fs, !fast);
     if (!p) std::fprintf(stderr, "[vk] pipeline creation failed\n");

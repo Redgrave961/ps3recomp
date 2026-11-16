@@ -762,7 +762,7 @@ void renderer::on_draw(const rsx::draw_clause& clause)
     }
     if (!draw_setup()) {
         stats.skipped_shader++;
-        if (m_trace) std::fprintf(stderr, "[trace] %u dropped: %s program\n", id, m_vp ? "fragment" : "vertex");
+        if (m_trace) std::fprintf(stderr, "[trace] %u skipped: %s program compiling or failed\n", id, m_vp ? "fragment" : "vertex");
         return;
     }
     draw_execute(clause, id);

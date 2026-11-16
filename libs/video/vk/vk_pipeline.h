@@ -72,6 +72,7 @@ public:
     pipeline_key normalize(const pipeline_key& key) const;
 
     bool shader_library(shader& s, VkShaderStageFlagBits stage);
+    void work(std::function<void()> task);
     void record_vertex(const uint32_t* program, const rsx_spv_vp_key& key);
     void record_fragment(const uint32_t* ucode, uint32_t words, const rsx_spv_fp_key& key);
 
@@ -82,7 +83,6 @@ private:
         VkPipeline fast = VK_NULL_HANDLE;
     };
 
-    void work(std::function<void()> task);
     void worker();
     void record(char type, const void* a, size_t an, const void* b, size_t bn);
     VkPipeline monolithic(const pipeline_key& k, const shader& vs, const shader& fs) const;
