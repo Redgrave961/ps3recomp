@@ -137,12 +137,20 @@ target_include_directories(ps3recomp_runtime PRIVATE
 )
 
 # Platform-specific link libraries
+option(PS3RECOMP_PAD_SDL2 "Windows: SDL2 controller backend (native DualSense/DualShock over USB and Bluetooth) instead of XInput" OFF)
 if(WIN32)
     target_link_libraries(ps3recomp_runtime PRIVATE
         ws2_32      # Winsock for network modules
         ole32       # COM for WASAPI audio
         bcrypt      # BCryptGenRandom for SSL RNG
     )
+    if(PS3RECOMP_PAD_SDL2)
+        find_package(SDL2 CONFIG REQUIRED)
+        target_link_libraries(ps3recomp_runtime PRIVATE
+            $<IF:$<TARGET_EXISTS:SDL2::SDL2>,SDL2::SDL2,SDL2::SDL2-static>)
+        target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_PAD_USE_SDL2)
+        message(STATUS "  SDL2:         controller backend")
+    endif()
 else()
     # cellPad and cellAudio select their SDL2 backends unconditionally off
     # Windows (see PAD_BACKEND_SDL2 / AUDIO_BACKEND_SDL2), so SDL2 is required
