@@ -628,6 +628,7 @@ void present_main()
     if (!swapchain_build()) std::fprintf(stderr, "[vk] swapchain creation failed\n");
     mark("swapchain");
     uint64_t seen = 0;
+    bool rebuilt = false;
     for (;;) {
         uint64_t tick;
         {
@@ -639,19 +640,26 @@ void present_main()
             read_refresh();
             restart_measurement();
         }
-        if (g.resized.exchange(false)) rebuild_swapchain();
+        if (g.resized.exchange(false)) {
+            rebuild_swapchain();
+            rebuilt = true;
+        }
         if (tick == seen) continue;
         seen = tick;
-        int pick;
+        int pick = -1;
         {
             std::lock_guard<std::mutex> hold(g.queue_lock);
             if (g.latest_new) {
                 g.shown = g.latest;
                 g.latest_new = false;
+                pick = g.shown;
+            } else if (rebuilt) {
+                pick = g.shown;
             }
-            pick = g.shown;
         }
-        if (pick >= 0) present_slot((uint32_t)pick);
+        if (pick < 0) continue;
+        rebuilt = false;
+        present_slot((uint32_t)pick);
     }
 }
 

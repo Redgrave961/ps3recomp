@@ -220,16 +220,39 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
         }
         bool bound = s == m_fb.depth;
         for (surface* f : m_fb.color) bound |= f == s;
-        path = "dummy: surface sampled while bound";
-        if (bound) return false;
-        end_rendering();
-        barrier(c, s->img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
         const VkImageAspectFlags aspect = s->depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
-        const VkImageView view = view_for(s->img, VK_IMAGE_VIEW_TYPE_2D, s->depth ? s->img.format : d.format, aspect, d.swizzle);
+        image* source = &s->img;
+        end_rendering();
+        if (bound) {
+            image& snap = s->snapshot;
+            path = "dummy: snapshot creation failed";
+            if (snap.width != s->img.width || snap.height != s->img.height || snap.format != s->img.format) {
+                if (snap.handle) m_garbage.emplace_back(*m_submitted + 1u, snap);
+                snap = image{};
+                if (!create_image(snap, s->img.format, s->img.width, s->img.height,
+                                  VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, s->img.aspect))
+                    return false;
+                s->snapshot_draw = ~0ull;
+            }
+            if (s->snapshot_draw != m_draw_counter) {
+                barrier(c, s->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+                barrier(c, snap, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+                VkImageCopy region{};
+                region.srcSubresource = { aspect, 0, 0, 1 };
+                region.dstSubresource = { aspect, 0, 0, 1 };
+                region.extent = { s->img.width, s->img.height, 1 };
+                vkCmdCopyImage(c, s->img.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, snap.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                               &region);
+                s->snapshot_draw = m_draw_counter;
+            }
+            source = &snap;
+        }
+        barrier(c, *source, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+        const VkImageView view = view_for(*source, VK_IMAGE_VIEW_TYPE_2D, s->depth ? s->img.format : d.format, aspect, d.swizzle);
         path = "dummy: surface view failed";
         if (!view) return false;
-        path = "surface";
+        path = bound ? "surface snapshot" : "surface";
         out = { sampler, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
         return true;
     }

@@ -116,12 +116,13 @@ void renderer::close()
         vkQueueWaitIdle(m_d->queue);
     }
     m_occlusion.destroy();
-    for (auto& s : m_surfaces) destroy_image(s->img);
-    for (auto& s : m_retired) destroy_image(s->img);
+    for (auto& s : m_surfaces) {
+        destroy_image(s->img);
+        destroy_image(s->snapshot);
+    }
     for (auto& g : m_garbage) destroy_image(g.second);
     destroy_image(m_display);
     m_surfaces.clear();
-    m_retired.clear();
     m_garbage.clear();
     for (image& i : m_dummy) destroy_image(i);
     for (auto& [k, e] : m_textures) destroy_image(e->img);
@@ -277,7 +278,7 @@ void renderer::destroy_image(image& img)
 void renderer::retire(surface* s)
 {
     m_garbage.emplace_back(*m_submitted + 1u, s->img);
-    s->img = image{};
+    if (s->snapshot.handle) m_garbage.emplace_back(*m_submitted + 1u, s->snapshot);
     auto it = std::find_if(m_surfaces.begin(), m_surfaces.end(), [s](const std::unique_ptr<surface>& p) { return p.get() == s; });
     if (it != m_surfaces.end()) m_surfaces.erase(it);
 }

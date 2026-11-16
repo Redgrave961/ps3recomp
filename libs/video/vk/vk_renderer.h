@@ -52,6 +52,8 @@ struct surface {
     bool gpu_dirty = false;
     u64 last_use = 0;
     image img;
+    image snapshot;
+    u64 snapshot_draw = ~0ull;
     u32 bytes() const { return pitch * height * aa_v; }
 };
 
@@ -121,7 +123,6 @@ private:
     framebuffer m_fb;
     bool m_fb_valid = false;
     std::vector<std::unique_ptr<surface>> m_surfaces;
-    std::vector<std::unique_ptr<surface>> m_retired;
     std::vector<std::pair<uint64_t, image>> m_garbage;
     image m_display;
     occlusion m_occlusion;
@@ -145,7 +146,6 @@ private:
     VkDescriptorBufferInfo m_constants{};
     const vertex_program* m_vp = nullptr;
     const fragment_program* m_fp = nullptr;
-    VkPipeline m_pipeline = VK_NULL_HANDLE;
     u32 m_fp_ea = 0;
     VkDeviceSize m_ubo_align = 256;
     VkDeviceSize m_ssbo_align = 256;
