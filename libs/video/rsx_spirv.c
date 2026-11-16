@@ -29,7 +29,7 @@ enum {
     OpStore = 62, OpAccessChain = 65, OpArrayLength = 68, OpDecorate = 71, OpMemberDecorate = 72,
     OpVectorShuffle = 79, OpCompositeConstruct = 80, OpCompositeExtract = 81, OpCompositeInsert = 82,
     OpImageSampleImplicitLod = 87, OpImageSampleExplicitLod = 88, OpImageSampleDrefImplicitLod = 89,
-    OpConvertFToS = 110, OpConvertSToF = 111, OpConvertUToF = 112, OpBitcast = 124,
+    OpImageFetch = 95, OpImage = 100, OpConvertFToU = 109, OpConvertFToS = 110, OpConvertSToF = 111, OpConvertUToF = 112, OpBitcast = 124,
     OpFNegate = 127, OpIAdd = 128, OpFAdd = 129, OpISub = 130, OpFSub = 131, OpIMul = 132,
     OpFMul = 133, OpSDiv = 135, OpFDiv = 136, OpUMod = 137, OpVectorTimesScalar = 142, OpDot = 148,
     OpAny = 154, OpLogicalOr = 166, OpLogicalAnd = 167, OpLogicalNot = 168, OpSelect = 169,
@@ -45,7 +45,7 @@ enum {
 
 enum {
     SC_UniformConstant = 0, SC_Input = 1, SC_Uniform = 2, SC_Output = 3, SC_Private = 6,
-    SC_Function = 7, SC_StorageBuffer = 12
+    SC_Function = 7, SC_PushConstant = 9, SC_StorageBuffer = 12
 };
 
 enum {
@@ -55,7 +55,7 @@ enum {
 
 enum {
     BI_Position = 0, BI_PointSize = 1, BI_ClipDistance = 3, BI_FragCoord = 15, BI_PointCoord = 16,
-    BI_FrontFacing = 17, BI_FragDepth = 22, BI_VertexIndex = 42
+    BI_FrontFacing = 17, BI_FragDepth = 22, BI_GlobalInvocationId = 28, BI_VertexIndex = 42
 };
 
 enum {
@@ -429,6 +429,7 @@ static int spv_finish(spv* s, u32 model, const u32* caps, u32 ncaps, u32 entry, 
         }
     }
     for (u32 i = 0; i < nmodes; i++) sb_ins(s, o, OpExecutionMode, (const u32[]){ entry, modes[i] }, 2);
+    if (model == 5) sb_ins(s, o, OpExecutionMode, (const u32[]){ entry, 17, 8, 8, 1 }, 5);
     sb_cat(s, o, &s->deco);
     sb_cat(s, o, &s->tvc);
     sb_cat(s, o, &s->funcs);
@@ -2611,6 +2612,94 @@ int rsx_spv_fragment(const u32* ucode, u32 max_words, const rsx_spv_fp_key* key,
     fp_fill_info(c, info, depth);
     free(c);
     return rc;
+}
+
+static u32 depth_fetch(spv* s, u32 img, u32 x, u32 y)
+{
+    u32 coord = I(s, OpCompositeConstruct, tvec(s, ti(s), 2), bc(s, ti(s), x), bc(s, ti(s), y));
+    return exf(s, I(s, OpImageFetch, tv4(s), img, coord, IMG_Lod, ci(s, 0)), 0);
+}
+
+static u32 depth_unorm(spv* s, u32 z, float scale)
+{
+    u32 c = X(s, tf(s), GL_FClamp, z, cf(s, 0.f), cf(s, 1.f));
+    return I(s, OpConvertFToU, tu(s), fadd(s, tf(s), fmul(s, tf(s), c, cf(s, scale)), cf(s, 0.5f)));
+}
+
+static u32 depth16(spv* s, u32 z, u32 is_float)
+{
+    u32 half = uand(s, tu(s), X(s, tu(s), GL_PackHalf2x16, I(s, OpCompositeConstruct, tv2(s), z, cf(s, 0.f))), cu(s, 0xFFFFu));
+    return sel(s, tu(s), is_float, half, depth_unorm(s, z, 65535.f));
+}
+
+int rsx_spv_depth_pack(int d16, rsx_spv_blob* out)
+{
+    spv* s = spv_begin();
+    if (!s) return -1;
+    u32 mainid = newl(s);
+    u32 dvar = sampler_var(s, 1, 0, 0);
+    const u32 fimg = intern(s, OpTypeImage, 0, (const u32[]){ tf(s), 1, 0, 0, 0, 1, 0 }, 7, 0);
+    const u32 uimg = intern(s, OpTypeImage, 0, (const u32[]){ tu(s), 1, 0, 0, 0, 1, 0 }, 7, 0);
+    const u32 usi = intern(s, OpTypeSampledImage, 0, &uimg, 1, 0);
+    u32 svar = 0;
+    if (!d16) {
+        svar = gvar(s, usi, SC_UniformConstant, 0);
+        deco1(s, svar, DEC_DescriptorSet, 0);
+        deco1(s, svar, DEC_Binding, 1);
+    }
+    u32 ra = intern(s, OpTypeRuntimeArray, 0, (const u32[]){ tu(s) }, 1, 1);
+    deco1(s, ra, DEC_ArrayStride, 4);
+    u32 sst = intern(s, OpTypeStruct, 0, &ra, 1, 1);
+    mdeco(s, sst, 0, DEC_Offset, 0);
+    deco(s, sst, DEC_Block);
+    u32 buf = gvar(s, sst, SC_StorageBuffer, 0);
+    deco1(s, buf, DEC_DescriptorSet, 0);
+    deco1(s, buf, DEC_Binding, 2);
+    u32 pst = intern(s, OpTypeStruct, 0, (const u32[]){ tu(s), tu(s), tu(s) }, 3, 1);
+    for (u32 m = 0; m < 3; m++) mdeco(s, pst, m, DEC_Offset, m * 4u);
+    deco(s, pst, DEC_Block);
+    u32 push = gvar(s, pst, SC_PushConstant, 0);
+    u32 tu3 = tvec(s, tu(s), 3);
+    u32 gvarid = gvar(s, tu3, SC_Input, 0);
+    deco1(s, gvarid, DEC_BuiltIn, BI_GlobalInvocationId);
+
+    fn_begin(s, mainid);
+    u32 gid = ld(s, tu3, gvarid);
+    u32 x = ex(s, tu(s), gid, 0), y = ex(s, tu(s), gid, 1);
+    u32 pp = tptr(s, SC_PushConstant, tu(s));
+    u32 w = ld(s, tu(s), I(s, OpAccessChain, pp, push, ci(s, 0)));
+    u32 h = ld(s, tu(s), I(s, OpAccessChain, pp, push, ci(s, 1)));
+    u32 mode = ld(s, tu(s), I(s, OpAccessChain, pp, push, ci(s, 2)));
+    u32 cols = d16 ? ushr(s, tu(s), I(s, OpIAdd, tu(s), w, cu(s, 1)), cu(s, 1)) : w;
+    u32 inside = band(s, I(s, OpULessThan, tbool(s), x, cols), I(s, OpULessThan, tbool(s), y, h));
+    u32 merge, then_l;
+    sel_if(s, inside, &merge, &then_l);
+    u32 dimg = I(s, OpImage, fimg, ld(s, sampler_type(s, 1, 0), dvar));
+    u32 word;
+    if (d16) {
+        u32 x0 = ushl(s, tu(s), x, cu(s, 1));
+        u32 x1 = X(s, tu(s), GL_UMin, I(s, OpIAdd, tu(s), x0, cu(s, 1)), I(s, OpISub, tu(s), w, cu(s, 1)));
+        u32 is_float = I(s, OpIEqual, tbool(s), mode, cu(s, 1));
+        u32 p0 = depth16(s, depth_fetch(s, dimg, x0, y), is_float);
+        u32 p1 = depth16(s, depth_fetch(s, dimg, x1, y), is_float);
+        p1 = sel(s, tu(s), I(s, OpULessThan, tbool(s), I(s, OpIAdd, tu(s), x0, cu(s, 1)), w), p1, cu(s, 0));
+        word = uor(s, tu(s), p0, ushl(s, tu(s), p1, cu(s, 16)));
+    } else {
+        u32 z = depth_fetch(s, dimg, x, y);
+        u32 f24 = uand(s, tu(s), ushr(s, tu(s), bc(s, tu(s), z), cu(s, 7)), cu(s, 0xFFFFFFu));
+        u32 d24 = sel(s, tu(s), I(s, OpIEqual, tbool(s), mode, cu(s, 1)), f24, depth_unorm(s, z, 16777215.f));
+        u32 simg = I(s, OpImage, uimg, ld(s, usi, svar));
+        u32 coord = I(s, OpCompositeConstruct, tvec(s, ti(s), 2), bc(s, ti(s), x), bc(s, ti(s), y));
+        u32 st8 = uand(s, tu(s), ex(s, tu(s), I(s, OpImageFetch, tu4(s), simg, coord, IMG_Lod, ci(s, 0)), 0), cu(s, 0xFFu));
+        word = uor(s, tu(s), ushl(s, tu(s), d24, cu(s, 8)), st8);
+    }
+    u32 idx = I(s, OpIAdd, tu(s), I(s, OpIMul, tu(s), y, cols), x);
+    st(s, I(s, OpAccessChain, tptr(s, SC_StorageBuffer, tu(s)), buf, ci(s, 0), idx), word);
+    sel_end(s, merge);
+    sb_ins(s, BODY(s), OpReturn, k_none, 0);
+    fn_end(s);
+    const u32 caps[1] = { 1 };
+    return spv_finish(s, 5, caps, 1, mainid, NULL, 0, out);
 }
 
 void rsx_spv_blob_free(rsx_spv_blob* blob)

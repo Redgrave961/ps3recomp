@@ -187,6 +187,7 @@ typedef struct rsx_spv_vp_info {
 int  rsx_spv_vertex(const u32* ucode, const rsx_spv_vp_key* key, rsx_spv_blob* out, rsx_spv_vp_info* info);
 int  rsx_spv_fragment(const u32* ucode, u32 max_words, const rsx_spv_fp_key* key, rsx_spv_blob* out, rsx_spv_fp_info* info);
 int  rsx_spv_fragment_scan(const u32* ucode, u32 max_words, rsx_spv_fp_info* info);
+int  rsx_spv_depth_pack(int d16, rsx_spv_blob* out);
 void rsx_spv_blob_free(rsx_spv_blob* blob);
 
 #ifdef __cplusplus

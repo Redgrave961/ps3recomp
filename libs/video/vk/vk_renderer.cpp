@@ -105,7 +105,7 @@ bool renderer::open(vk_device& d, VkSemaphore timeline, uint64_t* submitted, con
     m_ssbo_align = std::max<VkDeviceSize>(16, d.props.limits.minStorageBufferOffsetAlignment);
     m_shaders.init(d);
     return m_ring.create(d, 256ull << 20, timeline) && m_pipelines.create(d, cache_path) && create_dummies() &&
-           m_occlusion.create(d, timeline);
+           m_occlusion.create(d, timeline) && m_depth_pack.create(d);
 }
 
 void renderer::close()
@@ -116,9 +116,11 @@ void renderer::close()
         vkQueueWaitIdle(m_d->queue);
     }
     m_occlusion.destroy();
+    m_depth_pack.destroy();
     for (auto& s : m_surfaces) {
         destroy_image(s->img);
         destroy_image(s->snapshot);
+        destroy_image(s->as_color);
     }
     for (auto& g : m_garbage) destroy_image(g.second);
     destroy_image(m_display);
@@ -279,6 +281,7 @@ void renderer::retire(surface* s)
 {
     m_garbage.emplace_back(*m_submitted + 1u, s->img);
     if (s->snapshot.handle) m_garbage.emplace_back(*m_submitted + 1u, s->snapshot);
+    if (s->as_color.handle) m_garbage.emplace_back(*m_submitted + 1u, s->as_color);
     auto it = std::find_if(m_surfaces.begin(), m_surfaces.end(), [s](const std::unique_ptr<surface>& p) { return p.get() == s; });
     if (it != m_surfaces.end()) m_surfaces.erase(it);
 }
@@ -307,6 +310,7 @@ surface* renderer::surface_for(u32 ea, u32 pitch, u32 width, u32 height, u32 for
     s->aa_v = aa_v;
     s->bpp = depth ? (format == 1 ? 2u : 4u) : color_bpp(format);
     const bool depth_float = (r(rsx::M_CONTROL0) >> 12) & 1u;
+    s->depth_float = depth && depth_float;
     VkFormat vf;
     VkImageAspectFlags aspect;
     VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;

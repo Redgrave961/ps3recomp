@@ -173,6 +173,51 @@ void renderer::describe_units()
     }
 }
 
+image* renderer::depth_as_color(surface& s, VkFormat format)
+{
+    image& dst = s.as_color;
+    if (dst.width != s.img.width || dst.height != s.img.height || dst.format != format) {
+        if (dst.handle) m_garbage.emplace_back(*m_submitted + 1u, dst);
+        dst = image{};
+        if (!create_image(dst, format, s.img.width, s.img.height, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                          VK_IMAGE_ASPECT_COLOR_BIT))
+            return nullptr;
+        s.as_color_draw = ~0ull;
+    }
+    if (s.as_color_draw == m_draw_counter) return &dst;
+    const bool d16 = s.bpp == 2;
+    const u32 w = s.img.width, h = s.img.height, row = d16 ? (w + 1u) & ~1u : w;
+    const VkDeviceSize bytes = (VkDeviceSize)row * h * s.bpp;
+    vk_slice slice = m_ring.alloc(bytes, m_ssbo_align);
+    if (!slice.ptr) return nullptr;
+    const VkComponentMapping identity{};
+    const VkImageView dv = view_for(s.img, VK_IMAGE_VIEW_TYPE_2D, s.img.format, VK_IMAGE_ASPECT_DEPTH_BIT, identity);
+    const VkImageView sv = d16 ? dv : view_for(s.img, VK_IMAGE_VIEW_TYPE_2D, s.img.format, VK_IMAGE_ASPECT_STENCIL_BIT, identity);
+    if (!dv || !sv) return nullptr;
+    VkCommandBuffer c = cmd();
+    end_rendering();
+    barrier(c, s.img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    m_depth_pack.record(c, dv, sv, slice.buffer, slice.offset, bytes, w, h, d16, s.depth_float);
+    VkMemoryBarrier2 mb{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+    mb.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    mb.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    mb.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    mb.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+    VkDependencyInfo di{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+    di.memoryBarrierCount = 1;
+    di.pMemoryBarriers = &mb;
+    vkCmdPipelineBarrier2(c, &di);
+    barrier(c, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    VkBufferImageCopy region{};
+    region.bufferOffset = slice.offset;
+    region.bufferRowLength = row;
+    region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    region.imageExtent = { w, h, 1 };
+    vkCmdCopyBufferToImage(c, slice.buffer, dst.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    s.as_color_draw = m_draw_counter;
+    return &dst;
+}
+
 bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out, rsx_spv_texture_state& state)
 {
     const u32 slot = vertex ? rsx::TEXTURES + unit : unit;
@@ -213,7 +258,23 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
         if (s->ea != ea) continue;
         if (s->state != SURFACE_VALID) { skipped = "memory: surface not valid"; continue; }
         if (d.cube || d.dimension == 3) { skipped = "memory: surface sampled as cube/3D"; continue; }
-        if (s->depth != d.depth) { skipped = s->depth ? "memory: depth surface sampled as color" : "memory: color surface sampled as depth"; continue; }
+        if (s->depth && !d.depth) {
+            if (d.compressed || s->bpp != texel_bytes(d.format)) {
+                skipped = "memory: depth surface sampled as color of another size";
+                continue;
+            }
+            image* packed = depth_as_color(*s, d.format);
+            path = "dummy: depth pack failed";
+            if (!packed) return false;
+            barrier(c, *packed, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+            const VkImageView view = view_for(*packed, VK_IMAGE_VIEW_TYPE_2D, d.format, VK_IMAGE_ASPECT_COLOR_BIT, d.swizzle);
+            if (!view) return false;
+            path = "depth packed as color";
+            out = { sampler, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+            return true;
+        }
+        if (s->depth != d.depth) { skipped = "memory: color surface sampled as depth"; continue; }
         if (!s->depth && (d.compressed || texel_bytes(s->img.format) == 0 || texel_bytes(s->img.format) != texel_bytes(d.format))) {
             skipped = "memory: surface texel size differs";
             continue;

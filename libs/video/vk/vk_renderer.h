@@ -6,6 +6,7 @@
 #include "vk_pipeline.h"
 #include "vk_shaders.h"
 #include "vk_occlusion.h"
+#include "vk_depth_pack.h"
 #include "rsx_texture.h"
 
 #include <array>
@@ -45,6 +46,7 @@ struct surface {
     u32 height = 0;
     u32 gcm_format = 0;
     bool depth = false;
+    bool depth_float = false;
     u32 bpp = 0;
     u32 aa_u = 1;
     u32 aa_v = 1;
@@ -54,6 +56,8 @@ struct surface {
     image img;
     image snapshot;
     u64 snapshot_draw = ~0ull;
+    image as_color;
+    u64 as_color_draw = ~0ull;
     u32 bytes() const { return pitch * height * aa_v; }
 };
 
@@ -126,6 +130,8 @@ private:
     std::vector<std::pair<uint64_t, image>> m_garbage;
     image m_display;
     occlusion m_occlusion;
+    depth_pack m_depth_pack;
+    image* depth_as_color(surface& s, VkFormat format);
 
     bool draw_setup();
     void draw_execute(const rsx::draw_clause& clause, u32 id);
