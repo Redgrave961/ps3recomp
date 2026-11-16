@@ -26,10 +26,9 @@
 
 namespace {
 
-constexpr uint32_t k_slots = 3;
+constexpr uint32_t k_slots = 4;
 constexpr uint32_t k_present_frames = 3;
 constexpr int64_t k_frame_ns = 1001000000ll / 60ll;
-constexpr int64_t k_scanout_phase_ns = 2000000;
 
 enum class pacing { measuring, vrr, locked, free };
 
@@ -95,12 +94,11 @@ struct state {
     slot slots[k_slots];
     std::mutex queue_lock;
     std::condition_variable queue_cv;
+    int queued = -1;
     int latest = -1;
     bool latest_new = false;
-    uint64_t latest_tick = 0;
     int shown = -1;
     uint64_t tick = 0;
-    int64_t tick_ns = 0;
 
     VkSemaphore present_timeline = VK_NULL_HANDLE;
     std::atomic<uint64_t> presented{ 0 };
@@ -630,12 +628,10 @@ void present_main()
     uint64_t seen = 0;
     for (;;) {
         uint64_t tick;
-        int64_t tick_ns;
         {
             std::unique_lock<std::mutex> hold(g.queue_lock);
             g.queue_cv.wait(hold, [&] { return g.tick != seen || g.resized.load() || g.display_changed.load(); });
             tick = g.tick;
-            tick_ns = g.tick_ns;
         }
         if (g.display_changed.exchange(false)) {
             read_refresh();
@@ -644,7 +640,6 @@ void present_main()
         if (g.resized.exchange(false)) rebuild_swapchain();
         if (tick == seen) continue;
         seen = tick;
-        sleep_until(tick_ns + k_scanout_phase_ns);
         int pick;
         {
             std::lock_guard<std::mutex> hold(g.queue_lock);
@@ -663,7 +658,11 @@ void vk_vblank(void*, u64 count)
     {
         std::lock_guard<std::mutex> hold(g.queue_lock);
         g.tick = count;
-        g.tick_ns = now_ns();
+        if (g.queued >= 0) {
+            g.latest = g.queued;
+            g.latest_new = true;
+            g.queued = -1;
+        }
     }
     g.queue_cv.notify_one();
 }
@@ -824,7 +823,7 @@ void vk_present(void*, u32, const rsx_display_buffer* db)
     uint32_t i = 0;
     {
         std::lock_guard<std::mutex> hold(g.queue_lock);
-        while ((int)i == g.shown || (int)i == g.latest) i++;
+        while ((int)i == g.shown || (int)i == g.latest || (int)i == g.queued) i++;
     }
     slot& s = g.slots[i];
     timeline_wait(g.present_timeline, s.released);
@@ -873,9 +872,7 @@ void vk_present(void*, u32, const rsx_display_buffer* db)
     s.rendered = g.submitted;
     {
         std::lock_guard<std::mutex> hold(g.queue_lock);
-        g.latest = (int)i;
-        g.latest_new = true;
-        g.latest_tick = rsx_core_vblank_count();
+        g.queued = (int)i;
     }
     g.queue_cv.notify_one();
 

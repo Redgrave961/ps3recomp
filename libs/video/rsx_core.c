@@ -312,15 +312,25 @@ static void rsx_flush(void)
     if (s.renderer && s.renderer->flush) s.renderer->flush(s.renderer->user);
 }
 
-static void rsx_present(u32 buffer)
+static void rsx_scanout(u32 buffer)
 {
     if (s.renderer && s.renderer->present)
         s.renderer->present(s.renderer->user, buffer, &s.display[buffer]);
+}
+
+static void rsx_flip_done(u32 buffer)
+{
     __atomic_store_n(&s.current_display, buffer, __ATOMIC_RELEASE);
     __atomic_store_n(&s.last_flip_time, rsx_core_system_time(), __ATOMIC_RELEASE);
     __atomic_store_n(&s.flip_status, 0u, __ATOMIC_RELEASE);
     __atomic_add_fetch(&s.frames, 1u, __ATOMIC_RELEASE);
     rsx_core_raise(RSX_EVENT_FLIP, 1);
+}
+
+static void rsx_present(u32 buffer)
+{
+    rsx_scanout(buffer);
+    rsx_flip_done(buffer);
 }
 
 static void rsx_flip(u32 buffer)
@@ -333,8 +343,9 @@ static void rsx_flip(u32 buffer)
     s.sema4097_ctx = RSX_DMA_SEMAPHORE_RW;
     s.report_ctx = RSX_DMA_REPORT_LOCAL;
     if (s.renderer && s.renderer->reset) s.renderer->reset(s.renderer->user);
+    rsx_scanout(buffer);
     if (s.vsync) rsx_wait_vblank();
-    rsx_present(buffer);
+    rsx_flip_done(buffer);
     for (u32 i = 0; i < 16u; i += 4u) rsx_store_label(RSX_SEMAPHORE_EA + 0x10u + i, 0);
 }
 
