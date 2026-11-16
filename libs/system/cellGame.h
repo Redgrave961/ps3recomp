@@ -123,31 +123,19 @@ typedef struct CellGameSetInitParams {
  * Configuration (call before game boots)
  * -----------------------------------------------------------------------*/
 
-/* Set the game's title ID (e.g., "BLUS30443") */
-void cellGame_set_title_id(const char* title_id);
-
 /* Read title/version fields from the game's PARAM.SFO at boot (robust title id
  * for all path building). Falls back to defaults if the SFO can't be read. */
 void cellGame_init_from_paramsfo(const char* sfo_path);
 void cellGame_init_boot(const char* vfs_root);
 const char* cellGame_get_boot_path(void);
 
-/* Central title-id accessor (so other modules don't hardcode placeholders). */
-const char* cellGame_get_title_id(void);
 const char* cellGame_get_hdd_title_id(void);
 const char* cellGame_get_title(void);
-
-/* Set the game's title string */
-void cellGame_set_title(const char* title);
-
-/* Set the content info path root */
-void cellGame_set_content_path(const char* path);
 
 /* ---------------------------------------------------------------------------
  * Functions
  * -----------------------------------------------------------------------*/
 
-s32 cellGamePatchCheck(CellGameContentSize* size, u32 reserved);
 s32 cellGameBootCheck(u32* type, u32* attributes, CellGameContentSize* size,
                        char* dirName);
 
@@ -155,28 +143,10 @@ s32 cellGameContentPermit(char* contentInfoPath, char* usrdirPath);
 
 s32 cellGameDataCheck(u32 type, const char* dirName, CellGameContentSize* size);
 
-s32 cellGameDataCheckCreate(u32 version, const char* dirName, u32 errDialog,
-                            void* funcStat, u32 container);
-s32 cellHddGameCheck(u32 version, const char* dirName, u32 errDialog,
-                     void* funcStat, u32 container);
-
-s32 cellGameDataCheckCreate2(u32 version, const char* dirName, u32 errDialog,
-                             void* funcStat, u32 container);
-
-s32 cellGameGetParamInt(s32 id, s32* value);
-
 s32 cellGameGetParamString(s32 id, char* buf, u32 bufsize);
 
 s32 cellGameCreateGameData(CellGameSetInitParams* init, char* tmp_contentInfoPath,
                             char* tmp_usrdirPath);
-
-s32 cellGameDeleteGameData(const char* dirName);
-
-/* cellGameSetExitParam — see cellGameExec.h for correct signature */
-
-s32 cellGameGetSizeKB(s32* sizeKB);
-
-s32 cellGameGetLocalWebContentPath(char* path);
 
 /* Show a system content-error message. type >= 100 means the title exits
  * right after; the type and dirName are the only record of what it objected

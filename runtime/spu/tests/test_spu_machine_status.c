@@ -51,7 +51,7 @@ int main(void) {
     }
     spu_begin_image(77);spu_register_function(0x240,landed);
     for(unsigned ie=0;ie<2;ie++) {
-        ctx.image_id=77;ctx.policy_mode=1;ctx.status=SPU_STATUS_RUNNING;
+        ctx.image_id=77;ctx.status=SPU_STATUS_RUNNING;
         ctx.int_enable=1-ie;ctx.gpr[7]=spu_splat_u32(0x240);ctx.pc=0x4000;
         word(0x4000,0x35000000|(7<<7)|(ie?0x40000:0x80000)); /* bi E/D $7 */
         spu_indirect_branch(&ctx);
@@ -66,12 +66,7 @@ unsigned long long ps3_ms_now(void){abort();}
 uint32_t g_ww_lo=0xFFFFFFFFu,g_ww_hi;int g_resv_store_active;
 
 uint32_t g_barrier_sync_watch;
-uint32_t g_ydkj_real_spurs_ea, g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
 void spurs_ef_set_from_spu(uint32_t ea, uint16_t bits) { (void)ea; (void)bits; abort(); }
-void ydkj_wake_all_event_flags(void) { abort(); }
-void spurs_pm_build_context(spu_context* c, uint32_t a, uint32_t b, uint32_t d) {
-    (void)c; (void)a; (void)b; (void)d; abort();
-}
 uint32_t g_spu_image_src_ea, g_spu_image_ls_start, g_spu_image_span;
 /* LV2 worker publication is outside the machine-status paths exercised here. */
 void spu_thread_publish_ctx(uint32_t tid, void* c) { (void)tid; (void)c; abort(); }

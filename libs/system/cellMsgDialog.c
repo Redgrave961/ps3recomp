@@ -249,18 +249,6 @@ s32 cellMsgDialogOpen2(CellMsgDialogType type, const char* msgString,
     return CELL_OK;
 }
 
-/* cellMsgDialogOpen -- the pre-3.40 entry point, identical arguments and
- * behaviour to Open2 (RPCS3 forwards it the same way). Registering only Open2
- * meant a title on the older API got the unresolved-NID default and then waited
- * forever for a callback that could never fire. Virtua Fighter 5 opens one
- * during boot and stops dead there. */
-s32 cellMsgDialogOpen(CellMsgDialogType type, const char* msgString,
-                      CellMsgDialogCallback callback, void* userdata,
-                      void* extParam)
-{
-    return cellMsgDialogOpen2(type, msgString, callback, userdata, extParam);
-}
-
 s32 cellMsgDialogClose(float delayMs)
 {
     printf("[cellMsgDialog] Close(delay=%.1f ms)\n", delayMs);
@@ -292,38 +280,6 @@ s32 cellMsgDialogAbort(void)
     s_nobutton_deadline = 0;
     s_callback = NULL;
     s_userdata = NULL;
-
-    return CELL_OK;
-}
-
-s32 cellMsgDialogProgressBarSetMsg(u32 progressBarIndex, const char* msgString)
-{
-    if (progressBarIndex >= MAX_PROGRESS_BARS)
-        return CELL_MSGDIALOG_ERROR_PARAM;
-
-    if (!s_dialog_open)
-        return CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED;
-
-    if (msgString) {
-        strncpy(s_progress[progressBarIndex].message, GUEST_PTR(msgString, const char*),
-                sizeof(s_progress[progressBarIndex].message) - 1);
-        s_progress[progressBarIndex].message[sizeof(s_progress[progressBarIndex].message) - 1] = '\0';
-        printf("[cellMsgDialog] ProgressBar[%u] msg='%s'\n", progressBarIndex, guest_str(msgString));
-    }
-
-    return CELL_OK;
-}
-
-s32 cellMsgDialogProgressBarReset(u32 progressBarIndex)
-{
-    if (progressBarIndex >= MAX_PROGRESS_BARS)
-        return CELL_MSGDIALOG_ERROR_PARAM;
-
-    if (!s_dialog_open)
-        return CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED;
-
-    s_progress[progressBarIndex].value = 0;
-    printf("[cellMsgDialog] ProgressBar[%u] reset to 0%%\n", progressBarIndex);
 
     return CELL_OK;
 }

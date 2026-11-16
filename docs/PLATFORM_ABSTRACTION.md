@@ -16,7 +16,6 @@ How ps3recomp handles cross-platform compatibility between Windows and POSIX (Li
 8. [Input](#input)
 9. [Cryptographic RNG](#cryptographic-rng)
 10. [Filesystem Differences](#filesystem-differences)
-11. [Fiber / Coroutine Support](#fiber--coroutine-support)
 
 ---
 
@@ -359,39 +358,3 @@ ps3_stat->st_ctime  = host_to_be64(host_stat.st_ctime);
 | `CELL_FS_O_CREAT` | 0x100 | `CREATE_ALWAYS` | `O_CREAT` |
 | `CELL_FS_O_TRUNC` | 0x200 | `TRUNCATE_EXISTING` | `O_TRUNC` |
 | `CELL_FS_O_APPEND` | 0x400 | `FILE_APPEND_DATA` | `O_APPEND` |
-
----
-
-## Fiber / Coroutine Support
-
-### Windows Fibers
-
-```c
-// Convert current thread to a fiber
-ConvertThreadToFiber(NULL);
-
-// Create a new fiber
-LPVOID fiber = CreateFiber(stack_size, fiber_proc, param);
-
-// Switch to fiber
-SwitchToFiber(fiber);
-
-// Delete fiber
-DeleteFiber(fiber);
-```
-
-### POSIX ucontext
-
-```c
-ucontext_t ctx;
-getcontext(&ctx);
-ctx.uc_stack.ss_sp = stack_memory;
-ctx.uc_stack.ss_size = stack_size;
-ctx.uc_link = &return_context;
-makecontext(&ctx, fiber_proc, 1, param);
-
-// Switch to fiber
-swapcontext(&current, &ctx);
-```
-
-**Note:** `ucontext` is deprecated on macOS but still works. For production macOS builds, consider using `setjmp`/`longjmp` with manual stack management, or platform-specific alternatives.

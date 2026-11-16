@@ -107,7 +107,7 @@ int64_t sys_cond_create(ppu_context* ctx)
             p[0] = (uint8_t)(id >> 24); p[1] = (uint8_t)(id >> 16);
             p[2] = (uint8_t)(id >> 8); p[3] = (uint8_t)id;
         }
-        if (getenv("PS3_SYNCLOG") || getenv("YDKJ_SYNCLOG")) {
+        if (getenv("PS3_SYNCLOG")) {
             char name[9]; memcpy(name, c->name, 8); name[8] = 0;
             fprintf(stderr, "[SYNC] cond_create id=%u name='%s' mutex=%u id_at=0x%08X lr=0x%08X\n",
                     i + 1, name, mid, out, (uint32_t)ctx->lr);
@@ -139,23 +139,7 @@ int64_t sys_cond_wait(ppu_context* ctx)
 {
     ppu_thread_note_block(ctx->thread_id);   /* PS3_PRIO_START */
     uint64_t timeout = LV2_ARG_U64(ctx, 1);
-    /* Preserve upstream's opt-in wait diagnostics across the waiter rewrite. */
-    const char* peek = getenv("PS3_COND_PEEK");
-    if (peek) {
-        uint32_t ea = (uint32_t)strtoul(peek, NULL, 16);
-        if (ea) {
-            const uint8_t* p = vm_to_host(ea);
-            uint32_t value = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-                             ((uint32_t)p[2] << 8) | p[3];
-            fprintf(stderr, "[PEEK] [0x%08X]=%u (0x%08X) at cond_wait(cond=%u)\n",
-                    ea, value, value, LV2_ARG_U32(ctx, 0));
-        }
-    }
-#ifdef _WIN32
-    const char* spurious = getenv("PS3_COND_SPURIOUS_MS");
-    long probe_ms = spurious ? atol(spurious) : 0;
-    if (probe_ms > 0 && !timeout) timeout = (uint64_t)probe_ms * 1000;
-#endif
+
     if (timeout > ((1ull << 48) - 1)) timeout = (1ull << 48) - 1;
 #ifdef _WIN32
     /* The QPC deadline below multiplies by the counter frequency in 64 bits;

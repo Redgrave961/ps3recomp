@@ -17,12 +17,11 @@ root = Path(__file__).resolve().parents[1]
 sources = ['runtime/spu/tests/test_spu_channel_semantics.c',
            'runtime/spu/spu_drain.c', 'runtime/spu/spu_lockstep.c',
            'runtime/spu/spu_coherency.c', 'runtime/spu/spu_workload.c',
-           'runtime/spu/spurs_policy.c', 'runtime/spu/spurs_job.c',
-           'runtime/spu/spu_tsp_weak.c', 'runtime/spu/spu_vm_pagemap.c',
-           'runtime/spu/spurs_policy_blob_weak.c', 'runtime/spu/spu_interp.c',
+           'runtime/spu/spu_vm_pagemap.c',
+           'runtime/spu/spu_interp.c',
            'runtime/platform/win32_compat.c']
 env = {k: v for k, v in os.environ.items()
-       if not k.startswith(('SPU_', 'SPURS_', 'YDKJ_', 'LBP_', 'GH3_'))}
+       if not k.startswith(('SPU_', 'SPURS_'))}
 with tempfile.TemporaryDirectory(prefix='spu-channel-semantics-') as tmp:
     binary = Path(tmp) / 'test'
     subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-w',

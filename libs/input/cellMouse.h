@@ -87,17 +87,8 @@ typedef struct CellMouseRawData {
  * -----------------------------------------------------------------------*/
 
 s32 cellMouseInit(u32 max_connect);
-s32 cellMouseEnd(void);
-s32 cellMouseGetData(u32 port_no, CellMouseData* data);
 s32 cellMouseGetDataList(u32 port_no, CellMouseDataList* data);
 s32 cellMouseGetInfo(u32 info_ea);   /* guest EA -- BE fields, SDK layout */
-s32 cellMouseSetTabletMode(u32 port_no, u32 mode);
-s32 cellMouseClearBuf(u32 port_no);
-
-/* Internal: feed mouse events from host input system */
-void cellMouse_moveEvent(u32 port, s8 dx, s8 dy);
-void cellMouse_buttonEvent(u32 port, u8 button_mask, int pressed);
-void cellMouse_wheelEvent(u32 port, s8 wheel);
 
 #ifdef __cplusplus
 }

@@ -495,11 +495,6 @@ static void pad_init_backend(void)
     pad_xinput_load();
 }
 
-static void pad_shutdown_backend(void)
-{
-    /* XInput needs no explicit shutdown */
-}
-
 #endif /* PAD_BACKEND_XINPUT */
 
 /* ---------------------------------------------------------------------------
@@ -834,29 +829,6 @@ s32 cellPadInit(u32 max_connect)
     return CELL_OK;
 }
 
-s32 cellPadEnd(void)
-{
-    printf("[cellPad] End()\n");
-
-    if (!s_pad_initialized)
-        return CELL_PAD_ERROR_NOT_OPENED;
-
-    pad_lock();
-    pad_shutdown_backend();
-    pad_unlock();
-
-    s_pad_initialized = 0;
-    s_max_connect = 0;
-    return CELL_OK;
-}
-
-void cellPad_poll(void)
-{
-    if (s_pad_initialized) {
-        pad_poll_backend();
-    }
-}
-
 /* HLE args are GUEST effective addresses; guest structs are BIG-ENDIAN. The
  * vm_write helpers from ppu_memory.h translate + byte-swap. (cellPad was
  * written for host pointers and was never actually invoked until its NIDs
@@ -880,50 +852,6 @@ s32 cellPadGetData(u32 port_no, CellPadData* data_guest)
     /* Poll fresh state */
     pad_poll_backend();
 
-    /* YDKJ_INJECT_PAD: the game's wait loop polls the pad (cellPadSetActDirect /
-     * GetData) -- if it's parked on a "press button" prompt after loading, no
-     * host input means it waits forever. Inject a real button PULSE (CROSS+START+
-     * CIRCLE) so it advances. Legit input simulation, not forged pixels. */
-    /* NOTE: cache getenv() -- this runs on every poll from multiple threads, and the
-     * uncached version crashed deterministically (varying fault address = race). Every
-     * other probe in this tree uses the cached `static int x=-1` pattern; match it. */
-    static int  s_inj   = -1;
-    static u16  s_btn   = 0x0008u;   /* default START */
-    static long s_delay = 3000;
-    if (s_inj < 0) {
-        s_inj = getenv("YDKJ_INJECT_PAD") ? 1 : 0;
-        const char* be = getenv("YDKJ_PAD_BTN");   if (be) s_btn   = (u16)strtoul(be,0,0);
-        const char* de = getenv("YDKJ_PAD_DELAY"); if (de) s_delay = strtol(de,0,0);
-    }
-    /* Gate on WALL-CLOCK, not poll count: the game polls the pad hundreds of thousands
-     * of times inside an early wait loop, so any count-based delay fires during init
-     * (crash: guest ctr=0x0005F8A0 r3=0 -- button handler on an unconstructed object).
-     * YDKJ_PAD_DELAY is now SECONDS to wait before the first injected press. */
-    if (s_inj && port_no < PAD_MAX_HOST_PORTS) {
-        static long _pc = 0; _pc++;
-        /* Cheap counter gate FIRST: clock() is a slow call and this poll loop is hammered
-         * by the guest from multiple threads; sampling it every poll perturbs timing. Only
-         * consult the clock once every 256 polls, and never after arming. */
-        static int     s_armed = 0;
-        static clock_t s_t0    = 0;
-        if (!s_armed) {
-            if ((_pc & 0xFF) == 0) {
-                if (!s_t0) s_t0 = clock();
-                else if ((double)(clock() - s_t0) / (double)CLOCKS_PER_SEC >= (double)s_delay) s_armed = 1;
-            }
-            goto skip_inject;
-        }
-        u16 btn = s_btn; long delay = 0;
-        /* Delay past init, then a single clean pulse every ~180 calls (press 15, release 165). */
-        if (_pc > delay) {
-            long ph = (_pc - delay) % 180;
-            if (ph < 15) s_host_state[port_no].buttons |= btn;
-            else         s_host_state[port_no].buttons &= ~btn;
-            s_host_state[port_no].connected = 1;
-        }
-    }
-skip_inject: ;
-
     if (port_no >= PAD_MAX_HOST_PORTS || (!s_host_state[port_no].connected && port_no != 0)) {
         goto emit;   /* data stays zeroed -> len=0 */
     }
@@ -946,9 +874,7 @@ skip_inject: ;
      * advances. len=0 drain reads still build the ordinary payload, but do
      * not consume a PAD_FILE report. See the emission contract below. */
     {
-        static int always = -1;
-        if (always < 0) always = getenv("PAD_ALWAYS_CHANGE") ? 1 : 0;
-        if (!always && port_no < PAD_MAX_HOST_PORTS && data->len) {
+        if (port_no < PAD_MAX_HOST_PORTS && data->len) {
             if (!s_data_fresh[port_no]) data->len = 0;   /* nothing new: end the drain */
             else                        s_data_fresh[port_no] = 0;
         }
@@ -1076,7 +1002,7 @@ skip_inject: ;
      * fixed positions. Rubber Ducky drives its camera from the sticks and never
      * moves on its own, so with no host pad the view is frozen wherever it
      * started -- which can leave the subject of the demo off-screen or too far
-     * away to make out. Legit input simulation, same footing as YDKJ_INJECT_PAD. */
+     * away to make out. */
     { static int s_st = -1;
       static unsigned char s_v[4] = {128,128,128,128};
       /* Optional 5th/6th fields: the seconds the hold starts and ends, so the menus
@@ -1206,54 +1132,6 @@ emit:
     return CELL_OK;
 }
 
-/* cellPadGetInfo (v1 API, NID 0x3AAAD464) — used by PSL1GHT's ioPadGetInfo.
- * Layout (RPCS3 cellPad.h CellPadInfo, all big-endian):
- *   +0x00 u32 max_connect        +0x04 u32 now_connect   +0x08 u32 system_info
- *   +0x0C u16 vendor_id[127]     +0x10A u16 product_id[127] +0x208 u8 status[127]
- *   (CELL_MAX_PADS / PSL1GHT MAX_PADS = 127 -- NOT 7; see below)
- * Leaving this unimplemented let the guest read stack garbage as pad state and
- * run off into the weeds before ever reaching gcm init. */
-s32 cellPadGetInfo(CellPadInfo2* info)
-{
-    uint32_t gaddr = (uint32_t)(uintptr_t)info;
-    if (!s_pad_initialized)
-        return CELL_PAD_ERROR_NOT_OPENED;
-    if (!gaddr)
-        return CELL_PAD_ERROR_INVALID_PARAMETER;
-
-    pad_poll_backend();
-
-    /* Present a virtual pad on port 0 when nothing physical is attached, the
-     * same as cellPadGetInfo2 does.
-     *
-     * The two entry points disagreed: GetInfo2 carried the fallback and GetInfo
-     * did not, so which one a title imports decided whether it believed a
-     * controller existed. The Orange Box's chooser imports GetInfo (v1) and
-     * never GetInfo2, so it saw zero pads, opened "SIXAXIS wireless controller
-     * not detected", took the auto-OK, and opened it again -- forever, before
-     * it ever finished booting. Both entry points describe the same hardware
-     * and have to answer the same way. */
-    u32 connected = 0;
-    for (u32 i = 0; i < s_max_connect && i < PAD_MAX_HOST_PORTS; i++)
-        if (s_host_state[i].connected || i == 0) connected++;
-
-    vm_write32(gaddr + 0x00, s_max_connect);
-    vm_write32(gaddr + 0x04, connected);
-    vm_write32(gaddr + 0x08, 0);                       /* system_info */
-    /* CellPadInfo (v1) sizes its arrays by CELL_MAX_PADS = 127, not by the 7
-     * ports: vendor_id[127] @0x0C, product_id[127] @0x10A, status[127] @0x208.
-     * Packed for 7 ports, status landed at 0x28 and GH3 -- which reads
-     * info+0x208+port -- saw port 0 disconnected and never polled the pad. */
-    for (u32 i = 0; i < CELL_PAD_MAX_PORT_NUM; i++) {
-        int on = (i < s_max_connect && i < PAD_MAX_HOST_PORTS &&
-                  (s_host_state[i].connected || i == 0));
-        vm_write16(gaddr + 0x00C + i * 2, on ? 0x054C : 0);   /* vendor: Sony  */
-        vm_write16(gaddr + 0x10A + i * 2, on ? 0x0268 : 0);   /* product: DS3  */
-        vm_write8(gaddr + 0x208 + i, (u8)((on ? CELL_PAD_STATUS_CONNECTED : 0) | pad_status_take(i)));
-    }
-    return CELL_OK;
-}
-
 s32 cellPadGetInfo2(CellPadInfo2* info_guest)
 {
     if (!s_pad_initialized)
@@ -1300,65 +1178,6 @@ s32 cellPadGetInfo2(CellPadInfo2* info_guest)
     return CELL_OK;
 }
 
-/* cellPadPeriphGetInfo -- the peripheral-class view of the pad ports (NID
- * 0x4CC9B68D). LBP polls this during boot; leaving it unresolved returned
- * CELL_OK with the caller's CellPadPeriphInfo left as uninitialised stack
- * garbage, so the game read junk port_status/pclass_type for all 7 ports.
- *
- * Layout (SDK cell/pad/pad_codes.h) -- all u32, so the whole struct marshals
- * big-endian in one sweep like cellPadGetInfo2:
- *   max_connect, now_connect, system_info,
- *   port_status[7], port_setting[7], device_capability[7],
- *   device_type[7], pclass_type[7], pclass_profile[7]
- * We report a standard DUALSHOCK-class pad (pclass_type STANDARD = 0, no
- * profile bits) mirroring the ports cellPadGetInfo2 already reports. */
-s32 cellPadPeriphGetInfo(CellPadPeriphInfo* info_guest)
-{
-    if (!s_pad_initialized)
-        return CELL_PAD_ERROR_NOT_OPENED;
-    if (!info_guest)
-        return CELL_PAD_ERROR_INVALID_PARAMETER;
-
-    pad_poll_backend();
-
-    CellPadPeriphInfo _in; CellPadPeriphInfo* info = &_in;
-    memset(info, 0, sizeof(CellPadPeriphInfo));
-    info->max_connect = s_max_connect;
-    info->system_info = 0;
-
-    u32 connected = 0;
-    for (u32 i = 0; i < s_max_connect && i < CELL_PAD_MAX_PORT_NUM; i++) {
-        /* Same virtual-pad-on-port-0 rule as cellPadGetInfo2, so both views of
-         * the ports agree (a game that cross-checks them must see one truth). */
-        if ((i < PAD_MAX_HOST_PORTS && s_host_state[i].connected) || i == 0) {
-            info->port_status[i]       = CELL_PAD_STATUS_CONNECTED | pad_status_take(i);
-            info->port_setting[i]      = s_port_setting[i];
-            info->device_capability[i] = CELL_PAD_CAPABILITY_PS3_CONFORMITY
-                                       | CELL_PAD_CAPABILITY_PRESS_MODE
-                                       | CELL_PAD_CAPABILITY_SENSOR_MODE
-                                       | CELL_PAD_CAPABILITY_HP_ANALOG_STICK
-                                       | CELL_PAD_CAPABILITY_ACTUATOR;
-            info->device_type[i]       = CELL_PAD_DEV_TYPE_STANDARD;
-            info->pclass_type[i]       = CELL_PAD_PCLASS_TYPE_STANDARD;
-            info->pclass_profile[i]    = 0;
-            connected++;
-        } else {
-            info->port_status[i] = CELL_PAD_STATUS_DISCONNECTED | pad_status_take(i);
-        }
-    }
-    info->now_connect = connected;
-
-    { unsigned int ea = (unsigned int)(uintptr_t)info_guest;
-      for (unsigned int _o = 0; _o < sizeof(CellPadPeriphInfo); _o += 4)
-          vm_write32((unsigned long long)ea + _o, *(u32*)((char*)info + _o)); }
-
-    { static int _n = 0;
-      if (PS3_LOG_FIRST(_n, 2))
-          printf("[cellPad] PeriphGetInfo(max=%u now=%u) -> STANDARD class\n",
-                 info->max_connect, connected); }
-    return CELL_OK;
-}
-
 s32 cellPadSetPortSetting(u32 port_no, u32 port_setting)
 {
     printf("[cellPad] SetPortSetting(port=%u, setting=0x%X)\n",
@@ -1371,94 +1190,6 @@ s32 cellPadSetPortSetting(u32 port_no, u32 port_setting)
         return CELL_PAD_ERROR_INVALID_PARAMETER;
 
     s_port_setting[port_no] = port_setting;
-    return CELL_OK;
-}
-
-/* cellPadInfoPressMode (NID 0x0E2DFAAD) / cellPadSetPressMode (NID 0xF83F8182)
- *
- * Press mode makes the digital buttons report an analog 0..255 pressure in the
- * extended part of CellPadData. A DS3 supports it, and the virtual pad reported
- * by cellPadGetInfo/GetInfo2 already advertises CELL_PAD_CAPABILITY_PRESS_MODE,
- * so these have to agree with that claim rather than fall through to the
- * unresolved-NID path.
- *
- * Info returns 1 when the port supports press mode; Set toggles it, recorded in
- * the same s_port_setting word cellPadSetPortSetting uses so a title that reads
- * the setting back sees what it asked for. */
-s32 cellPadInfoPressMode(u32 port_no)
-{
-    if (!s_pad_initialized)
-        return CELL_PAD_ERROR_NOT_OPENED;
-    if (port_no >= CELL_PAD_MAX_PORT_NUM)
-        return CELL_PAD_ERROR_INVALID_PARAMETER;
-    return 1;                                  /* supported */
-}
-
-s32 cellPadSetPressMode(u32 port_no, u32 mode)
-{
-    if (!s_pad_initialized)
-        return CELL_PAD_ERROR_NOT_OPENED;
-    if (port_no >= CELL_PAD_MAX_PORT_NUM)
-        return CELL_PAD_ERROR_INVALID_PARAMETER;
-    if (mode)
-        s_port_setting[port_no] |= CELL_PAD_SETTING_PRESS_ON;
-    else
-        s_port_setting[port_no] &= ~(u32)CELL_PAD_SETTING_PRESS_ON;
-    return CELL_OK;
-}
-
-/* cellPadInfoSensorMode (NID 0x78200559) / cellPadSetSensorMode (NID 0xBE5BE3BA)
- *
- * The same pair for the SIXAXIS sensors, which the virtual pad also advertises
- * (CELL_PAD_CAPABILITY_SENSOR_MODE). Unresolved, Info answered 0 -- "no
- * sensors" from a pad whose capability word says otherwise -- and Set never
- * turned the sensor block of CellPadData on. With SENSOR_ON the packet grows to
- * CELL_PAD_LEN_CHANGE_SENSOR_ON and carries the at-rest readings (see
- * cellPadGetData), which is what a DS3 lying still reports. */
-s32 cellPadInfoSensorMode(u32 port_no)
-{
-    if (!s_pad_initialized)
-        return CELL_PAD_ERROR_NOT_OPENED;
-    if (port_no >= CELL_PAD_MAX_PORT_NUM)
-        return CELL_PAD_ERROR_INVALID_PARAMETER;
-    return 1;                                  /* supported */
-}
-
-s32 cellPadSetSensorMode(u32 port_no, u32 mode)
-{
-    if (!s_pad_initialized)
-        return CELL_PAD_ERROR_NOT_OPENED;
-    if (port_no >= CELL_PAD_MAX_PORT_NUM)
-        return CELL_PAD_ERROR_INVALID_PARAMETER;
-    const u32 was = s_port_setting[port_no] & CELL_PAD_SETTING_SENSOR_ON;
-    if (mode)
-        s_port_setting[port_no] |= CELL_PAD_SETTING_SENSOR_ON;
-    else
-        s_port_setting[port_no] &= ~(u32)CELL_PAD_SETTING_SENSOR_ON;
-    if (was != (s_port_setting[port_no] & CELL_PAD_SETTING_SENSOR_ON))
-        printf("[cellPad] SetSensorMode(port %u) -> %s\n", port_no, mode ? "on" : "off");
-    return CELL_OK;
-}
-
-s32 cellPadGetCapabilityInfo(u32 port_no, CellPadCapabilityInfo* info)
-{
-    if (!s_pad_initialized)
-        return CELL_PAD_ERROR_NOT_OPENED;
-
-    if (port_no >= CELL_PAD_MAX_PORT_NUM || !info)
-        return CELL_PAD_ERROR_INVALID_PARAMETER;
-
-    u32 info_ea = (u32)(uintptr_t)info;
-    for (u32 i = 0; i < CELL_PAD_MAX_CODES; i++)
-        vm_write32(info_ea + i * 4, 0);
-
-    /* Report standard DualShock 3 capabilities */
-    vm_write32(info_ea, CELL_PAD_CAPABILITY_PS3_CONFORMITY
-                        | CELL_PAD_CAPABILITY_PRESS_MODE
-                        | CELL_PAD_CAPABILITY_SENSOR_MODE
-                        | CELL_PAD_CAPABILITY_HP_ANALOG_STICK
-                        | CELL_PAD_CAPABILITY_ACTUATOR);
-
     return CELL_OK;
 }
 
@@ -1500,14 +1231,3 @@ s32 cellPadSetActDirect(u32 port_no, CellPadActParam* param)
     return CELL_OK;
 }
 
-s32 cellPadClearBuf(u32 port_no)
-{
-    if (!s_pad_initialized)
-        return CELL_PAD_ERROR_NOT_OPENED;
-
-    if (port_no >= CELL_PAD_MAX_PORT_NUM)
-        return CELL_PAD_ERROR_INVALID_PARAMETER;
-
-    /* Nothing to clear in our implementation -- state is polled fresh */
-    return CELL_OK;
-}

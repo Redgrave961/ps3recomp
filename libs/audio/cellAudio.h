@@ -87,33 +87,8 @@ s32 cellAudioPortStart(u32 portNum);
 /* NID: 0x5B1E2C73 */
 s32 cellAudioPortStop(u32 portNum);
 
-/* NID: 0x04AF134E */
-s32 cellAudioCreateNotifyEventQueue(u32* id, u64* key);
-
-/* NID: 0x377E0CD9 */
-s32 cellAudioSetNotifyEventQueue(u64 key);
-
-/* NID: 0xFF3626FD */
-s32 cellAudioRemoveNotifyEventQueue(u64 key);
-
 /* NID: 0x74A66AF0 */
 s32 cellAudioGetPortConfig(u32 portNum, CellAudioPortConfig* config);
-
-/* NID: 0xB8EF8006 */
-s32 cellAudioPortGetStatus(u32 portNum, u32* status);
-
-/* NID: 0xE4046AFE */
-s32 cellAudioGetPortBlockTag(u32 portNum, u64 blockNo, u64* tag);
-
-/* NID: 0xFF3626FD */
-s32 cellAudioGetPortTimestamp(u32 portNum, u64 tag, u64* stamp);
-
-/* NID: 0x5676F81C */
-s32 cellAudioGetPortBlockTag(u32 portNum, u64 blockNo, u64* tag);
-s32 cellAudioSetPersonalDevice(s32 iPersonalStream, s32 iDevice);
-
-/* NID: 0x28BC1409 */
-s32 cellAudioUnsetPersonalDevice(s32 iPersonalStream);
 
 #ifdef __cplusplus
 }

@@ -179,12 +179,6 @@ s32 sceNpTrophyGetTrophyUnlockState(SceNpTrophyContext context,
                                     SceNpTrophyFlagArray* flags,
                                     u32* count);
 
-s32 sceNpTrophyGetGameProgress(SceNpTrophyContext context,
-                               SceNpTrophyHandle handle,
-                               s32* percentage);
-
-void sceNpTrophySetStoragePath(const char* path);
-
 #ifdef __cplusplus
 }
 #endif

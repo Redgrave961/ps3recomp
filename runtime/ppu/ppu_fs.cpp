@@ -6,10 +6,6 @@
  * etc.) are translated to a host root (the game directory that contains
  * PS3_GAME), set by the boot harness from the EBOOT path (or $PS3_VFS_ROOT).
  *
- * Only the calls the boot actually imports are implemented:
- *   cellFsOpen/Close/Read/Write/Lseek/Stat/Fstat/Opendir/Readdir/Closedir/
- *   Mkdir/Rmdir/Unlink/Fsync.
- *
  * Context-aware HLE: guest pointers (path, buffers, out params) are read/written
  * through vm_base in big-endian.
  */
@@ -17,21 +13,14 @@
 #include "ppu_recomp.h"      /* ppu_context */
 #include "../../libs/filesystem/npdrm.h"
 #include "ps3emu/nid.h"      /* ps3_compute_nid */
-#include "ps3emu/guest_call.h" /* ps3_invoke_guest: AIO completion is a guest OPD */
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <errno.h>
 #include <mutex>
-#include <atomic>
 #include <sys/stat.h>
 #include "../platform/win32_dirent.h"   /* <dirent.h>, or a Win32 stand-in */
-#include "../platform/ps3_dev_flash.h"   /* ps3_dev_flash_path: PS3_DEV_FLASH may name several roots */
-
-/* Guest-resolving host backtrace (ppu_loader.cpp). Must be declared at file scope:
- * `extern "C"` inside a function body is ill-formed in C++. */
-extern "C" void ydkj_host_bt(const char* tag);
 #include <fcntl.h>
 #ifdef _WIN32
 #include <io.h>          /* open/close on MinGW */
@@ -72,17 +61,13 @@ typedef struct stat fs_stat64_t;
 #endif
 
 extern "C" uint8_t* vm_base;
-extern "C" void ppu_guest_caller(char* out, size_t n);
 extern "C" uint32_t ppu_vm_size;
 extern "C" void     ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
 extern "C" void     vm_write32(uint64_t a, uint32_t v);
 extern "C" void     vm_write64(uint64_t a, uint64_t v);
-#include "../platform/win32_backtrace.h"   /* RtlCaptureStackBackTrace / GetModuleHandleA on POSIX */
+extern "C" void     sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size);
 #include "ps3emu/log_first.h"
 #include "ps3emu/ps3_env_once.h"   /* ps3_env_once: each switch looked up once */
-
-/* Host root that the PS3 mount points map into (dir containing PS3_GAME). */
-extern "C" const char* ppu_vfs_root = ".";
 
 /* CELL_FS return / mode / flag constants. */
 #define CELL_OK              0
@@ -96,13 +81,18 @@ extern "C" const char* ppu_vfs_root = ".";
 #define CELL_FS_EMFILE       (-2147418068)   /* 0x8001002C: fd table full */
 #define CELL_FS_EINVAL       (-2147418110)   /* 0x80010002 */
 #define CELL_FS_ENOSYS       (-2147418109)   /* 0x80010003 */
+#define CELL_FS_EFAULT       ((int32_t)0x8001000Du)
+#define CELL_FS_EEXIST       ((int32_t)0x80010014u)
+#define CELL_FS_EROFS        ((int32_t)0x80010026u)
+#define CELL_FS_ENOTDIR      ((int32_t)0x8001002Eu)
+#define CELL_FS_EXDEV        ((int32_t)0x80010030u)
+#define CELL_FS_ENOTMOUNTED  ((int32_t)0x8001003Au)
 #define CELL_FS_S_IFDIR      0x4000u
 #define CELL_FS_S_IFREG      0x8000u
 #define CELL_FS_O_RDONLY     0
 #define CELL_FS_O_WRONLY     1
 #define CELL_FS_O_RDWR       2
-/* Open flags: the PS3 SDK values (octal), byte for byte the set
- * libs/filesystem/cellFs.h declares. The hex guesses that used to be here
+/* Open flags: the PS3 SDK values (octal). The hex guesses that used to be here
  * (O_CREAT 0x0200, O_TRUNC 0x0400, O_APPEND 0x0100) put the right numbers on
  * the wrong names -- 0x200 and 0x400 are TRUNC and APPEND, not CREAT and
  * TRUNC -- so a title opening a file with O_RDWR|O_CREAT (flags 0x42 =
@@ -131,84 +121,9 @@ static void guest_strcpy(char* dst, uint32_t gaddr, size_t cap)
     dst[i] = 0;
 }
 
-/* Defined in runtime/syscalls/sys_fs.c -- shared by all three path
- * translators. (extern "C" is ill-formed at block scope.) */
-extern "C" void ps3_vfs_ps3game_fallback(char* path, size_t cap);
-
-/* Translate a guest path to a host path under ppu_vfs_root. Known PS3 mount
- * prefixes are stripped; the rest is appended to the root. */
 static void host_path(char* out, size_t cap, const char* guest)
 {
-    const char* rel = guest;
-    /* /dev_hdd0 overlays the installed game-update dir (a disc title patched to
-     * e.g. v1.30 runs the update's EBOOT and reads its patchN.farc from
-     * /dev_hdd0/game/<title>/), mirroring the PS3/RPCS3 layout: base data on
-     * /dev_bdvd (disc), update data on /dev_hdd0. Set PS3_HDD0_ROOT to the host
-     * dir that /dev_hdd0 maps into (the one containing game/<title>/). */
-    static const char* hdd0_root = nullptr; static int hdd0_init = 0;
-    if (!hdd0_init) { hdd0_root = ps3_env_once("PS3_HDD0_ROOT"); hdd0_init = 1; }
-    if (hdd0_root && strncmp(guest, "/dev_hdd0/", 10) == 0) {
-        snprintf(out, cap, "%s/%s", hdd0_root, guest + 10);
-        for (char* p = out; *p; p++) if (*p == '\\') *p = '/';
-        return;
-    }
-
-    /* /dev_hdd1 is the CACHE partition (cellSysCacheMount mounts it), and it
-     * must be WRITABLE and separate from the disc mount: without its own root
-     * the mount table below resolves /dev_hdd1 to <ppu_vfs_root>/cache/..., i.e.
-     * into the read-only disc tree, so a title's first cache open fails and it
-     * never creates its media threads. PS3_HDD1_ROOT selects the host dir, the
-     * same convention as PS3_HDD0_ROOT. */
-    static const char* hdd1_root = nullptr; static int hdd1_init = 0;
-    if (!hdd1_init) { hdd1_root = ps3_env_once("PS3_HDD1_ROOT"); hdd1_init = 1; }
-    if (hdd1_root && *hdd1_root && strncmp(guest, "/dev_hdd1/", 10) == 0) {
-        snprintf(out, cap, "%s/%s", hdd1_root, guest + 10);
-        for (char* p = out; *p; p++) if (*p == '\\') *p = '/';
-        return;
-    }
-
-    /* /dev_flash is FIRMWARE, not game data — mapping it into the game root (the
-     * old behaviour) makes every firmware lookup miss. YDKJ's FMOD asks for
-     * /dev_flash/sys/external/flashMP3.pic and, on a miss, prints "mp3 failed to
-     * load MP3 codec (are you using the correct flash?)" and then crashes.
-     * Serve it from a real dev_flash tree instead ($PS3_DEV_FLASH, else RPCS3's). */
-    if (strncmp(guest, "/dev_flash/", 11) == 0) {
-        const char* fw = ps3_env_once("PS3_DEV_FLASH");
-        if (!fw || !*fw) fw = "D:/recomp/tools/rpcs3/dev_flash";
-        ps3_dev_flash_path(out, cap, fw, guest + 11);
-        for (char* p = out; *p; p++) if (*p == '\\') *p = '/';
-        return;
-    }
-
-    static const char* mounts[] = {
-        "/dev_bdvd/", "/app_home/", "/dev_hdd0/", "/dev_hdd1/",
-        "/dev_flash/", "/host_root/", "/dev_usb000/", "/dev_usb/"
-    };
-    for (size_t i = 0; i < sizeof(mounts)/sizeof(mounts[0]); i++) {
-        size_t n = strlen(mounts[i]);
-        if (strncmp(guest, mounts[i], n) == 0) { rel = guest + n; break; }
-        /* Every mount above ends in '/', so a BARE device root never matched
-         * its own mount: "/dev_bdvd" is not a prefix-match for "/dev_bdvd/".
-         * It fell through to the strip-leading-slash case and resolved to
-         * <root>/dev_bdvd, which does not exist -- so a title that opendirs or
-         * stats the device to check the medium is present reads it as "no
-         * disc". YDKJ does exactly that, 27 times a boot, and consequently
-         * loaded none of its Scaleform UI or FMOD banks: no logos, no legal
-         * screen, just a clear colour.
-         *
-         * libs/filesystem/cellFs.c already carries this fix (Tokyo Jungle hit
-         * the same wall and retried forever); ppu_fs is the other half of the
-         * split filesystem and never got it. Map the bare root to the mount
-         * directory itself. */
-        if (n > 1 && strncmp(guest, mounts[i], n - 1) == 0 && guest[n - 1] == '\0') {
-            rel = guest + n - 1;   /* points at the NUL -> <root>/ */
-            break;
-        }
-    }
-    if (rel == guest && guest[0] == '/') rel = guest + 1;   /* strip leading '/' */
-    snprintf(out, cap, "%s/%s", ppu_vfs_root, rel);
-    for (char* p = out; *p; p++) if (*p == '\\') *p = '/';
-    ps3_vfs_ps3game_fallback(out, cap);
+    sys_fs_translate_path(guest, out, (int)cap);
 }
 
 /* ---- fd / dir handle tables ---- */
@@ -217,8 +132,6 @@ static FILE* g_files[FS_MAX];
 static npdrm_file* g_drm[FS_MAX];
 static uint64_t g_drm_pos[FS_MAX];
 static std::mutex g_drm_lock;
-static uint8_t g_fd_usm[FS_MAX];
-static char    g_fd_path[FS_MAX][192];   /* guest path per fd (diagnostics) */   /* 1 if this fd is an open .usm movie (read tracker) */
 static DIR*  g_dirs[FS_MAX];
 /* Last transfer direction on each fd's stream: 0 none, 1 read, 2 write.
  *
@@ -344,29 +257,7 @@ static void cellFsOpen(ppu_context* ctx)
     g_drm[fd] = drm;
     g_drm_pos[fd] = 0;
     if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
-    g_fd_usm[fd] = (strstr(gpath, ".usm") != nullptr) ? 1 : 0;
-    /* FS_CALLER=1: name the guest function that opened each file. A title whose
-     * streaming layer opens a file and never reads it (You Don't Know Jack's
-     * movies) is diagnosed from the opener: its sibling read path is the one
-     * that is not running. */
-    if (fd >= 0 && fd < FS_MAX) { strncpy(g_fd_path[fd], gpath, sizeof g_fd_path[fd]-1); g_fd_path[fd][sizeof g_fd_path[fd]-1]=0; }
-    { char who[64] = "?";
-      if (ps3_env_once("FS_CALLER")) { ppu_guest_caller(who, sizeof who);
-          fprintf(stderr, "[fs] open '%s' -> fd %d  (opened by %s)\n", gpath, fd, who);
-          /* FS_STACK=<substr>: every open funnels through one guest wrapper, so
-           * one caller level says nothing about WHICH subsystem wanted the file.
-           * Dump the guest call chain for the opens that matter. */
-          { const char* want = ps3_env_once("FS_STACK");
-            if (want && *want && strstr(gpath, want)) ydkj_host_bt("fs-open");
-          } }
-      else fprintf(stderr, "[fs] open '%s' -> fd %d\n", gpath, fd); }
-    if (ps3_env_once("PS3_FSLOG_BT") && strstr(gpath, ".usm")) {
-        /* Resolve to GUEST functions (raw host RVAs are useless here): this tells us
-         * which criMv/criFs function opened the movie, so the reader-attach path
-         * (stream+0x10, never wired => movie opened but never read) can be found. */
-        fprintf(stderr,"[USMBT] open '%s' -> fd %d\n", gpath, fd); fflush(stderr);
-        ydkj_host_bt("usm-open");
-    }
+    fprintf(stderr, "[fs] open '%s' -> fd %d\n", gpath, fd);
     ctx->gpr[3] = CELL_OK;
 }
 
@@ -391,8 +282,6 @@ static void cellFsSdataOpen(ppu_context* ctx)
 static void cellFsClose(ppu_context* ctx)
 {
     int fd = (int)(uint32_t)ctx->gpr[3];
-    if (ps3_env_once("FS_CALLER")) { char w[64]="?"; ppu_guest_caller(w,sizeof w);
-        fprintf(stderr, "[fs] close fd=%d  (by %s)\n", fd, w); }
     FILE* f = nullptr;
     npdrm_file* drm = nullptr;
     if (fd >= 0 && fd < FS_MAX) {
@@ -401,9 +290,8 @@ static void cellFsClose(ppu_context* ctx)
         drm = g_drm[fd];
         g_drm[fd] = nullptr;
         if (f) {
-            if (g_fd_usm[fd] && ps3_env_once("PS3_FSLOG_READS")) fprintf(stderr, "[USMRD] CLOSE usm fd=%d\n", fd);
             __atomic_store_n(&g_files[fd], (FILE*)nullptr, __ATOMIC_RELEASE);
-            g_fd_usm[fd] = 0; g_fd_dir[fd] = 0;
+            g_fd_dir[fd] = 0;
         }
     }
     if (drm) npdrm_close(drm);
@@ -451,66 +339,25 @@ static void cellFsRead(ppu_context* ctx)
         ctx->gpr[3] = CELL_OK;
         return;
     }
-    uint64_t raw_nbytes = ctx->gpr[5];
-    long fpos_before = ftell(f);
     if (ppu_vm_size && (uint64_t)buf + nbytes > ppu_vm_size) nbytes = ppu_vm_size - buf;
     fs_prefault(buf, nbytes);
     fs_set_dir(fd, f, 1);
     size_t n = fread(vm_base + buf, 1, (size_t)nbytes, f);   /* raw bytes, no swap */
-    /* PS3_FSLOG_EOF=<fd>,<bytes>: report end-of-file past <bytes> on one descriptor.
-     * The intro cinematic is 28 seconds and this port renders it at a few frames
-     * a second, so it cannot be watched to its end -- truncating the stream makes
-     * the demuxer see EOF and the movie finish, which is what advances the title
-     * to whatever follows the intro. Deliberately a testing knob, not a fix. */
-    { static int efd = -2; static long elim = 0;
-      if (efd == -2) { const char* e = ps3_env_once("PS3_FSLOG_EOF");
-          if (e) { efd = atoi(e); const char* c = strchr(e, 44); elim = c ? atol(c + 1) : 0; }
-          else efd = -1; }
-      if (efd >= 0 && fd == efd && elim > 0 && fpos_before >= elim) {
-          static int once = 0;
-          if (!once++) fprintf(stderr, "[fs] PS3_FSLOG_EOF: fd=%d truncated at %ld bytes\n", fd, elim);
-          n = 0;
-      } }
-    if (g_fd_usm[fd] && ps3_env_once("PS3_FSLOG_READS")) fprintf(stderr, "[USMRD] READ usm fd=%d nbytes=%llu -> %zu magic=%02X%02X%02X%02X pos=%ld lr=0x%08X\n", fd, (unsigned long long)nbytes, n, vm_base[buf], vm_base[buf+1], vm_base[buf+2], vm_base[buf+3], fpos_before, (uint32_t)ctx->lr);
-    /* PS3_FSLOG_READS=<fd>: log every read on one descriptor. PS3_FSLOG caps at 20
-     * lines and they are all spent before a movie ever opens, so it cannot
-     * answer "is the streamer reading the .avi". */
-    { static int wfd = -2;
-      if (wfd == -2) { const char* e = ps3_env_once("PS3_FSLOG_READS"); wfd = e ? atoi(e) : -1; }
-      if (wfd >= 0 && fd == wfd)
-          fprintf(stderr, "[fsread] fd=%d want=%llu got=%zu pos=%ld\n",
-                  fd, (unsigned long long)nbytes, n, fpos_before); }
-    if (ps3_env_once("PS3_FSLOG")) { static int _fd=0; if(PS3_LOG_FIRST(_fd, 20)) fprintf(stderr,"[FSDBG] fd=%d raw_nbytes=0x%llX clamped=0x%llX buf=0x%08X fpos_before=%ld n=%zu eof=%d err=%d\n", fd,(unsigned long long)raw_nbytes,(unsigned long long)nbytes,buf,fpos_before,n,feof(f),ferror(f)); }
-#ifdef _WIN32
-    if (ps3_env_once("PS3_FSLOG") && buf==0 && raw_nbytes>0x10000) { static int _b=0; if(_b++<2){ void* fr[30]; unsigned short nn=RtlCaptureStackBackTrace(0,30,fr,0); uintptr_t mb=(uintptr_t)GetModuleHandleA(0); fprintf(stderr,"[FSBT] null-buf read caller rvas:"); for(unsigned short i=0;i<nn&&i<16;i++) fprintf(stderr," %llX",(unsigned long long)((uintptr_t)fr[i]-mb)); fprintf(stderr,"\n"); } }
-#endif
-    /* Per-fd totals, not just the first 50 lines. The flat cap made "this file is
-     * opened and never read" unfalsifiable: reads on a later-opened fd fall off
-     * the end of the log and look identical to reads that never happen.
-     * FS_READ_ALL=1 logs every read; otherwise a per-fd first-read line plus a
-     * periodic summary is enough to tell the two apart. */
+    /* Per-fd totals, not just the first 50 lines: a per-fd first-read line
+     * plus a periodic summary tells "opened and never read" apart from reads
+     * that fell off the end of the log. */
     { static uint64_t tot=0; static int _n=0;
       static uint64_t per_fd[64]; static uint32_t cnt_fd[64];
       tot+=n;
       if (fd>=0 && fd<64) { per_fd[fd]+=n; cnt_fd[fd]++; }
       int first_for_fd = (fd>=0 && fd<64 && cnt_fd[fd]==1);
-      if(PS3_LOG_FIRST(_n, 50) || first_for_fd || ps3_env_once("FS_READ_ALL"))
+      if(PS3_LOG_FIRST(_n, 50) || first_for_fd)
         fprintf(stderr,"[fs] read fd=%d nbytes=%llu -> %zu (magic=%02X%02X%02X%02X, total=%llu)%s\n",
                 fd,(unsigned long long)nbytes,n,vm_base[buf],vm_base[buf+1],vm_base[buf+2],vm_base[buf+3],
                 (unsigned long long)tot, first_for_fd?"  <= FIRST READ ON THIS FD":"");
-      if (ps3_env_once("FS_READ_PATH") && fd>=0 && fd<64 && g_fd_path[fd][0])
-          fprintf(stderr, "        from %s\n", g_fd_path[fd]);
       if ((_n % 2000)==0) { fprintf(stderr,"[fs] read summary after %d reads:",_n);
           for (int i=0;i<64;i++) if (cnt_fd[i]) fprintf(stderr," fd%d=%ux/%lluB",i,cnt_fd[i],(unsigned long long)per_fd[i]);
           fprintf(stderr,"\n"); } }
-    if (ps3_env_once("PS3_FSLOG_TOC") && nbytes >= 50000) {  /* data.toc read -> who parses it? */
-        fprintf(stderr, "[TOC] data.toc read into buf=0x%08X n=%zu; lr=0x%08llX; guest-stack RAs:\n", buf, n, (unsigned long long)ctx->lr);
-        uint32_t sp = (uint32_t)ctx->gpr[1];
-        for (uint32_t i = 0; i < 128 && sp + i*4 + 4 <= ppu_vm_size; i++) {
-            uint32_t a = sp + i*4; uint32_t w = (vm_base[a]<<24)|(vm_base[a+1]<<16)|(vm_base[a+2]<<8)|vm_base[a+3];
-            if (w >= 0x10000u && w < 0x600000u) fprintf(stderr, "[TOC]   ra 0x%08X (@sp+0x%X)\n", w, i*4);
-        }
-    }
     if (nread_ptr) vm_write64(nread_ptr, n);
     ctx->gpr[3] = CELL_OK;
 }
@@ -526,75 +373,8 @@ static void cellFsWrite(ppu_context* ctx)
     fs_prefault(buf, nbytes);   /* kernel READS the buffer; same reserved-page trap */
     fs_set_dir(fd, f, 2);
     size_t n = fwrite(vm_base + buf, 1, (size_t)nbytes, f);
-    /* DIAGNOSTIC (PS3_FSLOG_BT=1): dump the guest back-chain when the game logs the
-     * render-config failure, to locate setScreenRenderTargetInternal & the config obj. */
-    if (ps3_env_once("PS3_FSLOG_BT") && buf && nbytes > 0 && nbytes < 4096 && vm_base) {
-        char tmp[256]; uint32_t nn = (uint32_t)(nbytes < 255 ? nbytes : 255);
-        memcpy(tmp, vm_base + buf, nn); tmp[nn] = 0;
-        if (strstr(tmp,"config") || strstr(tmp,"Config") || strstr(tmp,"Mystery") ||
-            strstr(tmp,"downsample") || strstr(tmp,"RenderTarget")) {
-            uint32_t sp = (uint32_t)ctx->gpr[1];
-            fprintf(stderr, "[cfgbt] write \"%.60s\" lr=0x%08X sp=0x%08X\n", tmp, (uint32_t)ctx->lr, sp);
-            for (int i = 0; i < 24 && sp && sp < 0x10000000u; i++) {
-                uint32_t nsp; memcpy(&nsp, vm_base + sp, 4);
-                nsp = ((nsp>>24)&0xFF)|((nsp>>8)&0xFF00)|((nsp<<8)&0xFF0000)|((nsp<<24)&0xFF000000);
-                if (nsp <= sp || nsp >= 0x10000000u) break;
-                uint32_t lr; memcpy(&lr, vm_base + nsp + 0x10, 4);
-                lr = ((lr>>24)&0xFF)|((lr>>8)&0xFF00)|((lr<<8)&0xFF0000)|((lr<<24)&0xFF000000);
-                fprintf(stderr, "[cfgbt]   #%d lr=0x%08X\n", i, lr);
-                sp = nsp;
-            }
-            fflush(stderr);
-        }
-    }
     if (nwr_ptr) vm_write64(nwr_ptr, n);
     ctx->gpr[3] = CELL_OK;
-}
-
-/* cellFsFGetBlockSize(int fd, u64* sector_size, u64* block_size)
- * cellFsGetBlockSize(const char* path, u64* sector_size, u64* block_size)
- *
- * Titles ask the filesystem what granularity it wants and then size and ALIGN
- * their reads to the answer. Left unregistered, the call fell through to the
- * unresolved-NID path: the out-params were never written, so the title read
- * whatever was already in them.
- *
- * The Orange Box's chooser does exactly this. With no answer it re-seeks to
- * offset 0 and re-reads the same 64 KB of APP_CHOOSER.GRP forever -- 241,997
- * reads and 15.86 GB of I/O against a 4 MB file in one run -- because the
- * offset arithmetic it derives from the block size collapses to zero.
- *
- * Both out-params are u64 and big-endian, so they go through vm_write64.
- * PS3_FS_BLOCK_SIZE overrides the value for a title that wants a different
- * granularity. */
-static void fs_report_block_size(ppu_context* ctx, uint32_t sec_ptr, uint32_t blk_ptr)
-{
-    static uint64_t bs = 0;
-    if (!bs) {
-        const char* e = ps3_env_once("PS3_FS_BLOCK_SIZE");
-        bs = (e && *e) ? (uint64_t)strtoull(e, nullptr, 0) : 4096ull;
-        if (!bs) bs = 4096ull;
-    }
-    if (sec_ptr) vm_write64(sec_ptr, bs);
-    if (blk_ptr) vm_write64(blk_ptr, bs);
-    ctx->gpr[3] = CELL_OK;
-}
-
-static void cellFsFGetBlockSize(ppu_context* ctx)
-{
-    int fd = (int)(uint32_t)ctx->gpr[3];
-    if (!fd_file(fd)) {
-        ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EBADF;
-        return;
-    }
-    fs_report_block_size(ctx, (uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[5]);
-}
-
-static void cellFsGetBlockSize(ppu_context* ctx)
-{
-    /* Path variant: the answer does not depend on the file, only the device,
-     * and every mount we serve is backed by the same host filesystem. */
-    fs_report_block_size(ctx, (uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[5]);
 }
 
 static void cellFsLseek(ppu_context* ctx)
@@ -605,8 +385,6 @@ static void cellFsLseek(ppu_context* ctx)
     uint32_t pos_ptr = (uint32_t)ctx->gpr[6];
     FILE* f = fd_file(fd);
     if (!f) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EBADF; return; }
-    if (ps3_env_once("FS_CALLER")) { char w[64]="?"; ppu_guest_caller(w,sizeof w);
-        fprintf(stderr, "[fs] lseek fd=%d off=%lld whence=%u  (by %s)\n", fd, (long long)off, wh, w); }
     /* An unknown whence, or a seek that would land before the start of the
      * file, is CELL_EINVAL and leaves the offset where it was. fseek failing
      * is not harmless on the MSVC CRT: it drops the stream's buffer and the
@@ -672,7 +450,6 @@ static void cellFsStat(ppu_context* ctx)
      * equal. */
     if (sb) write_stat(sb, mode, (uint64_t)st.st_size,
                        (int64_t)st.st_atime, (int64_t)st.st_mtime, (int64_t)st.st_ctime);
-    if (ps3_env_once("PS3_FSLOG") && strstr(gpath,".toc")) fprintf(stderr,"[FSDBG] cellFsStat('%s') -> size=0x%llX\n",gpath,(unsigned long long)st.st_size);
     ctx->gpr[3] = CELL_OK;
 }
 
@@ -682,8 +459,6 @@ static void cellFsFstat(ppu_context* ctx)
     uint32_t sb = (uint32_t)ctx->gpr[4];
     FILE* f = fd_file(fd);
     if (!f) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EBADF; return; }
-    if (ps3_env_once("FS_CALLER")) { char w[64]="?"; ppu_guest_caller(w,sizeof w);
-        fprintf(stderr, "[fs] fstat fd=%d  (by %s)\n", fd, w); }
     int64_t sz;
     if (g_drm[fd]) {
         sz = (int64_t)npdrm_size(g_drm[fd]);
@@ -693,18 +468,6 @@ static void cellFsFstat(ppu_context* ctx)
         sz = FS_TELL64(f);
         FS_SEEK64(f, cur, SEEK_SET);
     }
-    /* FS_FSTAT_CAP=<bytes>: DIAGNOSTIC. Report a smaller size than the file
-     * has. You Don't Know Jack reads a 100 KB archive whole but only probes
-     * (open/fstat/close) its 500 KB and 2.4 MB ones; if that branch is driven
-     * by the size it just asked for, capping it makes the title take the read
-     * path. Answers whether the split is size-based -- nothing more. */
-    { const char* cap = ps3_env_once("FS_FSTAT_CAP");
-      const char* only = ps3_env_once("FS_FSTAT_CAP_PATH");
-      if (cap && only && *only && !(g_fd_path[fd][0] && strstr(g_fd_path[fd], only))) cap = 0;
-      if (cap) { long long c = strtoll(cap, 0, 0);
-          if (c > 0 && sz > c) {
-              fprintf(stderr, "[fs] fstat fd=%d size %lld -> capped %lld (FS_FSTAT_CAP)\n", fd, (long long)sz, c);
-              sz = c; } } }
     if (sb) {
         /* Times only from the host: the size above also counts unflushed writes. */
         fs_stat64_t fst;   /* 64-bit: a 32-bit fstat fails on a file past 2 GiB */
@@ -764,60 +527,6 @@ static void cellFsReaddir(ppu_context* ctx)
     ctx->gpr[3] = CELL_OK;
 }
 
-/* CellFsDirectoryEntry is a 52-byte stat followed by a 258-byte dirent,
- * rounded to four-byte alignment: 312 bytes. entries_size is bytes, while
- * data_count is a big-endian u32 count of complete entries. The stream is
- * shared with cellFsReaddir and cellFsClosedir. */
-static void cellFsGetDirectoryEntries(ppu_context* ctx)
-{
-    const uint32_t fd = (uint32_t)ctx->gpr[3];
-    const uint32_t entries = (uint32_t)ctx->gpr[4];
-    const uint32_t bytes = (uint32_t)ctx->gpr[5];
-    const uint32_t count_ptr = (uint32_t)ctx->gpr[6];
-    const uint64_t limit = ppu_vm_size ? ppu_vm_size : 0x100000000ull;
-    if (!entries || !count_ptr || uint64_t(entries) + bytes > limit ||
-        uint64_t(count_ptr) + 4 > limit) {
-        ctx->gpr[3] = 0x8001000Du; // CELL_EFAULT
-        return;
-    }
-    DIR* d = fd < 3 ? nullptr : fd_dir(fd);
-    if (!d) {
-        ctx->gpr[3] = 0x8001002Au; // CELL_EBADF
-        return;
-    }
-    uint32_t count = 0;
-    ctx->gpr[3] = CELL_OK;
-    for (; count < bytes / 312; ++count) {
-        errno = 0;
-        struct dirent* entry = readdir(d);
-        if (!entry) {
-            if (errno) ctx->gpr[3] = 0x8001002Bu; // CELL_EIO
-            break;
-        }
-        char path[1300];
-        snprintf(path, sizeof path, "%s/%s", g_dir_path[fd], entry->d_name);
-        struct stat st;
-        if (stat(path, &st) != 0) {
-            ctx->gpr[3] = 0x8001002Bu; // entry disappeared or cannot be inspected
-            break;
-        }
-        uint32_t out = entries + count * 312;
-        memset(vm_base + out, 0, 312);
-        bool directory = (st.st_mode & S_IFDIR) != 0;
-        write_stat(out, (directory ? CELL_FS_S_IFDIR : CELL_FS_S_IFREG) |
-                        (uint32_t(st.st_mode) & 0777), uint64_t(st.st_size));
-        vm_write64(out + 0x0C, uint64_t(st.st_atime));
-        vm_write64(out + 0x14, uint64_t(st.st_mtime));
-        vm_write64(out + 0x1C, uint64_t(st.st_ctime));
-        size_t length = strlen(entry->d_name);
-        if (length > 255) length = 255;
-        vm_base[out + 52] = directory ? CELL_FS_TYPE_DIR : CELL_FS_TYPE_REG;
-        vm_base[out + 53] = uint8_t(length);
-        memcpy(vm_base + out + 54, entry->d_name, length);
-    }
-    vm_write32(count_ptr, count);
-}
-
 static void cellFsClosedir(ppu_context* ctx)
 {
     int fd = (int)(uint32_t)ctx->gpr[3];
@@ -866,6 +575,38 @@ static void cellFsMkdir(ppu_context* ctx)
     if (ps3_env_once("PS3_FSLOG")) fprintf(stderr, "[fs] mkdir '%s' -> '%s' (%s)\n", gpath, hpath, r == 0 ? "OK" : "FAIL");
     ctx->gpr[3] = CELL_OK;   /* existing dir is benign for boot */
 }
+static size_t fs_mount_len(const char* p)
+{
+    if (p[0] != '/') return 0;
+    const char* e = strchr(p + 1, '/');
+    return e ? (size_t)(e - p) : strlen(p);
+}
+
+static void cellFsRename(ppu_context* ctx)
+{
+    const uint32_t from_ea = (uint32_t)ctx->gpr[3], to_ea = (uint32_t)ctx->gpr[4];
+    if (!from_ea || !to_ea) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EFAULT; return; }
+    char gfrom[1024], gto[1024], hfrom[1100], hto[1100];
+    guest_strcpy(gfrom, from_ea, sizeof gfrom);
+    guest_strcpy(gto, to_ea, sizeof gto);
+    const size_t mf = fs_mount_len(gfrom), mt = fs_mount_len(gto);
+    if (!mf || !mt) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOTMOUNTED; return; }
+    if (mf != mt || strncmp(gfrom, gto, mf) != 0) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EXDEV; return; }
+    if (strncmp(gfrom, "/dev_bdvd", mf) == 0 || strncmp(gfrom, "/dev_flash", mf) == 0) {
+        ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EROFS; return;
+    }
+    host_path(hfrom, sizeof hfrom, gfrom);
+    host_path(hto, sizeof hto, gto);
+    fs_stat64_t st;
+    if (FS_STAT64(hfrom, &st) != 0) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return; }
+    if (FS_STAT64(hto, &st) == 0) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EEXIST; return; }
+    if (rename(hfrom, hto) != 0) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(errno == ENOTDIR ? CELL_FS_ENOTDIR : CELL_FS_ENOENT);
+        return;
+    }
+    ctx->gpr[3] = CELL_OK;
+}
+
 static void cellFsRmdir(ppu_context* ctx)  { ctx->gpr[3] = CELL_OK; }
 static void cellFsUnlink(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }
 static void cellFsFsync(ppu_context* ctx)
@@ -874,26 +615,6 @@ static void cellFsFsync(ppu_context* ctx)
     if (FILE* f = fd_file(fd)) fflush(f);
     ctx->gpr[3] = CELL_OK;
 }
-/* (fd, u64 size). The libs/filesystem version looks fds up in its own table,
- * which cellFsOpen here never fills, so it always returned EBADF. */
-static void cellFsFtruncate(ppu_context* ctx)
-{
-    FILE* f = fd_file((int)(uint32_t)ctx->gpr[3]);
-    if (!f) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EBADF; return; }
-    fflush(f);
-#ifdef _WIN32
-    int rc = _chsize_s(_fileno(f), (long long)ctx->gpr[4]);
-#else
-    int rc = ftruncate(fileno(f), (off_t)ctx->gpr[4]);
-#endif
-    if (ps3_env_once("PS3_FSLOG")) fprintf(stderr, "[FSDBG] cellFsFtruncate(fd=%d, size=0x%llX) -> %d\n",
-                                     (int)(uint32_t)ctx->gpr[3], (unsigned long long)ctx->gpr[4], rc);
-    ctx->gpr[3] = rc == 0 ? CELL_OK : (uint64_t)(int64_t)CELL_FS_EIO;
-}
-/* File-area preallocation (LBP cache warm-up spams this): host filesystems
- * grow files on write, so accepting is correct -- no preallocation needed. */
-static void cellFsAllocateFileAreaWithoutZeroFill(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }
-
 /* Free space for (path, u32* block_size, u64* free_block_count). Unregistered,
  * the call took the unresolved-NID path: CELL_OK with both out-params left as
  * unwritten, so a title sizing a cache read whatever was there. Report a
@@ -905,7 +626,6 @@ static void cellFsGetFreeSize(ppu_context* ctx)
     if (fb) vm_write64(fb, (32ULL << 30) / 4096);
     ctx->gpr[3] = CELL_OK;
 }
-static void cellFsChmod(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }   /* host ignores PS3 mode bits */
 static void cellFsUtime(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }   /* timestamps are not modelled */
 /* SDATA opened from an already-open fd is not implemented: fail visibly rather
  * than return CELL_OK with *sdata_fd never written. */
@@ -915,145 +635,6 @@ static void cellFsSdataOpenByFd(ppu_context* ctx)
     if (PS3_LOG_FIRST(n, 4)) fprintf(stderr, "[fs] cellFsSdataOpenByFd(fd=%d) not implemented -> CELL_ENOSYS\n",
                          (int)(uint32_t)ctx->gpr[3]);
     ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOSYS;
-}
-
-/* ---- cellFs AIO -----------------------------------------------------------
- *
- * Scott Pilgrim loads everything through cellFsAioRead: it opens gamedata.fat
- * with cellFsOpen and then never calls cellFsRead again. With the AIO NIDs
- * unresolved, its loader thread submitted requests that nothing ever completed
- * and the whole boot parked -- one open, no reads, and the main thread spinning.
- *
- * CellFsAio, big-endian, 0x28 bytes:
- *   0x00 u32 fd    0x08 u64 offset    0x10 u32 buf    0x18 u64 size    0x20 u64 user_data
- *
- * The completion callback is (CellFsAio* aio, s32 error, s32 id, u64 size).
- *
- * ponytail: the read runs synchronously and the callback fires before the
- * submit call returns. A title that submits, THEN arms the thing the callback
- * signals, would miss it -- move completion to a worker thread if one shows up.
- */
-#ifdef _WIN32
-#  define HOST_FSEEK64(f,off) _fseeki64((f), (__int64)(off), SEEK_SET)
-#  define HOST_FTELL64(f)     _ftelli64(f)
-#  define HOST_LOCKFILE(f)    _lock_file(f)
-#  define HOST_UNLOCKFILE(f)  _unlock_file(f)
-#else
-#  define HOST_FSEEK64(f,off) fseeko((f), (off_t)(off), SEEK_SET)
-#  define HOST_FTELL64(f)     ftello(f)
-#  define HOST_LOCKFILE(f)    flockfile(f)
-#  define HOST_UNLOCKFILE(f)  funlockfile(f)
-#endif
-
-static uint32_t guest_be32(uint32_t a)
-{
-    if (ppu_vm_size && (uint64_t)a + 4 > ppu_vm_size) return 0;
-    return ((uint32_t)vm_base[a] << 24) | ((uint32_t)vm_base[a+1] << 16) |
-           ((uint32_t)vm_base[a+2] << 8) | (uint32_t)vm_base[a+3];
-}
-static uint64_t guest_be64(uint32_t a)
-{
-    return ((uint64_t)guest_be32(a) << 32) | guest_be32(a + 4);
-}
-
-static void cellFsAioInit(ppu_context* ctx)   { ctx->gpr[3] = CELL_OK; }
-static void cellFsAioFinish(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }
-/* Nothing is ever outstanding, so a cancel has nothing to find. Real cellFs
- * answers CELL_FS_ENOENT for an unknown id and callers treat that as "already
- * done", which is exactly true here. */
-static void cellFsAioCancel(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }
-
-static void cellFsAioRead(ppu_context* ctx)
-{
-    uint32_t aio    = (uint32_t)ctx->gpr[3];
-    uint32_t id_ptr = (uint32_t)ctx->gpr[4];
-    uint32_t cb_opd = (uint32_t)ctx->gpr[5];
-
-    int      fd     = (int)guest_be32(aio + 0x00);
-    uint64_t offset = guest_be64(aio + 0x08);
-    uint32_t buf    = guest_be32(aio + 0x10);
-    uint64_t size   = guest_be64(aio + 0x18);
-
-    static std::atomic<int32_t> s_next_id{1};
-    int32_t id = s_next_id++;
-    if (id_ptr) vm_write32(id_ptr, (uint32_t)id);
-
-    size_t n = 0;
-    int32_t err = CELL_FS_ENOENT;
-    if (FILE* f = fd_file(fd)) {
-        if (ppu_vm_size && (uint64_t)buf + size > ppu_vm_size) size = ppu_vm_size - buf;
-        fs_prefault(buf, size);
-        if (g_drm[fd]) {
-            const int64_t got = fs_drm_read(fd, offset, vm_base + buf, size);
-            n = got < 0 ? 0 : (size_t)got;
-            err = got < 0 ? CELL_FS_EIO : CELL_OK;
-        } else {
-        /* AIO reads are absolute: they must not move the fd's own position,
-         * and the guest issues them from several threads at once (FIOS media
-         * threads, audio streamers) on the same fd as its plain reads. A bare
-         * seek + read on the shared FILE* did both: another thread's seek
-         * could land between the two, and the next cellFsRead continued from
-         * wherever the AIO stopped. Hold the stream lock across seek, read
-         * and the seek back (stdio's own calls take the same lock). */
-        HOST_LOCKFILE(f);
-        const int64_t pos = (int64_t)HOST_FTELL64(f);
-        if (HOST_FSEEK64(f, offset) == 0)
-            n = fread(vm_base + buf, 1, (size_t)size, f);
-        if (pos >= 0) HOST_FSEEK64(f, pos);
-        HOST_UNLOCKFILE(f);
-        err = CELL_OK;
-        }
-    }
-    if (ps3_env_once("PS3_FSLOG"))
-        fprintf(stderr, "[fs] aio read id=%d fd=%d off=%llu size=%llu -> %zu\n",
-                id, fd, (unsigned long long)offset, (unsigned long long)size, n);
-
-    ctx->gpr[3] = CELL_OK;
-    if (cb_opd) ps3_invoke_guest(cb_opd, aio, (uint64_t)(int64_t)err,
-                                 (uint64_t)(int64_t)id, (uint64_t)n, 0, 0, 0, 0);
-}
-
-/* MLB The Show 16 copies files into its /dev_hdd1 cache in 64 KB chunks, each
- * written with cellFsAioWrite, and polls a status word its completion callback
- * sets. With the NID unresolved the submit "succeeded", nothing was written, the
- * callback never ran, and the boot parked on the first screen. Same contract and
- * the same synchronous-completion shortcut as cellFsAioRead above. */
-static void cellFsAioWrite(ppu_context* ctx)
-{
-    uint32_t aio    = (uint32_t)ctx->gpr[3];
-    uint32_t id_ptr = (uint32_t)ctx->gpr[4];
-    uint32_t cb_opd = (uint32_t)ctx->gpr[5];
-
-    int      fd     = (int)guest_be32(aio + 0x00);
-    uint64_t offset = guest_be64(aio + 0x08);
-    uint32_t buf    = guest_be32(aio + 0x10);
-    uint64_t size   = guest_be64(aio + 0x18);
-
-    static std::atomic<int32_t> s_next_id{1};
-    int32_t id = s_next_id++;
-    if (id_ptr) vm_write32(id_ptr, (uint32_t)id);
-
-    size_t n = 0;
-    int32_t err = CELL_FS_ENOENT;
-    if (FILE* f = fd_file(fd)) {
-        if (ppu_vm_size && (uint64_t)buf + size > ppu_vm_size) size = ppu_vm_size - buf;
-        /* Absolute, like the read: leave the fd's own position where it was. */
-        HOST_LOCKFILE(f);
-        const int64_t pos = (int64_t)HOST_FTELL64(f);
-        if (HOST_FSEEK64(f, offset) == 0)
-            n = fwrite(vm_base + buf, 1, (size_t)size, f);
-        fflush(f);
-        if (pos >= 0) HOST_FSEEK64(f, pos);
-        HOST_UNLOCKFILE(f);
-        err = (n == size) ? CELL_OK : CELL_FS_EIO;
-    }
-    if (ps3_env_once("PS3_FSLOG"))
-        fprintf(stderr, "[fs] aio write id=%d fd=%d off=%llu size=%llu -> %zu\n",
-                id, fd, (unsigned long long)offset, (unsigned long long)size, n);
-
-    ctx->gpr[3] = CELL_OK;
-    if (cb_opd) ps3_invoke_guest(cb_opd, aio, (uint64_t)(int64_t)err,
-                                 (uint64_t)(int64_t)id, (uint64_t)n, 0, 0, 0, 0);
 }
 
 extern "C" void ppu_fs_register(void)
@@ -1067,30 +648,17 @@ extern "C" void ppu_fs_register(void)
     ps3_hle_register_ctx(ps3_compute_nid("cellFsRead"),     "cellFsRead",     cellFsRead);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsWrite"),    "cellFsWrite",    cellFsWrite);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsLseek"),    "cellFsLseek",    cellFsLseek);
-    ps3_hle_register_ctx(ps3_compute_nid("cellFsFGetBlockSize"), "cellFsFGetBlockSize", cellFsFGetBlockSize);
-    ps3_hle_register_ctx(ps3_compute_nid("cellFsGetBlockSize"),  "cellFsGetBlockSize",  cellFsGetBlockSize);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsStat"),     "cellFsStat",     cellFsStat);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsFstat"),    "cellFsFstat",    cellFsFstat);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsOpendir"),  "cellFsOpendir",  cellFsOpendir);
-    ps3_hle_register_ctx(ps3_compute_nid("cellFsGetDirectoryEntries"), "cellFsGetDirectoryEntries", cellFsGetDirectoryEntries);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsReaddir"),  "cellFsReaddir",  cellFsReaddir);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsClosedir"), "cellFsClosedir", cellFsClosedir);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsMkdir"),    "cellFsMkdir",    cellFsMkdir);
+    ps3_hle_register_ctx(ps3_compute_nid("cellFsRename"),   "cellFsRename",   cellFsRename);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsRmdir"),    "cellFsRmdir",    cellFsRmdir);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsUnlink"),   "cellFsUnlink",   cellFsUnlink);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsFsync"),    "cellFsFsync",    cellFsFsync);
-    ps3_hle_register_ctx(ps3_compute_nid("cellFsFtruncate"), "cellFsFtruncate", cellFsFtruncate);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsGetFreeSize"),   "cellFsGetFreeSize",   cellFsGetFreeSize);
-    ps3_hle_register_ctx(ps3_compute_nid("cellFsChmod"),         "cellFsChmod",         cellFsChmod);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsUtime"),         "cellFsUtime",         cellFsUtime);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsSdataOpenByFd"), "cellFsSdataOpenByFd", cellFsSdataOpenByFd);
-    ps3_hle_register_ctx(ps3_compute_nid("cellFsAllocateFileAreaWithoutZeroFill"),
-                         "cellFsAllocateFileAreaWithoutZeroFill", cellFsAllocateFileAreaWithoutZeroFill);
-    /* AIO by literal import NID -- ps3_compute_nid() of the friendly name does
-     * not match the exported symbols. */
-    ps3_hle_register_ctx(0xDB869F20u, "cellFsAioInit",   cellFsAioInit);
-    ps3_hle_register_ctx(0x9F951810u, "cellFsAioFinish", cellFsAioFinish);
-    ps3_hle_register_ctx(0xC1C507E7u, "cellFsAioRead",   cellFsAioRead);
-    ps3_hle_register_ctx(0x4CEF342Eu, "cellFsAioWrite",  cellFsAioWrite);
-    ps3_hle_register_ctx(0x7F13FC8Cu, "cellFsAioCancel", cellFsAioCancel);
 }

@@ -40,7 +40,7 @@ for gen in "$HERE"/gen_test_*.py; do
 
     # Optional per-test extra build args (extra sources / -I dirs). A
     # test_<name>.deps file is sourced with $REPO/$RUNTIME_SPU in scope and may
-    # set EXTRA="..." (e.g. to link a libs/ HLE module like cellSync.c).
+    # set EXTRA="..." (e.g. to link a libs/ HLE module).
     EXTRA=""
     [ -f "$HERE/test_${name}.deps" ] && . "$HERE/test_${name}.deps"
 

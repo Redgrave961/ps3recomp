@@ -11,10 +11,10 @@ if os.name == 'nt':
 root = Path(__file__).resolve().parents[1]
 spu = root / 'runtime/spu'
 sources = ['spu_channels.c', 'spu_drain.c', 'spu_workload.c', 'spu_lockstep.c',
-           'spu_coherency.c', 'spurs_policy.c', 'spurs_job.c', 'spu_tsp_weak.c',
-           'spu_vm_pagemap.c', 'spurs_policy_blob_weak.c', 'spu_interp.c']
+           'spu_coherency.c',
+           'spu_vm_pagemap.c', 'spu_interp.c']
 env = {k: v for k, v in os.environ.items()
-       if not k.startswith(('SPU_', 'SPURS_', 'YDKJ_', 'LBP_', 'GH3_'))}
+       if not k.startswith(('SPU_', 'SPURS_'))}
 with tempfile.TemporaryDirectory(prefix='spu-raw-runcntl-stop-') as tmp:
     binary = Path(tmp) / 'test'
     subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-UNDEBUG',

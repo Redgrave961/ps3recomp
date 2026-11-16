@@ -149,44 +149,24 @@ s32 cellSysutilGetSystemParamString(s32 id, u32 buf_ea, u32 bufsize);
  * BGM playback control
  * -----------------------------------------------------------------------*/
 
-s32 cellSysutilEnableBgmPlayback(void);
-s32 cellSysutilDisableBgmPlayback(void);
-s32 cellSysutilGetBgmPlaybackStatus(s32* status);
-s32 cellSysutilSetBgmPlaybackExtraParam(void* param);
-s32 cellSysutilEnableBgmPlaybackEx(s32 param);
-s32 cellSysutilDisableBgmPlaybackEx(void);
-
 /* ---------------------------------------------------------------------------
  * System cache
  * -----------------------------------------------------------------------*/
 
 s32 cellSysCacheMount(char* cachePath);
-s32 cellSysCacheClear(void);
 
 /* ---------------------------------------------------------------------------
  * Disc game check
  * -----------------------------------------------------------------------*/
-
-s32 cellDiscGameGetBootDiscInfo(void* getParam);
-s32 cellDiscGameRegisterDiscChangeCallback(void (*callback)(void*), void* arg);
-s32 cellDiscGameUnregisterDiscChangeCallback(void);
 
 /* ---------------------------------------------------------------------------
  * cellSysconf (exported by cellSysutil): the system accessory settings
  * screen (Bluetooth headset and the like)
  * -----------------------------------------------------------------------*/
 
-/* `func` is the guest callback's OPD, void func(s32 result, void* userdata);
- * `userdata` a guest pointer handed back to it. */
-s32 cellSysconfOpen(u32 type, u32 func, u32 userdata, u32 extparam, u32 id);
-s32 cellSysconfAbort(void);
-
 /* ---------------------------------------------------------------------------
  * Misc utilities
  * -----------------------------------------------------------------------*/
-
-s32 cellSysutilGetLicenseArea(void);
-s32 cellSysutilIsMeetingApp(void);
 
 #ifdef __cplusplus
 }

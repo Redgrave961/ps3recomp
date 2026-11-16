@@ -3,7 +3,6 @@
 #include <stddef.h>
 #include "../system/cellSysutil.h"
 #include "../system/cellGame.h"
-#include "../filesystem/cellFs.h"
 #include "ps3emu/guest_call.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,6 +25,8 @@
 #define NP_TROPHY_COMM_SIGN_MAGIC 0xB9DDE13Bu
 #define TRP_HEADER_SIZE 0x40u
 #define RTC_TICK_UNIX_EPOCH 62135596800000000ull
+
+void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size);
 
 static int s_trophy_initialized = 0;
 static char s_storage_path[512] = "gamedata/trophies";
@@ -184,7 +185,8 @@ static int trophy_pack_open(TrophyContext* ctx)
         char guest[640], host[1024];
         snprintf(guest, sizeof(guest), "%sTROPDIR/%s/TROPHY.TRP",
                  pass == 0 ? app : "/dev_bdvd/PS3_GAME/", ctx->name);
-        if (cellfs_translate_path(guest, host, sizeof(host)) == 0 && trp_open(host, &ctx->pack)) {
+        sys_fs_translate_path(guest, host, (int)sizeof(host));
+        if (trp_open(host, &ctx->pack)) {
             printf("[sceNpTrophy] trophy pack %s\n", guest);
             return 1;
         }
@@ -233,16 +235,6 @@ static s32 trophy_platinum_unlocked_by(const TrophyContext* ctx, s32 trophyId)
             return SCE_NP_TROPHY_INVALID_TROPHY_ID;
     }
     return d->pid;
-}
-
-void sceNpTrophySetStoragePath(const char* path)
-{
-    path = path ? (const char*)(vm_base + (uint32_t)(uintptr_t)path) : NULL;
-    if (path) {
-        strncpy(s_storage_path, path, sizeof(s_storage_path) - 1);
-        s_storage_path[sizeof(s_storage_path) - 1] = '\0';
-        s_storage_path_set = 1;
-    }
 }
 
 s32 sceNpTrophyInit(void* poolPtr, u32 poolSize, u32 containerId, u64 options)
@@ -596,25 +588,3 @@ s32 sceNpTrophyGetTrophyUnlockState(SceNpTrophyContext context,
     return CELL_OK;
 }
 
-s32 sceNpTrophyGetGameProgress(SceNpTrophyContext context,
-                               SceNpTrophyHandle handle,
-                               s32* percentage)
-{
-    if (!s_trophy_initialized)
-        return (s32)SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
-    TrophyContext* ctx;
-    s32 err = trophy_get_context(context, handle, 0, &ctx);
-    if (err) return err;
-    if (!percentage)
-        return (s32)SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
-    if (!ctx->registered)
-        return (s32)SCE_NP_TROPHY_ERROR_CONTEXT_NOT_REGISTERED;
-
-    u32 unlocked = 0;
-    const u32 n = (u32)ctx->set.n;
-    for (u32 id = 0; id < n && id < SCE_NP_TROPHY_MAX_NUM_TROPHIES; id++)
-        unlocked += ctx->unlocked[id] ? 1u : 0u;
-    const u32 pct = n ? (unlocked * 100u + n / 2u) / n : 0u;
-    vm_write32(GUEST_EA(percentage), pct);
-    return CELL_OK;
-}

@@ -46,46 +46,6 @@ static MousePortState s_mouse_ports[CELL_MOUSE_MAX_MICE];
  * Host event injection
  * -----------------------------------------------------------------------*/
 
-void cellMouse_moveEvent(u32 port, s8 dx, s8 dy)
-{
-    if (!s_mouse_initialized || port >= CELL_MOUSE_MAX_MICE)
-        return;
-
-    MousePortState* ms = &s_mouse_ports[port];
-    if (!ms->connected) ms->connected = 1;
-
-    ms->acc_dx += dx;
-    ms->acc_dy += dy;
-    ms->updated = 1;
-}
-
-void cellMouse_buttonEvent(u32 port, u8 button_mask, int pressed)
-{
-    if (!s_mouse_initialized || port >= CELL_MOUSE_MAX_MICE)
-        return;
-
-    MousePortState* ms = &s_mouse_ports[port];
-    if (!ms->connected) ms->connected = 1;
-
-    if (pressed)
-        ms->buttons |= button_mask;
-    else
-        ms->buttons &= ~button_mask;
-    ms->updated = 1;
-}
-
-void cellMouse_wheelEvent(u32 port, s8 wheel)
-{
-    if (!s_mouse_initialized || port >= CELL_MOUSE_MAX_MICE)
-        return;
-
-    MousePortState* ms = &s_mouse_ports[port];
-    if (!ms->connected) ms->connected = 1;
-
-    ms->acc_wheel += wheel;
-    ms->updated = 1;
-}
-
 /* Push a snapshot into the ring buffer */
 static void mouse_push_ring(MousePortState* ms)
 {
@@ -141,17 +101,6 @@ s32 cellMouseInit(u32 max_connect)
     return CELL_OK;
 }
 
-s32 cellMouseEnd(void)
-{
-    printf("[cellMouse] End()\n");
-
-    if (!s_mouse_initialized)
-        return CELL_MOUSE_ERROR_UNINITIALIZED;
-
-    s_mouse_initialized = 0;
-    return CELL_OK;
-}
-
 /* Guest CellMouseData layout (big-endian, 8 bytes): +0 update u8, +1 buttons
  * u8, +2 x_axis s8, +3 y_axis s8, +4 wheel s8, +5 tilt s8, +6..7 pad. The
  * arg is a GUEST EA -- write via vm accessors (see cellMouseGetInfo below);
@@ -167,43 +116,6 @@ static void mouse_write_data(unsigned long long ea, u8 update, u8 buttons,
     vm_write8(ea + 5, 0);           /* tilt */
     vm_write8(ea + 6, 0);
     vm_write8(ea + 7, 0);
-}
-
-s32 cellMouseGetData(u32 port_no, CellMouseData* data)
-{
-    unsigned long long ea = (unsigned int)(uintptr_t)data;
-
-    if (!s_mouse_initialized)
-        return CELL_MOUSE_ERROR_UNINITIALIZED;
-
-    if (port_no >= s_mouse_max_connect || !data)
-        return CELL_MOUSE_ERROR_INVALID_PARAMETER;
-
-    MousePortState* ms = &s_mouse_ports[port_no];
-
-    if (!ms->connected) {
-        mouse_write_data(ea, 0, 0, 0, 0, 0);
-        return CELL_MOUSE_ERROR_NO_DEVICE;
-    }
-
-    /* Clamp accumulated deltas to s8 range */
-    s32 dx = ms->acc_dx;
-    s32 dy = ms->acc_dy;
-    s32 wh = ms->acc_wheel;
-    if (dx > 127) dx = 127; if (dx < -128) dx = -128;
-    if (dy > 127) dy = 127; if (dy < -128) dy = -128;
-    if (wh > 127) wh = 127; if (wh < -128) wh = -128;
-
-    mouse_write_data(ea, ms->updated ? 1 : 0, ms->buttons,
-                     (s8)dx, (s8)dy, (s8)wh);
-
-    /* Reset accumulated state */
-    ms->acc_dx = 0;
-    ms->acc_dy = 0;
-    ms->acc_wheel = 0;
-    ms->updated = 0;
-
-    return CELL_OK;
 }
 
 /* Guest CellMouseDataList layout: +0x00 list_num u32, +0x04 CellMouseData[8]. */
@@ -308,35 +220,3 @@ s32 cellMouseGetInfo(u32 info_ea)
     return CELL_OK;
 }
 
-s32 cellMouseSetTabletMode(u32 port_no, u32 mode)
-{
-    printf("[cellMouse] SetTabletMode(port=%u, mode=%u)\n", port_no, mode);
-
-    if (!s_mouse_initialized)
-        return CELL_MOUSE_ERROR_UNINITIALIZED;
-
-    if (port_no >= CELL_MOUSE_MAX_MICE)
-        return CELL_MOUSE_ERROR_INVALID_PARAMETER;
-
-    s_mouse_ports[port_no].mode = mode;
-    return CELL_OK;
-}
-
-s32 cellMouseClearBuf(u32 port_no)
-{
-    if (!s_mouse_initialized)
-        return CELL_MOUSE_ERROR_UNINITIALIZED;
-
-    if (port_no >= CELL_MOUSE_MAX_MICE)
-        return CELL_MOUSE_ERROR_INVALID_PARAMETER;
-
-    MousePortState* ms = &s_mouse_ports[port_no];
-    ms->acc_dx = 0;
-    ms->acc_dy = 0;
-    ms->acc_wheel = 0;
-    ms->updated = 0;
-    ms->ring_count = 0;
-    ms->ring_write = 0;
-
-    return CELL_OK;
-}

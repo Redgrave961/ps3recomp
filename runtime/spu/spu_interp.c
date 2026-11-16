@@ -281,8 +281,7 @@ static int spu_step(spu_context* ctx) {
     case SPU_dftsv:  DST = spu_dftsv(A, (int32_t)(d.rb & 0x7F)); break;   /* I7 sits in the rb field */
     /* control flow */
     case SPU_br: case SPU_bra: next = d.tgt; break;
-    case SPU_brsl: case SPU_brasl: DST = spu_link((pc + 4) & 0x3FFFC); next = d.tgt;
-        { extern void spu_trace_call(uint32_t,uint32_t); spu_trace_call(pc, d.tgt); } break;
+    case SPU_brsl: case SPU_brasl: DST = spu_link((pc + 4) & 0x3FFFC); next = d.tgt; break;
     case SPU_brz:  if (PREF(DST) == 0) next = d.tgt; break;
     case SPU_brnz: if (PREF(DST) != 0) next = d.tgt; break;
     case SPU_brhz: if ((PREF(DST) & 0xFFFF) == 0) next = d.tgt; break;
@@ -330,8 +329,7 @@ static int spu_step(spu_context* ctx) {
         int hit = (d.op==SPU_heq||d.op==SPU_heqi)   ? (a == rhs)
                 : (d.op==SPU_hgt||d.op==SPU_hgti)   ? ((int32_t)a > (int32_t)rhs)
                 :                                     (a > rhs);      /* hlgt/hlgti */
-        if (hit) { extern void spu_trace_dump(uint32_t); spu_trace_dump(pc);
-                   ctx->pc = pc; ctx->stop_code = 0x1000; ctx->status = SPU_STATUS_STOPPED_BY_HALT; return 1; }
+        if (hit) { ctx->pc = pc; ctx->stop_code = 0x1000; ctx->status = SPU_STATUS_STOPPED_BY_HALT; return 1; }
         break; }
     default:
         fprintf(stderr, "[spu_interp] unimplemented op '%s' (0x%08X) at LS 0x%05X\n",
@@ -344,25 +342,6 @@ static int spu_step(spu_context* ctx) {
 
 uint32_t g_spu_interp_last_pc = 0;
 uint64_t g_spu_interp_steps   = 0;
-
-/* Call-trace ring buffer for diagnosing SPU asserts (env SPU_CALLTRACE). */
-#define SPU_TRACE_N 32
-static struct { uint32_t from, to; } s_trace[SPU_TRACE_N];
-static unsigned s_trace_i = 0;
-void spu_trace_call(uint32_t from, uint32_t to) {
-    s_trace[s_trace_i % SPU_TRACE_N].from = from;
-    s_trace[s_trace_i % SPU_TRACE_N].to   = to;
-    s_trace_i++;
-}
-void spu_trace_dump(uint32_t at) {
-    if (!getenv("SPU_CALLTRACE")) return;
-    fprintf(stderr, "[SPU-TRACE] halt at LS 0x%05X; last %d calls (from->to):\n", at, SPU_TRACE_N);
-    unsigned n = s_trace_i < SPU_TRACE_N ? s_trace_i : SPU_TRACE_N;
-    for (unsigned k = 0; k < n; k++) {
-        unsigned idx = (s_trace_i - n + k) % SPU_TRACE_N;
-        fprintf(stderr, "   0x%05X -> 0x%05X\n", s_trace[idx].from, s_trace[idx].to);
-    }
-}
 
 uint32_t spu_interp_run(spu_context* ctx, uint32_t start_lsa) {
     return spu_interp_run_until(ctx, start_lsa, 0);
@@ -457,34 +436,7 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
     ctx->pc = start_lsa & 0x3FFFC;
     ctx->status = SPU_STATUS_RUNNING;
     uint64_t steps = 0;
-    /* YDKJ_SPU_TRACE=N: log the last N PCs into a ring buffer and dump them when the
-     * interp halts -- shows the path to a branch-to-0 (the cri task/policy wall). */
-    static int _tr=-1; if(_tr<0){const char*e=getenv("YDKJ_SPU_TRACE");_tr=e?atoi(e):0;}
-    static uint64_t _cap=0; { static int _ci=0; if(!_ci){_ci=1; const char*e=getenv("SPU_STEPCAP"); _cap=e?strtoull(e,0,0):0;} }
-    /* YDKJ_CRI_GATE1TRACE=N: cri decode task busy-spins in the validator func_00026E80
-     * (LS 0x26E80..0x26F14), a straight-line leaf that returns r3 = 0 / 0x8041090F /
-     * 0x80410909. Hand-decoding its selb/fsm/gb/ceqh lanes proved unreliable, so log the
-     * ACTUAL runtime result + inputs the first N times it returns. Fires on range-exit
-     * (pc left the fn), when r3 and the leaf's non-restored intermediates are still live. */
-    static int _g1=-1; if(_g1<0){const char*e=getenv("YDKJ_CRI_GATE1TRACE");_g1=e?atoi(e):0;}
-    static int _g1in=0;
-    uint32_t ring[64]; int rc=0, rn=0;
     for (;;) {
-        /* Match the lifted path: only synthetic HLE tasks may bypass the
-         * resident policy. Real tasksets also store 0xA70 in their API table.
-         * Preserve the legacy CRI return convention while invoking the HLE. */
-        if (ctx->pc == 0xA70u) {
-            uint32_t sc = ((uint32_t)ctx->ls[0x27C4]<<24)|((uint32_t)ctx->ls[0x27C5]<<16)
-                        | ((uint32_t)ctx->ls[0x27C6]<<8) | ctx->ls[0x27C7];
-            if (ctx->image_id == 22 || (ctx->policy_mode && sc == 0xA70u)) {
-                extern void spu_spurs_taskset_syscall(spu_context*);
-                int _save = ctx->image_id; ctx->image_id = 22;
-                spu_spurs_taskset_syscall(ctx);
-                ctx->image_id = _save;
-                ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;   /* resume at link r0 */
-                continue;
-            }
-        }
         /* Rejoin the compiled fast path only for images that HAVE lifted
          * functions (image_id >= 0). image_id < 0 = pure interpretation: an
          * un-lifted image (e.g. a title's raw SPU jobs) must never rejoin
@@ -492,38 +444,8 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
         /* ponytail: pc-only match; a recursive call through the same site would stop early -- compare r1 too if one shows up. */
         if (ctx->image_id >= 0 && ((stop_lsa && ctx->pc == stop_lsa) || spu_lifted_lookup(ctx, ctx->pc))) { g_spu_interp_steps = steps; g_spu_interp_last_pc = ctx->pc; return ctx->pc; }  /* rejoin fast path */
         g_spu_interp_last_pc = ctx->pc;
-        if (_g1>0) {
-            int inr = (ctx->pc >= 0x26E80u && ctx->pc < 0x26F14u);
-            if (inr) { _g1in = 1; }
-            else if (_g1in) {
-                _g1in = 0;
-                #define GLB(o) (((uint32_t)ctx->ls[(o)]<<24)|((uint32_t)ctx->ls[(o)+1]<<16)|((uint32_t)ctx->ls[(o)+2]<<8)|ctx->ls[(o)+3])
-                fprintf(stderr,"[gate1] func_00026E80 ret r3=%08X | LS2FB0=%08X LS2FB4=%08X LS2FB8=%08X | LS1E0=%08X LS1E4=%08X LS1E8=%08X | r1=%05X r29=%08X r32=%08X r16=%08X r22=%08X r8=%08X r6=%08X\n",
-                    ctx->gpr[3]._u32[0], GLB(0x2FB0),GLB(0x2FB4),GLB(0x2FB8), GLB(0x1E0),GLB(0x1E4),GLB(0x1E8),
-                    ctx->gpr[1]._u32[0], ctx->gpr[29]._u32[0], ctx->gpr[32]._u32[0],
-                    ctx->gpr[16]._u32[0], ctx->gpr[22]._u32[0], ctx->gpr[8]._u32[0], ctx->gpr[6]._u32[0]);
-                #undef GLB
-                fflush(stderr); _g1--;
-            }
-        }
-        if (_tr>0) { ring[rc&63]=ctx->pc; rc++; if(rn<64)rn++; }
         steps++;
         if (interp_stats_on()) interp_stats_step(ctx);
-        /* SPU_STEPCAP=N: a task that never halts (infinite work/wait loop) never
-         * dumps its ring. Force a one-shot dump after N steps to see where it loops. */
-        if (_tr>0 && _cap && steps == _cap) {
-            fprintf(stderr,"[spu-trace] STEPCAP pc=0x%05X after %llu steps; last %d PCs:",
-                    ctx->pc, (unsigned long long)steps, rn);
-            for(int k=rn;k>0;k--) fprintf(stderr," %05X", ring[(rc-k)&63]);
-            fprintf(stderr,"\n");
-            /* dump the LS 0x2700 SpursTasksetContext the poll reads -- compare to the
-             * working RPCS3 SPU0 dump (RUNNING/READY/ENABLED=0x80000000, SIGNALLED=0). */
-            #define LB(o) (((uint32_t)ctx->ls[(o)]<<24)|((uint32_t)ctx->ls[(o)+1]<<16)|((uint32_t)ctx->ls[(o)+2]<<8)|ctx->ls[(o)+3])
-            fprintf(stderr,"[spu-trace] LS ctx: RUN=%08X READY=%08X PEND=%08X ENA=%08X SIG=%08X WAIT=%08X | 2790=%08X 2794=%08X 27D8=%08X 2FB0=%08X\n",
-                LB(0x2700),LB(0x2710),LB(0x2720),LB(0x2730),LB(0x2740),LB(0x2750),LB(0x2790),LB(0x2794),LB(0x27D8),LB(0x2FB0));
-            #undef LB
-            fflush(stderr); _tr--; g_spu_interp_steps=steps; return 0x2000u;
-        }
         if (spu_step(ctx)) {
             /* stop 0x110 = SYS_SPU_THREAD_STOP_RECEIVE_EVENT. The worker writes
              * the SPU queue number to its out-mailbox, stops, and lv2 replies
@@ -545,10 +467,6 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
                 continue;
             }
             g_spu_interp_steps = steps;
-            if (_tr>0) { fprintf(stderr,"[spu-trace] halt stop=0x%X pc=0x%05X after %llu steps; last %d PCs:",
-                    ctx->stop_code, ctx->pc, (unsigned long long)steps, rn);
-                for(int k=rn;k>0;k--) fprintf(stderr," %05X", ring[(rc-k)&63]);
-                fprintf(stderr,"\n"); fflush(stderr); _tr--; }
             return ctx->stop_code; }
     }
 }

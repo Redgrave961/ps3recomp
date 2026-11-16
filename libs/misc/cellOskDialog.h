@@ -100,26 +100,15 @@ typedef struct CellOskDialogParam {
  * Functions
  * -----------------------------------------------------------------------*/
 
-s32 cellOskDialogInit(u32 container);
-s32 cellOskDialogEnd(void);
-
 s32 cellOskDialogLoadAsync(u32 container,
                            const CellOskDialogParam* dialogParam,
                            const CellOskDialogInputFieldInfo* inputFieldInfo);
 s32 cellOskDialogUnloadAsync(CellOskDialogCallbackReturnParam* result);
 
-s32 cellOskDialogGetSize(u32* width, u32* height);
 s32 cellOskDialogAbort(void);
 
-s32 cellOskDialogSetInitialInputDevice(u32 device);
 s32 cellOskDialogSetInitialKeyLayout(u32 layout);
 s32 cellOskDialogSetLayoutMode(u32 mode);
-s32 cellOskDialogSetSeparateWindowOption(u32 option);
-
-s32 cellOskDialogGetInputText(CellOskDialogCallbackReturnParam* result);
-
-/* Set a default response string (call before LoadAsync if desired) */
-void cellOskDialogSetDefaultResponse(const char* text);
 
 #ifdef __cplusplus
 }

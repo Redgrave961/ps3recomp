@@ -15,7 +15,7 @@ applies to any decrypted PRX from `dev_flash`, not just SPURS.
 5. [Step 2: relocate and lift with `lift_prx.py`](#step-2-relocate-and-lift-with-lift_prxpy)
 6. [Step 3: lift the image to C](#step-3-lift-the-image-to-c)
 7. [Step 4: load, patch, and bind at runtime](#step-4-load-patch-and-bind-at-runtime)
-8. [What is proven vs. what is expected](#what-is-proven-vs-what-is-expected)
+8. [In use](#in-use)
 9. [SPU correctness is a prerequisite](#spu-correctness-is-a-prerequisite)
 10. [Legal and redistribution](#legal-and-redistribution)
 11. [Clean-room notes](#clean-room-notes)
@@ -25,8 +25,7 @@ applies to any decrypted PRX from `dev_flash`, not just SPURS.
 ## Why LLE a firmware module
 
 ps3recomp's default approach to system libraries is HLE: reimplement each `cellXxx` /
-`sys_xxx` call in C against a NID table, per [ARCHITECTURE.md](ARCHITECTURE.md) and
-[GAME_PORTING_GUIDE.md](GAME_PORTING_GUIDE.md). That works well for most of the cell libraries.
+`sys_xxx` call in C against a NID table, per [ARCHITECTURE.md](ARCHITECTURE.md). That works well for most of the cell libraries.
 It works poorly for `cellSpurs`.
 
 SPURS is not a thin syscall wrapper, it is a scheduler: a cooperative task-dispatch kernel
@@ -94,8 +93,8 @@ in scope; your own lifted kernel output stays local.
 Extract the module you want to LLE from your own decrypted `dev_flash`. For SPURS this is
 `libsre.prx`. The file must be a plain decrypted ELF64 big-endian PRX (`e_type` 0xFFA4, PPC64),
 not the encrypted SELF-wrapped form Sony ships on disc; if you only have the encrypted form,
-decrypt it first with your own tooling (this is the same class of step as decrypting a game's
-`EBOOT.BIN`, see [GAME_PORTING_GUIDE.md](GAME_PORTING_GUIDE.md), Phase 2).
+decrypt it first with your own tooling (the same class of step as decrypting a game's
+`EBOOT.BIN`).
 
 ## Step 2: relocate and lift with `lift_prx.py`
 
@@ -139,40 +138,24 @@ discovery pass (branch targets, tail entries) fills in interior functions within
 
 ## Step 4: load, patch, and bind at runtime
 
-This step is per-game integration and is intentionally not covered by generic tooling here,
-the same way ps3recomp's existing game runner pattern (see the `host_main` / runner code a
-port project builds per [GAME_PORTING_GUIDE.md](GAME_PORTING_GUIDE.md)) is per-game. At
-a high level, a runner that wants to use a lifted firmware module needs to:
+`runtime/prx/prx_loader.c` does this from the module description the lift emits
+(`<name>_module.c`); the port calls it from `ps3_load_prx_modules` (`port/prx_init.cpp`):
 
-1. **Load the image.** Copy `<name>_image.bin` into guest memory at `--base` (or map it there),
-   the same way the runner already places the game's own ELF segments.
-2. **Patch the module's own import stub slots.** Walk `<name>_imports.json` and write your
-   HLE bridge descriptor (whatever the runtime's NID dispatch convention is, see
-   `import_stubs.cpp` / `nid_dispatch()` as described in
-   [GAME_PORTING_GUIDE.md](GAME_PORTING_GUIDE.md)'s HLE bridge section) into each stub slot
-   address, exactly as you would for a game's own unresolved imports.
-3. **Bind the game's imports to the lifted module.** For every NID in the game's own import
-   table that belongs to the firmware module's library (for SPURS: the `cellSpurs`/SPURS NIDs),
-   look up that NID in `<name>_exports.json` and point the game's import stub at that address
-   instead of an HLE bridge. From here on, the game's calls into that library reach the real,
-   lifted kernel code instead of a hand-written stand-in.
+1. **Load the image** into guest memory at its base and register the lifted functions.
+2. **The module's own imports** are lifted as `ps3_hle_call(nid)` stubs, so they resolve
+   through the same dispatcher as the game's.
+3. **Bind the game's imports to the lifted module.** `ps3_hle_call` asks
+   `prx_resolve_export` before any HLE handler, so every NID a loaded module exports runs the
+   lifted firmware code.
 
 After this, the game's own SPURS calls run the actual scheduler loop: task creation, dispatch,
 and the SPU-side context switch machinery are all the lifted firmware code, not an
 approximation of it.
 
-## What is proven vs. what is expected
+## In use
 
-**Proven (validated on one title so far, Yakuza: Dead Souls):** the lifted SPURS scheduler
-loop runs stably under this project's PPU/SPU recompiled runtime and dispatches a real game's
-tasks, including SPU-side task context switches driven by the real kernel rather than an HLE
-approximation.
-
-**Expected, not yet generalized:** that this unblocks every title stuck on the SPU task
-pipeline. The technique is not tied to SPURS or to this one game (the tooling relocates and
-lifts any decrypted PRX the same way), but it has only been exercised end to end on this one
-title and one firmware module so far. Treat "this will fix your SPURS hang" as a hypothesis to
-test on your own title, not a guarantee.
+The port runs libsre (SPURS, cellSync) and libresc (cellResc) this way, including libsre's
+SPU kernel, on real SPU thread groups.
 
 ## SPU correctness is a prerequisite
 

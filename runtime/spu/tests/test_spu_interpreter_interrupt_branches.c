@@ -20,7 +20,7 @@ static void word(uint32_t at,uint32_t w){ctx.ls[at]=w>>24;ctx.ls[at+1]=w>>16;ctx
 #endif
 static unsigned checks;
 static void run(uint32_t opcode,uint32_t cond,int initial,uint32_t target,int want_enable,int alias,int mode){
- memset(&ctx,0,sizeof(ctx));spu_context_init(&ctx,0);ctx.image_id=77;ctx.policy_mode=1;
+ memset(&ctx,0,sizeof(ctx));spu_context_init(&ctx,0);ctx.image_id=77;
  unsigned ra=(opcode>>7)&127,rt=opcode&127;ctx.pc=0x4000;ctx.int_enable=initial;ctx.srr0=0x240;
  ctx.gpr[ra]=spu_splat_u32(mode==2?0x240:0x40243); /* interpreter/microstep also verify target masking */
  if((opcode>>21)>=0x128 && (opcode>>21)<=0x12b)ctx.gpr[rt]=spu_splat_u32(cond);
@@ -90,11 +90,6 @@ unsigned long long ps3_ms_now(void){abort();}
 uint32_t g_ww_lo=0xFFFFFFFFu,g_ww_hi;int g_resv_store_active;
 
 uint32_t g_barrier_sync_watch;
-uint32_t g_ydkj_real_spurs_ea, g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
 void spurs_ef_set_from_spu(uint32_t ea, uint16_t bits) { (void)ea; (void)bits; abort(); }
-void ydkj_wake_all_event_flags(void) { abort(); }
 void spu_thread_publish_ctx(uint32_t tid, void* c) { (void)tid; (void)c; abort(); }
-void spurs_pm_build_context(spu_context* c, uint32_t a, uint32_t b, uint32_t d) {
-    (void)c; (void)a; (void)b; (void)d; abort();
-}
 uint32_t g_spu_image_src_ea, g_spu_image_ls_start, g_spu_image_span;

@@ -77,10 +77,5 @@ unsigned long long ps3_ms_now(void) { abort(); }
 uint32_t g_ww_lo = 0xFFFFFFFFu, g_ww_hi;
 int g_resv_store_active;
 uint32_t g_barrier_sync_watch;
-uint32_t g_ydkj_real_spurs_ea, g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
 void spurs_ef_set_from_spu(uint32_t ea, uint16_t bits) { (void)ea; (void)bits; abort(); }
-void ydkj_wake_all_event_flags(void) { abort(); }
-void spurs_pm_build_context(spu_context* c, uint32_t a, uint32_t b, uint32_t d) {
-    (void)c; (void)a; (void)b; (void)d; abort();
-}
 uint32_t g_spu_image_src_ea, g_spu_image_ls_start, g_spu_image_span;

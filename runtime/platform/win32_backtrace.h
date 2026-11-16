@@ -54,7 +54,7 @@
  *   succeeds; the name comes from whatever the loaded image already carries.
  *
  * Kept out of win32_compat.h deliberately. That header is included by library
- * translation units (cellSpurs.c, cellGcmSys.c, spu_channels.c, lv2_register.c)
+ * translation units (cellGcmSys.c, spu_channels.c, lv2_register.c)
  * and <execinfo.h> does not exist on musl, so folding these in would put a
  * needless portability floor under the whole runtime for the sake of a
  * debug-only facility the library never calls.

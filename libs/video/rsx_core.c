@@ -307,6 +307,11 @@ static void rsx_flip(u32 buffer)
 {
     buffer &= 7u;
     rsx_core_raise(RSX_EVENT_QUEUE, 1);
+    s.sema406e_ctx = RSX_DMA_SEMAPHORE_R;
+    s.sema406e_off = 0x10u;
+    s.notify_ctx = 0x66604200u;
+    s.sema4097_ctx = RSX_DMA_SEMAPHORE_RW;
+    s.report_ctx = RSX_DMA_REPORT_LOCAL;
     if (s.renderer && s.renderer->reset) s.renderer->reset(s.renderer->user);
     if (s.vsync) rsx_wait_vblank();
     rsx_present(buffer);
@@ -607,7 +612,9 @@ void rsx_core_init(u32 local_size, u32 main_size)
     s.ret = RSX_NO_RETURN;
     s.method_left = 0;
     s.fault_get = 0xFFFFFFFFu;
-    s.sema406e_ctx = RSX_DMA_SEMAPHORE_RW;
+    s.sema406e_ctx = RSX_DMA_SEMAPHORE_R;
+    s.sema406e_off = 0x30u;
+    s.notify_ctx = 0x66604200u;
     s.sema4097_ctx = RSX_DMA_SEMAPHORE_RW;
     s.report_ctx = RSX_DMA_REPORT_LOCAL;
     s.vsync = 1;

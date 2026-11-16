@@ -19,7 +19,6 @@
 /* What the runtime would provide. */
 uint8_t* vm_base;
 uint32_t ppu_vm_size;
-int g_spu_force_ch_block;
 void (*g_spu_out_mbox_hook)(uint32_t, uint32_t, int, uint32_t);
 PPU_THREAD_LOCAL ppu_context* g_active_ctx;
 void spu_ch_wake(spu_context* c) { (void)c; }

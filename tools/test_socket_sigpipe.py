@@ -15,7 +15,7 @@ def main():
         return
     with tempfile.TemporaryDirectory(prefix="ps3recomp-sigpipe-") as tmp:
         for define, modes in (("TEST_SYS_NET", ("send", "sendto-null", "sendto")),
-                              ("TEST_HTTP", ("send",)), ("TEST_PSNR", ("send",))):
+                              ("TEST_PSNR", ("send",))):
             binary = pathlib.Path(tmp) / define
             subprocess.run(["cc", "-std=gnu17", "-ffunction-sections", "-fdata-sections",
                             "-Iinclude", "-D" + define, "libs/network/tests/test_socket_sigpipe.c",
@@ -28,7 +28,7 @@ def main():
                     p = subprocess.run([str(binary), mode, disposition], capture_output=True,
                                        text=True, timeout=10)
                     assert p.returncode == 0, (define, mode, disposition, p.returncode, p.stderr)
-        print("Socket SIGPIPE PASS: sys_net send/sendto, HTTP, PSNR, guest EPIPE, scoped signals")
+        print("Socket SIGPIPE PASS: sys_net send/sendto, PSNR, guest EPIPE, scoped signals")
 
 
 if __name__ == "__main__":

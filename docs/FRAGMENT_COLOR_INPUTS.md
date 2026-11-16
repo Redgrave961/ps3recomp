@@ -10,13 +10,6 @@ The production change is limited to the two COL0/COL1 input expressions.
 No render-target, cache, vertex-program, tone mapping, texture or shader-control
 behavior changes.
 
-`test_color_input_metal.m` uses actual translated shaders and an RGBA32Float
-target, which preserves values below0 and above1. MOV, MUL and MAD test both
-color inputs, all source positions, identity/reversed swizzles, abs/negate
-ordering, half/full export selection, and unrestricted FOG/TC0 controls. The
-optional RSX_COLOR_TEST_TEX9 define checks TC9 on baselines that already support
-it; it is not an additional feature of this patch.
-
 Primary oracle: RPCS3 FragmentProgramDecompiler.cpp GetSRC documents hardware
 tests and explicitly saturates input registers1/2 before source modifiers.
 https://github.com/RPCS3/rpcs3/blob/master/rpcs3/Emu/RSX/Program/FragmentProgramDecompiler.cpp

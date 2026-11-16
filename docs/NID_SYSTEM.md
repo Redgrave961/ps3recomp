@@ -459,4 +459,4 @@ static void nid_dispatch(ppu_context* ctx, uint32_t nid, const char* name) {
 }
 ```
 
-See [CUSTOM_MODULES.md](CUSTOM_MODULES.md) for the complete module development guide, and [RSX_GRAPHICS.md](RSX_GRAPHICS.md) for how the cellGcmSys bridge handles RSX-specific data structures.
+

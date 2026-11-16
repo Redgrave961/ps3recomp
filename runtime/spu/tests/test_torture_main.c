@@ -58,7 +58,6 @@ void spu_recomp_register(void);
 void spu_func_00000000(spu_context* ctx);
 
 /* diagnostics externs referenced from spu_dma.h in the full runtime */
-int g_cri_video_dma = 0;
 
 int main(void) {
     spu_context* ctx = (spu_context*)calloc(1, sizeof(spu_context));

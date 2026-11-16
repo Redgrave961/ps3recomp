@@ -31,21 +31,12 @@ s32 sceNpCommerce2CreateCtx(u32 version, const void* npId, u32 handler, u32 arg,
 s32 sceNpCommerce2DestroyCtx(SceNpCommerce2Context ctx);
 s32 sceNpCommerce2CreateSessionStart(SceNpCommerce2Context ctx);
 s32 sceNpCommerce2CreateSessionFinish(SceNpCommerce2Context ctx);
-s32 sceNpCommerce2GetSessionInfo(SceNpCommerce2Context ctx, void* info);
 s32 sceNpCommerce2GetCategoryContentsStart(SceNpCommerce2Context ctx,
                                              const char* categoryId,
                                              u32 startPosition, u32 maxItems);
-s32 sceNpCommerce2GetCategoryContentsFinish(SceNpCommerce2Context ctx);
 s32 sceNpCommerce2GetCategoryContentsGetResult(SceNpCommerce2Context ctx,
                                                  void* result);
-s32 sceNpCommerce2GetProductInfoStart(SceNpCommerce2Context ctx,
-                                        const char* productId);
-s32 sceNpCommerce2GetProductInfoFinish(SceNpCommerce2Context ctx);
-s32 sceNpCommerce2GetProductInfoGetResult(SceNpCommerce2Context ctx,
-                                            void* result);
-s32 sceNpCommerce2AbortReq(SceNpCommerce2Context ctx);
 s32 sceNpCommerce2DestroyReq(SceNpCommerce2Context ctx);
-s32 sceNpCommerce2DoCheckoutFinishAsync(SceNpCommerce2Context ctx);
 
 #ifdef __cplusplus
 }

@@ -220,13 +220,15 @@ static void rap_to_rif(const uint8_t rap[16], uint8_t key[16])
     }
 }
 
+void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size);
+
 static int rap_key(const uint8_t* content_id, uint8_t key[16])
 {
-    const char* hdd0 = getenv("PS3_HDD0_ROOT");
-    char cid[49], path[1024];
+    char cid[49], guest[96], path[1024];
     memcpy(cid, content_id, 48);
     cid[48] = 0;
-    snprintf(path, sizeof path, "%s/home/00000001/exdata/%s.rap", hdd0 ? hdd0 : "dev_hdd0", cid);
+    snprintf(guest, sizeof guest, "/dev_hdd0/home/00000001/exdata/%s.rap", cid);
+    sys_fs_translate_path(guest, path, (int)sizeof path);
     FILE* f = fopen(path, "rb");
     if (!f) return 0;
     uint8_t rap[16];

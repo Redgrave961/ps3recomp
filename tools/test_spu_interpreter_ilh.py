@@ -11,7 +11,7 @@ if os.name == 'nt':
 root = Path(__file__).resolve().parents[1]
 spu = root / 'runtime/spu'
 env = {k: v for k, v in os.environ.items()
-       if not k.startswith(('SPU_', 'SPURS_', 'YDKJ_', 'LBP_', 'GH3_'))}
+       if not k.startswith(('SPU_', 'SPURS_'))}
 with tempfile.TemporaryDirectory(prefix='spu-ilh-') as tmp:
     for name in ['test_spu_interpreter_ilh', 'spu_interp_selftest']:
         binary = Path(tmp) / name

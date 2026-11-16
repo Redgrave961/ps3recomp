@@ -26,7 +26,7 @@ def main():
             headers.extend(fn.body_lines)
             headers.append("}")
         (temp/"fnms_test_lifted.h").write_text("\n".join(headers)+"\n")
-        env={k:v for k,v in os.environ.items() if not k.startswith(("SPU_","SPURS_","YDKJ_"))}
+        env={k:v for k,v in os.environ.items() if not k.startswith(("SPU_","SPURS_"))}
         cmd=[os.environ.get("CC","cc"),"-std=gnu17","-O2","-fsanitize=undefined","-fno-sanitize-recover=all","-UNDEBUG"]
         cmd += ["-I"+str(x) for x in (temp,ROOT/"runtime",ROOT/"include",ROOT/"runtime/spu")]
         cmd += [str(ROOT/"tests/test_spu_fnms_zero_extended.c"),str(ROOT/"runtime/spu/spu_interp.c"),"-lm","-o",str(temp/"fixture")]

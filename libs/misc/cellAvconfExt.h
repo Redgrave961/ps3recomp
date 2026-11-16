@@ -71,7 +71,6 @@ typedef struct CellAudioOutConfiguration {
  * -----------------------------------------------------------------------*/
 
 s32 cellAudioOutGetSoundAvailability(u32 audioOut, u32 type, u32 fs, u32 option);
-s32 cellAudioOutGetSoundAvailability2(u32 audioOut, u32 type, u32 fs, u32 ch, u32 option);
 
 s32 cellAudioOutGetDeviceInfo(u32 audioOut, u32 deviceIndex,
                                CellAudioOutDeviceInfo* info);
@@ -79,16 +78,9 @@ s32 cellAudioOutGetConfiguration(u32 audioOut,
                                   CellAudioOutConfiguration* config,
                                   void* option, u32 optionSize);
 s32 cellAudioOutGetState(u32 audioOut, u32 deviceIndex, void* state);
-s32 cellAudioOutSetCopyControl(u32 audioOut, u32 control);
 
 /* HDMI/display audio */
 s32 cellAudioOutGetNumberOfDevice(u32 audioOut);
-
-/* Video output extended queries */
-s32 cellVideoOutGetGamma(u32 videoOut, float* gamma);
-s32 cellVideoOutSetGamma(u32 videoOut, float gamma);
-void avconf_register_ctx(void);
-float cellAvconfExt_display_gamma(void);
 
 #ifdef __cplusplus
 }

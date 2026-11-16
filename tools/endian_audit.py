@@ -49,15 +49,14 @@ import sys
 # matched against the FILE STEM, e.g. "cellAudio") sort first, in this order.
 # Anything not matching any bucket sorts after, alphabetically.
 PRIORITY_BUCKETS = [
-    ("audio", ["audio", "voice", "mic"]),
+    ("audio", ["audio"]),
     ("fs", ["fs", "savedata"]),
-    ("gcm_video", ["gcm", "video", "rsx", "resc"]),
-    ("sysutil", ["sysutil", "sysmodule", "sys_interrupt", "userinfo"]),
+    ("gcm_video", ["gcm", "video", "rsx"]),
+    ("sysutil", ["sysutil", "sysmodule", "userinfo"]),
 ]
 
-# Bswap / vm_write call families that silence a flag (verified 2026-07-05
-# against libs/filesystem/cellFs.c and runtime/ppu/ppu_memory.h -- the only
-# two helper families used in this codebase for guest-endian stores).
+# Bswap / vm_write call families that silence a flag: the two helper families
+# used in this codebase for guest-endian stores.
 SILENCING_CALL_RE = re.compile(r"\b(?:ps3_bswap(?:16|32|64)|vm_write(?:8|16|32|64))\s*\(")
 
 # Built-in scalar out-param types we always recognize (host-endian-native

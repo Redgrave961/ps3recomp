@@ -9,14 +9,11 @@
  * a silent STATUS_GUARD_PAGE_VIOLATION death).
  *
  * This TU is compiled by clang inside the game build: on a registry hit the
- * dispatch is a GUARANTEED tail call -- zero stack growth. Anything unusual
- * (policy-module service addresses, the taskset PM syscall at LS 0xA70, the
- * image-23 cri hack, lookup miss diagnostics) falls back to the full resolver.
+ * dispatch is a GUARANTEED tail call -- zero stack growth. A lookup miss falls
+ * back to the full resolver.
  */
 #include "spu_context.h"
 #include "spu_interp.h"
-#include <stdio.h>
-#include <stdlib.h>
 
 typedef spu_lifted_fn spu_dispatch_fn;
 void spu_indirect_branch(spu_context* ctx);               /* full resolver in the lib */
@@ -24,43 +21,10 @@ void spu_indirect_branch(spu_context* ctx);               /* full resolver in th
 void spu_indirect_branch_mt(spu_context* ctx)
 {
     uint32_t pc = ctx->pc & SPU_LS_MASK;
-    /* PS3_SPU_PCWATCH: attribute silent SPU spins (a task that stops logging
-     * but never returns). Each SPU job runs on its own host thread, so a
-     * thread-local counter + small PC ring is race-free; a trace line prints
-     * every ~4M dispatches -- a healthy task finishes long before tripping. */
-    { static int s_watch = -1;
-      if (s_watch < 0) s_watch = getenv("PS3_SPU_PCWATCH") ? 1 : 0;
-      if (s_watch) {
-          static _Thread_local unsigned long long n;
-          static _Thread_local uint32_t ring[8];
-          ring[n & 7] = pc;
-          if ((++n & 0x3FFFFFu) == 0)
-              fprintf(stderr, "[spu-pcwatch] image=%d %lluM dispatches; recent pc:"
-                      " %05X %05X %05X %05X %05X %05X %05X %05X\n",
-                      ctx->image_id, n >> 20, ring[0], ring[1], ring[2], ring[3],
-                      ring[4], ring[5], ring[6], ring[7]);
-      } }
-    /* Policy modules MUST use this fast path for ordinary branches too: the
-     * lib resolver's plain `fn(ctx)` cannot tail under MSVC, so routing every
-     * policy-mode branch there stacked one resolver frame per PM loop
-     * iteration -- the moment the jobmanager PM got REAL work (intro skip ->
-     * loading jobs) it recursed ~28k deep and stack-overflowed the SPURS
-     * kernel thread (C00000FD, bt = spu_indirect_branch repeating). Only the
-     * kernel-service addresses (exit-to-kernel / select-workload, which the
-     * lib intercepts and RETURNS from without dispatching) and the special
-     * HLE addresses still take the slow path. */
-    int special = (ctx->policy_mode &&
-                   (pc == SPURS_PM_EXIT_TO_KERNEL_LS ||
-                    pc == SPURS_PM_SELECT_WORKLOAD_LS))
-                  || pc == SPURS_TASKSET_PM_SYSCALL_LS
-                  || ctx->image_id == SPU_RESOLVER_ONLY_IMAGE_ID;
-    if (!special) {
-        spu_dispatch_fn fn = spu_lifted_lookup(ctx, pc);
-        if (fn) {
-            ctx->pc = pc;
-            __attribute__((musttail)) return fn(ctx);
-        }
+    spu_dispatch_fn fn = spu_lifted_lookup(ctx, pc);
+    if (fn) {
+        ctx->pc = pc;
+        __attribute__((musttail)) return fn(ctx);
     }
-    /* slow / special path: full resolver (diagnostics, intercepts, miss log) */
     __attribute__((musttail)) return spu_indirect_branch(ctx);
 }

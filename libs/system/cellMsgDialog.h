@@ -62,9 +62,6 @@ typedef void (*CellMsgDialogCallback)(s32 buttonType, void* userdata);
  * Functions
  * -----------------------------------------------------------------------*/
 
-s32 cellMsgDialogOpen(CellMsgDialogType type, const char* msgString,
-                      CellMsgDialogCallback callback, void* userdata,
-                      void* extParam);
 s32 cellMsgDialogOpen2(CellMsgDialogType type, const char* msgString,
                         CellMsgDialogCallback callback, void* userdata,
                         void* extParam);
@@ -72,10 +69,6 @@ s32 cellMsgDialogOpen2(CellMsgDialogType type, const char* msgString,
 s32 cellMsgDialogClose(float delayMs);
 
 s32 cellMsgDialogAbort(void);
-
-s32 cellMsgDialogProgressBarSetMsg(u32 progressBarIndex, const char* msgString);
-
-s32 cellMsgDialogProgressBarReset(u32 progressBarIndex);
 
 s32 cellMsgDialogProgressBarInc(u32 progressBarIndex, u32 delta);
 

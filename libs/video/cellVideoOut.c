@@ -31,17 +31,6 @@ static void get_resolution_wh(u32 resId, u16* w, u16* h);
  * Configuration
  * -----------------------------------------------------------------------*/
 
-void cellVideoOut_set_resolution(u8 resolutionId)
-{
-    s_resolution_id = resolutionId;
-
-    /* Update pitch based on resolution (host-endian helper; the public
-     * cellVideoOutGetResolution writes guest big-endian now) */
-    u16 w, h;
-    get_resolution_wh(resolutionId, &w, &h);
-    s_pitch = (u32)w * 4;
-}
-
 /* ---------------------------------------------------------------------------
  * Helpers
  * -----------------------------------------------------------------------*/
@@ -73,39 +62,6 @@ static void get_resolution_wh(u32 resId, u16* w, u16* h)
 /* ---------------------------------------------------------------------------
  * API implementations
  * -----------------------------------------------------------------------*/
-
-s32 cellVideoOutGetState(u32 videoOut, u32 deviceIndex, CellVideoOutState* state)
-{
-    printf("[cellVideoOut] GetState(videoOut=%u, deviceIndex=%u)\n",
-           videoOut, deviceIndex);
-
-    if (!state)
-        return CELL_VIDEO_OUT_ERROR_ILLEGAL_PARAMETER;
-
-    if (videoOut != CELL_VIDEO_OUT_PRIMARY && videoOut != CELL_VIDEO_OUT_SECONDARY)
-        return CELL_VIDEO_OUT_ERROR_UNSUPPORTED_VIDEO_OUT;
-
-    state = GUEST_PTR(state, CellVideoOutState*);
-    memset(state, 0, sizeof(CellVideoOutState));
-
-    if (videoOut == CELL_VIDEO_OUT_PRIMARY) {
-        state->state      = 0; /* CELL_VIDEO_OUT_OUTPUT_STATE_ENABLED (was 2=PREPARING; PhyreEngine gates render-target config on ENABLED) */
-        state->colorSpace = CELL_VIDEO_OUT_COLOR_SPACE_RGB;
-
-        /* Fill the 8-byte displayMode struct byte-wise (endian-safe): the
-         * guest reads resolutionId/scanMode/aspect as individual bytes. */
-        (void)0;
-        state->displayMode.resolutionId = (u8)s_resolution_id;
-        state->displayMode.scanMode     = CELL_VIDEO_OUT_SCAN_MODE_PROGRESSIVE;
-        state->displayMode.conversion   = 0;
-        state->displayMode.aspect       = CELL_VIDEO_OUT_ASPECT_16_9;
-        state->displayMode.refreshRates = ps3_bswap16(0x0001); /* 59.94Hz flag */
-    } else {
-        state->state = 0; /* disabled */
-    }
-
-    return CELL_OK;
-}
 
 s32 cellVideoOutGetResolution(u32 resolutionId, CellVideoOutResolution* resolution)
 {
@@ -154,27 +110,6 @@ s32 cellVideoOutConfigure(u32 videoOut, CellVideoOutConfiguration* config,
 
     printf("[cellVideoOut] Configure: resId=%u, format=%u, aspect=%u, pitch=%u\n",
            s_resolution_id, s_color_format, s_aspect, s_pitch);
-
-    return CELL_OK;
-}
-
-s32 cellVideoOutGetConfiguration(u32 videoOut, CellVideoOutConfiguration* config,
-                                   void* option)
-{
-    printf("[cellVideoOut] GetConfiguration(videoOut=%u)\n", videoOut);
-
-    if (!config)
-        return CELL_VIDEO_OUT_ERROR_ILLEGAL_PARAMETER;
-
-    if (videoOut != CELL_VIDEO_OUT_PRIMARY)
-        return CELL_VIDEO_OUT_ERROR_UNSUPPORTED_VIDEO_OUT;
-
-    config = GUEST_PTR(config, CellVideoOutConfiguration*);
-    memset(config, 0, sizeof(CellVideoOutConfiguration));
-    config->resolutionId = s_resolution_id;
-    config->format       = s_color_format;
-    config->aspect       = s_aspect;
-    config->pitch        = ps3_bswap32(s_pitch);  /* guest BE struct */
 
     return CELL_OK;
 }

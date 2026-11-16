@@ -352,7 +352,7 @@ int main(void)
 #endif
     for (char* c = s_root; *c; c++) if (*c == '\\') *c = '/';
     MKDIR(s_root);
-    snprintf(g_sys_fs_root, sizeof g_sys_fs_root, "%s", s_root);
+    ppu_vfs_root = s_root;
 
     test_flag_values();
     test_open_flags();

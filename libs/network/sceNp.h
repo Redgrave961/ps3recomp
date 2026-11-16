@@ -105,16 +105,8 @@ s32 sceNpTerm(void);
 
 #define SCE_NP_COMMUNITY_ERROR_ALREADY_INITIALIZED 0x8002a101
 #define SCE_NP_COMMUNITY_ERROR_NOT_INITIALIZED     0x8002a102
-s32 sceNpScoreInit(void);
-s32 sceNpScoreTerm(void);
 
 s32 sceNpGetNpId(s32 userId, SceNpId* npId);
-s32 sceNpGetOnlineId(s32 userId, SceNpOnlineId* onlineId);
-s32 sceNpGetOnlineName(s32 userId, SceNpOnlineName* onlineName);
-s32 sceNpGetUserProfile(s32 userId, SceNpUserInfo* userInfo);
-s32 sceNpGetAccountRegion(s32 userId, u32* region);
-s32 sceNpGetAccountAge(s32 userId, s32* age);
-s32 sceNpGetMyLanguages(SceNpMyLanguages* langs);
 
 /* --- NP Manager (sign-in state). We run permanently offline: GetStatus reports
  * OFFLINE so games cleanly skip online flows instead of blocking on sign-in. --- */
@@ -129,32 +121,12 @@ typedef void (*SceNpManagerCallback)(s32 event, s32 result, void* arg);
  * ticket's size, or a negative error. */
 #define SCE_NP_MANAGER_EVENT_GOT_TICKET         255
 
-s32 sceNpManagerGetEntitlementIdList(void* entIdList, u32 entIdListNum);
 s32 sceNpManagerGetStatus(s32* status);
-s32 sceNpManagerRegisterCallback(SceNpManagerCallback callback, void* arg);
-s32 sceNpManagerUnregisterCallback(void);
 s32 sceNpManagerGetNpId(SceNpId* npId);
-s32 sceNpManagerGetOnlineId(SceNpOnlineId* onlineId);
-s32 sceNpManagerGetOnlineName(SceNpOnlineName* onlineName);
-s32 sceNpManagerGetAccountAge(s32* age);
 
-/* Tickets, account region and network time. Every pointer is a guest
- * address. OFFLINE without a psnr server; see sceNp.c. */
-s32 sceNpManagerRequestTicket2(u32 npId, u32 version, u32 serviceId, u32 cookie,
-                               u32 cookieSize, u32 entitlementId, u32 consumedCount);
-s32 sceNpManagerGetTicket(u32 buffer, u32 bufferSize);
-s32 sceNpManagerGetTicketParam(s32 paramId, u32 param);
 s32 sceNpManagerGetAccountRegion(u32 countryCode, u32 language);
-s32 sceNpManagerGetNetworkTime(u32 pTick);
 
-/* NPDRM availability checks. The guest passes its klicensee (16 bytes) and the
- * path of an EDAT/SELF; the klicensee is handed to the EDAT reader, which then
- * decrypts that title's files on open. Always CELL_OK (licence present). */
-s32 sceNpDrmIsAvailable(const u8* k_licensee, const char* drm_path);
 s32 sceNpDrmIsAvailable2(const u8* k_licensee, const char* drm_path);
-
-/* Set the fake PSN username (call before sceNpInit if desired) */
-void sceNpSetFakeUsername(const char* username);
 
 #ifdef __cplusplus
 }

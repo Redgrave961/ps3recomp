@@ -132,22 +132,14 @@ typedef struct CellVideoOutDeviceInfo {
  * Configuration
  * -----------------------------------------------------------------------*/
 
-/* Set the default resolution (call before game boots) */
-void cellVideoOut_set_resolution(u8 resolutionId);
-
 /* ---------------------------------------------------------------------------
  * Functions
  * -----------------------------------------------------------------------*/
-
-s32 cellVideoOutGetState(u32 videoOut, u32 deviceIndex, CellVideoOutState* state);
 
 s32 cellVideoOutGetResolution(u32 resolutionId, CellVideoOutResolution* resolution);
 
 s32 cellVideoOutConfigure(u32 videoOut, CellVideoOutConfiguration* config,
                             void* option, u32 waitForEvent);
-
-s32 cellVideoOutGetConfiguration(u32 videoOut, CellVideoOutConfiguration* config,
-                                   void* option);
 
 s32 cellVideoOutGetDeviceInfo(u32 videoOut, u32 deviceIndex,
                                CellVideoOutDeviceInfo* info);

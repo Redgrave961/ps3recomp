@@ -14,9 +14,6 @@
 extern "C" {
 #endif
 
-/* Configure committed callback scratch before guest execution. */
-s32 cellSaveData_set_scratch_region(u32 base, u32 size);
-
 /* ---------------------------------------------------------------------------
  * Constants
  * -----------------------------------------------------------------------*/
@@ -262,66 +259,6 @@ typedef struct CellSaveDataSetBuf {
  * Functions
  * -----------------------------------------------------------------------*/
 
-/* pre-3.00 entry points; forwarders to the "2" forms with userdata = NULL. */
-s32 cellSaveDataListSave(u32 version, CellSaveDataSetList* setList,
-                         CellSaveDataSetBuf* setBuf, CellSaveDataListCallback funcList,
-                         CellSaveDataStatCallback funcStat,
-                         CellSaveDataFileCallback funcFile, u32 container);
-s32 cellSaveDataListLoad(u32 version, CellSaveDataSetList* setList,
-                         CellSaveDataSetBuf* setBuf, CellSaveDataListCallback funcList,
-                         CellSaveDataStatCallback funcStat,
-                         CellSaveDataFileCallback funcFile, u32 container);
-s32 cellSaveDataFixedSave(u32 version, CellSaveDataSetList* setList,
-                          CellSaveDataSetBuf* setBuf, CellSaveDataFixedCallback funcFixed,
-                          CellSaveDataStatCallback funcStat,
-                          CellSaveDataFileCallback funcFile, u32 container);
-s32 cellSaveDataFixedLoad(u32 version, CellSaveDataSetList* setList,
-                          CellSaveDataSetBuf* setBuf, CellSaveDataFixedCallback funcFixed,
-                          CellSaveDataStatCallback funcStat,
-                          CellSaveDataFileCallback funcFile, u32 container);
-
-s32 cellSaveDataListSave2(u32 version, CellSaveDataSetList* setList,
-                           CellSaveDataSetBuf* setBuf,
-                           CellSaveDataListCallback funcList,
-                           CellSaveDataStatCallback funcStat,
-                           CellSaveDataFileCallback funcFile,
-                           u32 container, void* userdata);
-
-s32 cellSaveDataListLoad2(u32 version, CellSaveDataSetList* setList,
-                           CellSaveDataSetBuf* setBuf,
-                           CellSaveDataListCallback funcList,
-                           CellSaveDataStatCallback funcStat,
-                           CellSaveDataFileCallback funcFile,
-                           u32 container, void* userdata);
-
-s32 cellSaveDataFixedSave2(u32 version, CellSaveDataSetList* setList,
-                            CellSaveDataSetBuf* setBuf,
-                            CellSaveDataFixedCallback funcFixed,
-                            CellSaveDataStatCallback funcStat,
-                            CellSaveDataFileCallback funcFile,
-                            u32 container, void* userdata);
-
-s32 cellSaveDataFixedLoad2(u32 version, CellSaveDataSetList* setList,
-                            CellSaveDataSetBuf* setBuf,
-                            CellSaveDataFixedCallback funcFixed,
-                            CellSaveDataStatCallback funcStat,
-                            CellSaveDataFileCallback funcFile,
-                            u32 container, void* userdata);
-
-s32 cellSaveDataListAutoLoad(u32 version, u32 errDialog,
-                            CellSaveDataSetList* setList, CellSaveDataSetBuf* setBuf,
-                            CellSaveDataFixedCallback funcFixed,
-                            CellSaveDataStatCallback funcStat,
-                            CellSaveDataFileCallback funcFile,
-                            u32 container, void* userdata);
-
-s32 cellSaveDataAutoSave2(u32 version, const char* dirName,
-                           u32 errDialog,
-                           CellSaveDataSetBuf* setBuf,
-                           CellSaveDataStatCallback funcStat,
-                           CellSaveDataFileCallback funcFile,
-                           u32 container, void* userdata);
-
 s32 cellSaveDataAutoLoad2(u32 version, const char* dirName,
                            u32 errDialog,
                            CellSaveDataSetBuf* setBuf,
@@ -344,11 +281,6 @@ s32 cellSaveDataAutoLoad(u32 version, const char* dirName,
                           CellSaveDataStatCallback funcStat,
                           CellSaveDataFileCallback funcFile,
                           u32 container, void* userdata);
-s32 cellSaveDataDelete(u32 version, const char* dirName, u32 container);
-s32 cellSaveDataUserAutoSave(u32 version, u32 userId, const char* dirName,
-                             u32 errDialog, CellSaveDataSetBuf* setBuf,
-                             CellSaveDataStatCallback funcStat,
-                             CellSaveDataFileCallback funcFile, u32 container);
 s32 cellSaveDataUserAutoLoad(u32 version, u32 userId, const char* dirName,
                              u32 errDialog, CellSaveDataSetBuf* setBuf,
                              CellSaveDataStatCallback funcStat,

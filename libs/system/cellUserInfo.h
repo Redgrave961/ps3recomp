@@ -71,15 +71,7 @@ typedef struct CellUserInfoListSet {
  * Functions
  * -----------------------------------------------------------------------*/
 
-s32 cellUserInfoGetStat(u32 id, CellUserInfoUserStat* stat);
 s32 cellUserInfoGetList(u32* listNum, CellUserInfoUserList* list, u32* currentUser);
-s32 cellUserInfoSelectUser_ListSet(u32 listType,
-                                    const CellUserInfoListSet* listSet,
-                                    CellUserInfoFinishCallback callback,
-                                    void* userdata);
-s32 cellUserInfoSelectUser_ListGet(u32* selectedUser);
-s32 cellUserInfoEnableOverlay(s32 enable);
-s32 cellUserInfoGetHomeDir(u32 id, char* homePath, u32 homePathSize);
 
 #ifdef __cplusplus
 }

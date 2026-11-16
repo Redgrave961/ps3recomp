@@ -49,9 +49,6 @@ static int netctl_online(void)
     return v;
 }
 
-/* For the libraries that answer the same question (cellSysutilNpEula.c). */
-int ps3_netctl_online(void) { return netctl_online(); }
-
 typedef struct {
     int              in_use;
     cellNetCtlHandler handler;
@@ -266,25 +263,6 @@ s32 cellNetCtlGetInfo(s32 code, CellNetCtlInfo* info)
     return CELL_OK;
 }
 
-s32 cellNetCtlGetNatInfo(CellNetCtlNatInfo* natInfo)
-{
-    if (!s_netctl_initialized)
-        return CELL_NET_CTL_ERROR_NOT_INITIALIZED;
-
-    if (!natInfo)
-        return CELL_NET_CTL_ERROR_INVALID_ADDR;
-
-    natInfo = GUEST_PTR(natInfo, CellNetCtlNatInfo*);
-    natInfo->size        = ps3_bswap32((u32)sizeof(CellNetCtlNatInfo));
-    natInfo->upnp_status = 0;
-    natInfo->stun_status = 0;
-    natInfo->nat_type    = ps3_bswap32((u32)CELL_NET_CTL_NATINFO_NAT_TYPE_2); /* moderate */
-    natInfo->mapped_addr = 0;
-
-    printf("[cellNetCtl] GetNatInfo() -> NAT Type 2\n");
-    return CELL_OK;
-}
-
 s32 cellNetCtlAddHandler(cellNetCtlHandler handler, void* arg, s32* hid)
 {
     if (!s_netctl_initialized)
@@ -305,25 +283,6 @@ s32 cellNetCtlAddHandler(cellNetCtlHandler handler, void* arg, s32* hid)
     }
 
     return CELL_NET_CTL_ERROR_HANDLER_MAX;
-}
-
-s32 cellNetCtlDelHandler(s32 hid)
-{
-    if (!s_netctl_initialized)
-        return CELL_NET_CTL_ERROR_NOT_INITIALIZED;
-
-    if (hid < 0 || hid >= CELL_NET_CTL_HANDLER_MAX)
-        return CELL_NET_CTL_ERROR_INVALID_ID;
-
-    if (!s_handlers[hid].in_use)
-        return CELL_NET_CTL_ERROR_ID_NOT_FOUND;
-
-    s_handlers[hid].in_use  = 0;
-    s_handlers[hid].handler = NULL;
-    s_handlers[hid].arg     = NULL;
-
-    printf("[cellNetCtl] DelHandler(hid=%d)\n", hid);
-    return CELL_OK;
 }
 
 /* ---------------------------------------------------------------------------
@@ -353,12 +312,6 @@ s32 cellNetCtlNetStartDialogLoadAsync(const CellNetCtlNetStartDialogParam* param
     printf("[cellNetCtl] NetStartDialogLoadAsync() -> auto-connect\n");
     netstart_broadcast(CELL_SYSUTIL_NET_CTL_NETSTART_LOADED);
     netstart_broadcast(CELL_SYSUTIL_NET_CTL_NETSTART_FINISHED);
-    return CELL_OK;
-}
-
-s32 cellNetCtlNetStartDialogAbortAsync(void)
-{
-    printf("[cellNetCtl] NetStartDialogAbortAsync()\n");
     return CELL_OK;
 }
 

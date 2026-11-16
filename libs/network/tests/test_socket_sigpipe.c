@@ -3,9 +3,6 @@
 #define main existing_sys_net_test_main
 #include "test_sys_net.c"
 #undef main
-#elif defined(TEST_HTTP)
-#include "../cellHttp.c"
-uint8_t* vm_base;
 #elif defined(TEST_PSNR)
 #include "../psnr/psnr.c"
 #else
@@ -74,9 +71,6 @@ int main(int argc, char** argv)
         assert((uint32_t)result == 0x80010220u);
         assert(errno_cell() == 32);
     }
-#elif defined(TEST_HTTP)
-    assert(http_send_all(pair[0], "x", 1) == (healthy ? 0 : -1));
-    if (!healthy) assert(errno == EPIPE);
 #elif defined(TEST_PSNR)
     psnr_client client; memset(&client, 0, sizeof(client)); client.s = pair[0];
     assert(send_all(&client, (const uint8_t*)"x", 1) == (healthy ? 0 : -1));

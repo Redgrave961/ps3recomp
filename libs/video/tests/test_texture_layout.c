@@ -4,10 +4,6 @@
  * Build and run directly, no framework:
  *   cc -I include -I libs/video -o /tmp/t libs/video/tests/test_texture_layout.c \
  *      libs/video/rsx_texture_layout.c && /tmp/t
- *
- * The expectations are the behaviour rsx_d3d12_backend.c's uploader had before
- * the layout maths moved out of it, so this is a regression net for the
- * extraction as much as a unit test.
  */
 #include "rsx_texture_layout.h"
 

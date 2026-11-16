@@ -3,20 +3,16 @@
  *
  * Real PNG decoding using stb_image.h.
  * Guest memory is accessed through vm_base (host_ptr = vm_base + guest_addr).
- * PS3 file paths are translated through cellfs_translate_path().
- *
- * NOTE: You must vendor stb_image.h at libs/codec/stb_image.h.
- *       Download from https://github.com/nothings/stb/blob/master/stb_image.h
  */
 
 #include "cellPngDec.h"
-#include "cellFs.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 /* vm_base: base pointer for the PS3 guest address space */
 extern uint8_t* vm_base;
+void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size);
 
 /* Guest memory access (translate + byte-swap). The guest passes POINTERS as
  * 32-bit big-endian addresses into vm_base; every struct field the guest reads
@@ -39,26 +35,11 @@ static void vm_read_str(u32 addr, char* dst, size_t cap)
     dst[i] = 0;
 }
 
-/* ---------------------------------------------------------------------------
- * stb_image inclusion
- *
- * cellPngDec.c is the "owner" TU — it defines STB_IMAGE_IMPLEMENTATION.
- * cellJpgDec.c and cellGifDec.c just include the header without the impl.
- * -----------------------------------------------------------------------*/
-#if __has_include("stb_image.h")
-  #define PNGDEC_HAS_STB 1
-  #define STB_IMAGE_IMPLEMENTATION
-  #define STBI_ONLY_PNG
-  #define STBI_ONLY_JPEG
-  #define STBI_ONLY_GIF
-  #include "stb_image.h"
-#elif defined(PS3RECOMP_HAS_STB_IMAGE)
-  #define PNGDEC_HAS_STB 1
-  #include "stb_image.h"
-#else
-  #define PNGDEC_HAS_STB 0
-  /* stb_image.h not found — place it at libs/codec/stb_image.h */
-#endif
+#define STB_IMAGE_IMPLEMENTATION
+#define STBI_ONLY_PNG
+#define STBI_ONLY_JPEG
+#define STBI_ONLY_GIF
+#include "stb_image.h"
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -117,11 +98,8 @@ static int pngdec_load_source(PngDecSubState* sub)
     if (sub->src.srcSelect == CELL_PNGDEC_FILE) {
         /* Translate PS3 path (e.g. "/dev_hdd0/game/NPUA80001/ICON0.PNG")
          * to a host filesystem path. */
-        char host_path[CELL_FS_MAX_FS_PATH_LENGTH];
-        if (cellfs_translate_path(sub->src.fileName, host_path, sizeof(host_path)) != 0) {
-            printf("[cellPngDec] Cannot translate path: %s\n", sub->src.fileName);
-            return -1;
-        }
+        char host_path[1024];
+        sys_fs_translate_path(sub->src.fileName, host_path, (int)sizeof(host_path));
 
         FILE* f = fopen(host_path, "rb");
         if (!f) {
@@ -183,27 +161,6 @@ static void pngdec_free_source(PngDecSubState* sub)
  * the HLE bridge passes the raw gpr values, so a `CellPngDecMainHandle*` arrives
  * as a big-endian guest address, NOT a host pointer. Handles are opaque to the
  * guest, so we hand back small indices. */
-
-s32 cellPngDecCreate(u32 mainHandle_addr, u32 threadInParam_addr, u32 threadOutParam_addr)
-{
-    (void)threadInParam_addr;
-    printf("[cellPngDec] Create()\n");
-
-    if (!mainHandle_addr)
-        return CELL_PNGDEC_ERROR_ARG;
-
-    for (u32 i = 0; i < PNGDEC_MAX_HANDLES; i++) {
-        if (!s_png_main[i].in_use) {
-            s_png_main[i].in_use = 1;
-            vm_write32(mainHandle_addr, i);   /* handle value -> guest memory */
-            if (threadOutParam_addr)
-                vm_write32(threadOutParam_addr + 0, 0x00010000);  /* pngCodecVersion */
-            return CELL_OK;
-        }
-    }
-
-    return CELL_PNGDEC_ERROR_BUSY;
-}
 
 s32 cellPngDecDestroy(CellPngDecMainHandle mainHandle)
 {
@@ -301,7 +258,6 @@ s32 cellPngDecReadHeader(CellPngDecMainHandle mainHandle,
     if (pngdec_load_source(sub) < 0)
         return CELL_PNGDEC_ERROR_OPEN_FILE;
 
-#if PNGDEC_HAS_STB
     {
         int w, h, comp;
         if (!stbi_info_from_memory(sub->src_data, (int)sub->src_size, &w, &h, &comp)) {
@@ -330,44 +286,6 @@ s32 cellPngDecReadHeader(CellPngDecMainHandle mainHandle,
         pngdec_write_info(info_addr, &sub->info);
         return CELL_OK;
     }
-#else
-    /* Fallback: minimal PNG header parsing without stb_image */
-    if (sub->src_size < 33) /* minimum: 8 sig + 25 IHDR */
-        return CELL_PNGDEC_ERROR_HEADER;
-
-    /* Check PNG signature */
-    static const u8 png_sig[8] = {0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A};
-    if (memcmp(sub->src_data, png_sig, 8) != 0)
-        return CELL_PNGDEC_ERROR_STREAM_FORMAT;
-
-    /* Parse IHDR (starts at offset 8, length=4, type=4, data=13) */
-    const u8* ihdr = sub->src_data + 16; /* skip sig(8) + length(4) + "IHDR"(4) */
-    u32 w = ((u32)ihdr[0] << 24) | ((u32)ihdr[1] << 16) | ((u32)ihdr[2] << 8) | ihdr[3];
-    u32 h = ((u32)ihdr[4] << 24) | ((u32)ihdr[5] << 16) | ((u32)ihdr[6] << 8) | ihdr[7];
-    u8 bit_depth   = ihdr[8];
-    u8 color_type  = ihdr[9];
-    u8 interlace   = ihdr[12];
-
-    sub->info.imageWidth  = w;
-    sub->info.imageHeight = h;
-    sub->info.bitDepth    = bit_depth;
-    sub->info.interlaceMethod = interlace;
-
-    switch (color_type) {
-        case 0: sub->info.colorSpace = CELL_PNGDEC_GRAYSCALE;       sub->info.numComponents = 1; break;
-        case 2: sub->info.colorSpace = CELL_PNGDEC_RGB;             sub->info.numComponents = 3; break;
-        case 3: sub->info.colorSpace = CELL_PNGDEC_PALETTE;         sub->info.numComponents = 1; break;
-        case 4: sub->info.colorSpace = CELL_PNGDEC_GRAYSCALE_ALPHA; sub->info.numComponents = 2; break;
-        case 6: sub->info.colorSpace = CELL_PNGDEC_RGBA;            sub->info.numComponents = 4; break;
-        default: sub->info.colorSpace = CELL_PNGDEC_RGBA;           sub->info.numComponents = 4; break;
-    }
-
-    printf("[cellPngDec]   %ux%u (header-only parse, no stb_image)\n", w, h);
-
-    sub->header_read = 1;
-    pngdec_write_info(info_addr, &sub->info);
-    return CELL_OK;
-#endif
 }
 
 /* CellPngDecInParam guest layout (7 x u32): commandPtr, outputMode,
@@ -456,7 +374,6 @@ s32 cellPngDecDecodeData(CellPngDecMainHandle mainHandle,
     if (!sub->header_read || !sub->param_set)
         return CELL_PNGDEC_ERROR_SEQ;
 
-#if PNGDEC_HAS_STB
     {
         int w, h, comp;
         int desired_comp;
@@ -504,11 +421,6 @@ s32 cellPngDecDecodeData(CellPngDecMainHandle mainHandle,
         pngdec_write_outinfo(dataOutInfo_addr, CELL_PNGDEC_DEC_STATUS_FINISH);
         return CELL_OK;
     }
-#else
-    printf("[cellPngDec] DecodeData: stb_image not available — place stb_image.h in libs/codec/\n");
-    pngdec_write_outinfo(dataOutInfo_addr, CELL_PNGDEC_DEC_STATUS_STOP);
-    return (s32)CELL_ENOSYS;
-#endif
 }
 
 s32 cellPngDecClose(CellPngDecMainHandle mainHandle,

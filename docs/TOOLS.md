@@ -255,11 +255,11 @@ Functions are named `func_XXXXXXXX` where `XXXXXXXX` is the guest address in hex
 ```c
 { g_trampoline_fn = (void(*)(void*))func_NEXT; return; }
 ```
-The preamble declares `g_trampoline_fn` as `extern "C" __declspec(thread)` to match the TLS definition in the game project's `indirect_dispatch.cpp`. The game project must define `g_trampoline_fn` as `__declspec(thread)` and add `DRAIN_TRAMPOLINE(ctx)` after every `bl` (function call) in the generated code. This converts recursive split-function chains into iterative loops, preventing both native and guest stack overflow from backward branches across fragment boundaries.
+The preamble declares `g_trampoline_fn` as a thread-local `extern "C"`, defined in `runtime/ppu/ppu_loader.cpp`, and the generated code drains it after every `bl`. This converts recursive split-function chains into iterative loops, preventing both native and guest stack overflow from backward branches across fragment boundaries.
 
-**Indirect calls (bctrl):** Emitted as `ps3_indirect_call(ctx)` which dispatches through a hash table mapping guest addresses to host function pointers. The game project must provide this function. It also handles OPD (Official Procedure Descriptor) resolution.
+**Indirect calls (bctrl):** Emitted as `ps3_indirect_call(ctx)` (`runtime/ppu/ppu_loader.cpp`), which dispatches through a table mapping guest addresses to host function pointers and resolves OPDs.
 
-**TOC save:** The lifter does NOT emit `std r2, 40(r1)` before import stub calls (the PS3 linker normally inserts this). Game projects must save the TOC in their `nid_dispatch()` function.
+**TOC save:** The lifter does NOT emit `std r2, 40(r1)` before import stub calls (the PS3 linker normally inserts this). `ps3_hle_call` saves and restores the caller's TOC.
 
 **VMX/AltiVec:** Vector instructions operate on `ctx->vr[N]` (128-bit registers). Vector loads/stores access guest memory via `vm_base + addr` with 16-byte alignment. Float operations treat each register as 4×float32.
 
@@ -574,7 +574,6 @@ Module: EBOOT.ELF
   Imports from cellFs: 12 functions (12/12 implemented = 100%)
   Imports from cellPad: 5 functions (5/5 implemented = 100%)
   Imports from cellGcmSys: 27 functions (27/27 implemented = 100%)
-  Imports from cellSpurs: 15 functions (12/15 implemented = 80%)
   ---
   Total: 139/140 imports resolved (99.3%)
   Missing: 1 function from cellFoo (NID 0xABCDEF01)
@@ -599,8 +598,8 @@ Module: EBOOT.ELF
 ```bash
 # Generate stubs from an RPCS3 module file
 python tools/generate_stubs.py \
-    --input rpcs3/Emu/Cell/Modules/cellFs.cpp \
-    --output libs/filesystem/cellFs.c
+    --input rpcs3/Emu/Cell/Modules/cellPad.cpp \
+    --output libs/input/cellPad.c
 
 # Generate stubs for all modules in a directory
 python tools/generate_stubs.py \
@@ -700,17 +699,12 @@ Listed in `requirements.txt` (repository root):
 
 | Package | Purpose |
 |---------|---------|
-| `pycryptodome` | AES/SHA for SELF decryption |
-| `capstone` | PowerPC disassembly |
-| `construct` | Structured binary parsing |
-| `tabulate` | CLI tables |
-| `tomli` | TOML parsing on Python versions before 3.11 |
-| `tqdm` | Progress bars |
+| `pycryptodome` | AES for NPDRM, SELF and PKG decryption |
+| `capstone` | PowerPC disassembly cross-checks |
 
 ### Installation
 
-Create and activate the virtual environment described in
-[Getting Started](GETTING_STARTED.md#2-create-a-python-environment), then run:
+In a virtual environment:
 
 ```bash
 python -m pip install -r requirements.txt

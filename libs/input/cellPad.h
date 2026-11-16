@@ -173,34 +173,17 @@ typedef struct CellPadActParam {
 /* NID: 0x1CF98800 */
 s32 cellPadInit(u32 max_connect);
 
-/* NID: 0x4D9B75D5 */
-s32 cellPadEnd(void);
-
 /* NID: 0x8B72CBA1 */
 s32 cellPadGetData(u32 port_no, CellPadData* data);
 
 /* NID: 0x8B8013DA */
 s32 cellPadGetInfo2(CellPadInfo2* info);
-s32 cellPadPeriphGetInfo(CellPadPeriphInfo* info);
 
 /* NID: 0xA703A51D */
 s32 cellPadSetPortSetting(u32 port_no, u32 port_setting);
-s32 cellPadInfoPressMode(u32 port_no);
-s32 cellPadSetPressMode(u32 port_no, u32 mode);
-s32 cellPadInfoSensorMode(u32 port_no);
-s32 cellPadSetSensorMode(u32 port_no, u32 mode);
-
-/* NID: 0x578E3C98 */
-s32 cellPadGetCapabilityInfo(u32 port_no, CellPadCapabilityInfo* info);
 
 /* NID: 0xBE5C3E81 */
 s32 cellPadSetActDirect(u32 port_no, CellPadActParam* param);
-
-/* NID: 0x3733EA3C */
-s32 cellPadClearBuf(u32 port_no);
-
-/* Internal: call once per frame to update pad state from host input */
-void cellPad_poll(void);
 
 #ifdef __cplusplus
 }

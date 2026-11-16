@@ -69,11 +69,6 @@ s32 sceNpLookupDestroyTransactionCtx(s32 transId)
 
 static int trans_ok(s32 id) { return id >= 1 && id <= TRANS_MAX && s_trans[id]; }
 
-s32 sceNpLookupAbortTransaction(s32 transId)
-{
-    return trans_ok(transId) ? CELL_OK : (s32)LOOKUP_ERROR_INVALID_ID;
-}
-
 /* Everything completes at the call. */
 s32 sceNpLookupPollAsync(s32 transId, u32 result)
 {
@@ -115,23 +110,3 @@ s32 sceNpLookupUserProfileAsync(s32 transId, u32 npId, u32 userInfo, u32 aboutMe
     return CELL_OK;
 }
 
-s32 sceNpLookupUserProfile(s32 transId, u32 npId, u32 userInfo, u32 aboutMe,
-                           u32 languages, u32 countryCode, u32 avatarImage)
-{
-    return sceNpLookupUserProfileAsync(transId, npId, userInfo, aboutMe,
-                                       languages, countryCode, avatarImage, 0);
-}
-
-/* (transId, avatarUrl*, avatarImage*, prio, option) */
-s32 sceNpLookupAvatarImageAsync(s32 transId, u32 avatarUrl, u32 avatarImage, s32 prio, u32 option)
-{
-    (void)avatarUrl; (void)prio; (void)option;
-    if (!trans_ok(transId)) return (s32)LOOKUP_ERROR_INVALID_ID;
-    empty_avatar(avatarImage);
-    return CELL_OK;
-}
-
-s32 sceNpLookupAvatarImage(s32 transId, u32 avatarUrl, u32 avatarImage, u32 option)
-{
-    return sceNpLookupAvatarImageAsync(transId, avatarUrl, avatarImage, 0, option);
-}

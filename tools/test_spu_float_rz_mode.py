@@ -11,8 +11,8 @@ if os.name == 'nt':
 root = Path(__file__).resolve().parents[1]
 spu = root / 'runtime/spu'
 sources = ['spu_channels.c', 'spu_drain.c', 'spu_lockstep.c', 'spu_coherency.c',
-           'spu_workload.c', 'spurs_policy.c', 'spurs_job.c', 'spu_tsp_weak.c',
-           'spu_vm_pagemap.c', 'spurs_policy_blob_weak.c', 'spu_interp.c']
+           'spu_workload.c',
+           'spu_vm_pagemap.c', 'spu_interp.c']
 with tempfile.TemporaryDirectory(prefix='spu-float-rz-mode-') as tmp:
     binary = Path(tmp) / 'test'
     subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-UNDEBUG',
@@ -24,7 +24,7 @@ with tempfile.TemporaryDirectory(prefix='spu-float-rz-mode-') as tmp:
                     '-o', str(binary)], check=True)
     for rz in ('0', '1'):
         env = {k: v for k, v in os.environ.items()
-               if not k.startswith(('SPU_', 'SPURS_', 'YDKJ_', 'LBP_', 'GH3_'))}
+               if not k.startswith(('SPU_', 'SPURS_'))}
         env['SPU_FLOAT_RZ'] = rz
         result = subprocess.run([str(binary)], capture_output=True, text=True,
                                 timeout=10, cwd=tmp, env=env)

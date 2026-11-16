@@ -81,43 +81,9 @@ static u32 osk_guest_utf16(u32 ea, CellOskDialogChar* dst, u32 max)
     return n;
 }
 
-void cellOskDialogSetDefaultResponse(const char* text)
-{
-    if (text) {
-        strncpy(s_default_response, GUEST_PTR(text, const char*),
-                CELL_OSK_MAX_TEXT_LENGTH);
-        s_default_response[CELL_OSK_MAX_TEXT_LENGTH] = '\0';
-    }
-}
-
 /* ---------------------------------------------------------------------------
  * API implementations
  * -----------------------------------------------------------------------*/
-
-s32 cellOskDialogInit(u32 container)
-{
-    (void)container;
-    printf("[cellOskDialog] Init()\n");
-
-    if (s_osk_initialized)
-        return CELL_OSK_ERROR_ALREADY_INITIALIZED;
-
-    s_osk_initialized = 1;
-    s_osk_loaded = 0;
-    return CELL_OK;
-}
-
-s32 cellOskDialogEnd(void)
-{
-    printf("[cellOskDialog] End()\n");
-
-    if (!s_osk_initialized)
-        return CELL_OSK_ERROR_NOT_INITIALIZED;
-
-    s_osk_initialized = 0;
-    s_osk_loaded = 0;
-    return CELL_OK;
-}
 
 s32 cellOskDialogLoadAsync(u32 container,
                            const CellOskDialogParam* dialogParam,
@@ -204,17 +170,6 @@ s32 cellOskDialogUnloadAsync(CellOskDialogCallbackReturnParam* result)
     return CELL_OK;
 }
 
-s32 cellOskDialogGetSize(u32* width, u32* height)
-{
-    if (!width || !height)
-        return CELL_OSK_ERROR_INVALID_PARAMETER;
-
-    /* Standard PS3 OSK dimensions */
-    vm_write32((u32)(uintptr_t)width, (u32)640);
-    vm_write32((u32)(uintptr_t)height, (u32)240);
-    return CELL_OK;
-}
-
 s32 cellOskDialogAbort(void)
 {
     printf("[cellOskDialog] Abort()\n");
@@ -223,12 +178,6 @@ s32 cellOskDialogAbort(void)
         return CELL_OSK_ERROR_DIALOG_NOT_LOADED;
 
     s_osk_loaded = 0;
-    return CELL_OK;
-}
-
-s32 cellOskDialogSetInitialInputDevice(u32 device)
-{
-    (void)device;
     return CELL_OK;
 }
 
@@ -246,32 +195,3 @@ s32 cellOskDialogSetLayoutMode(u32 mode)
     return CELL_OK;
 }
 
-s32 cellOskDialogSetSeparateWindowOption(u32 option)
-{
-    (void)option;
-    return CELL_OK;
-}
-
-s32 cellOskDialogGetInputText(CellOskDialogCallbackReturnParam* result)
-{
-    if (!s_osk_initialized)
-        return CELL_OSK_ERROR_NOT_INITIALIZED;
-
-    if (!result)
-        return CELL_OSK_ERROR_INVALID_PARAMETER;
-
-    u32 res_ea = GUEST_EA(result);
-    vm_write32(res_ea + OSKRET_O_RESULT, (s_result_length > 0)
-               ? CELL_OSK_DIALOG_INPUT_FIELD_RESULT_OK
-               : CELL_OSK_DIALOG_INPUT_FIELD_RESULT_NO_INPUT_TEXT);
-    vm_write32(res_ea + OSKRET_O_NUMCHARS, s_result_length);
-
-    u32 str_ea = vm_read32(res_ea + OSKRET_O_PRESULTSTRING);
-    if (str_ea && s_result_length > 0) {
-        /* UTF-16, big-endian in guest memory: one unit at a time. */
-        for (u32 i = 0; i <= s_result_length; i++)
-            vm_write16(str_ea + i * 2, s_result_text[i]);
-    }
-
-    return CELL_OK;
-}

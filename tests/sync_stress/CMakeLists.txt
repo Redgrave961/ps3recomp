@@ -1,14 +1,7 @@
 # ps3recomp - tests/sync_stress
 #
 # Deterministic lv2 sync-primitive stress suite.
-# Standalone project: its OWN build dir, never yakuza\build.
-#
-# Build on Windows (chain in ONE command -- Launch-VsDevShell is blocked in
-# this harness; shell state does not persist between tool calls):
-#
-#   cmd /c "call ""C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat"" >nul && cmake -S tests\sync_stress -B tests\sync_stress\build -G Ninja && ninja -C tests\sync_stress\build"
-#
-# Build on Linux / macOS:
+# Standalone project with its own build dir:
 #
 #   cmake -S tests/sync_stress -B tests/sync_stress/build -G Ninja && ninja -C tests/sync_stress/build
 #
@@ -129,23 +122,6 @@ else()
 endif()
 add_test(NAME sync_semantics COMMAND test_sync_semantics)
 set_tests_properties(sync_semantics PROPERTIES LABELS "runtime;sync" TIMEOUT 60)
-
-# cellSyncMutex*: CELL_SYNC_ERROR_ALIGN for a mutex that is not 4-byte aligned.
-# Links libs/sync/cellSync.c alone; the SPU lock-line hooks are stubbed.
-add_executable(test_cellsync_mutex
-    test_cellsync_mutex.c
-    "${PS3RECOMP_TREE_ROOT}/libs/sync/cellSync.c")
-target_include_directories(test_cellsync_mutex PRIVATE
-    "${PS3RECOMP_TREE_ROOT}" "${PS3RECOMP_TREE_ROOT}/include"
-    "${PS3RECOMP_TREE_ROOT}/libs/sync")
-if(MSVC)
-    target_compile_definitions(test_cellsync_mutex PRIVATE _CRT_SECURE_NO_WARNINGS)
-    target_compile_options(test_cellsync_mutex PRIVATE /experimental:c11atomics)
-else()
-    target_compile_options(test_cellsync_mutex PRIVATE -Wall -Wextra -Wno-unused-parameter)
-endif()
-add_test(NAME cellsync_mutex COMMAND test_cellsync_mutex)
-set_tests_properties(cellsync_mutex PROPERTIES LABELS "runtime;sync" TIMEOUT 20)
 
 # sys_mutex_destroy: EBUSY while the mutex is held or a thread is blocked
 # acquiring it. Win32 host threads, through the shim off Windows.

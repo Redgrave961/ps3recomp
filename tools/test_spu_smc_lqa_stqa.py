@@ -47,9 +47,6 @@ HARNESS = r'''
 #include "spu_interp.h"
 
 SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*);
-int g_spu_ls_watch_n = 0;   /* LS watch off */
-void spu_ls_watch_slow(uint32_t lsa, int is_write, const uint8_t* p, uint32_t pc, uint32_t lr)
-{ (void)lsa; (void)is_write; (void)p; (void)pc; (void)lr; }
 void spu_indirect_branch(spu_context* ctx) { (void)ctx; }
 uint32_t spu_interp_run_until(spu_context* ctx, uint32_t a, uint32_t b)
 { (void)ctx; (void)a; (void)b; return 0; }

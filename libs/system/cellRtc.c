@@ -83,29 +83,11 @@ static struct tm datetime_to_tm(const CellRtcDateTime* dt)
     return t;
 }
 
-static int is_leap_year(int y)
-{
-    return (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
-}
-
-static const int s_days_in_month[12] = {
-    31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31
-};
-
-/* Day of week names for RFC formatting */
-static const char* s_dow_names[] = {
-    "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"
-};
-static const char* s_month_names[] = {
-    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
-};
-
 /* ---------------------------------------------------------------------------
  * Guest/host dual-mode accessors.
  *
  * Public entry points receive GUEST addresses (the generic HLE adapter passes
- * PPC registers raw), but internal helpers (TickAdd*) call the same functions
+ * PPC registers raw), but internal helpers call the same functions
  * with HOST stack locals. Values in guest memory are BIG-ENDIAN, so a plain
  * pointer translation is not enough — each field store must byte-swap.
  * Discriminate by value: guest EAs are < 4GB, host pointers are not.
@@ -114,10 +96,6 @@ static int rtc_is_guest(const void* p)
 {
     uintptr_t v = (uintptr_t)p;
     return v && v < 0x100000000ull;
-}
-static char* rtc_str(char* p)
-{
-    return rtc_is_guest(p) ? (char*)(vm_base + (uint32_t)(uintptr_t)p) : p;
 }
 static u64 rtc_tick_read(const CellRtcTick* p)
 {
@@ -220,28 +198,6 @@ s32 cellRtcGetCurrentClockLocalTime(CellRtcDateTime* pClock)
     return CELL_OK;
 }
 
-s32 cellRtcGetCurrentClockUtc(CellRtcDateTime* pClock)
-{
-    if (!pClock)
-        return CELL_EINVAL;
-
-    u64 host_usec = get_host_time_usec();
-    time_t t = (time_t)(host_usec / USEC_PER_SEC);
-    u32 usec = (u32)(host_usec % USEC_PER_SEC);
-
-    struct tm utc_tm;
-#ifdef _WIN32
-    gmtime_s(&utc_tm, &t);
-#else
-    gmtime_r(&t, &utc_tm);
-#endif
-
-    CellRtcDateTime dt_u;
-    tm_to_datetime(&utc_tm, usec, &dt_u);
-    rtc_dt_write(pClock, &dt_u);
-    return CELL_OK;
-}
-
 s32 cellRtcGetTime_t(const CellRtcTick* pTick, s64* pTime)
 {
     if (!pTick || !pTime)
@@ -261,116 +217,6 @@ s32 cellRtcSetTime_t(CellRtcTick* pTick, s64 iTime)
         return CELL_EINVAL;
 
     rtc_tick_write(pTick, time_t_to_tick(iTime));
-    return CELL_OK;
-}
-
-s32 cellRtcTickAddYears(CellRtcTick* pTick0, const CellRtcTick* pTick1, s32 iAdd)
-{
-    if (!pTick0 || !pTick1)
-        return CELL_EINVAL;
-
-    /* Convert tick to datetime, add years, convert back */
-    CellRtcDateTime dt;
-    cellRtcSetTick(&dt, pTick1);
-    dt.year = (u16)((s32)dt.year + iAdd);
-
-    /* Clamp Feb 29 -> Feb 28 if not leap year */
-    if (dt.month == 2 && dt.day == 29 && !is_leap_year(dt.year))
-        dt.day = 28;
-
-    cellRtcGetTick(&dt, pTick0);
-    return CELL_OK;
-}
-
-s32 cellRtcTickAddMonths(CellRtcTick* pTick0, const CellRtcTick* pTick1, s32 iAdd)
-{
-    if (!pTick0 || !pTick1)
-        return CELL_EINVAL;
-
-    CellRtcDateTime dt;
-    cellRtcSetTick(&dt, pTick1);
-
-    s32 total_months = (s32)(dt.year - 1) * 12 + (s32)(dt.month - 1) + iAdd;
-    if (total_months < 0) total_months = 0;
-
-    dt.year  = (u16)(total_months / 12 + 1);
-    dt.month = (u16)(total_months % 12 + 1);
-
-    /* Clamp day */
-    s32 max_day = cellRtcGetDaysInMonth((s32)dt.year, (s32)dt.month);
-    if (dt.day > (u16)max_day)
-        dt.day = (u16)max_day;
-
-    cellRtcGetTick(&dt, pTick0);
-    return CELL_OK;
-}
-
-s32 cellRtcTickAddDays(CellRtcTick* pTick0, const CellRtcTick* pTick1, s32 iAdd)
-{
-    if (!pTick0 || !pTick1)
-        return CELL_EINVAL;
-
-    rtc_tick_write(pTick0, rtc_tick_read(pTick1) + (u64)((s64)iAdd * 24LL * 3600LL * USEC_PER_SEC));
-    return CELL_OK;
-}
-
-s32 cellRtcTickAddHours(CellRtcTick* pTick0, const CellRtcTick* pTick1, s32 iAdd)
-{
-    if (!pTick0 || !pTick1)
-        return CELL_EINVAL;
-
-    rtc_tick_write(pTick0, rtc_tick_read(pTick1) + (u64)((s64)iAdd * 3600LL * USEC_PER_SEC));
-    return CELL_OK;
-}
-
-s32 cellRtcTickAddMinutes(CellRtcTick* pTick0, const CellRtcTick* pTick1, s32 iAdd)
-{
-    if (!pTick0 || !pTick1)
-        return CELL_EINVAL;
-
-    rtc_tick_write(pTick0, rtc_tick_read(pTick1) + (u64)((s64)iAdd * 60LL * USEC_PER_SEC));
-    return CELL_OK;
-}
-
-s32 cellRtcTickAddSeconds(CellRtcTick* pTick0, const CellRtcTick* pTick1, s64 iAdd)
-{
-    if (!pTick0 || !pTick1)
-        return CELL_EINVAL;
-
-    rtc_tick_write(pTick0, rtc_tick_read(pTick1) + (u64)(iAdd * (s64)USEC_PER_SEC));
-    return CELL_OK;
-}
-
-s32 cellRtcTickAddMicroseconds(CellRtcTick* pTick0, const CellRtcTick* pTick1, s64 iAdd)
-{
-    if (!pTick0 || !pTick1)
-        return CELL_EINVAL;
-
-    rtc_tick_write(pTick0, rtc_tick_read(pTick1) + (u64)iAdd);
-    return CELL_OK;
-}
-
-s32 cellRtcConvertLocalTimeToUtc(const CellRtcTick* pLocalTime, CellRtcTick* pUtc)
-{
-    if (!pLocalTime || !pUtc)
-        return CELL_EINVAL;
-
-    /* Get local-to-UTC offset using the C runtime */
-    time_t now = time(NULL);
-    struct tm local_tm, utc_tm;
-#ifdef _WIN32
-    localtime_s(&local_tm, &now);
-    gmtime_s(&utc_tm, &now);
-#else
-    localtime_r(&now, &local_tm);
-    gmtime_r(&now, &utc_tm);
-#endif
-
-    time_t local_t = mktime(&local_tm);
-    time_t utc_t   = mktime(&utc_tm);
-    s64 offset_sec = (s64)(local_t - utc_t);
-
-    rtc_tick_write(pUtc, rtc_tick_read(pLocalTime) - (u64)(offset_sec * (s64)USEC_PER_SEC));
     return CELL_OK;
 }
 
@@ -397,81 +243,6 @@ s32 cellRtcConvertUtcToLocalTime(const CellRtcTick* pUtc, CellRtcTick* pLocalTim
     return CELL_OK;
 }
 
-s32 cellRtcFormatRfc2822(char* pszDateTime, const CellRtcTick* pTick, s32 iTimeZoneMinutes)
-{
-    if (!pszDateTime || !pTick)
-        return CELL_EINVAL;
-
-    /* Convert tick to time_t, apply timezone offset */
-    s64 unix_time = tick_to_time_t(rtc_tick_read(pTick));
-    unix_time += (s64)iTimeZoneMinutes * 60;
-
-    time_t t = (time_t)unix_time;
-    struct tm tm_val;
-#ifdef _WIN32
-    gmtime_s(&tm_val, &t);
-#else
-    gmtime_r(&t, &tm_val);
-#endif
-
-    s32 tz_h = iTimeZoneMinutes / 60;
-    s32 tz_m = abs(iTimeZoneMinutes) % 60;
-
-    sprintf(rtc_str(pszDateTime), "%s, %02d %s %04d %02d:%02d:%02d %c%02d%02d",
-            s_dow_names[tm_val.tm_wday],
-            tm_val.tm_mday,
-            s_month_names[tm_val.tm_mon],
-            tm_val.tm_year + 1900,
-            tm_val.tm_hour,
-            tm_val.tm_min,
-            tm_val.tm_sec,
-            iTimeZoneMinutes >= 0 ? '+' : '-',
-            abs(tz_h), tz_m);
-
-    return CELL_OK;
-}
-
-s32 cellRtcFormatRfc3339(char* pszDateTime, const CellRtcTick* pTick, s32 iTimeZoneMinutes)
-{
-    if (!pszDateTime || !pTick)
-        return CELL_EINVAL;
-
-    s64 unix_time = tick_to_time_t(rtc_tick_read(pTick));
-    unix_time += (s64)iTimeZoneMinutes * 60;
-
-    time_t t = (time_t)unix_time;
-    struct tm tm_val;
-#ifdef _WIN32
-    gmtime_s(&tm_val, &t);
-#else
-    gmtime_r(&t, &tm_val);
-#endif
-
-    if (iTimeZoneMinutes == 0) {
-        sprintf(rtc_str(pszDateTime), "%04d-%02d-%02dT%02d:%02d:%02dZ",
-                tm_val.tm_year + 1900,
-                tm_val.tm_mon + 1,
-                tm_val.tm_mday,
-                tm_val.tm_hour,
-                tm_val.tm_min,
-                tm_val.tm_sec);
-    } else {
-        s32 tz_h = iTimeZoneMinutes / 60;
-        s32 tz_m = abs(iTimeZoneMinutes) % 60;
-        sprintf(rtc_str(pszDateTime), "%04d-%02d-%02dT%02d:%02d:%02d%c%02d:%02d",
-                tm_val.tm_year + 1900,
-                tm_val.tm_mon + 1,
-                tm_val.tm_mday,
-                tm_val.tm_hour,
-                tm_val.tm_min,
-                tm_val.tm_sec,
-                iTimeZoneMinutes >= 0 ? '+' : '-',
-                abs(tz_h), tz_m);
-    }
-
-    return CELL_OK;
-}
-
 s32 cellRtcGetDayOfWeek(s32 year, s32 month, s32 day)
 {
     /* Tomohiko Sakamoto's algorithm */
@@ -479,42 +250,6 @@ s32 cellRtcGetDayOfWeek(s32 year, s32 month, s32 day)
     int y = year;
     if (month < 3) y -= 1;
     return (y + y/4 - y/100 + y/400 + t[month - 1] + day) % 7;
-}
-
-s32 cellRtcGetDaysInMonth(s32 year, s32 month)
-{
-    if (month < 1 || month > 12)
-        return 0;
-
-    if (month == 2 && is_leap_year(year))
-        return 29;
-
-    return s_days_in_month[month - 1];
-}
-
-s32 cellRtcSetTick(CellRtcDateTime* pDateTime, const CellRtcTick* pTick)
-{
-    if (!pDateTime || !pTick)
-        return CELL_EINVAL;
-
-    u64 tick = rtc_tick_read(pTick);
-    u32 usec = (u32)(tick % USEC_PER_SEC);
-    s64 unix_time = tick_to_time_t(tick);
-
-    time_t t = (time_t)unix_time;
-    struct tm tm_val;
-#ifdef _WIN32
-    gmtime_s(&tm_val, &t);
-#else
-    gmtime_r(&t, &tm_val);
-#endif
-
-    {
-        CellRtcDateTime dt_s;
-        tm_to_datetime(&tm_val, usec, &dt_s);
-        rtc_dt_write(pDateTime, &dt_s);
-    }
-    return CELL_OK;
 }
 
 s32 cellRtcGetTick(const CellRtcDateTime* pDateTime, CellRtcTick* pTick)

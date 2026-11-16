@@ -65,8 +65,7 @@ extern "C" {
 #define CELL_FS_S_IRGRP   0000040
 #define CELL_FS_S_IROTH   0000004
 
-/* Open flags. The SDK values are OCTAL (libs/filesystem/cellFs.h has the same
- * set): O_CREAT 0100, O_EXCL 0200, O_TRUNC 01000, O_APPEND 02000. They used to
+/* Open flags. The SDK values are OCTAL: O_CREAT 0100, O_EXCL 0200, O_TRUNC 01000, O_APPEND 02000. They used to
  * be spelt 0x100/0x400/0x2000 here, which are different bits: a guest libc's
  * open(O_WRONLY|O_CREAT) of a new file (0x41) never saw O_CREAT and failed
  * ENOENT, and fopen("a") (O_APPEND = 0x400) was read as O_EXCL and overwrote
@@ -111,8 +110,8 @@ typedef struct sys_fs_dir_info {
 extern sys_fs_fd_info  g_sys_fs_fds[SYS_FS_FD_MAX];
 extern sys_fs_dir_info g_sys_fs_dirs[SYS_FS_DIR_MAX];
 
-/* Configurable root directory for path mapping */
-extern char g_sys_fs_root[512];
+/* Host directory the PS3 mount points map into */
+extern const char* ppu_vfs_root;
 
 /* Path translation: convert PS3 path to host path */
 void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size);

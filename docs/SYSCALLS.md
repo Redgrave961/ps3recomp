@@ -518,7 +518,7 @@ SPU management syscalls are **defined but minimally implemented**. The full set 
 - `sys_spu_thread_bind_queue/unbind_queue`
 - `sys_spu_image_open/close`
 
-Most games use the higher-level `cellSpurs` framework instead of raw SPU syscalls. The SPURS HLE module in `libs/spurs/` provides the management layer.
+Most games use the higher-level `cellSpurs` framework instead of raw SPU syscalls. SPURS is Sony's libsre, lifted, running on these syscalls.
 
 ---
 

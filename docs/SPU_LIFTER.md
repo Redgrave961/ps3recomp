@@ -28,10 +28,10 @@ Related pieces:
 - `SPU_INTERP_STATS=<seconds>` (PR #394) is read in `runtime/spu/spu_interp.c`
   (`getenv`, about line 454). While set, the interpreter reports how much SPU
   code runs interpreted, by image and 1 KB page of local store.
-- SPURS workload registration: `spu_workload_register()` and
+- Image registration: `spu_workload_register()` and
   `spu_workload_register_img()` in `runtime/spu/spu_workload.c` take a content
-  fingerprint and a lifted entry function; `cellSpurs` calls
-  `spu_workload_dispatch()` to run the matching image. `tools/build_spu_workloads.py`
+  fingerprint and a lifted entry function; SPU thread and raw-SPU image loads
+  find the matching lifted image by fingerprint. `tools/build_spu_workloads.py`
   generates the registration table.
 
 Targets the ABI in `runtime/spu/spu_context.h` (`u128 gpr[128]`, 256 KB
@@ -273,9 +273,8 @@ Still open:
   and `longjmp`s from inside the halt path, so a HALT really stops the
   SPU instead of unwinding a stack frame at a time.
 - **CMake integration - done.** `cmake/PS3RecompSPU.cmake` provides
-  `ps3recomp_generate_spu()`, and `templates/project/CMakeLists.txt` calls it
-  when `PORT_ENABLE_SPU` is on and `PORT_SPU_INPUTS` is set (see "Discovery and
-  registration coverage" below).
+  `ps3recomp_generate_spu()` and `ps3recomp_generate_spu_jobs()`;
+  `port/CMakeLists.txt` calls both with `PORT_SPU_INPUTS`.
 
 ## Known stubs
 
@@ -390,9 +389,7 @@ python tools/build_spu_workloads.py --input /path/to/EBOOT.ELF \
     --out /path/to/generated_spu/spu_workloads.c --constructor
 ```
 
-See [the project template](../templates/project/README.md#automatically-discover-and-register-spu-elf-programs)
-for automatic CMake integration, output ownership, coverage failures, partial
-mode, and limitations. A `registered` status confirms generation and table
+`cmake/PS3RecompSPU.cmake` runs this at configure time. A `registered` status confirms generation and table
 coverage; it does not establish correct execution of the program. The standalone
 lifter's optional `--report PATH` emits function ranges, unsupported instruction
 counts, and direct branch/call targets for tools consuming its output.

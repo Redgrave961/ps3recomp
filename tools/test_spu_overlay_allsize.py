@@ -14,8 +14,8 @@ parser.add_argument('--output-dir',type=pathlib.Path)
 parser.add_argument('--source',type=pathlib.Path)
 parser.add_argument('--mutants',action='store_true')
 args=parser.parse_args()
-units=['spu_drain','spu_lockstep','spu_coherency','spu_workload','spurs_policy','spurs_job','spu_tsp_weak','spu_vm_pagemap','spurs_policy_blob_weak','spu_interp']
-env={k:v for k,v in os.environ.items() if not k.startswith(('SPU_','SPURS_','YDKJ_','LBP_','GH3_'))}
+units=['spu_drain','spu_lockstep','spu_coherency','spu_workload','spu_vm_pagemap','spu_interp']
+env={k:v for k,v in os.environ.items() if not k.startswith(('SPU_','SPURS_'))}
 source=(args.source or SPU/'spu_channels.c').read_text()
 def instrument(text):
     text=text.replace('#include "../','#include "'+str(SPU.parent)+'/')

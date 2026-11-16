@@ -18,7 +18,6 @@ char g_spu_interp_steps[64];
 char g_spu_out_mbox_hook[64];
 char g_spu_user_event_hook[64];
 char g_spurs_kernel_hook[64];
-char g_ydkj_spurs_ctx_ea[64];
 char ppu_guard_page[64];
 
 /* functions */
@@ -35,13 +34,10 @@ long long spu_have_function() { return 0; }
 long long spu_image_of_function() { return 0; }
 long long spu_indirect_branch() { return 0; }
 long long spu_interp_run() { return 0; }
-long long spu_lookup_ppu_fallback() { return 0; }
 long long spu_mfc_release() { return 0; }
 long long spu_raw_note_image() { return 0; }
-long long spu_register_ppu_fallback() { return 0; }
 long long spu_registry_fallback() { return 0; }
 long long spu_run_with_halt() { return 0; }
-long long spurs_job_ls_for_handle() { return 0; }
 long long sys_cond_init() { return 0; }
 long long sys_event_init() { return 0; }
 long long sys_event_queue_push_by_id() { return 0; }

@@ -23,15 +23,6 @@
 #include "ps3emu/log_first.h"
 #include "ps3emu/thread_name.h"
 
-/* Event-queue push/lookup (runtime/syscalls/sys_event.c). Forward-declared
- * rather than including sys_event.h to avoid pulling PPU context/syscall
- * table types into the HLE audio module. */
-extern int      sys_event_queue_push_by_id(uint32_t queue_id,
-                                            uint64_t source, uint64_t data1,
-                                            uint64_t data2,  uint64_t data3);
-extern uint32_t sys_event_find_queue_by_key(uint64_t key);
-extern uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size);
-
 /* ---------------------------------------------------------------------------
  * Backend selection
  * -----------------------------------------------------------------------*/
@@ -132,16 +123,6 @@ typedef struct {
 
 static int            s_audio_initialized = 0;
 static AudioPortSlot  s_ports[CELL_AUDIO_PORT_MAX];
-
-/* Event queue notification */
-typedef struct {
-    int  in_use;
-    u64  key;
-} AudioNotifySlot;
-static AudioNotifySlot s_notify_queues[CELL_AUDIO_MAX_NOTIFY_EVENT_QUEUES];
-
-/* Timestamp anchor for cellAudioGetPortTimestamp (microseconds, set at init) */
-static u64            s_audio_start_us = 0;
 
 /* Mixing thread */
 static unsigned long long g_audio_dropped;   /* frames the device had no room for */
@@ -551,21 +532,6 @@ static void audio_mix_one_block(void)
  * Mixing thread
  * -----------------------------------------------------------------------*/
 
-static void audio_notify_event_queues(void)
-{
-    /* Push the audio-period event (data1 = CELL_AUDIO_EVENT_MIX = 0) to each
-     * registered notify queue, so the game's audio loop (blocked on
-     * sys_event_queue_receive) wakes once per block and writes the next one.
-     * Resolve the queue by its ipc_key (set via cellAudioSetNotifyEventQueue). */
-    for (int i = 0; i < CELL_AUDIO_MAX_NOTIFY_EVENT_QUEUES; i++) {
-        if (!s_notify_queues[i].in_use) continue;
-        uint32_t qid = sys_event_find_queue_by_key(s_notify_queues[i].key);
-        if (qid)
-            sys_event_queue_push_by_id(qid, s_notify_queues[i].key,
-                                       0 /*CELL_AUDIO_EVENT_MIX*/, 0, 0);
-    }
-}
-
 /* The loudest sample of the block just mixed (AUDIO_PEAK). */
 static float audio_mix_peak(void)
 {
@@ -663,8 +629,6 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
                 g_audio_holes[0] = g_audio_holes[1] = 0;
                 n = z = 0; d0 = g_audio_dropped; u0 = g_audio_underruns; t0 = now; } } }
 
-        /* Notify event queues */
-        audio_notify_event_queues();
     }
 
     printf("[cellAudio] Mixing thread stopped\n");
@@ -681,7 +645,6 @@ static void* audio_mix_thread_func(void* arg)
         audio_mix_one_block();
         audio_dump_mix();
         audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
-        audio_notify_event_queues();
         /* AUDIO_PEAK=1: the loudest sample of every second of mixed output (187.5 blocks of 256). */
         { static int pk_on = -1; if (pk_on < 0) pk_on = getenv("AUDIO_PEAK") ? 1 : 0;
           if (pk_on) {
@@ -766,7 +729,6 @@ s32 cellAudioInit(void)
         return CELL_AUDIO_ERROR_ALREADY_INIT;
 
     memset(s_ports, 0, sizeof(s_ports));
-    memset(s_notify_queues, 0, sizeof(s_notify_queues));
     mutex_init(&s_audio_mutex);
 
     if (audio_backend_init() < 0) {
@@ -775,15 +737,6 @@ s32 cellAudioInit(void)
     }
 
 
-#ifdef _WIN32
-    { LARGE_INTEGER f, c;
-      QueryPerformanceFrequency(&f); QueryPerformanceCounter(&c);
-      s_audio_start_us = (u64)(c.QuadPart / f.QuadPart) * 1000000ULL +
-          (u64)(c.QuadPart % f.QuadPart) * 1000000ULL / (u64)f.QuadPart; }
-#else
-    { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-      s_audio_start_us = (u64)ts.tv_sec * 1000000ULL + (u64)ts.tv_nsec / 1000ULL; }
-#endif
     if (audio_start_mix_thread() < 0) {
         printf("[cellAudio] WARNING: Could not start mixing thread\n");
     }
@@ -964,154 +917,6 @@ s32 cellAudioPortStop(u32 portNum)
     return CELL_OK;
 }
 
-s32 cellAudioGetPortBlockTag(u32 portNum, u64 blockNo, u64* tag)
-{
-    uint32_t tag_ea = (uint32_t)(uintptr_t)tag;
-    if (!s_audio_initialized)
-        return CELL_AUDIO_ERROR_NOT_INIT;
-    if (portNum >= CELL_AUDIO_PORT_MAX)
-        return CELL_AUDIO_ERROR_PARAM;
-    if (!s_ports[portNum].in_use)
-        return CELL_AUDIO_ERROR_PORT_NOT_OPEN;
-    if (!tag_ea)
-        return CELL_AUDIO_ERROR_PARAM;
-
-    mutex_lock(&s_audio_mutex);
-    AudioPortSlot* port = &s_ports[portNum];
-    u64 nblk = port->param.nBlock ? port->param.nBlock : 1;
-    if (blockNo >= nblk) {
-        mutex_unlock(&s_audio_mutex);
-        return CELL_AUDIO_ERROR_PARAM;
-    }
-    u64 t = port->read_index + blockNo - (port->read_index % nblk);
-    if (blockNo < port->read_index % nblk) t += nblk;
-    mutex_unlock(&s_audio_mutex);
-
-    vm_write64(tag_ea, t);
-    return CELL_OK;
-}
-
-s32 cellAudioGetPortTimestamp(u32 portNum, u64 tag, u64* stamp)
-{
-    uint32_t stamp_ea = (uint32_t)(uintptr_t)stamp;
-    if (!s_audio_initialized)
-        return CELL_AUDIO_ERROR_NOT_INIT;
-    if (portNum >= CELL_AUDIO_PORT_MAX)
-        return CELL_AUDIO_ERROR_PARAM;
-    if (!s_ports[portNum].in_use)
-        return CELL_AUDIO_ERROR_PORT_NOT_OPEN;
-    if (!stamp_ea)
-        return CELL_AUDIO_ERROR_PARAM;
-
-    mutex_lock(&s_audio_mutex);
-    u64 global_counter = s_ports[portNum].read_index;
-    mutex_unlock(&s_audio_mutex);
-    if (tag > global_counter)
-        return CELL_AUDIO_ERROR_TAG_NOT_FOUND;
-
-    u64 t = s_audio_start_us + tag * 256000000ULL / 48000ULL;
-    vm_write64(stamp_ea, t);
-    return CELL_OK;
-}
-
-/* cellAudioCreateNotifyEventQueue(sys_event_queue_t* id, u64* key)
- *
- * Creates the queue the game will block on for audio-period events, and
- * registers it for notification in one step -- the game never calls
- * SetNotifyEventQueue for this one.
- *
- * This was missing entirely. YDKJ imports it, got the unimplemented-NID path,
- * and then blocked on an id nothing had created: sys_event_queue_receive
- * answered CELL_ESRCH every time and the title logged 1.7 MILLION
- * "ERROR - LIBAUDIO DROPOUT" lines in a 60 s run.
- *
- * Both params are GUEST addresses and both are big-endian out-values; the id
- * is 32-bit and the key 64-bit, so they cannot be written with a plain store. */
-s32 cellAudioCreateNotifyEventQueue(u32* id, u64* key)
-{
-    uint32_t id_ea  = (uint32_t)(uintptr_t)id;
-    uint32_t key_ea = (uint32_t)(uintptr_t)key;
-
-    printf("[cellAudio] CreateNotifyEventQueue(id_ea=0x%08X key_ea=0x%08X)\n",
-           id_ea, key_ea);
-
-    if (!s_audio_initialized)
-        return CELL_AUDIO_ERROR_NOT_INIT;
-    if (!id_ea || !key_ea)
-        return CELL_AUDIO_ERROR_PARAM;
-
-    /* A distinct key per queue: the notify path resolves queues BY KEY, and the
-     * game creates its other queues with key 0, so reusing 0 here would make
-     * find_queue_by_key ambiguous and post audio events to whichever matched. */
-    static uint64_t s_next_key = 0x8000000000000001ull;
-    uint64_t k = s_next_key++;
-
-    uint32_t qid = sys_event_queue_create_direct(k, 8);
-    if (!qid)
-        return CELL_AUDIO_ERROR_EVENT_QUEUE;
-
-    mutex_lock(&s_audio_mutex);
-    int slot = -1;
-    for (int i = 0; i < CELL_AUDIO_MAX_NOTIFY_EVENT_QUEUES; i++) {
-        if (!s_notify_queues[i].in_use) { slot = i; break; }
-    }
-    if (slot < 0) { mutex_unlock(&s_audio_mutex); return CELL_AUDIO_ERROR_PARAM; }
-    s_notify_queues[slot].in_use = 1;
-    s_notify_queues[slot].key    = k;
-    mutex_unlock(&s_audio_mutex);
-
-    vm_write32(id_ea, qid);
-    vm_write64(key_ea, k);
-    printf("[cellAudio] CreateNotifyEventQueue -> id=%u key=0x%llX\n",
-           qid, (unsigned long long)k);
-    return CELL_OK;
-}
-
-s32 cellAudioSetNotifyEventQueue(u64 key)
-{
-    printf("[cellAudio] SetNotifyEventQueue(key=0x%llX)\n",
-           (unsigned long long)key);
-
-    if (!s_audio_initialized)
-        return CELL_AUDIO_ERROR_NOT_INIT;
-
-    mutex_lock(&s_audio_mutex);
-
-    for (int i = 0; i < CELL_AUDIO_MAX_NOTIFY_EVENT_QUEUES; i++) {
-        if (!s_notify_queues[i].in_use) {
-            s_notify_queues[i].in_use = 1;
-            s_notify_queues[i].key = key;
-            mutex_unlock(&s_audio_mutex);
-            return CELL_OK;
-        }
-    }
-
-    mutex_unlock(&s_audio_mutex);
-    return CELL_AUDIO_ERROR_PARAM; /* no free slots */
-}
-
-s32 cellAudioRemoveNotifyEventQueue(u64 key)
-{
-    printf("[cellAudio] RemoveNotifyEventQueue(key=0x%llX)\n",
-           (unsigned long long)key);
-
-    if (!s_audio_initialized)
-        return CELL_AUDIO_ERROR_NOT_INIT;
-
-    mutex_lock(&s_audio_mutex);
-
-    for (int i = 0; i < CELL_AUDIO_MAX_NOTIFY_EVENT_QUEUES; i++) {
-        if (s_notify_queues[i].in_use && s_notify_queues[i].key == key) {
-            s_notify_queues[i].in_use = 0;
-            mutex_unlock(&s_audio_mutex);
-            return CELL_OK;
-        }
-    }
-
-    mutex_unlock(&s_audio_mutex);
-    return CELL_AUDIO_ERROR_PARAM;
-}
-
 s32 cellAudioGetPortConfig(u32 portNum, CellAudioPortConfig* config)
 {
     if (!s_audio_initialized)
@@ -1159,37 +964,3 @@ s32 cellAudioGetPortConfig(u32 portNum, CellAudioPortConfig* config)
     return CELL_OK;
 }
 
-s32 cellAudioPortGetStatus(u32 portNum, u32* status)
-{
-    if (!s_audio_initialized)
-        return CELL_AUDIO_ERROR_NOT_INIT;
-
-    if (portNum >= CELL_AUDIO_PORT_MAX || !status)
-        return CELL_AUDIO_ERROR_PARAM;
-
-    if (!s_ports[portNum].in_use) {
-        vm_write32((u32)(uintptr_t)status, CELL_AUDIO_STATUS_CLOSE);
-    } else if (s_ports[portNum].running) {
-        vm_write32((u32)(uintptr_t)status, CELL_AUDIO_STATUS_RUN);
-    } else {
-        vm_write32((u32)(uintptr_t)status, CELL_AUDIO_STATUS_READY);
-    }
-
-    return CELL_OK;
-}
-
-s32 cellAudioSetPersonalDevice(s32 iPersonalStream, s32 iDevice)
-{
-    (void)iPersonalStream;
-    (void)iDevice;
-    printf("[cellAudio] SetPersonalDevice(stream=%d, device=%d) - stub\n",
-           iPersonalStream, iDevice);
-    return CELL_OK;
-}
-
-s32 cellAudioUnsetPersonalDevice(s32 iPersonalStream)
-{
-    (void)iPersonalStream;
-    printf("[cellAudio] UnsetPersonalDevice(stream=%d) - stub\n", iPersonalStream);
-    return CELL_OK;
-}

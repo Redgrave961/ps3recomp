@@ -45,19 +45,16 @@ static volatile long g_lockline = 0;
  * and Sleep(0) only to one of equal or higher priority -- neither reaches a
  * lower-priority holder that is waiting for a core. With every core busy, waiters
  * above the holder's priority could keep it off the CPU for tens of milliseconds.
- * A normal wait is far under a microsecond and never gets here.
- * SPU_LOCKLINE_SLEEP=0 keeps the plain spin. */
+ * A normal wait is far under a microsecond and never gets here. */
 void spu_lockline_lock(void)
 {
-    static int s_sleep = -1;
     unsigned spins = 0, rounds = 0;
     while (_InterlockedExchange(&g_lockline, 1)) {
-        if (s_sleep < 0) { const char* e = getenv("SPU_LOCKLINE_SLEEP"); s_sleep = !(e && e[0] == '0'); }
         do {
             _mm_pause();
             if (++spins >= 4096) {
                 spins = 0;
-                if (rounds++ < 6 || !s_sleep) SwitchToThread(); else Sleep(1);
+                if (rounds++ < 6) SwitchToThread(); else Sleep(1);
             }
         } while (g_lockline);
     }
@@ -291,8 +288,7 @@ int spu_coh_is_reserved(uint32_t addr)
  * the fixtures and any build without it have no PPU reservations to break.
  * POSIX: a weak no-op definition the loader's overrides (a weak undefined
  * reference is not enough: ld64 only lets those stay unresolved for dylib
- * symbols). link.exe/lld-link: the linker's own default (see ppu_gcm_pump in
- * ppu_loader.cpp). */
+ * symbols). link.exe/lld-link: the linker's own default. */
 #if defined(_MSC_VER)
 void ppu_resv_break_line(uint32_t ea);
 void ppu_resv_break_line_absent(uint32_t ea) { (void)ea; }
@@ -399,15 +395,6 @@ void spu_coh_notify_write(uint32_t ea)
         if (spu_coh_holds(c, line)) {
             SPU_EVENT_SET(c, SPU_EVENT_LR);
             __atomic_store_n(&c->resv_valid, 0, __ATOMIC_RELAXED);   /* reservation lost, PUTLLC must fail */
-            /* SPU_PUTLLC_WHY=1: name the agent that killed it. A PUTLLC that
-             * always fails for "no reservation" is useless without knowing who
-             * took it away -- a peer SPU, or the PPU committing to the line. */
-            { static int s_w = -1;
-              if (s_w < 0) s_w = getenv("SPU_PUTLLC_WHY") ? 1 : 0;
-              if (s_w) { static unsigned long long n;
-                  if ((++n % 200000) == 1)
-                      fprintf(stderr, "[resv-lost] %llu: line 0x%08X taken from img=%d ctx=%p\n",
-                              n, line, c->image_id, (void*)c); } }
             g_spu_lr_raise++;
             /* The event_status store has to be visible before the wake. The
              * waiter re-polls its predicate on a timeout as well, so a

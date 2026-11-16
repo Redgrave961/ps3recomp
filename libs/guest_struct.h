@@ -11,12 +11,12 @@
  *
  *   - The struct holds a pointer. The guest's is 4 bytes and the host's is 8,
  *     so every field after it sits at a different offset. Read those by
- *     explicit guest offset (see cellFont.c, cellHttp.c).
+ *     explicit guest offset.
  *
  *   - The struct holds a u64 or a double. A big-endian u64 is high word first,
  *     but on a little-endian host the low half comes first in memory, so a
  *     word-at-a-time copy swaps the two halves. Use vm_read64/vm_write64 for
- *     that field (see cellJpgDec.c's jpgdec_out_param_store).
+ *     that field.
  *
  * A struct of nothing but u32/s32/float is the common case, and that is what
  * these two are for.

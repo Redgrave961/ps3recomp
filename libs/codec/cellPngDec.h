@@ -147,11 +147,6 @@ typedef struct CellPngDecDataInfo {
  * Functions
  * -----------------------------------------------------------------------*/
 
-/* Pointer parameters are GUEST addresses (u32): the HLE bridge forwards raw
- * gpr values, so these arrive as big-endian guest addresses, not host pointers.
- * Marshalling to/from guest memory happens inside the .c. */
-s32 cellPngDecCreate(u32 mainHandle_addr, u32 threadInParam_addr, u32 threadOutParam_addr);
-
 s32 cellPngDecDestroy(CellPngDecMainHandle mainHandle);
 
 s32 cellPngDecOpen(CellPngDecMainHandle mainHandle,

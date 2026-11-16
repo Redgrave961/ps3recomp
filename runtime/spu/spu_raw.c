@@ -44,7 +44,6 @@
 #endif
 
 extern uint8_t* vm_base;
-extern int g_spu_force_ch_block;              /* spu_channels.c */
 extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
 /* For attributing an MMIO store to the guest code that made it. */
 #include "../ppu/ppu_context.h"
@@ -423,8 +422,6 @@ static void raw_spu_start(raw_spu* s)
 
     uint32_t npc = be32_load(s->base + SPU_RAW_NPC) & ~3u;
     s->ctx->pc = npc ? npc : elf_entry;
-
-    g_spu_force_ch_block = 1;   /* an empty RdInMbox must park, not fabricate 0 */
 
     /* Local store content at the start of the run. An all-zero LS means nobody
      * loaded the image -- the SPU would branch straight into zeros and halt at

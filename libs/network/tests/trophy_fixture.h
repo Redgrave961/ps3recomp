@@ -81,11 +81,10 @@ static void fixture_remove_pack(void)
 }
 
 const char* cellGame_get_boot_path(void) { return NULL; }
-int cellfs_translate_path(const char* ps3_path, char* host_buf, size_t buf_size)
+void sys_fs_translate_path(const char* ps3_path, char* host_buf, int buf_size)
 {
-    if (strncmp(ps3_path, "/dev_bdvd/", 10)) return -1;
-    snprintf(host_buf, buf_size, "%s/%s", g_fixture_root, ps3_path + 10);
-    return 0;
+    if (strncmp(ps3_path, "/dev_bdvd/", 10)) { host_buf[0] = 0; return; }
+    snprintf(host_buf, (size_t)buf_size, "%s/%s", g_fixture_root, ps3_path + 10);
 }
 
 static void fixture_guest_sign(uint32_t ea)

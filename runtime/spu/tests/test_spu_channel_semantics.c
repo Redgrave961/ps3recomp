@@ -214,7 +214,6 @@ int main(int argc, char** argv)
 
     spu_context_init(&g_spu, 0);
     g_spu.image_id = -1;
-    g_spu_force_ch_block = 1;           /* blocking reads, as for a raw SPU */
 
     test_wake_is_ordered_after_the_waiter();
     test_blocking_read_handoff(handoffs);
@@ -241,16 +240,7 @@ int      g_resv_store_active = 0;
 uint32_t g_barrier_sync_watch = 0;
 
 void (*g_spurs_kernel_hook)(uint32_t) = 0;
-uint32_t g_ydkj_spurs_ctx_ea = 0;
-uint32_t g_ydkj_real_spurs_ea = 0;
-uint32_t g_ydkj_real_taskset_ea = 0;
-uint32_t g_ydkj_real_taskid = 0;
 void spurs_ef_set_from_spu(uint32_t ea, uint16_t bits) { (void)ea; (void)bits; }
-void ydkj_wake_all_event_flags(void)                   { }
-void spurs_pm_build_context(spu_context* c, uint32_t a, uint32_t b, uint32_t d)
-{
-    (void)c; (void)a; (void)b; (void)d;
-}
 
 uint32_t g_spu_image_src_ea, g_spu_image_ls_start, g_spu_image_span;
 void spu_thread_publish_ctx(uint32_t tid, void* ctx) { (void)tid; (void)ctx; }

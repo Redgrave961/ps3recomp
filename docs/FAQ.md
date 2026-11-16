@@ -30,19 +30,12 @@ Yes, under the same principles as all clean-room recompilation projects:
 
 ### What games work?
 
-**flOw** by thatgamecompany is the first active port — see the [case study](GAME_PORTING_GUIDE.md#case-study-flow). The framework is ready for other games; contributions welcome.
+This tree serves the Asura's Wrath port (`../port`, BLES01227).
 
 ### What platforms are supported?
 
-- **Windows** — clang-cl, D3D12, XInput, WASAPI
-- **Linux** — GCC/Clang, SDL3, Vulkan (opt-in) or the headless null backend
-- **macOS arm64** — Apple Clang, Metal, SDL3
-
-All three build and run their platform test suites on every pull request.
-Windows is the only host currently claimed to run a recompiled retail title
-from this tree. Linux and macOS also boot the synthetic PPU smoke title through
-the project template, but no retail title is validated from this tree on either
-POSIX host yet.
+- **Windows** — clang-cl, XInput or SDL3, WASAPI; the host the port runs on
+- **Linux** — GCC/Clang, SDL3; the runtime builds and its tests run in CI
 
 ---
 
@@ -58,10 +51,7 @@ POSIX host yet.
 
 ### What about the SPUs?
 
-The Cell processor has 6 SPU cores with their own ISA and 256KB local store each. ps3recomp handles SPUs via:
-- **HLE** (preferred) — many SPU tasks (audio mixing, decompression) can be replaced with native equivalents
-- **SPU lifter** — for complex SPU programs, `tools/spu_lifter.py` translates SPU assembly to C
-- **SPURS management** — the cellSpurs module handles task scheduling without actual SPU execution
+The Cell processor has 6 SPU cores with their own ISA and 256KB local store each. `tools/spu_lifter.py` translates SPU programs to C ahead of time, an interpreter runs code that was not lifted, and SPURS is Sony's own libsre, lifted, on real SPU thread groups.
 
 ### Why C instead of C++?
 
@@ -86,7 +76,7 @@ See [NID_SYSTEM.md](NID_SYSTEM.md) for the deep dive.
 
 The RSX (Reality Synthesizer) is an NV47-class GPU. Games write GPU commands to a command buffer via cellGcmSys. Currently:
 - **cellGcmSys is fully implemented** — display buffers, memory mapping, tile/zcull config, flip control
-- **Command buffer parsing is not** — translating NV47 methods to Vulkan/D3D12 draw calls is the largest remaining task
+- **The RSX command processor** parses the NV47 FIFO and tracks GPU state for the renderer
 
 ### How accurate does recompilation need to be?
 
@@ -118,16 +108,10 @@ extern "C" {
 }
 ```
 
-**`C11 _Atomic in C++ file`**
-Some headers (e.g., `cellSync.h`) use C11 atomics incompatible with C++. Only include headers for modules you actually bridge — use stubs for the rest.
-
 ### Runtime Errors
 
-**`[HLE] UNIMPLEMENTED: funcName (NID 0xABCDEF01)`**
-The game called a function your HLE modules don't handle. Either:
-1. Add the function to your module registration
-2. Check if ps3recomp already has a real implementation in `libs/`
-3. Add a stub that returns `CELL_OK` if the function isn't critical
+**`[hle] unresolved NID 0xABCDEF01`**
+The game called an import nothing registers; it is logged and answered `CELL_OK`. Implement it as a non-static `cell*`/`sys*`/`sce*` function in `libs/` (`tools/gen_hle_nids.py` registers it) or as a context handler.
 
 **`vm_init failed`**
 The runtime couldn't allocate the 4GB virtual address space. Check:

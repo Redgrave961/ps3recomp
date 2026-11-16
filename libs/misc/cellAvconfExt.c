@@ -7,7 +7,6 @@
 
 #include "cellAvconfExt.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write32: translate + byte-swap */
-#include "../../runtime/ppu/ppu_context.h"  /* the float argument of SetGamma is in f1 */
 #include <stdlib.h>
 
 /* The HLE ABI adapter passes pointer parameters as raw guest addresses, so a
@@ -21,12 +20,6 @@ extern u8* vm_base;
 #define GUEST_PTR(p, T) ((T)((p) ? (void*)(vm_base + (uint32_t)(uintptr_t)(p)) : (void*)0))
 #include <stdio.h>
 #include <string.h>
-
-/* ---------------------------------------------------------------------------
- * Internal state
- * -----------------------------------------------------------------------*/
-
-static float s_gamma = 1.0f;
 
 /* ---------------------------------------------------------------------------
  * API implementations
@@ -55,19 +48,6 @@ s32 cellAudioOutGetSoundAvailability(u32 audioOut, u32 type, u32 fs, u32 option)
         return CELL_AUDIO_OUT_CHNUM_6;
 
     return 0; /* not available */
-}
-
-s32 cellAudioOutGetSoundAvailability2(u32 audioOut, u32 type, u32 fs, u32 ch, u32 option)
-{
-    (void)audioOut;
-    (void)option;
-
-    if (type == CELL_AUDIO_OUT_CODING_TYPE_LPCM &&
-        (fs & CELL_AUDIO_OUT_FS_48KHZ) &&
-        (ch == CELL_AUDIO_OUT_CHNUM_2 || ch == CELL_AUDIO_OUT_CHNUM_6 || ch == CELL_AUDIO_OUT_CHNUM_8))
-        return 1; /* available */
-
-    return 0;
 }
 
 s32 cellAudioOutGetDeviceInfo(u32 audioOut, u32 deviceIndex,
@@ -157,60 +137,10 @@ s32 cellAudioOutGetState(u32 audioOut, u32 deviceIndex, void* state)
     return CELL_OK;
 }
 
-s32 cellAudioOutSetCopyControl(u32 audioOut, u32 control)
-{
-    (void)audioOut;
-    printf("[cellAvconfExt] AudioOutSetCopyControl(control=%u)\n", control);
-    return CELL_OK;
-}
-
 s32 cellAudioOutGetNumberOfDevice(u32 audioOut)
 {
     (void)audioOut;
     return 1; /* one audio output device */
-}
-
-s32 cellVideoOutGetGamma(u32 videoOut, float* gamma)
-{
-    (void)videoOut;
-    if (!gamma) return CELL_EINVAL;
-    { float g = s_gamma; uint32_t bits; memcpy(&bits, &g, 4);
-      vm_write32((uint32_t)(uintptr_t)gamma, bits); }
-    return CELL_OK;
-}
-
-s32 cellVideoOutSetGamma(u32 videoOut, float gamma)
-{
-    (void)videoOut;
-    printf("[cellAvconfExt] VideoOutSetGamma(%.2f)\n", gamma);
-    if (gamma < 0.8f || gamma > 1.2f) return (s32)0x8002b223;   /* PARAMETER_OUT_OF_RANGE */
-    s_gamma = gamma;
-    return CELL_OK;
-}
-
-/* The gamma is a float, which the PPU ABI passes in f1, not r4: registered
- * through a plain C prototype it arrived as garbage (inFAMOUS 2 logged 0.00)
- * and the game's brightness setting never reached the screen. The context
- * handler reads f1 (avconf_register_ctx, called with the other ctx handlers). */
-static void hle_video_out_set_gamma(ppu_context* ctx)
-{
-    ctx->gpr[3] = (u64)(s64)cellVideoOutSetGamma((u32)ctx->gpr[3], (float)ctx->fpr[1]);
-}
-
-void avconf_register_ctx(void)
-{
-    extern void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
-    ps3_hle_register_ctx(0xC7020F62u, "cellVideoOutSetGamma", hle_video_out_set_gamma);
-}
-
-/* The display gamma for the presenter: what the title set (0.8..1.2, 1 by
- * default), or PS3_DISPLAY_GAMMA=<g> to override it. The video out applies
- * it as out = in^gamma, like RPCS3's calibration pass. */
-float cellAvconfExt_display_gamma(void)
-{
-    static float env = -1.0f;
-    if (env < 0.0f) { const char* e = getenv("PS3_DISPLAY_GAMMA"); env = e ? (float)atof(e) : 0.0f; }
-    return env > 0.0f ? env : s_gamma;
 }
 
 /* cellAudioOutConfigure(audioOut, config, option, waitForEvent) -- set the

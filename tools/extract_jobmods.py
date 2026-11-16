@@ -3,8 +3,8 @@
 Extract WWS SPU job code modules (C0DEC0DE) from a title's SDATA archives.
 
 Pipeline:
-  1. SDATA-decrypt patch.sdat / data.sdat (same algorithm as the runtime's
-     sdata_decrypt.h -- verified against RPCS3 Crypto/unedat.cpp).
+  1. SDATA-decrypt patch.sdat / data.sdat (verified against RPCS3
+     Crypto/unedat.cpp).
   2. Find every zlib stream in the plaintext and inflate it FULLY (no size cap
      -- the earlier extraction capped at 32 KiB and truncated 5 modules, one of
      which had its entry point past the 32 KiB boundary).
@@ -36,7 +36,7 @@ def sdata_decrypt(d: bytes):
         return None
     if block_size == 0 or file_size == 0 or file_size > len(d):
         return None
-    if (flags & 0x01) or (flags & 0x20):  # compressed / 0x20-metadata variants unused by LBP
+    if (flags & 0x01) or (flags & 0x20):  # compressed / 0x20-metadata variants
         return None
     enc_key = (flags & 0x08) != 0
     crypt_key = bytes(dh ^ sk for dh, sk in zip(dev_hash, SDAT_KEY))

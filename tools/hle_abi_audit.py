@@ -44,9 +44,7 @@ from dataclasses import dataclass, field
 MODULE_PRIORITY = [
     "cellGcmSys",
     "cellVideoOut",
-    "cellResc",
     "sys_fs",
-    "cellFsUtility",
     "cellAudio",
     "cellSysutil",
     "cellSysmodule",

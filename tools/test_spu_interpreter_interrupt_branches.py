@@ -4,8 +4,8 @@ import os,subprocess,tempfile
 from pathlib import Path
 root=Path(__file__).resolve().parents[1];spu=root/'runtime/spu'
 if os.name=='nt':print('SKIP: POSIX compiler/linker fixture');raise SystemExit(0)
-sources=['spu_channels.c','spu_drain.c','spu_lockstep.c','spu_coherency.c','spu_workload.c','spurs_policy.c','spurs_job.c','spu_tsp_weak.c','spu_vm_pagemap.c','spurs_policy_blob_weak.c','spu_interp.c']
-env={k:v for k,v in os.environ.items() if not k.startswith(('SPU_','SPURS_','YDKJ_','LBP_','GH3_'))}
+sources=['spu_channels.c','spu_drain.c','spu_lockstep.c','spu_coherency.c','spu_workload.c','spu_vm_pagemap.c','spu_interp.c']
+env={k:v for k,v in os.environ.items() if not k.startswith(('SPU_','SPURS_'))}
 with tempfile.TemporaryDirectory(prefix='spu-interrupt-branches-') as tmp:
  tmp=Path(tmp)
  from spu_disasm import spu_decode

@@ -22,6 +22,8 @@
  * is what proves this path runs at all on POSIX.
  */
 #include "../../../libs/video/rsx_core.h"
+#include "../../../libs/video/vk/rsx_vk.h"
+extern "C" const char* cellGame_get_title(void);
 #include <stdarg.h>
 #include "ppu_recomp.h"
 #include "ps3emu/milestone.h"   /* ps3_ms / ps3_ms_kv -- boot milestone log */
@@ -884,7 +886,7 @@ int main(int argc, char** argv)
     /* Reserve the full 4 GB guest space; pages commit on first touch via the VEH. */
     AddVectoredExceptionHandler(1, guard_report_veh);  /* diagnose 0x80000001 silent deaths */
     AddVectoredExceptionHandler(1, vm_commit_veh);
-    vm_base = (uint8_t*)VirtualAlloc(NULL, VM_SIZE, MEM_RESERVE, PAGE_READWRITE);
+    vm_base = (uint8_t*)VirtualAlloc(NULL, VM_SIZE, MEM_RESERVE | MEM_WRITE_WATCH, PAGE_READWRITE);
     ppu_vm_size = 0;   /* full 32-bit space backed -> OOB guard unnecessary */
 #else
     vm_base = (uint8_t*)calloc(1, 0xE0000000u);
@@ -906,6 +908,7 @@ int main(int argc, char** argv)
      * belonging to no title. Same shape as the live-draw engine before 1a050be:
      * a working facility with no caller in the shared harness. */
     cellGame_init_boot(ppu_vfs_root);
+    rsx_core_set_renderer(rsx_vk_renderer(cellGame_get_title()));
 
     fprintf(stderr,"[boot-dbg] before ppu_recomp_register\n"); fflush(stderr);
     ppu_recomp_register();   /* lifted function table -> address map */

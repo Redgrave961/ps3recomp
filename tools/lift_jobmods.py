@@ -65,19 +65,6 @@ CODE_END = {
     "jobmod_6943e26934ea_e0A20": 0xAE48,   # real code ends at br 0xA534 @ 0xAE40
 }
 
-# Extra function entries, in LS addresses, applied to every module that
-# contains them ($LBP_JOBMOD_EXTRA_FUNCS, comma-separated).
-#
-# All 46 modules stream into the SAME job-code buffer at LS 0x4000 and only one
-# is resident at a time, so an indirect-branch target seen at runtime is an LS
-# address without a module attached to it -- there is no way to know from the
-# BRANCH-TO-0 alone which image was resident. Offering the address to every
-# module is the honest response: spu_lifter only splits a function that
-# actually spans the address, so modules that do not contain it are unchanged.
-EXTRA_FUNCS = [a.strip() for a in
-               os.environ.get("LBP_JOBMOD_EXTRA_FUNCS", "").split(",") if a.strip()]
-
-
 def manual_link_targets(raw, base=BASE):
     """Return targets built into the link register by hand:
         ila  $r0, off
@@ -202,15 +189,14 @@ def reachable(raw, entries, hi, base=BASE):
 
 def module_code_end(raw, name, base=BASE):
     """End of a module's code: one past the highest instruction reachable from
-    its seeded entries, never past its CODE_END entry. The entry, +0x30 and
-    $LBP_JOBMOD_EXTRA_FUNCS seed it directly; a manual link or switch table
+    its seeded entries, never past its CODE_END entry. The entry and +0x30 seed
+    it directly; a manual link or switch table
     target seeds it once the `ila`/`bi` that names it is itself reachable, so a
     pattern decoded from the data tail cannot pull the end into the data. The
     lifter is then given only the seeds below this end, so every seeded entry
     it lifts lies inside the registered span."""
     hi = min(base + len(raw), CODE_END.get(name, base + len(raw)))
     seeds = {base + struct.unpack_from(">I", raw, 0x10)[0], base + 0x30}
-    seeds |= {int(a, 0) for a in EXTRA_FUNCS}
     derived = manual_link_sites(raw, base) + switch_table_sites(raw, base)
     while True:
         seen = reachable(raw, seeds, hi, base)
@@ -225,8 +211,6 @@ def module_code_end(raw, name, base=BASE):
 
 def module_seeds(raw, base=BASE):
     """Extra function entries offered to the lifter for one module."""
-    # Only offer addresses that fall inside THIS module's image.
-    inside = [a for a in EXTRA_FUNCS if base <= int(a, 0) < base + len(raw)]
     # The module's first function starts right after the 0x30-byte header
     # (`4 ila | entry | size | 0 | 0 | C0DEC0DE | 0 | 0 | n`). Usually it is
     # reached by a branch and found anyway, but in two modules it is a bare
@@ -237,7 +221,7 @@ def module_seeds(raw, base=BASE):
     # corrupted stack (drain-mismatch return_pc=0x50C8 pc=0xA800, jobmod
     # ef33c6c99dc7). Seeding it is exact, not a heuristic: every module's
     # first instruction is at +0x30.
-    inside.append(hex(base + 0x30))
+    inside = [hex(base + 0x30)]
     inside += [hex(a) for a in manual_link_targets(raw, base)]
     inside += [hex(a) for a in switch_table_targets(raw, base)]
     return inside
@@ -353,8 +337,6 @@ def main():
     OUTDIR  = args.out
     register_c = args.register or os.path.join(OUTDIR, "jobmods_register.c")
 
-    if EXTRA_FUNCS:
-        print(f"  extra function entries: {', '.join(EXTRA_FUNCS)}")
     if args.engine_elf:
         return lift_engine_elf(args, register_c)
     JOBMODS = args.jobmods

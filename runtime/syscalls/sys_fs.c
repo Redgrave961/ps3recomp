@@ -29,7 +29,6 @@
  * -----------------------------------------------------------------------*/
 sys_fs_fd_info  g_sys_fs_fds[SYS_FS_FD_MAX];
 sys_fs_dir_info g_sys_fs_dirs[SYS_FS_DIR_MAX];
-char            g_sys_fs_root[512] = ".";
 
 /* fd and dir-fd slots are claimed and released under this lock. These
  * syscalls are live from several guest threads at once (one thread opens a
@@ -73,17 +72,8 @@ static void write_be64(uint32_t addr, uint64_t val)
     *p = val;
 }
 
-/* ---------------------------------------------------------------------------
- * Path translation
- *
- * Maps PS3 virtual paths to host filesystem paths:
- *   /dev_hdd0/...  -> <root>/dev_hdd0/...
- *   /dev_bdvd/...  -> <root>/dev_bdvd/...
- *   /dev_flash/... -> <root>/dev_flash/...
- *   /app_home/...  -> <root>/app_home/...
- *   /dev_usb000/.. -> <root>/dev_usb000/...
- *   Others         -> <root>/<path>
- * -----------------------------------------------------------------------*/
+const char* ppu_vfs_root = ".";
+
 static void fs_normalize_sep(char* p) {
 #ifdef _WIN32
     for (char* c = p; *c; c++) if (*c == '/') *c = '\\';
@@ -92,34 +82,34 @@ static void fs_normalize_sep(char* p) {
 #endif
 }
 
+static void fs_forward_slashes(char* p)
+{
+    for (; *p; p++) if (*p == '\\') *p = '/';
+}
+
 /* Extracted game trees come in two shapes: the disc layout (<root>/PS3_GAME/
  * USRDIR/...) and a flattened one (<root>/USRDIR/...). cellGame hands the title
  * disc-style paths either way -- cellGameContentPermit reports
  * /dev_bdvd/PS3_GAME/USRDIR -- so on a flattened tree every path that came from
- * cellGame misses. flOw opendir'd /dev_bdvd/PS3_GAME/USRDIR, got ENOENT, and
- * read that as "no disc".
+ * cellGame misses.
  *
  * Additive and last-resort: if the translated path does not exist but dropping
  * a PS3_GAME component yields one that does, use that. When neither exists the
- * original is kept, so failure messages still name the path the guest asked for.
- *
- * All three path translators call this -- sys_fs, cellFs and ppu_fs each do
- * their own translation (see docs), and a guest path can arrive at any of them. */
+ * original is kept, so failure messages still name the path the guest asked for. */
 /* cellGame.c; weak so fixtures that link sys_fs.c without it still link. The
  * only weak reference to it: under COFF each one emits its own fallback. */
 extern __attribute__((weak)) const char* cellGame_get_hdd_title_id(void);
 
-void ps3_vfs_ps3game_fallback(char* path, size_t cap)
+static void ps3_vfs_ps3game_fallback(char* path, size_t cap)
 {
     struct stat st;
     if (!path || !*path || stat(path, &st) == 0)
         return;
     /* An HDD game (a PSN title, CATEGORY "HG") boots from /dev_hdd0/game/<id>/,
      * so that directory is the booted game tree: <root>/game/<id>/X is
-     * <boot>/PS3_GAME/X when the former does not exist. Simpsons Arcade reads
-     * /dev_hdd0/game/NPUB30563/USRDIR/0B/SIMPSONS.SR once cellGameBootCheck
-     * reports it as HDD (#359). Disc titles are left alone: their
-     * /dev_hdd0/game/<id>/ is the update dir, and a miss there is meaningful. */
+     * <boot>/PS3_GAME/X when the former does not exist. Disc titles are left
+     * alone: their /dev_hdd0/game/<id>/ is the update dir, and a miss there is
+     * meaningful. */
     {
         const char* id = cellGame_get_hdd_title_id ? cellGame_get_hdd_title_id() : NULL;
         char key[48];
@@ -139,9 +129,7 @@ void ps3_vfs_ps3game_fallback(char* path, size_t cap)
     }
     char* p = strstr(path, "/PS3_GAME/");
     if (!p) {
-        /* The reverse: sys_fs flattens any "USRDIR/" path to <root>/USRDIR/...,
-         * which misses on a disc-layout tree. GH3's Bink movies (ATVI, INTRO --
-         * the attract loop) opened as <root>/USRDIR/DATA/MOVIES and failed. */
+        /* The reverse: a flattened "USRDIR/" path on a disc-layout tree. */
         char* u = strstr(path, "/USRDIR/");
         if (!u) u = strstr(path, "\\USRDIR\\");
         if (!u) return;
@@ -167,155 +155,57 @@ void ps3_vfs_ps3game_fallback(char* path, size_t cap)
 
 void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size)
 {
-    /* Lazily adopt PS3_VFS_ROOT if the root is still the default ".", so this
-     * sys_fs layer points at the same place as the cellFs layer (ppu_vfs_root). */
-    if (g_sys_fs_root[0] == '.' && g_sys_fs_root[1] == '\0') {
-        const char* env = getenv("PS3_VFS_ROOT");
-        if (env && *env) { strncpy(g_sys_fs_root, env, sizeof(g_sys_fs_root) - 1); g_sys_fs_root[sizeof(g_sys_fs_root)-1] = 0; }
+    const size_t cap = (size_t)host_path_size;
+
+    /* /dev_hdd0 overlays the installed game-update dir, mirroring the PS3/RPCS3
+     * layout: base data on /dev_bdvd (disc), update data on /dev_hdd0. */
+    static const char* hdd0_root = NULL; static int hdd0_init = 0;
+    if (!hdd0_init) { hdd0_root = getenv("PS3_HDD0_ROOT"); hdd0_init = 1; }
+    if (hdd0_root && strncmp(ps3_path, "/dev_hdd0/", 10) == 0) {
+        snprintf(host_path, cap, "%s/%s", hdd0_root, ps3_path + 10);
+        fs_forward_slashes(host_path);
+        return;
     }
 
-    /* /dev_hdd0 overlays the installed game-update dir (patchN.farc live there
-     * for a disc title patched to e.g. v1.30) -- mirror ppu_fs.cpp host_path.
-     * PS3_HDD0_ROOT = host dir that /dev_hdd0 maps into (contains game/<title>/). */
-    {
-        static const char* hdd0_root = NULL; static int hdd0_init = 0;
-        if (!hdd0_init) { hdd0_root = getenv("PS3_HDD0_ROOT"); hdd0_init = 1; }
-        if (hdd0_root && strncmp(ps3_path, "/dev_hdd0/", 10) == 0) {
-            snprintf(host_path, (size_t)host_path_size, "%s/%s", hdd0_root, ps3_path + 10);
-            fs_normalize_sep(host_path);
-            return;
-        }
+    /* /dev_hdd1 is the CACHE partition (cellSysCacheMount mounts it), and it
+     * must be writable and separate from the disc mount. */
+    static const char* hdd1_root = NULL; static int hdd1_init = 0;
+    if (!hdd1_init) { hdd1_root = getenv("PS3_HDD1_ROOT"); hdd1_init = 1; }
+    if (hdd1_root && *hdd1_root && strncmp(ps3_path, "/dev_hdd1/", 10) == 0) {
+        snprintf(host_path, cap, "%s/%s", hdd1_root, ps3_path + 10);
+        fs_forward_slashes(host_path);
+        return;
     }
 
-    /* /dev_hdd1 overlays the CACHE partition, the same way ppu_fs.cpp host_path
-     * maps it: /dev_hdd0/... is the installed-update dir, /dev_hdd1/... the
-     * writable cache. PS3_HDD1_ROOT = host dir that /dev_hdd1 maps into. */
-    {
-        static const char* hdd1_root = NULL; static int hdd1_init = 0;
-        if (!hdd1_init) { hdd1_root = getenv("PS3_HDD1_ROOT"); hdd1_init = 1; }
-        if (hdd1_root && *hdd1_root && strncmp(ps3_path, "/dev_hdd1/", 10) == 0) {
-            snprintf(host_path, (size_t)host_path_size, "%s/%s", hdd1_root, ps3_path + 10);
-            fs_normalize_sep(host_path);
-            return;
-        }
+    /* /dev_flash is FIRMWARE, not game data: serve it from a real dev_flash
+     * tree. */
+    if (strncmp(ps3_path, "/dev_flash/", 11) == 0) {
+        const char* fw = getenv("PS3_DEV_FLASH");
+        if (!fw || !*fw) fw = "D:/recomp/tools/rpcs3/dev_flash";
+        ps3_dev_flash_path(host_path, cap, fw, ps3_path + 11);
+        fs_forward_slashes(host_path);
+        return;
     }
 
-    /* /dev_flash is FIRMWARE, not game data. ppu_fs.cpp serves it from a real
-     * dev_flash tree ($PS3_DEV_FLASH); this layer was missing the same branch, so
-     * a firmware path opened through the raw syscall resolved to <root>/... and
-     * missed. ps1_netemu loads its PS1 BIOS as /dev_flash/ps1emu/ps1_rom.bin and
-     * refuses to boot without it. Keep both halves of the split filesystem agreed. */
-    {
-        static const char* fw = NULL; static int fw_init = 0;
-        if (!fw_init) { fw = getenv("PS3_DEV_FLASH"); fw_init = 1; }
-        if (fw && *fw && strncmp(ps3_path, "/dev_flash/", 11) == 0) {
-            ps3_dev_flash_path(host_path, (size_t)host_path_size, fw, ps3_path + 11);
-            fs_normalize_sep(host_path);
-            return;
-        }
-    }
-
-    /* Strip a known mount prefix so this sys_fs layer resolves to the SAME host
-     * tree as the cellFs layer (ppu_fs.cpp host_path). Previously /dev_bdvd/X
-     * mapped to <root>/dev_bdvd/X -- a directory that doesn't exist -- so a title
-     * that opens disc content through the raw sys_fs path (LBP's Bink videos,
-     * e.g. gamedata/videos/localisation_test.bik) failed even though the file is
-     * present, stalling the loader waiting on the resource. /app_home/ is the
-     * game's install dir (== the USRDIR root); the title also opens it in
-     * non-leading spellings ("app_home/...", "e:/app_home/..."). */
     static const char* const mounts[] = {
         "/dev_bdvd/", "/app_home/", "/dev_hdd0/", "/dev_hdd1/",
         "/dev_flash/", "/host_root/", "/dev_usb000/", "/dev_usb/"
     };
     const char* rel = ps3_path;
-    /* flОw first: map anything from a "USRDIR/" component onward to <root>/USRDIR/...
-     * directly, bypassing the full /dev_hdd0/game/<ID>/USRDIR install tree (which we
-     * normally provide via a filesystem junction) -- concurrent opens THROUGH a
-     * Windows junction intermittently fail (the nondeterministic Cg shader "could
-     * not be read" abort). The real assets live under <root>/USRDIR. flОw's failing
-     * paths carry "USRDIR/"; LBP's raw-sys_fs disc paths (/dev_bdvd Bink videos) do
-     * not, so they fall through to sagemono's mount-prefix stripping below. */
-    const char* usrp = strstr(ps3_path, "USRDIR/");
-    if (usrp) {
-        /* PS3_USRDIR_BASE: a title installed as a full /dev_hdd0/game/<ID> tree
-         * keeps its USRDIR there, not at the vfs root, so the flattening above
-         * sends it to a directory that does not exist. ps1_netemu writes its
-         * settings with a bare "/USRDIR/CONFIG" and read them back the same way;
-         * both missed, and it printed "save config file: /USRDIR/CONFIG" /
-         * "failed" on every boot. Opt-in so flattened trees keep the old path. */
-        const char* ub = getenv("PS3_USRDIR_BASE");
-        if (ub && *ub) {
-            snprintf(host_path, (size_t)host_path_size, "%s/%s", ub, usrp);
-            fs_normalize_sep(host_path);
-            return;
-        }
-        rel = usrp;                        /* "USRDIR/..." */
-    } else {
-        /* Otherwise strip a known mount prefix so this sys_fs layer resolves to the
-         * SAME host tree as the cellFs layer (ppu_fs.cpp). /dev_bdvd/X previously
-         * mapped to <root>/dev_bdvd/X -- a dir that doesn't exist -- stalling titles
-         * that open disc content through raw sys_fs. */
-        int matched = 0;
-        for (size_t i = 0; i < sizeof(mounts) / sizeof(mounts[0]); i++) {
-            size_t n = strlen(mounts[i]);
-            if (strncmp(ps3_path, mounts[i], n) == 0) { rel = ps3_path + n; matched = 1; break; }
-        }
-        if (!matched) {
-            const char* ah = strstr(ps3_path, "app_home/");
-            if (ah) rel = ah + 9;          /* non-leading app_home spelling */
-            else if (rel[0] == '/') rel++; /* otherwise just strip leading slash */
+    for (size_t i = 0; i < sizeof(mounts) / sizeof(mounts[0]); i++) {
+        size_t n = strlen(mounts[i]);
+        if (strncmp(ps3_path, mounts[i], n) == 0) { rel = ps3_path + n; break; }
+        /* A bare device root ("/dev_bdvd") maps to the mount directory itself:
+         * titles stat or opendir it to check the medium is present. */
+        if (n > 1 && strncmp(ps3_path, mounts[i], n - 1) == 0 && ps3_path[n - 1] == '\0') {
+            rel = ps3_path + n - 1;
+            break;
         }
     }
-
-    snprintf(host_path, (size_t)host_path_size, "%s/%s", g_sys_fs_root, rel);
-    fs_normalize_sep(host_path);
-    /* NOTE: do NOT stat() the direct path and fall back to the dev_hdd0 junction
-     * on failure. stat() intermittently returns ENOENT for an existing file here
-     * (a Windows transient), and the junction fallback made it WORSE -- the flaky
-     * stat sent a real open to a path that doesn't exist. The direct <root>/USRDIR
-     * layout holds the assets; a genuinely-missing direct path is handled by the
-     * caller's open retry + the extracted-dump fallback below. */
-
-    /* Extracted-dump fallback: our test setups often hold a title's data at
-     * <root>/extracted/USRDIR/... rather than the full /dev_hdd0/game/<ID>/USRDIR
-     * install tree the guest opens. If the primary path doesn't exist but a
-     * USRDIR-relative path under <root>/extracted does, use that. Additive: only
-     * affects paths unresolved at the primary location. */
-    struct stat st;
-    if (stat(host_path, &st) != 0) {
-        const char* usr = strstr(ps3_path, "/USRDIR/");
-        if (usr) {
-            char alt[1024];
-            snprintf(alt, sizeof(alt), "%s/extracted/USRDIR/%s", g_sys_fs_root, usr + 8);
-            fs_normalize_sep(alt);
-            if (stat(alt, &st) == 0)
-                snprintf(host_path, (size_t)host_path_size, "%s", alt);
-        }
-    }
-
-    /* Working-directory fallback: a PS3 title runs with its USRDIR as the
-     * working directory, so a RELATIVE open resolves there -- not at the vfs
-     * root. flOw opens "Data/Resources/first.xml" that way (it prints
-     * "Command Line: /dev_bdvd/PS3_GAME/USRDIR/" and "Working Path: /"), and
-     * resolving it against the root looked for <root>/Data/... while the file
-     * sits at <root>/USRDIR/Data/... . Missing it left the engine without its
-     * render config, which is what produced
-     *   PCoreGcmRenderInterface::setScreenRenderTargetInternal(): No config
-     * and therefore no draw calls at all.
-     *
-     * Additive and last-resort: only when the primary path does not exist and
-     * the guest path is relative, so nothing that already resolves changes. */
-    /* Use the STRIPPED path and do not require a relative spelling: the title
-     * reports Working Path "/" and opens "/Data/Resources/first.xml", which is
-     * absolute but still means "relative to my USRDIR". */
-    if (stat(host_path, &st) != 0) {
-        char alt2[1024];
-        snprintf(alt2, sizeof(alt2), "%s/USRDIR/%s", g_sys_fs_root, rel);
-        fs_normalize_sep(alt2);
-        if (stat(alt2, &st) == 0)
-            snprintf(host_path, (size_t)host_path_size, "%s", alt2);
-    }
-    ps3_vfs_ps3game_fallback(host_path, (size_t)host_path_size);
+    if (rel == ps3_path && ps3_path[0] == '/') rel = ps3_path + 1;
+    snprintf(host_path, cap, "%s/%s", ppu_vfs_root, rel);
+    fs_forward_slashes(host_path);
+    ps3_vfs_ps3game_fallback(host_path, cap);
 }
 
 /* ---------------------------------------------------------------------------
@@ -340,30 +230,6 @@ int64_t sys_fs_open(ppu_context* ctx)
     const char* ps3_path = (const char*)vm_to_host(path_addr);
     char host_path[1024];
     sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
-
-    { extern char* getenv(const char*); if (getenv("FLOW_TITLEOPEN") && ps3_path && strstr(ps3_path, "Titles")) {
-        size_t _l = strlen(ps3_path);
-        fprintf(stderr, "[TITLEOPEN] path='%s' (len=%zu, ends_slash=%d) guest_lr=0x%08X\n",
-                ps3_path, _l, (_l && ps3_path[_l-1]=='/')?1:0, (uint32_t)ctx->lr); fflush(stderr);
-#ifdef _WIN32
-        { char* mb=(char*)GetModuleHandleA(0); void* bt[30]; unsigned short fr=RtlCaptureStackBackTrace(0,30,bt,0);
-          char ln[820]; int p=snprintf(ln,sizeof ln,"[TITLEOPEN-bt] rva:");
-          for(unsigned short i=0;i<fr;i++) p+=snprintf(ln+p,sizeof(ln)-p," %llX",(unsigned long long)((char*)bt[i]-mb));
-          fprintf(stderr,"%s\n",ln); fflush(stderr); }
-#endif
-    } }
-    /* DIAGNOSTIC (FLOW_TITLEFIX): the game builds the title path with an EMPTY filename
-     * (a stale-lift string-construction bug) -> opens the dir. Redirect a bare
-     * ".../Data/Titles/" open to the language file so we can confirm the render path. */
-    { extern char* getenv(const char*); if (getenv("FLOW_TITLEFIX")) {
-        size_t hl = strlen(host_path);
-        if (hl >= 8 && (strcmp(host_path + hl - 8, "Titles\\") == 0 || strcmp(host_path + hl - 8, "Titles/") == 0
-                        || strcmp(host_path + hl - 7, "Titles\\") == 0 || strcmp(host_path + hl - 7, "Titles/") == 0)) {
-            if (hl + 20 < sizeof(host_path)) { strcat(host_path, "Titles_English.xml");
-                fprintf(stderr, "[TITLEFIX] redirected empty-filename title open -> %s\n", host_path); fflush(stderr); }
-        }
-    } }
-
 
     /* (The fd slot is claimed at the end, under fs_slot_lock, once the host
      * file is open.) */
@@ -461,11 +327,7 @@ int64_t sys_fs_open(ppu_context* ctx)
     }
 
     /* A DIRECTORY open is not a failure. fopen() cannot open one on Windows,
-     * but real cellFsOpen answers CELL_EISDIR and titles branch on it -- flOw
-     * opens Data/Titles/ (its localisation XML dir) and a generic ENOENT tells
-     * it the content is missing rather than "that is a directory".
-     * libs/filesystem/cellFs.c and runtime/ppu/ppu_fs.cpp already answer this
-     * correctly; sys_fs is the third filesystem path and never got it. */
+     * but real cellFsOpen answers CELL_EISDIR and titles branch on it. */
     if (!fp) {
         struct stat _sd;
         if (stat(host_path, &_sd) == 0 && (_sd.st_mode & S_IFMT) == S_IFDIR) {
@@ -533,7 +395,6 @@ int64_t sys_fs_read(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_EBADF;
 
     void* buf = vm_to_host(buf_addr);
-    long pos_before = ftell(f->fp);
     /* The VM commits pages on first user-mode touch; a read the CRT hands to
      * the kernel (anything past its 4 KB buffer) into a still-reserved page
      * fails instead, and fread comes back short. GH3's Bink reader saw that
@@ -542,39 +403,9 @@ int64_t sys_fs_read(ppu_context* ctx)
     if (size) vm_commit(buf_addr, (uint32_t)size);
     size_t nread = fread(buf, 1, (size_t)size, f->fp);
 
-    /* PS3_FSTRACE=<n>: every nth read, the fd and the file offset it came from.
-     *
-     * The PS1 title under test streams its intro movie off the disc image and
-     * never stops -- 560 s undriven and the blit counter is still climbing. If
-     * the offsets here keep advancing, the stream is progressing and the movie
-     * genuinely has not reached its end; if they repeat, the disc read is stuck
-     * and the movie is looping over the same sectors forever. Those need
-     * opposite fixes and nothing else distinguishes them. */
-    { static int s_ft = -1;
-      if (s_ft < 0) { const char* e = getenv("PS3_FSTRACE");
-                      s_ft = e ? (atoi(e) > 0 ? atoi(e) : 200) : 0; }
-      if (s_ft) { static unsigned long fn;
-          if ((++fn % (unsigned long)s_ft) == 0)
-              fprintf(stderr, "[fs] n=%lu fd=%d off=%ld size=%llu -> %llu\n",
-                      fn, fd, pos_before, (unsigned long long)size,
-                      (unsigned long long)nread); } }
-
     if (nread_addr != 0) {
         write_be64(nread_addr, (uint64_t)nread);
     }
-
-    /* FLOW_FSDBG: the lv2 path is what PhyreEngine titles actually use (they do
-     * not go through the cellFs HLE), so PS3_FSLOG in ppu_fs.cpp never fires. */
-    { extern char* getenv(const char*);
-      if (getenv("FLOW_FSDBG")) {
-        const unsigned char* b = (const unsigned char*)buf;
-        fprintf(stderr, "[FSDBG] read fd=%d '%s' pos=%ld want=%llu got=%zu"
-                        " head=%02X%02X%02X%02X lr=0x%08X\n",
-                fd, f->path, pos_before, (unsigned long long)size, nread,
-                nread > 0 ? b[0] : 0, nread > 1 ? b[1] : 0,
-                nread > 2 ? b[2] : 0, nread > 3 ? b[3] : 0,
-                (uint32_t)ctx->lr);
-      } }
 
     return CELL_OK;
 }

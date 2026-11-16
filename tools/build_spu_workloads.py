@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """build_spu_workloads.py -- lift a title's SPU images and emit a workload registry.
 
-General, title-agnostic replacement for gen_spu_workloads.py (which hard-coded
-flOw's paths/glob/symbol names). For a directory of SPU ELFs it will:
+For a directory of SPU ELFs it will:
 
   1. Lift each image with spu_lifter.py under a per-image C *symbol prefix*
      (derived from the image filename) so that dozens of images -- each of which
@@ -16,12 +15,10 @@ flOw's paths/glob/symbol names). For a directory of SPU ELFs it will:
      runtime workload registry by FNV-1a-64 content fingerprint, under a distinct
      image id, and (optionally) auto-registers via a constructor.
 
-cellSpurs AddWorkload / CreateTask / RunJobChain call spu_workload_dispatch(),
-which fingerprints the guest image the game hands to SPURS, finds the lifted
-entry registered here, loads it into a fresh local store and runs it. The
-fingerprint computed here is byte-identical to runtime/spu/spu_workload.c's
-spu_workload_fingerprint() over spu_elf_image_size() bytes, so registrations and
-the images the title passes to cellSpurs line up.
+An SPU image load fingerprints the guest image and finds the lifted entry
+registered here. The fingerprint computed here is byte-identical to
+runtime/spu/spu_workload.c's spu_workload_fingerprint() over
+spu_elf_image_size() bytes, so registrations and loaded images line up.
 
 Example:
   python tools/build_spu_workloads.py \

@@ -54,30 +54,14 @@ s32 cellRtcGetCurrentTick(CellRtcTick* pTick);
 
 s32 cellRtcGetCurrentClockLocalTime(CellRtcDateTime* pClock);
 
-s32 cellRtcGetCurrentClockUtc(CellRtcDateTime* pClock);
-
 s32 cellRtcGetTime_t(const CellRtcTick* pTick, s64* pTime);
 
 s32 cellRtcSetTime_t(CellRtcTick* pTick, s64 iTime);
 
-s32 cellRtcTickAddYears(CellRtcTick* pTick0, const CellRtcTick* pTick1, s32 iAdd);
-s32 cellRtcTickAddMonths(CellRtcTick* pTick0, const CellRtcTick* pTick1, s32 iAdd);
-s32 cellRtcTickAddDays(CellRtcTick* pTick0, const CellRtcTick* pTick1, s32 iAdd);
-s32 cellRtcTickAddHours(CellRtcTick* pTick0, const CellRtcTick* pTick1, s32 iAdd);
-s32 cellRtcTickAddMinutes(CellRtcTick* pTick0, const CellRtcTick* pTick1, s32 iAdd);
-s32 cellRtcTickAddSeconds(CellRtcTick* pTick0, const CellRtcTick* pTick1, s64 iAdd);
-s32 cellRtcTickAddMicroseconds(CellRtcTick* pTick0, const CellRtcTick* pTick1, s64 iAdd);
-
-s32 cellRtcConvertLocalTimeToUtc(const CellRtcTick* pLocalTime, CellRtcTick* pUtc);
 s32 cellRtcConvertUtcToLocalTime(const CellRtcTick* pUtc, CellRtcTick* pLocalTime);
 
-s32 cellRtcFormatRfc2822(char* pszDateTime, const CellRtcTick* pTick, s32 iTimeZoneMinutes);
-s32 cellRtcFormatRfc3339(char* pszDateTime, const CellRtcTick* pTick, s32 iTimeZoneMinutes);
-
 s32 cellRtcGetDayOfWeek(s32 year, s32 month, s32 day);
-s32 cellRtcGetDaysInMonth(s32 year, s32 month);
 
-s32 cellRtcSetTick(CellRtcDateTime* pDateTime, const CellRtcTick* pTick);
 s32 cellRtcGetTick(const CellRtcDateTime* pDateTime, CellRtcTick* pTick);
 
 #ifdef __cplusplus

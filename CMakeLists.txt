@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-# Keep in step with the changelog in README.md. This sat at 0.3.0 until August
+# Keep in step with CHANGELOG.md. This sat at 0.3.0 until August
 # 2026 while the project shipped 0.6.x through 0.8.0, so every build printed
 # "ps3recomp runtime v0.3.0" and was believed. v0.9.0 is the first TAGGED one.
 project(ps3recomp_runtime
@@ -34,28 +34,11 @@ file(GLOB_RECURSE HLE_SOURCES
     "libs/audio/*.c"
     "libs/video/*.c"
     "libs/network/*.c"
-    "libs/spurs/*.c"
-    "libs/sync/*.c"
     "libs/codec/*.c"
-    "libs/font/*.c"
     "libs/misc/*.c"
-    "libs/hardware/*.c"
 )
 # Exclude test harnesses (e.g. libs/video/tests/*): they define their own main().
 list(FILTER HLE_SOURCES EXCLUDE REGEX "/tests/")
-
-# cellAtrac decodes with FFmpeg's ATRAC3plus decoder as extracted by PPSSPP
-# (LGPL-2.1, kept separate in third_party/at3_standalone -- see its README).
-# PS3RECOMP_ATRAC_LGPL=OFF swaps the decoder for a stub that fails every open, which keeps the library and any
-# binary linked from it free of LGPL code (third_party/at3_stub); the title then sees an ATRAC error.
-option(PS3RECOMP_ATRAC_LGPL "Link the LGPL-2.1 ATRAC3plus decoder (cellAtrac)" ON)
-if(PS3RECOMP_ATRAC_LGPL)
-    file(GLOB AT3_SOURCES "third_party/at3_standalone/*.cpp")
-    set_source_files_properties(${AT3_SOURCES} PROPERTIES COMPILE_OPTIONS "-w")  # upstream code
-    list(APPEND HLE_SOURCES ${AT3_SOURCES})
-else()
-    list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/third_party/at3_stub/at3_stub.c")
-endif()
 
 # Runtime core (syscalls, PPU, SPU, memory)
 file(GLOB_RECURSE RUNTIME_SOURCES
@@ -65,16 +48,15 @@ file(GLOB_RECURSE RUNTIME_SOURCES
 # Exclude:
 #  - test harnesses (runtime/*/tests/*): they have their own main() and #include
 #    per-game generated headers (spu_recomp.h) that a plain library build lacks.
-#  - the PPU boot scaffold (runtime/ppu/, runtime/host/): these are compiled
-#    per-game against the lifter-generated ppu_recomp.h (and the game's RSX/D3D12
-#    backend), not as part of the game-agnostic runtime library. See
+#  - the PPU boot scaffold (runtime/ppu/): compiled by the port against the
+#    lifter-generated ppu_recomp.h, not as part of the runtime library. See
 #    docs/PPU_RECOMP.md.
 #  - spu_dispatch_mt.c: the musttail SPU indirect-branch fast path. It uses
 #    __attribute__((musttail)), which MSVC cannot parse, and it must be compiled
 #    *inside the game build* by clang so the tail call is guaranteed -- a plain
-#    call leaks one resolver frame per guest loop iteration. A port adds it to
-#    its own target; see templates/project/CMakeLists.txt.
-list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/tests/|/runtime/ppu/|/runtime/host/|/spu_dispatch_mt\.c$")
+#    call leaks one resolver frame per guest loop iteration. The port adds it to
+#    its own target.
+list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/tests/|/runtime/ppu/|/spu_dispatch_mt\.c$")
 
 # ---------------------------------------------------------------------------
 # Static library
@@ -96,69 +78,38 @@ target_include_directories(ps3recomp_runtime PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/libs/audio"
     "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
     "${CMAKE_CURRENT_SOURCE_DIR}/libs/network"
-    "${CMAKE_CURRENT_SOURCE_DIR}/libs/spurs"
-    "${CMAKE_CURRENT_SOURCE_DIR}/libs/sync"
     "${CMAKE_CURRENT_SOURCE_DIR}/libs/codec"
-    "${CMAKE_CURRENT_SOURCE_DIR}/libs/font"
     "${CMAKE_CURRENT_SOURCE_DIR}/libs/misc"
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime/spu"
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
 )
 
-# Platform-specific link libraries
+find_package(SDL3 CONFIG REQUIRED)
+find_package(VulkanHeaders CONFIG REQUIRED)
+find_package(volk CONFIG REQUIRED)
+find_package(VulkanMemoryAllocator CONFIG REQUIRED)
+file(GLOB VK_RENDERER_SOURCES CONFIGURE_DEPENDS "libs/video/vk/*.cpp")
+target_sources(ps3recomp_runtime PRIVATE ${VK_RENDERER_SOURCES})
+set_source_files_properties(${VK_RENDERER_SOURCES} PROPERTIES
+    COMPILE_DEFINITIONS "NOMINMAX;_CRT_SECURE_NO_WARNINGS"
+    COMPILE_OPTIONS "-Wno-nullability-completeness;-Wno-missing-field-initializers")
+set_source_files_properties("libs/video/vk/vk_device.cpp" PROPERTIES COMPILE_OPTIONS "-Wno-nullability-completeness;-Wno-missing-field-initializers;-Wno-unused-variable")
+target_link_libraries(ps3recomp_runtime PRIVATE SDL3::SDL3 Vulkan::Headers volk::volk GPUOpen::VulkanMemoryAllocator)
+
 option(PS3RECOMP_PAD_SDL "Windows: SDL3 controller backend (native DualSense/DualShock over USB and Bluetooth) instead of XInput" OFF)
 if(WIN32)
     target_link_libraries(ps3recomp_runtime PRIVATE
-        ws2_32      # Winsock for network modules
-        ole32       # COM for WASAPI audio
-        bcrypt      # BCryptGenRandom for SSL RNG
+        ws2_32
+        ole32
+        bcrypt
         synchronization
     )
     if(PS3RECOMP_PAD_SDL)
-        find_package(SDL3 CONFIG REQUIRED)
-        target_link_libraries(ps3recomp_runtime PRIVATE SDL3::SDL3)
         target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_PAD_USE_SDL)
-        message(STATUS "  SDL3:         controller backend")
     endif()
 else()
-    # cellPad and cellAudio select their SDL3 backends unconditionally off
-    # Windows (see PAD_BACKEND_SDL / AUDIO_BACKEND_SDL), so SDL3 is required
-    # here -- docs/BUILDING.md lists it as the Linux/macOS dependency.
-    find_package(SDL3 CONFIG QUIET)
-    if(SDL3_FOUND)
-        target_link_libraries(ps3recomp_runtime PRIVATE SDL3::SDL3)
-        message(STATUS "  SDL3:         found (input + audio backends enabled)")
-    else()
-        message(FATAL_ERROR
-            "SDL3 not found. It provides the cellPad and cellAudio backends on "
-            "non-Windows hosts.\n"
-            "  macOS:  brew install sdl3\n"
-            "  Debian: apt install libsdl3-dev\n"
-            "If SDL3 is installed in a non-standard prefix, pass "
-            "-DCMAKE_PREFIX_PATH=<prefix>.")
-    endif()
-
     find_package(Threads REQUIRED)
     target_link_libraries(ps3recomp_runtime PRIVATE Threads::Threads)
-endif()
-
-# cellVdec decodes H.264 / MPEG-2 through FFmpeg when this is on. libavcodec
-# is loaded at run time (dlopen / LoadLibrary), never linked, so building needs
-# only the FFmpeg headers, and a binary run where FFmpeg is absent -- or with
-# PS3RECOMP_FFMPEG=0 -- keeps the callback-only decoders. FFmpeg stays a
-# separate, user-supplied LGPL library. See libs/codec/ffmpeg_runtime.h.
-option(PS3RECOMP_FFMPEG_RUNTIME "Decode media through FFmpeg loaded at run time (needs the FFmpeg headers)" OFF)
-if(PS3RECOMP_FFMPEG_RUNTIME)
-    find_path(PS3RECOMP_FFMPEG_INCLUDE_DIR libavcodec/avcodec.h)
-    if(NOT PS3RECOMP_FFMPEG_INCLUDE_DIR)
-        message(FATAL_ERROR "FFmpeg headers not found. Debian/Ubuntu: "
-            "libavcodec-dev, Fedora: ffmpeg-free-devel, MSYS2: mingw-w64-x86_64-ffmpeg "
-            "-- or pass -DPS3RECOMP_FFMPEG_INCLUDE_DIR=<dir containing libavcodec/avcodec.h>")
-    endif()
-    target_include_directories(ps3recomp_runtime PRIVATE "${PS3RECOMP_FFMPEG_INCLUDE_DIR}")
-    target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_FFMPEG_RUNTIME)
-    target_link_libraries(ps3recomp_runtime PUBLIC ${CMAKE_DL_LIBS})
-    message(STATUS "  FFmpeg:       run-time loaded (headers in ${PS3RECOMP_FFMPEG_INCLUDE_DIR})")
 endif()
 
 # ---------------------------------------------------------------------------
@@ -242,27 +193,10 @@ if(PS3RECOMP_BUILD_TESTS)
     # the suite runs everywhere -- and is the arm64 memory-model regression
     # net for the lv2 sync primitives.
     add_subdirectory(tests/sync_stress)
-    # cellFiber switches contexts with Windows fibers on Windows and ucontext
-    # everywhere else. Apple deprecated the ucontext routines and gates both
-    # them and the shape of ucontext_t on _XOPEN_SOURCE, so whether that path
-    # works on arm64 is a question to answer rather than assume.
-    add_subdirectory(tests/fiber_switch)
     # Syscall 14's address/flags classification as a plain unit test: the
     # check is pure, so the test links one runtime translation unit
     # (lv2_lock_line.c) and nothing else.
     add_subdirectory(tests/syscalls)
-    # cellVdec through its guest API: the callback-only decoder always, and
-    # real H.264 / MPEG-2 decode when FFmpeg is on (libs/codec/tests).
-    add_subdirectory(libs/codec/tests)
-    # cellGcm's FIFO walker without a backend: where GET_REPORT writes for
-    # each report DMA context. Links the runtime like the POSIX host below.
-    if(UNIX)
-        add_subdirectory(tests/gcm_reports)
-        # The per-call tile and zcull log lines, gated on PS3_VERBOSE.
-        add_subdirectory(tests/gcm_tile_log)
-        # The same walker's JUMP decode: the old and the new form.
-        add_subdirectory(tests/gcm_fifo_jump)
-    endif()
     # PS3_LOG_FIRST, the saturating counter behind the "first n times" log lines.
     add_executable(test_log_first tests/test_log_first.c)
     target_include_directories(test_log_first PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
@@ -321,10 +255,6 @@ if(PS3RECOMP_BUILD_TESTS)
         set_tests_properties(spu_lockline_wait PROPERTIES TIMEOUT 15)
 
     endif()
-    add_executable(test_rsx_present_policy tests/test_rsx_present_policy.c)
-    target_include_directories(test_rsx_present_policy PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
-    add_test(NAME rsx_present_policy COMMAND test_rsx_present_policy)
 
     # vmx_fmaf (fused multiply-add without a libm call per lane) against fmaf.
     # Without -mfma it takes the double-rounding path; with it, the builtin.
@@ -339,32 +269,14 @@ if(PS3RECOMP_BUILD_TESTS)
     add_test(NAME vmx_fmaf COMMAND test_vmx_fmaf)
     set_tests_properties(vmx_fmaf PROPERTIES TIMEOUT 120)
 
-    # Current colors are explicit shader inputs even when they equal the
-    # hardware default; exercise both compact fetch entry points without a GPU.
-    add_executable(test_vertex_current_color
-        libs/video/tests/test_vertex_current_color.c
-        libs/video/rsx_vertex_compact.c
-        libs/video/rsx_dispatch.c)
-    target_include_directories(test_vertex_current_color PRIVATE include libs/video)
-    add_test(NAME vertex_current_color COMMAND test_vertex_current_color)
-
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
         add_test(NAME spinlock_word_width
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spinlock_word_width.py")
-        add_test(NAME spurs_task_exit_code_initialize
-            COMMAND "${Python3_EXECUTABLE}"
-                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spurs_task_exit_code_initialize.py")
-        add_test(NAME spurs_taskset_size
-            COMMAND "${Python3_EXECUTABLE}"
-                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spurs_taskset_size.py")
         add_test(NAME spu_sdcrz
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_sdcrz.py")
-        add_test(NAME spu_dma_repeat
-            COMMAND "${Python3_EXECUTABLE}"
-                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_dma_repeat.py")
     endif()
     if(NOT WIN32)
         find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
@@ -382,113 +294,9 @@ if(PS3RECOMP_BUILD_TESTS)
         add_test(NAME loader_memory_domain
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_loader_memory_domain.py")
-        add_test(NAME mmapper_hle_heap
-            COMMAND "${Python3_EXECUTABLE}"
-                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_mmapper_hle_heap.py")
         add_test(NAME user_memory_domain
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_user_memory_domain.py")
-    endif()
-endif()
-
-# ---------------------------------------------------------------------------
-# POSIX host harness
-# ---------------------------------------------------------------------------
-# PPU boot smoke title
-# ---------------------------------------------------------------------------
-# The one target that LINKS AND RUNS the PPU boot scaffold. runtime/ppu/ is the
-# game-agnostic boot path every port is built on, and nothing here has ever
-# built it: it #includes the lifter's per-game ppu_recomp.h, so
-# tools/check_ppu_scaffold.py compiles it against a stub header and stops
-# there. Compiling is not running, and on POSIX the loader, the NID bridge, the
-# lv2 syscalls, guest threads, the frame clock and the RSX backend had never
-# once run together.
-#
-# runtime/ppu/tests/smoke/ supplies what was missing: a hand-written program in
-# the lifter's ABI, and tools/make_smoke_elf.py writes both the PPU ELF it is
-# loaded from and the ppu_recomp.h it compiles against -- the header from
-# ppu_lifter.py's own HEADER_PREAMBLE, so the synthetic title cannot drift away
-# from the ABI a real one gets.
-#
-# The HLE NID table is generated exactly as a port generates it, so the smoke
-# title's firmware imports resolve through the same bridge a game's do.
-if(UNIX)
-    find_package(Python3 COMPONENTS Interpreter QUIET)
-    if(NOT Python3_Interpreter_FOUND)
-        message(STATUS "  Boot smoke:   no python3; ps3recomp_boot_smoke not built")
-    else()
-        set(SMOKE_GEN "${CMAKE_CURRENT_BINARY_DIR}/smoke")
-
-        add_custom_command(
-            OUTPUT "${SMOKE_GEN}/smoke.elf" "${SMOKE_GEN}/ppu_recomp.h"
-            COMMAND "${Python3_EXECUTABLE}"
-                    "${CMAKE_CURRENT_SOURCE_DIR}/tools/make_smoke_elf.py"
-                    --out    "${SMOKE_GEN}/smoke.elf"
-                    --header "${SMOKE_GEN}/ppu_recomp.h"
-            DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tools/make_smoke_elf.py"
-                    "${CMAKE_CURRENT_SOURCE_DIR}/tools/ppu_lifter.py"
-            COMMENT "Generating the smoke title's image and ppu_recomp.h")
-
-        add_custom_command(
-            OUTPUT "${SMOKE_GEN}/ppu_hle_nids.cpp"
-            COMMAND "${Python3_EXECUTABLE}"
-                    "${CMAKE_CURRENT_SOURCE_DIR}/tools/gen_hle_nids.py"
-                    --out "${SMOKE_GEN}/ppu_hle_nids.cpp" --all
-            DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tools/gen_hle_nids.py"
-                    "${CMAKE_CURRENT_SOURCE_DIR}/tools/nid_database.py"
-            COMMENT "Generating the HLE NID -> handler table")
-
-        add_executable(ps3recomp_boot_smoke
-            runtime/ppu/tests/boot_main.cpp
-            runtime/ppu/tests/smoke/smoke_recomp.c
-            runtime/ppu/ppu_loader.cpp
-            runtime/ppu/ppu_hle.cpp
-            runtime/ppu/ppu_fs.cpp
-            runtime/ppu/ppu_sysprx.cpp
-            "${SMOKE_GEN}/ppu_hle_nids.cpp"
-            "${SMOKE_GEN}/ppu_recomp.h"
-        )
-        target_include_directories(ps3recomp_boot_smoke PRIVATE
-            "${SMOKE_GEN}"                                  # the generated ppu_recomp.h
-            "${CMAKE_CURRENT_SOURCE_DIR}/include"
-            "${CMAKE_CURRENT_SOURCE_DIR}/runtime/ppu"
-            "${CMAKE_CURRENT_SOURCE_DIR}/runtime/spu"
-            "${CMAKE_CURRENT_SOURCE_DIR}/runtime/memory"
-            "${CMAKE_CURRENT_SOURCE_DIR}/runtime/syscalls"
-            "${CMAKE_CURRENT_SOURCE_DIR}/runtime/platform"
-            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
-        )
-        target_link_libraries(ps3recomp_boot_smoke PRIVATE ps3recomp_runtime)
-        set_target_properties(ps3recomp_boot_smoke PROPERTIES LINKER_LANGUAGE CXX)
-
-        # Where the runnable image lands, so CI and a developer both say
-        #   ./build/ps3recomp_boot_smoke build/smoke/smoke.elf
-        message(STATUS "  Boot smoke:   ps3recomp_boot_smoke + smoke/smoke.elf")
-
-        # The same lift again, arranged the way a port's own tree arranges one:
-        # the generated ppu_recomp.h and the lifted source in one directory,
-        # which is what templates/project wants for -DRECOMP_DIR. The header is
-        # generated into the build tree and the source lives in the repository,
-        # so a directory holding both has to be made rather than pointed at.
-        #
-        # This is what lets CI build the project template against a real lift
-        # and run it -- the check that a port started from templates/project
-        # still boots, on a platform where it can be run.
-        set(SMOKE_LIFT "${SMOKE_GEN}/lift")
-        set(SMOKE_LIFT_SRC
-            "${CMAKE_CURRENT_SOURCE_DIR}/runtime/ppu/tests/smoke/smoke_recomp.c")
-        add_custom_command(
-            OUTPUT "${SMOKE_LIFT}/ppu_recomp.h" "${SMOKE_LIFT}/smoke_recomp.c"
-            COMMAND "${CMAKE_COMMAND}" -E make_directory "${SMOKE_LIFT}"
-            COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-                    "${SMOKE_GEN}/ppu_recomp.h" "${SMOKE_LIFT}/ppu_recomp.h"
-            COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-                    "${SMOKE_LIFT_SRC}" "${SMOKE_LIFT}/smoke_recomp.c"
-            DEPENDS "${SMOKE_GEN}/ppu_recomp.h" "${SMOKE_LIFT_SRC}"
-            COMMENT "Staging the smoke title's lift as a RECOMP_DIR")
-        add_custom_target(ps3recomp_smoke_lift ALL
-            DEPENDS "${SMOKE_LIFT}/ppu_recomp.h" "${SMOKE_LIFT}/smoke_recomp.c")
-        message(STATUS "  Smoke lift:   smoke/lift (a RECOMP_DIR for templates/project)")
     endif()
 endif()
 

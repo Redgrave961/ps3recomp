@@ -99,26 +99,13 @@ Register-local computation stays in host-native byte order. Conversion only happ
 | `0xC0000000 - 0xCFFFFFFF` | RSX local memory (VRAM, mapped) |
 | `0xD0000000 - 0xDFFFFFFF` | RSX IO-mapped main memory |
 
-## SPU Handling Strategy
+## SPU Handling
 
-SPU emulation is the hardest part of PS3 emulation. ps3recomp supports multiple strategies:
-
-### Strategy 1: HLE of SPU Tasks (Preferred)
-
-Many games use Sony's SPURS framework or cellSync to dispatch SPU tasks. If we can identify and HLE the task types:
-
-- **Audio mixing** (MultiStream, ATRAC3+): Replace with host audio decoding.
-- **Physics** (Havok SPU jobs): Intercept and run on host CPU.
-- **Vertex processing** (RSX vertex shaders uploaded to SPU): Skip; handle in the GPU backend.
-- **Decompression** (zlib, LZ-based): Replace with host implementations.
-
-### Strategy 2: SPU Interpreter
-
-A cycle-inaccurate interpreter that executes SPU instructions directly. Slow but compatible. Each SPU instruction is decoded and executed in a switch-case loop.
-
-### Strategy 3: SPU Recompilation
-
-The same static recompilation approach applied to SPU programs found in the ELF. SPU code is typically loaded at runtime into Local Store, making static analysis harder. Hybrid approach: statically recompile known SPU ELF segments, fall back to interpreter for dynamically loaded code.
+SPU programs found in the ELF and in the firmware are lifted to C ahead of time
+(`tools/spu_lifter.py`, `tools/build_spu_workloads.py`, `tools/lift_spurs_jobs.py`).
+Code that is loaded at run time without a lifted counterpart runs on the SPU
+interpreter (`runtime/spu/spu_interp.c`). SPURS is Sony's own libsre, lifted,
+running on real SPU thread groups.
 
 ## Module / NID System
 
@@ -134,34 +121,27 @@ The ELF's import table lists: `(module_name, NID)` pairs. At load time, the PS3 
 
 ### ps3recomp's Approach
 
-1. Parse the ELF's import stubs to extract `(module, NID)` pairs.
-2. Look up each NID in a database (`tools/nid_db.json`) to get the human-readable function name.
-3. Replace the import stub with a call to our HLE implementation (e.g., `cellFsOpen`).
-4. Unresolved NIDs log a warning and return `CELL_ENOSYS`.
-
-The NID database is derived from the RPCS3 project's function tables and Sony SDK headers.
+1. `tools/ppu_loader.py` extracts the `(module, NID, stub)` imports.
+2. `tools/ppu_lifter.py --hle-stubs` turns each import stub into `ps3_hle_call(nid)`.
+3. `ps3_hle_call` resolves the NID: fast handlers, lifted firmware exports, context handlers, then the table `tools/gen_hle_nids.py` generates from the `libs/` sources (`tools/nid_database.py` computes the NIDs).
+4. An unresolved NID is reported once and returns `CELL_OK`.
 
 ## RSX Graphics Pipeline
 
 The RSX GPU is handled by a three-layer translation architecture:
 
 ```
-cellGcmSys (HLE)  →  RSX Command Processor  →  Graphics Backend
-                          │                         │
-                    NV47xx FIFO parsing      D3D12 / Vulkan / null
-                    GPU state tracking        Real rendering
+cellGcmSys (HLE)  →  RSX Command Processor  →  Renderer
+                          │
+                    NV47xx FIFO parsing
+                    GPU state tracking
 ```
 
 1. **cellGcmSys** manages the interface between game code and the GPU: command buffer control, display buffers, memory mapping, flip/VBlank, tile/zcull configuration.
 
 2. **RSX Command Processor** (`rsx_commands.c`) parses the NV47xx FIFO command buffer and tracks GPU state: surfaces, viewport, blend, depth/stencil, textures (16 units), vertex attributes (16), shader programs, draw commands.
 
-3. **Graphics Backend** receives state changes and draw calls through the `rsx_backend` callback interface. Current backends:
-   - **Null**: Win32 window showing clear color (debugging)
-   - **D3D12**: Real GPU rendering — device, swap chain, clear, present (Phase 1)
-   - **Vulkan**: Planned
-
-See [RSX_GRAPHICS.md](RSX_GRAPHICS.md) for the complete graphics architecture, shader translation strategy, and primitive type mapping.
+3. **Renderer** receives state changes and draw calls from the command processor.
 
 ## Comparison with RPCS3
 
@@ -169,14 +149,14 @@ See [RSX_GRAPHICS.md](RSX_GRAPHICS.md) for the complete graphics architecture, s
 |---|---|---|
 | **Approach** | Dynamic emulation (JIT) | Static recompilation (AOT) |
 | **PPU** | LLVM JIT or interpreter | C source generation, compiled natively |
-| **SPU** | LLVM JIT or ASMJIT | HLE / interpreter / static recomp |
-| **RSX** | Vulkan/OpenGL renderer | Vulkan/D3D12 renderer (shared concepts) |
+| **SPU** | LLVM JIT or ASMJIT | Static recomp, interpreter fallback |
+| **RSX** | Vulkan/OpenGL renderer | Vulkan renderer |
 | **Compatibility** | Broad (~70% of library) | Per-game (each game is a project) |
 | **Performance** | Good, JIT overhead | Potentially better (fully optimized AOT) |
 | **Portability** | x86-64 primary, ARM64 WIP | Any platform with a C compiler |
 | **Development** | One binary runs many games | Each game needs analysis and customization |
 | **Memory** | Dynamic guest memory | Statically mapped guest address space |
-| **HLE modules** | ~100 modules, varying completion | Most modules complete, a few partial (see [MODULE_STATUS.md](MODULE_STATUS.md)), full runtime |
+| **HLE modules** | ~100 modules, varying completion | The modules the port imports (see [MODULE_STATUS.md](MODULE_STATUS.md)); libsre and libresc run as lifted firmware |
 | **Use case** | General-purpose emulator | Targeted game ports and mods |
 
 The key tradeoff: RPCS3 aims for broad compatibility across the PS3 library. ps3recomp trades that breadth for potentially higher performance and easier game-specific customization (modding, patching, porting to new platforms).
@@ -190,8 +170,6 @@ For deeper dives into specific subsystems, see:
 - **[RUNTIME.md](RUNTIME.md)** — Complete runtime reference (VM, PPU/SPU contexts, type system, endianness, syscall dispatch, DMA)
 - **[SYSCALLS.md](SYSCALLS.md)** — All LV2 kernel syscall implementations documented
 - **[NID_SYSTEM.md](NID_SYSTEM.md)** — How PS3 function linking works, NID computation, module registration
-- **[MODULES_REFERENCE.md](MODULES_REFERENCE.md)** — Detailed per-module documentation for the HLE modules
 - **[TOOLS.md](TOOLS.md)** — Recompiler pipeline tools reference
 - **[PLATFORM_ABSTRACTION.md](PLATFORM_ABSTRACTION.md)** — How Win32/POSIX differences are handled
-- **[BUILDING.md](BUILDING.md)** — Build system reference and troubleshooting
-- **[GAME_PORTING_GUIDE.md](GAME_PORTING_GUIDE.md)** — Step-by-step guide to porting a PS3 game
+- **[BUILDING.md](BUILDING.md)** — Build system reference

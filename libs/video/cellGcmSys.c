@@ -165,8 +165,6 @@ s32 _cellGcmInitBody(u32 context, u32 cmdSize, u32 ioSize, u32 ioAddress)
     return CELL_OK;
 }
 
-void cellGcmInitSystemMode(u64 mode) { g.system_mode = (u32)mode; }
-
 void cellGcmGetConfiguration(u32 config)
 {
     if (!g.initialized) return;
@@ -181,20 +179,7 @@ void cellGcmGetConfiguration(u32 config)
 u32 cellGcmGetControlRegister(void) { return RSX_CONTROL_EA; }
 u32 cellGcmGetDefaultCommandWordSize(void) { return g.command_words; }
 u32 cellGcmGetDefaultSegmentWordSize(void) { return g.segment_words; }
-s32 cellGcmInitDefaultFifoMode(s32 mode) { (void)mode; return CELL_OK; }
 s32 cellGcmSetDefaultFifoSize(u32 bufferSize, u32 segmentSize) { (void)bufferSize; (void)segmentSize; return CELL_OK; }
-
-s32 cellGcmSetDefaultCommandBufferAndSegmentWordSize(u32 bufferSize, u32 segmentSize)
-{
-    if (vm_read32(RSX_PUT_EA) != 0x1000u || vm_read32(RSX_GET_EA) != 0x1000u ||
-        bufferSize < segmentSize * 2u || segmentSize >= 0x80000000u)
-        return (s32)CELL_GCM_ERROR_FAILURE;
-    g.command_words = bufferSize;
-    g.segment_words = segmentSize;
-    return CELL_OK;
-}
-
-void cellGcmSetDefaultCommandBuffer(void) { vm_write32(g.ctx_out, GCM_CONTEXT_EA); }
 
 s32 cellGcmSetDisplayBuffer(u8 id, u32 offset, u32 pitch, u32 width, u32 height)
 {
@@ -209,24 +194,10 @@ s32 cellGcmSetDisplayBuffer(u8 id, u32 offset, u32 pitch, u32 width, u32 height)
     return CELL_OK;
 }
 
-u32 cellGcmGetDisplayInfo(void) { return GCM_DISPLAY_EA; }
-
-s32 cellGcmGetCurrentDisplayBufferId(u32 id)
-{
-    vm_write8(id, (u8)rsx_core_current_display_buffer());
-    return CELL_OK;
-}
-
-s32 cellGcmGetDisplayBufferByFlipIndex(u32 qid) { (void)qid; return -1; }
-u32 cellGcmGetCurrentField(void) { return 0; }
-
 void cellGcmSetFlipMode(u32 mode) { rsx_core_set_vsync(mode == CELL_GCM_DISPLAY_VSYNC); }
 u32 cellGcmGetFlipStatus(void) { return rsx_core_flip_status(); }
 void cellGcmResetFlipStatus(void) { rsx_core_set_flip_status(CELL_GCM_FLIP_STATUS_WAITING); }
-void cellGcmSetFlipStatus(void) { rsx_core_set_flip_status(CELL_GCM_FLIP_STATUS_DONE); }
 u64 cellGcmGetLastFlipTime(void) { return rsx_core_last_flip_time(); }
-u64 cellGcmGetVBlankCount(void) { return rsx_core_vblank_count(); }
-u64 cellGcmSysGetLastVBlankTime(void) { return rsx_core_last_vblank_time(); }
 u64 cellGcmGetLastSecondVTime(void) { return 0; }
 
 s32 cellGcmSetFlipImmediate(u8 id)
@@ -250,46 +221,13 @@ static s32 gcm_prepare_flip(u32 ctx, u32 id, int reserve)
 
 s32 cellGcmSetPrepareFlip(u32 ctx, u32 id) { return gcm_prepare_flip(ctx, id, 1); }
 
-s32 cellGcmSetFlip(u32 ctx, u32 id)
-{
-    return gcm_prepare_flip(ctx, id, 1) < 0 ? (s32)CELL_GCM_ERROR_FAILURE : CELL_OK;
-}
-
 void _cellGcmSetFlipCommand(u32 ctx, u32 id) { gcm_prepare_flip(ctx, id, 0); }
-
-void _cellGcmSetFlipCommandWithWaitLabel(u32 ctx, u32 id, u32 label_index, u32 label_value)
-{
-    const u32 args[2] = { label_index * 0x10u, label_value };
-    gcm_emit(ctx, GCM_METHOD_SEMAPHORE_OFFSET, args, 2);
-    gcm_prepare_flip(ctx, id, 0);
-}
-
-void cellGcmSetWaitFlip(u32 ctx)
-{
-    if (gcm_reserve(ctx, 3)) return;
-    const u32 args[2] = { 0x10u, 0 };
-    gcm_emit(ctx, GCM_METHOD_SEMAPHORE_OFFSET, args, 2);
-}
-
-void cellGcmSetWaitFlipUnsafe(u32 ctx)
-{
-    const u32 args[2] = { 0x10u, 0 };
-    gcm_emit(ctx, GCM_METHOD_SEMAPHORE_OFFSET, args, 2);
-}
-
-void cellGcmSetUserCommand(u32 ctx, u32 cause)
-{
-    if (gcm_reserve(ctx, 2)) return;
-    gcm_emit(ctx, GCM_METHOD_USER_COMMAND, &cause, 1);
-}
 
 void cellGcmSetFlipHandler(u32 handler) { __atomic_store_n(&g.handler[RSX_EVENT_FLIP], handler, __ATOMIC_RELEASE); }
 void cellGcmSetVBlankHandler(u32 handler) { __atomic_store_n(&g.handler[RSX_EVENT_VBLANK], handler, __ATOMIC_RELEASE); }
 void cellGcmSetUserHandler(u32 handler) { __atomic_store_n(&g.handler[RSX_EVENT_USER], handler, __ATOMIC_RELEASE); }
-void cellGcmSetQueueHandler(u32 handler) { __atomic_store_n(&g.handler[RSX_EVENT_QUEUE], handler, __ATOMIC_RELEASE); }
 s32 cellGcmSetSecondVHandler(u32 handler) { g.second_v_handler = handler; return CELL_OK; }
 void cellGcmSetGraphicsHandler(u32 handler) { g.graphics_handler = handler; }
-void cellGcmSetVBlankFrequency(u32 freq) { (void)freq; }
 void cellGcmSetSecondVFrequency(u32 freq) { (void)freq; }
 
 u32 cellGcmGetLabelAddress(u8 index) { return RSX_SEMAPHORE_EA + 0x10u * index; }
@@ -304,22 +242,6 @@ static u32 gcm_report_ea(u32 index, u32 location)
     return RSX_REPORT_EA + index * 0x10u;
 }
 
-u32 cellGcmGetReportDataAddressLocation(u32 index, u32 location) { return gcm_report_ea(index, location); }
-u32 cellGcmGetReportDataAddress(u32 index) { return gcm_report_ea(index, CELL_GCM_LOCATION_LOCAL); }
-
-u32 cellGcmGetReportDataLocation(u32 index, u32 location)
-{
-    const u32 ea = gcm_report_ea(index, location);
-    return ea ? vm_read32(ea + 8u) : 0;
-}
-
-u32 cellGcmGetReport(u32 type, u32 index)
-{
-    if (type < 1u || type > 5u) return 0xFFFFFFFFu;
-    const u32 ea = gcm_report_ea(index, CELL_GCM_LOCATION_LOCAL);
-    return ea ? vm_read32(ea + 8u) : 0;
-}
-
 u64 cellGcmGetTimeStampLocation(u32 index, u32 location)
 {
     const u32 ea = gcm_report_ea(index, location);
@@ -327,12 +249,6 @@ u64 cellGcmGetTimeStampLocation(u32 index, u32 location)
 }
 
 u64 cellGcmGetTimeStamp(u32 index) { return cellGcmGetTimeStampLocation(index, CELL_GCM_LOCATION_LOCAL); }
-
-u32 cellGcmGetNotifyDataAddress(u32 index)
-{
-    const u32 ea = rsx_io_to_ea(0x0F100000u);
-    return ea ? ea + index * 0x40u : 0;
-}
 
 s32 cellGcmAddressToOffset(u32 address, u32 offset)
 {
@@ -355,14 +271,6 @@ s32 cellGcmIoOffsetToAddress(u32 ioOffset, u32 address)
     return CELL_OK;
 }
 
-void cellGcmGetOffsetTable(u32 table)
-{
-    vm_write32(table + 0u, RSX_IO_TABLE_EA);
-    vm_write32(table + 4u, RSX_EA_TABLE_EA);
-}
-
-u32 cellGcmGetMaxIoMapSize(void) { return g.main_size - g.reserved; }
-
 static s32 gcm_map(u32 ea, u32 io, u32 size)
 {
     if (!size || (ea & 0xFFFFFu) || (io & 0xFFFFFu) || (size & 0xFFFFFu)) return (s32)CELL_GCM_ERROR_FAILURE;
@@ -370,20 +278,6 @@ static s32 gcm_map(u32 ea, u32 io, u32 size)
     if (rsx_io_map(ea, io, size) != 0) return (s32)CELL_GCM_ERROR_FAILURE;
     g.map_pages[ea >> 20] = (u8)(size >> 20);
     return CELL_OK;
-}
-
-s32 cellGcmMapEaIoAddress(u32 ea, u32 io, u32 size)
-{
-    AcquireSRWLockExclusive(&g.io_lock);
-    const s32 r = gcm_map(ea, io, size);
-    ReleaseSRWLockExclusive(&g.io_lock);
-    return r;
-}
-
-s32 cellGcmMapEaIoAddressWithFlags(u32 ea, u32 io, u32 size, u32 flags)
-{
-    if (flags != CELL_GCM_IOMAP_FLAG_STRICT_ORDERING) return (s32)CELL_GCM_ERROR_INVALID_VALUE;
-    return cellGcmMapEaIoAddress(ea, io, size);
 }
 
 s32 cellGcmMapMainMemory(u32 ea, u32 size, u32 offset)
@@ -424,45 +318,6 @@ s32 cellGcmUnmapIoAddress(u32 io)
     return r;
 }
 
-s32 cellGcmUnmapEaIoAddress(u32 ea)
-{
-    if ((ea >> 20) > 0xBFFu) return (s32)CELL_GCM_ERROR_FAILURE;
-    AcquireSRWLockExclusive(&g.io_lock);
-    const u32 io = rsx_ea_to_io(ea & ~0xFFFFFu);
-    const s32 r = (io != 0xFFFFFFFFu && io < g.main_size) ? gcm_unmap_io(io) : (s32)CELL_GCM_ERROR_FAILURE;
-    ReleaseSRWLockExclusive(&g.io_lock);
-    return r;
-}
-
-s32 cellGcmReserveIoMapSize(u32 size)
-{
-    if (size & 0xFFFFFu) return (s32)CELL_GCM_ERROR_INVALID_ALIGNMENT;
-    AcquireSRWLockExclusive(&g.io_lock);
-    const s32 r = size > g.main_size - g.reserved ? (s32)CELL_GCM_ERROR_INVALID_VALUE : CELL_OK;
-    if (r == CELL_OK) g.reserved += size;
-    ReleaseSRWLockExclusive(&g.io_lock);
-    return r;
-}
-
-s32 cellGcmUnreserveIoMapSize(u32 size)
-{
-    if (size & 0xFFFFFu) return (s32)CELL_GCM_ERROR_INVALID_ALIGNMENT;
-    AcquireSRWLockExclusive(&g.io_lock);
-    const s32 r = size > g.reserved ? (s32)CELL_GCM_ERROR_INVALID_VALUE : CELL_OK;
-    if (r == CELL_OK) g.reserved -= size;
-    ReleaseSRWLockExclusive(&g.io_lock);
-    return r;
-}
-
-s32 cellGcmMapLocalMemory(u32 address, u32 size)
-{
-    if (g.initialized) return (s32)CELL_GCM_ERROR_FAILURE;
-    g.local_size = gcm_local_size(g_ps3_sdk_version);
-    vm_write32(address, RSX_LOCAL_BASE);
-    vm_write32(size, g.local_size);
-    return CELL_OK;
-}
-
 void cellGcmSortRemapEaIoAddress(void) {}
 
 static void gcm_tile_publish(u32 index)
@@ -500,11 +355,6 @@ s32 cellGcmSetTileInfo(u8 index, u8 location, u32 offset, u32 size, u32 pitch, u
     return gcm_set_tile(index, location, offset, size, pitch, comp, base, bank, 0);
 }
 
-s32 cellGcmSetTile(u8 index, u8 location, u32 offset, u32 size, u32 pitch, u8 comp, u16 base, u8 bank)
-{
-    return gcm_set_tile(index, location, offset, size, pitch, comp, base, bank, 1);
-}
-
 s32 cellGcmBindTile(u8 index)
 {
     if (index >= CELL_GCM_MAX_TILE_COUNT) return (s32)CELL_GCM_ERROR_INVALID_VALUE;
@@ -520,9 +370,6 @@ s32 cellGcmUnbindTile(u8 index)
     gcm_tile_publish(index);
     return CELL_OK;
 }
-
-void cellGcmSetInvalidateTile(u8 index) { (void)index; }
-u32 cellGcmGetTileInfo(void) { return GCM_TILE_EA; }
 
 u32 cellGcmGetTiledPitchSize(u32 size)
 {
@@ -551,13 +398,6 @@ static void gcm_zcull(u8 index, u32 offset, u32 width, u32 height, u32 cull_star
     vm_write32(ea + 20u, 0x2000u | (0x20u << 16));
 }
 
-void cellGcmSetZcull(u8 index, u32 offset, u32 width, u32 height, u32 cullStart, u32 zFormat,
-                     u32 aaFormat, u32 zCullDir)
-{
-    if (index < CELL_GCM_MAX_ZCULL_COUNT)
-        gcm_zcull(index, offset, width, height, cullStart, zFormat, aaFormat, zCullDir);
-}
-
 s32 cellGcmBindZcull(u8 index, u32 offset, u32 width, u32 height, u32 cullStart, u32 zFormat,
                      u32 aaFormat, u32 zCullDir)
 {
@@ -573,13 +413,4 @@ s32 cellGcmUnbindZcull(u8 index)
     return CELL_OK;
 }
 
-u32 cellGcmGetZcullInfo(void) { return GCM_ZCULL_EA; }
-
-void cellGcmSetDebugOutputLevel(s32 level)
-{
-    if (level >= CELL_GCM_DEBUG_LEVEL0 && level <= CELL_GCM_DEBUG_LEVEL2) g.debug_level = (u32)level;
-}
-
-s32 cellGcmDumpGraphicsError(void) { return CELL_OK; }
-s32 cellGcmTerminate(void) { return CELL_OK; }
 void _cellGcmFunc15(u32 context) { (void)context; }

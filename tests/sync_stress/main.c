@@ -5,7 +5,7 @@
  * Exercises runtime/syscalls/sys_mutex.c, sys_cond.c, sys_semaphore.c,
  * sys_event.c directly (as C functions taking a ppu_context*), on Win32
  * threads -- real ones on Windows, runtime/platform/win32_compat.h's
- * elsewhere -- with NO dependency on the yakuza runner or the recompiled game.
+ * elsewhere -- with NO dependency on the recompiled game.
  *
  * Usage: sync_stress [seed]   (default seed 0)
  *

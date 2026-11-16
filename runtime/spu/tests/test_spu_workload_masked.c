@@ -19,7 +19,6 @@
 uint8_t* vm_base;
 uint32_t g_barrier_sync_watch;
 void (*g_spu_out_mbox_hook)(uint32_t, uint32_t, int, uint32_t);
-uint32_t g_ydkj_real_spurs_ea, g_ydkj_real_taskid, g_ydkj_real_taskset_ea;
 unsigned long long ps3_ms_now(void) { return 0; }
 void spu_coh_notify_write(uint32_t a) { (void)a; }
 void spu_coh_unregister(spu_context* c) { (void)c; }
@@ -29,17 +28,8 @@ void spu_coh_watch_remove(spu_coh_watch* w) { (void)w; }
 void spu_lockline_lock(void) { }
 void spu_lockline_unlock(void) { }
 void spu_mfc_release(spu_context* c) { (void)c; }
-int spu_run_spurs_job(spu_lifted_entry_fn e, int id, uint32_t ea, uint32_t sz)
-{ (void)e; (void)id; (void)ea; (void)sz; return -1; }
 int spu_run_with_halt(void (*f)(spu_context*), spu_context* c) { (void)f; (void)c; return -1; }
 void spu_thread_publish_ctx(uint32_t tid, void* c) { (void)tid; (void)c; }
-uint64_t spurs_pm_build_context(uint8_t* ls, uint32_t a, uint32_t b, uint32_t c, uint32_t d)
-{ (void)ls; (void)a; (void)b; (void)c; (void)d; return 0; }
-int spurs_run_taskset_policy_probe(uint32_t a, uint32_t b, uint32_t c, uint64_t d,
-                                   uint32_t e, uint8_t* ls, uint32_t f)
-{ (void)a; (void)b; (void)c; (void)d; (void)e; (void)ls; (void)f; return -1; }
-void tsp_spu_func_00000A00(spu_context* c) { (void)c; }
-void ydkj_wake_all_event_flags(void) { }
 
 static void prog_a(spu_context* c) { (void)c; }
 static void prog_b(spu_context* c) { (void)c; }

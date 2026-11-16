@@ -247,13 +247,6 @@ int64_t sys_timer_usleep(ppu_context* ctx)
           fprintf(stderr, "\n"); fflush(stderr);
         } } }
 
-    /* POLLSITE: resolve the host chain of the 1ms poller (LBP bringup) to
-     * guest functions -- names the stage that is starving. */
-    { static int _ps = -1; if (_ps < 0) _ps = getenv("POLLSITE") ? 12 : 0;
-      if (_ps > 0 && usec == 1000) { _ps--;
-        extern void ppu_log_host_chain(const char*);
-        ppu_log_host_chain("usleep1ms"); } }
-
 #ifdef _WIN32
     /* Use high-resolution sleep via waitable timer for better precision */
     if (usec >= 1000) {

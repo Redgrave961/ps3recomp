@@ -100,21 +100,19 @@ def check(ok, what):
         failures.append(what)
 
 
-def run(*argv, env=None):
-    r = subprocess.run([sys.executable, str(TOOL), *argv], capture_output=True, text=True,
-                       env=env)
+def run(*argv):
+    r = subprocess.run([sys.executable, str(TOOL), *argv], capture_output=True, text=True)
     if r.returncode:
         print(r.stdout, r.stderr)
         raise SystemExit("lift_jobmods failed")
     return r
 
 
-env = {k: v for k, v in os.environ.items() if k != "LBP_JOBMOD_EXTRA_FUNCS"}
 with tempfile.TemporaryDirectory(prefix="lift-jobmods-verified-") as tmp:
     tmp = Path(tmp)
     (tmp / "engine.elf").write_bytes(engine_elf())
     run("--engine-elf", str(tmp / "engine.elf"), "--out", str(tmp / "out"),
-        "--symbol-prefix", "synth", env=env)
+        "--symbol-prefix", "synth")
     manifest = json.loads((tmp / "out/jobmods_manifest.json").read_text())
     check([m["eas"] for m in manifest] == [[A_EA, A2_EA], [B_EA]],
           "modules found at their EAs, identical copies share one lift, decoy rejected")
@@ -153,7 +151,7 @@ with tempfile.TemporaryDirectory(prefix="lift-jobmods-verified-") as tmp:
         import hashlib
         e = struct.unpack_from(">I", raw, 0x10)[0]
         (tmp / "bins" / f"jobmod_{hashlib.sha1(raw).hexdigest()[:12]}_e{e:04X}.bin").write_bytes(raw)
-    run("--jobmods", str(tmp / "bins"), "--out", str(tmp / "sig"), env=env)
+    run("--jobmods", str(tmp / "bins"), "--out", str(tmp / "sig"))
     sig_reg = (tmp / "sig/jobmods_register.c").read_text()
     sig_manifest = json.loads((tmp / "sig/jobmods_manifest.json").read_text())
     check(sig_reg.count("spu_overlay_register_sig(sig, ") == 2 and
@@ -191,12 +189,6 @@ unsigned long long ps3_ms_now(void) { abort(); }
 uint32_t g_ww_lo = 0xFFFFFFFFu, g_ww_hi;
 int g_resv_store_active;
 uint32_t g_barrier_sync_watch;
-uint32_t g_ydkj_real_spurs_ea, g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
-void spurs_ef_set_from_spu(uint32_t ea, uint16_t bits) { (void)ea; (void)bits; abort(); }
-void ydkj_wake_all_event_flags(void) { abort(); }
-void spurs_pm_build_context(spu_context* c, uint32_t a, uint32_t b, uint32_t d) {
-    (void)c; (void)a; (void)b; (void)d; abort();
-}
 uint32_t g_spu_image_src_ea, g_spu_image_ls_start, g_spu_image_span;
 static int failed;
 static void check(int ok, const char* what) { printf("%s %s\n", ok ? "PASS" : "FAIL", what); failed |= !ok; }
@@ -236,8 +228,8 @@ int main(void)
             f"const unsigned char {n}[] = {{{','.join(str(x) for x in raw)}}};\n"
             f"const unsigned {n}_len = {len(raw)};\n" for n, raw in (("mod_a", A), ("mod_b", B))))
         sources = ["spu_channels.c", "spu_drain.c", "spu_lockstep.c", "spu_coherency.c",
-                   "spu_workload.c", "spurs_policy.c", "spurs_job.c", "spu_tsp_weak.c",
-                   "spu_vm_pagemap.c", "spurs_policy_blob_weak.c", "spu_interp.c"]
+                   "spu_workload.c",
+                   "spu_vm_pagemap.c", "spu_interp.c"]
         lifted = [str(tmp / "out" / m["name"] / "spu_recomp.c") for m in manifest]
         binary = tmp / "residency"
         subprocess.run([os.environ.get("CC", "cc"), "-std=gnu17", "-O1", "-UNDEBUG", "-w",
@@ -249,7 +241,7 @@ int main(void)
                         "-o", str(binary)], check=True)
         r = subprocess.run([str(binary)], capture_output=True, text=True, timeout=10, cwd=tmp,
                            env={k: v for k, v in os.environ.items()
-                                if not k.startswith(("SPU_", "SPURS_", "YDKJ_", "LBP_"))})
+                                if not k.startswith(("SPU_", "SPURS_"))})
         print(r.stdout.strip())
         if r.stderr.strip():
             print(r.stderr.strip()[-2000:])

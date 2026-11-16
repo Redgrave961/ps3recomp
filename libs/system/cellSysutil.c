@@ -16,6 +16,8 @@
 #endif
 #include <errno.h>
 #include <sys/stat.h>   /* mkdir -- preparing the /dev_hdd1 cache directory */
+
+void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size);
 #ifdef _WIN32
 #  include <direct.h>
 #  ifndef mkdir
@@ -152,13 +154,9 @@ static void drain_guest_completions(void)
     draining = 0;
 }
 
-static s32 s_bgm_enabled = 1;
-static s32 s_bgm_status = CELL_SYSUTIL_BGMPLAYBACK_STATUS_STOP;
 static char s_cache_path[CELL_SYSCACHE_PATH_MAX];
 static int s_cache_mounted = 0;
 
-static void (*s_disc_change_cb)(void*) = NULL;
-static void* s_disc_change_arg = NULL;
 
 /* ---------------------------------------------------------------------------
  * Core callbacks & params
@@ -211,7 +209,6 @@ s32 cellSysutilUnregisterCallback(s32 slot)
  * defers a dialog answer to this pump (which is where hardware delivers it) and
  * must not defer into a pump that never runs. */
 static int s_pump_seen = 0;
-int cellSysutil_pump_seen(void) { return s_pump_seen; }
 
 s32 cellSysutilCheckCallback(void)
 {
@@ -222,14 +219,7 @@ s32 cellSysutilCheckCallback(void)
     /* Turn psnr replies and pushes into queued NP callbacks first, so this
      * same poll delivers them. A no-op when no psnr server is configured. */
     { extern void np_psnr_pump(void); np_psnr_pump(); }
-    /* A pending PSN terms-of-service answer (cellSysutilNpEula.c) joins the
-     * completions, so this same poll runs the title's callback. */
-    { extern void ps3_np_eula_tick(void); ps3_np_eula_tick(); }
     drain_guest_completions();
-    /* No cellMsgDialog_pump() here: #155 replaced that mechanism with
-     * drain_guest_completions() above, deferring a dialog answer to this poll
-     * instead of pumping it separately. #156 branched before #155 landed, so its
-     * context still names the old call. */
     {
       if (!s_pump_seen) {
           s_pump_seen = 1;
@@ -491,66 +481,6 @@ s32 cellSysutilGetSystemParamString(s32 id, u32 buf_ea, u32 bufsize)
  * BGM playback control
  * -----------------------------------------------------------------------*/
 
-s32 cellSysutilEnableBgmPlayback(void)
-{
-    printf("[cellSysutil] EnableBgmPlayback()\n");
-    s_bgm_enabled = 1;
-    return CELL_OK;
-}
-
-s32 cellSysutilDisableBgmPlayback(void)
-{
-    printf("[cellSysutil] DisableBgmPlayback()\n");
-    s_bgm_enabled = 0;
-    s_bgm_status = CELL_SYSUTIL_BGMPLAYBACK_STATUS_STOP;
-    return CELL_OK;
-}
-
-s32 cellSysutilGetBgmPlaybackStatus(s32* status)
-{
-    /* `status` is a GUEST address (YDKJ's "FMOD BGM status query thread" passes its
-     * own stack, e.g. 0xD011FF00) -- the old `*status = ...` dereferenced it as a
-     * HOST pointer and segfaulted (same bug the GetSystemParamInt comment above
-     * describes). It is also NOT an s32 out-param: the real API fills a
-     * CellSysutilBgmPlaybackStatus (guest, big-endian):
-     *   +0x00 u8  playerState        +0x01 u8 reserved[7]
-     *   +0x08 char contentId[16]     +0x18 u8 reserved2[8]
-     *   +0x20 s32 currentFadeRatio   +0x24 u8 reserved3[4]     (0x28 bytes)
-     */
-    uint32_t out_ea = (uint32_t)(uintptr_t)status;
-    if (!out_ea)
-        return CELL_SYSUTIL_ERROR_VALUE;
-
-    for (uint32_t o = 0; o < 0x28; o += 4)
-        vm_write32(out_ea + o, 0);
-    vm_write8(out_ea + 0x00, (uint8_t)s_bgm_status);   /* playerState */
-    vm_write32(out_ea + 0x20, 0);                      /* currentFadeRatio */
-    return CELL_OK;
-}
-
-s32 cellSysutilSetBgmPlaybackExtraParam(void* param)
-{
-    (void)param;
-    printf("[cellSysutil] SetBgmPlaybackExtraParam()\n");
-    return CELL_OK;
-}
-
-s32 cellSysutilEnableBgmPlaybackEx(s32 param)
-{
-    (void)param;
-    printf("[cellSysutil] EnableBgmPlaybackEx(%d)\n", param);
-    s_bgm_enabled = 1;
-    return CELL_OK;
-}
-
-s32 cellSysutilDisableBgmPlaybackEx(void)
-{
-    printf("[cellSysutil] DisableBgmPlaybackEx()\n");
-    s_bgm_enabled = 0;
-    s_bgm_status = CELL_SYSUTIL_BGMPLAYBACK_STATUS_STOP;
-    return CELL_OK;
-}
-
 /* ---------------------------------------------------------------------------
  * System cache
  * -----------------------------------------------------------------------*/
@@ -582,15 +512,15 @@ s32 cellSysCacheMount(char* param)
     /* The guest path above is only half the mount: /dev_hdd1 must also exist as
      * a WRITABLE host directory, or a title's first cache open fails against the
      * read-only disc root and it never creates its media threads. Create the
-     * cache directory under the same host root ppu_fs.cpp maps /dev_hdd1 to
-     * (PS3_HDD1_ROOT); without that root /dev_hdd1 is not remapped, so there is
+     * cache directory where /dev_hdd1 maps to (PS3_HDD1_ROOT); without that root /dev_hdd1 is not remapped, so there is
      * nothing to prepare. */
     { const char* root = getenv("PS3_HDD1_ROOT");
       if (root && *root) {
-          char hpath[512];
-          snprintf(hpath, sizeof hpath, "%s/cache", root);
+          char gpath[512], hpath[1024];
+          sys_fs_translate_path("/dev_hdd1/cache", hpath, (int)sizeof hpath);
           mkdir(hpath, 0777);
-          snprintf(hpath, sizeof hpath, "%s/cache/%s", root, cache_id);
+          snprintf(gpath, sizeof gpath, "/dev_hdd1/cache/%s", cache_id);
+          sys_fs_translate_path(gpath, hpath, (int)sizeof hpath);
           if (mkdir(hpath, 0777) == 0 || errno == EEXIST)
               printf("[cellSysutil] SysCacheMount: host cache dir %s ready\n", hpath);
           else
@@ -600,78 +530,9 @@ s32 cellSysCacheMount(char* param)
     return CELL_OK;   /* CELL_SYSCACHE_RET_OK_CLEARED */
 }
 
-s32 cellSysCacheClear(void)
-{
-    printf("[cellSysutil] SysCacheClear()\n");
-    s_cache_mounted = 0;
-    s_cache_path[0] = '\0';
-    return CELL_OK;
-}
-
 /* ---------------------------------------------------------------------------
  * Disc game check
  * -----------------------------------------------------------------------*/
-
-/* cellDiscGameGetBootDiscInfo(CellDiscGameSystemFileParam* getParam)
- *
- * ONE argument, not three. This was declared (u32* type, char* titleId, u32
- * size), so the adapter handed it whatever r4 and r5 happened to hold at the
- * call -- and it wrote a title-id string through r4. In GT5P r4 still holds an
- * unrelated global the guest loaded for the cellDiscGameRegisterDiscChangeCallback
- * call two instructions earlier, so every boot stamped a string into 0x01025510.
- *
- * The real shape is a single out-struct the caller pre-zeroes (this title zeroes
- * 0x20 bytes of it) whose first field is titleId[CELL_DISCGAME_SYSP_TITLEID_SIZE].
- * The return code is what carries disc-vs-HDD: CELL_OK means booted from disc,
- * CELL_DISCGAME_ERROR_NOT_DISCBOOT (0x8002BD02) means not -- GT5P branches on
- * exactly those two values and ignores everything else.
- */
-s32 cellDiscGameGetBootDiscInfo(void* getParam)
-{
-    uint32_t ea = (uint32_t)(uintptr_t)getParam;
-    printf("[cellSysutil] DiscGameGetBootDiscInfo(param=0x%08X)\n", ea);
-
-    if (ea) {
-        extern const char* cellGame_get_title_id(void);
-        const char* tid = cellGame_get_title_id();
-        if (!tid || !tid[0]) tid = "GAME00000";
-        size_t n = strlen(tid);
-        if (n > CELL_DISCGAME_SYSP_TITLEID_SIZE - 1)
-            n = CELL_DISCGAME_SYSP_TITLEID_SIZE - 1;
-        memcpy(vm_base + ea, tid, n);
-        vm_base[ea + n] = '\0';
-    }
-
-    /* PS3_DISCGAME_BOOT=0 reports NOT_DISCBOOT instead, for a title that is
-     * genuinely installed to HDD. Disc is the default because that is the tree
-     * cellFs actually serves. */
-    { static int s_disc = -1;
-      if (s_disc < 0) { const char* e = getenv("PS3_DISCGAME_BOOT");
-                        s_disc = e ? atoi(e) : 1; }
-      if (!s_disc) {
-          printf("[cellSysutil]   -> NOT_DISCBOOT\n");
-          return (s32)CELL_DISCGAME_ERROR_NOT_DISCBOOT;
-      } }
-    printf("[cellSysutil]   -> disc boot, titleId='%s'\n",
-           (const char*)(vm_base + ea));
-    return CELL_OK;
-}
-
-s32 cellDiscGameRegisterDiscChangeCallback(void (*callback)(void*), void* arg)
-{
-    printf("[cellSysutil] DiscGameRegisterDiscChangeCallback()\n");
-    s_disc_change_cb = callback;
-    s_disc_change_arg = arg;
-    return CELL_OK;
-}
-
-s32 cellDiscGameUnregisterDiscChangeCallback(void)
-{
-    printf("[cellSysutil] DiscGameUnregisterDiscChangeCallback()\n");
-    s_disc_change_cb = NULL;
-    s_disc_change_arg = NULL;
-    return CELL_OK;
-}
 
 /* ---------------------------------------------------------------------------
  * cellSysconf
@@ -688,35 +549,9 @@ s32 cellDiscGameUnregisterDiscChangeCallback(void)
  * and it reached the game as an unresolved import.
  * -----------------------------------------------------------------------*/
 
-s32 cellSysconfOpen(u32 type, u32 func, u32 userdata, u32 extparam, u32 id)
-{
-    (void)extparam; (void)id;
-    printf("[cellSysutil] SysconfOpen(type=%u, func=0x%08X) -> closed\n", type, func);
-    if (func)
-        cellSysutilQueueGuestCallback(func, (u64)CELL_OK, (u64)userdata);
-    return CELL_OK;
-}
-
-s32 cellSysconfAbort(void)
-{
-    printf("[cellSysutil] SysconfAbort()\n");
-    return CELL_OK;
-}
-
 /* ---------------------------------------------------------------------------
  * Misc utilities
  * -----------------------------------------------------------------------*/
-
-s32 cellSysutilGetLicenseArea(void)
-{
-    /* Return 'A' for America */
-    return 'A';
-}
-
-s32 cellSysutilIsMeetingApp(void)
-{
-    return 0; /* Not a meeting app */
-}
 
 /* ---------------------------------------------------------------------------
  * Host quit: the window's close button, Cmd+Q, a host menu's "Quit game".

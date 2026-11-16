@@ -55,7 +55,6 @@ int main(int argc, char** argv) {
     const char* mode = argv[1];
     spu_context_init(&ctx, 0);
     ctx.image_id = 77;
-    ctx.policy_mode = 1; /* live policy APIs are below the unlifted job */
     ctx.status = SPU_STATUS_RUNNING;
     spu_begin_image(77);
     spu_register_function(0x200, helper);
@@ -98,10 +97,7 @@ int main(int argc, char** argv) {
         word(0x4004, 0x35000180); /* bi $3 */
     } else if (!strncmp(mode, "smc-ldst", 8)) {
         /* A generated save/restore stub's shape: quadword stores and loads,
-         * then a branch. "smc-ldst" runs it on the microstep's load/store fast
-         * loop (LS diagnostics read as off); "smc-ldst-diag" leaves the gates
-         * unread, so the generic path runs it. Same result either way. */
-        if (!strcmp(mode, "smc-ldst")) g_spu_ls_watch_n = g_spu_ls_probe = g_spu_smc_watch = 0;
+         * then a branch, run on the microstep's load/store fast loop. */
         for (int k = 0; k < 4; k++) {
             ctx.gpr[5]._u32[k] = 0x11223344u * (uint32_t)(k + 1);
             ctx.gpr[6]._u32[k] = 0xA0B0C0D0u ^ (uint32_t)k;
@@ -175,10 +171,5 @@ unsigned long long ps3_ms_now(void) { abort(); }
 uint32_t g_ww_lo = 0xFFFFFFFFu, g_ww_hi;
 int g_resv_store_active;
 uint32_t g_barrier_sync_watch;
-uint32_t g_ydkj_real_spurs_ea, g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
 void spurs_ef_set_from_spu(uint32_t ea, uint16_t bits) { (void)ea; (void)bits; abort(); }
-void ydkj_wake_all_event_flags(void) { abort(); }
-void spurs_pm_build_context(spu_context* c, uint32_t a, uint32_t b, uint32_t d) {
-    (void)c; (void)a; (void)b; (void)d; abort();
-}
 uint32_t g_spu_image_src_ea, g_spu_image_ls_start, g_spu_image_span;

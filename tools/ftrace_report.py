@@ -15,7 +15,7 @@ few frames as a timeline (one column per --ms-per-col ms):
   PPU   '#' running   '.' usleep poll   's' other blocking syscall
   SPU   '#' busy      ' ' waiting on a channel
   RSX   'S' blocked on ACQUIRE   'D' FIFO drain   'P' present   '|' flip reached
-        inside D/P: 'E' Metal encode   'G' waiting for the GPU   'R' render-target readback
+        inside D/P: 'E' GPU encode   'G' waiting for the GPU   'R' render-target readback
 """
 import argparse
 import collections
@@ -159,7 +159,7 @@ def main():
     # GPU execution per command buffer (headless commits wait for each one).
     ex = [s for s in spans if s[0] == GPU_EXEC and flips[0] <= s[5] <= flips[-1]]
     if ex:
-        print("  Metal command buffers (GPU's own execution time):")
+        print("  GPU command buffers (GPU's own execution time):")
         for kind, label in ((1, "present"), (0, "flush")):
             xs = [s for s in ex if s[3] == kind]
             if not xs:

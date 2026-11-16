@@ -4,14 +4,11 @@ Thanks for your interest in helping preserve PS3 games through static recompilat
 
 ## Ways to Contribute
 
-### Port a New Game
-The most impactful contribution. Pick a PS3 title, analyze its binary, lift the code, and wire up the HLE modules it needs. See the [Game Porting Guide](docs/GAME_PORTING_GUIDE.md) and the [flOw case study](docs/GAME_PORTING_GUIDE.md#case-study-flow) for a real-world walkthrough.
-
 ### Improve HLE Modules
 Many modules have stub implementations that return `CELL_OK` without doing real work. Upgrading a stub to a real implementation — backed by host OS services — directly unblocks games. Check [docs/MODULE_STATUS.md](docs/MODULE_STATUS.md) for what needs work.
 
 ### Add New HLE Modules
-Some PS3 system libraries aren't covered yet. If a game you're working on imports from an unimplemented module, adding it to `libs/` helps everyone. See [docs/CUSTOM_MODULES.md](docs/CUSTOM_MODULES.md) for the full walkthrough.
+An import nothing registers is logged and answered `CELL_OK`. Implement it in `libs/`.
 
 ### Improve the Lifter/Tools
 The PPU and SPU lifters in `tools/` handle most instructions but some edge cases remain (VMX/AltiVec SIMD, complex branch patterns). Improving instruction coverage benefits every game port.
@@ -31,14 +28,8 @@ Run existing game ports, compare behavior with RPCS3, and report discrepancies. 
 - **CMake 3.20+** — build system
 - **C17/C++20 compiler** — MSVC 19.x (VS 2019+), GCC 12+, or Clang 15+
 - **Ninja** — build tool used by the commands below
-- **SDL3** — required on Linux and macOS for input and audio
+- **SDL3, Vulkan-Headers, volk, VulkanMemoryAllocator** — found through CMake config packages (vcpkg)
 - **Git** — version control
-
-On macOS, install the command-line dependencies with:
-
-```bash
-brew install cmake ninja python@3.12 sdl3
-```
 
 ### Building from Source
 
@@ -46,8 +37,7 @@ brew install cmake ninja python@3.12 sdl3
 git clone https://github.com/sp00nznet/ps3recomp.git
 cd ps3recomp
 
-# macOS (on Linux, use: python3 -m venv .venv)
-"$(brew --prefix python@3.12)/bin/python3.12" -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
 
@@ -56,14 +46,7 @@ cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
 
-On Windows with Visual Studio:
-```powershell
-py -3 -m venv .venv
-.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
-cmake -B build
-cmake --build build --config Release
-```
+On Windows the port builds the runtime: `port/build.ps1`.
 
 ### Running Tests
 
@@ -87,11 +70,10 @@ ps3recomp/
 ├── runtime/        # Core C runtime: PPU/SPU contexts, virtual memory, LV2 syscalls
 ├── libs/           # HLE modules, one row each in docs/MODULE_STATUS.md (the bulk of the code)
 ├── include/ps3emu/ # Public API headers for game projects
-├── templates/      # Starter project template
 └── docs/           # Documentation (one Markdown file per topic)
 ```
 
-**Data flow:** PS3 ELF → `tools/` analyzes and lifts to C → game project links against `runtime/` + `libs/` → native executable.
+**Data flow:** PS3 ELF → `tools/` analyzes and lifts to C → the port links against `runtime/` + `libs/` → native executable.
 
 ---
 
@@ -106,8 +88,8 @@ ps3recomp/
 - **Include guards**: `#ifndef PS3RECOMP_CELL_FOO_H` / `#define` / `#endif`
 - **Comments**: `/* C-style */` block comments for sections, inline for non-obvious logic
 
-### C++ Code (game projects, templates/)
-- **C++20 standard** — game projects use C++ for convenience
+### C++ Code (runtime/ppu/, the port)
+- **C++20 standard**
 - **`extern "C"`** when including runtime/lib headers from C++
 
 ### Python Code (tools/)
@@ -124,8 +106,6 @@ ps3recomp/
 ---
 
 ## Adding an HLE Module
-
-Here's the condensed version. See [docs/CUSTOM_MODULES.md](docs/CUSTOM_MODULES.md) for the full tutorial.
 
 ### 1. Create the Header (`libs/<category>/cellFoo.h`)
 
@@ -197,24 +177,16 @@ s32 cellFooGetConfig(CellFooConfig* config)
 }
 ```
 
-### 3. Add to CMakeLists.txt
+### 3. Registration
 
-Add your `.c` file to the runtime library's source list.
-
-### 4. Register in a Game Project
-
-In the game's `hle_modules.cpp`, register functions by NID:
-
-```c
-reg_func(&mod_cellFoo, "cellFooInit", (void*)bridge_cellFooInit);
-```
+The CMake glob picks the file up, and `tools/gen_hle_nids.py --all` registers every non-static `cell*`/`sys*`/`sce*` function under its computed NID.
 
 ---
 
 ## Testing Your Changes
 
 1. **Build the runtime** — `cmake --build build` must succeed
-2. **Link to a game project** — build the flOw port or another test project
+2. **Build the port** — `port/build.ps1`
 3. **Compare with RPCS3** — run the same game in RPCS3 with logging enabled and compare HLE call sequences
 4. **Check for regressions** — make sure existing functionality still works
 
