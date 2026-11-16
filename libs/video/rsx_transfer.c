@@ -61,7 +61,6 @@ static void tiled_store(void* user, u8* dst, const u8* src, u32 len)
 static const rsx_tiled_mem s_tiled = { tiled_ptr, tiled_store, NULL };
 
 typedef struct span {
-    u32 dma;
     u32 offset;
     u32 ea;
     u32 size;
@@ -70,8 +69,6 @@ typedef struct span {
 
 static int span_open(span* sp, u32 dma, u32 offset, u32 size)
 {
-    if (dma != RSX_DMA_LOCAL && dma != RSX_DMA_MAIN) return 0;
-    sp->dma = dma;
     sp->offset = offset;
     sp->size = size;
     sp->ea = rsx_address(dma, offset, size);
@@ -96,7 +93,7 @@ static void span_write(const span* sp, u32 rel, const u8* src, u32 len)
 
 static int spans_overlap(const span* a, const span* b)
 {
-    return a->dma == b->dma && a->offset < b->offset + b->size && b->offset < a->offset + a->size;
+    return a->ea < b->ea + b->size && b->ea < a->ea + a->size;
 }
 
 static void transfer_fault(const char* what, u32 a, u32 b)

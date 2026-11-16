@@ -762,8 +762,11 @@ void window_main()
             g.queue_cv.notify_one();
             break;
         case SDL_EVENT_KEY_DOWN:
-            if (!e.key.repeat && (e.key.key == SDLK_F11 || (e.key.key == SDLK_RETURN && (e.key.mod & SDL_KMOD_ALT))))
+            if (e.key.repeat) break;
+            if (e.key.key == SDLK_F11 || (e.key.key == SDLK_RETURN && (e.key.mod & SDL_KMOD_ALT)))
                 SDL_SetWindowFullscreen(g.window, !(SDL_GetWindowFlags(g.window) & SDL_WINDOW_FULLSCREEN));
+            else if (e.key.key == SDLK_F12)
+                g.r.trace_request.store(true, std::memory_order_relaxed);
             break;
         default:
             break;
@@ -791,6 +794,11 @@ void vk_flush(void*)
 void vk_reset(void*)
 {
     g.r.flip_reset();
+}
+
+int vk_report(void*, u32 type, u32 ea)
+{
+    return g.r.report(type, ea) ? 1 : 0;
 }
 
 void vk_read_back(void*, u32 ea, u32 size)
@@ -895,7 +903,7 @@ void vk_close(void*)
 extern "C" const rsx_renderer* rsx_vk_renderer(const char* title)
 {
     static const rsx_renderer renderer = {
-        nullptr, vk_open, vk_methods, vk_flush, nullptr, vk_reset, nullptr, vk_present, vk_read_back, vk_wrote, vk_vblank, vk_close,
+        nullptr, vk_open, vk_methods, vk_flush, nullptr, vk_reset, vk_report, vk_present, vk_read_back, vk_wrote, vk_vblank, vk_close,
     };
     static std::once_flag started;
     std::call_once(started, [title] {

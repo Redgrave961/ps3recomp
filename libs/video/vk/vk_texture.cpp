@@ -175,10 +175,14 @@ void renderer::describe_units()
 
 bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out, rsx_spv_texture_state& state)
 {
-    unit_binding& b = m_units[vertex ? rsx::TEXTURES + unit : unit];
+    const u32 slot = vertex ? rsx::TEXTURES + unit : unit;
+    unit_binding& b = m_units[slot];
+    const char*& path = m_texture_path[slot];
+    path = "dummy: unit disabled";
     if (!b.valid) return false;
     const rsx::texture_desc& d = b.desc;
     const u32 ea = rsx_address(d.location ? RSX_DMA_MAIN : RSX_DMA_LOCAL, d.offset, d.guest_size);
+    path = "dummy: address out of range";
     if (!ea) return false;
 
     VkSamplerCustomBorderColorCreateInfoEXT border{ VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT };
@@ -203,30 +207,33 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
     const VkImageViewType type = d.cube ? VK_IMAGE_VIEW_TYPE_CUBE : d.dimension == 3 ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D;
     VkCommandBuffer c = cmd();
 
-    static const bool trace = std::getenv("PS3_VK_TEXTRACE") != nullptr;
+    const char* skipped = nullptr;
     for (auto& p : m_surfaces) {
         surface* s = p.get();
         if (s->ea != ea) continue;
-        if (trace && (s->state != SURFACE_VALID || s->depth != d.depth || (!s->depth && texel_bytes(s->img.format) != texel_bytes(d.format))))
-            std::fprintf(stderr, "[vk] surface 0x%08X skipped: state %d depth %d/%d format %d/%d gcm %02X\n", ea, s->state, s->depth, d.depth, s->img.format, d.format, d.gcm_format);
-        if (s->state != SURFACE_VALID || d.cube || d.dimension == 3) continue;
-        if (s->depth != d.depth) continue;
-        if (!s->depth && (d.compressed || texel_bytes(s->img.format) == 0 || texel_bytes(s->img.format) != texel_bytes(d.format))) continue;
+        if (s->state != SURFACE_VALID) { skipped = "memory: surface not valid"; continue; }
+        if (d.cube || d.dimension == 3) { skipped = "memory: surface sampled as cube/3D"; continue; }
+        if (s->depth != d.depth) { skipped = s->depth ? "memory: depth surface sampled as color" : "memory: color surface sampled as depth"; continue; }
+        if (!s->depth && (d.compressed || texel_bytes(s->img.format) == 0 || texel_bytes(s->img.format) != texel_bytes(d.format))) {
+            skipped = "memory: surface texel size differs";
+            continue;
+        }
         bool bound = s == m_fb.depth;
         for (surface* f : m_fb.color) bound |= f == s;
-        if (bound) {
-            if (trace) std::fprintf(stderr, "[vk] surface 0x%08X sampled while bound\n", ea);
-            return false;
-        }
+        path = "dummy: surface sampled while bound";
+        if (bound) return false;
         end_rendering();
         barrier(c, s->img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                 VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
         const VkImageAspectFlags aspect = s->depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
         const VkImageView view = view_for(s->img, VK_IMAGE_VIEW_TYPE_2D, s->depth ? s->img.format : d.format, aspect, d.swizzle);
+        path = "dummy: surface view failed";
         if (!view) return false;
+        path = "surface";
         out = { sampler, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
         return true;
     }
+    path = "dummy: texture creation failed";
 
     const uint64_t key = texture_key(d, ea);
     auto it = m_textures.find(key);
@@ -263,7 +270,6 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
 
     if (upload) {
         stats.uploads++;
-        if (trace) std::fprintf(stderr, "[vk] upload 0x%08X size %u fmt %02X %ux%u new %d\n", ea, d.guest_size, d.gcm_format, d.width, d.height, it == m_textures.end());
         const uint64_t bytes = rsx::texture_staging_size(d);
         vk_slice slice = m_ring.alloc(bytes, 16);
         if (!slice.ptr) return false;
@@ -293,6 +299,7 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
     }
     const VkImageView view = view_for(e->img, type, d.format, d.aspect & VK_IMAGE_ASPECT_DEPTH_BIT ? VK_IMAGE_ASPECT_DEPTH_BIT : d.aspect, d.swizzle);
     if (!view) return false;
+    path = skipped ? skipped : "memory";
     out = { sampler, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
     return true;
 }

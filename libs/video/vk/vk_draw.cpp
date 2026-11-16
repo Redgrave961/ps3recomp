@@ -323,7 +323,7 @@ bool renderer::draw_setup()
     return true;
 }
 
-void renderer::draw_execute(const rsx::draw_clause& clause)
+void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
 {
     const u32 prim = clause.primitive;
     bool emulated = false;
@@ -503,11 +503,13 @@ void renderer::draw_execute(const rsx::draw_clause& clause)
     const VkPipeline pipe = m_pipelines.get(key, m_vp->code, m_fp->code);
     if (!pipe) {
         stats.skipped_pipeline++;
+        if (m_trace) std::fprintf(stderr, "[trace] %u dropped: no pipeline\n", id);
         return;
     }
 
     begin_rendering();
     VkCommandBuffer c = cmd();
+    if (m_occlusion.enabled() && !m_occlusion.active()) m_occlusion.begin(c);
     vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     set_dynamic_state(c, *this, *m_d, m_pipelines, t, prim, restart && clause.kind == rsx::draw_kind::indexed);
 
@@ -550,6 +552,11 @@ void renderer::draw_execute(const rsx::draw_clause& clause)
     if (m_fb.depth && m_fb.depth_write) m_fb.depth->gpu_dirty = true;
     m_draw_counter++;
     stats.draws++;
+    if (m_trace) {
+        u32 n = 0;
+        for (const sub& s : subs) n += s.count;
+        trace_draw(id, prim, n, index_slice.ptr != nullptr);
+    }
 }
 
 }

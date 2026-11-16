@@ -10,6 +10,7 @@
 #endif
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define RSX_TB_FREQ        79800000ull
@@ -415,9 +416,9 @@ static void rsx_get_report(u32 arg)
         rsx_fault("report address", s.get, arg);
         return;
     }
-    const u32 value = (s.renderer && s.renderer->report) ? s.renderer->report(s.renderer->user, type) : 0u;
+    if (s.renderer && s.renderer->report && s.renderer->report(s.renderer->user, type, ea)) return;
     vm_write64(ea, rsx_core_timestamp());
-    vm_write32(ea + 8u, value);
+    vm_write32(ea + 8u, 0);
     vm_write32(ea + 12u, 0);
 }
 
@@ -582,8 +583,12 @@ static DWORD WINAPI rsx_fifo_thread(LPVOID unused)
 {
     (void)unused;
     if (s.renderer && s.renderer->open && s.renderer->open(s.renderer->user) != 0) {
-        fprintf(stderr, "[rsx] renderer failed to open; running without one\n");
-        s.renderer = NULL;
+        fprintf(stderr, "[rsx] renderer failed to open\n");
+        fflush(NULL);
+#ifdef _WIN32
+        MessageBoxA(NULL, "The Vulkan renderer failed to start. The console log has the reason.", "Renderer error", MB_OK | MB_ICONERROR);
+#endif
+        _Exit(1);
     }
     for (;;) {
         const u32 seen = __atomic_load_n(&s.bell, __ATOMIC_ACQUIRE);

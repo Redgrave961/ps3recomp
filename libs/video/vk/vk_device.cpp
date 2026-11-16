@@ -97,7 +97,7 @@ bool suitable(VkPhysicalDevice gpu, VkSurfaceKHR surface)
     VkPhysicalDeviceVulkan13Features f13{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, &f12 };
     VkPhysicalDeviceFeatures2 f{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f13 };
     vkGetPhysicalDeviceFeatures2(gpu, &f);
-    if (!f13.dynamicRendering || !f13.synchronization2 || !f12.timelineSemaphore) return false;
+    if (!f13.dynamicRendering || !f13.synchronization2 || !f12.timelineSemaphore || !f12.hostQueryReset) return false;
     return find_family(gpu, surface) >= 0;
 }
 
@@ -187,7 +187,7 @@ bool vk_device_create(vk_device& d, VkSurfaceKHR surface)
     for (VkPhysicalDevice gpu : gpus)
         if (suitable(gpu, surface) && (!d.gpu || rank(gpu) > rank(d.gpu))) d.gpu = gpu;
     if (!d.gpu) {
-        std::fprintf(stderr, "[vk] no Vulkan 1.3 GPU with dynamic rendering, synchronization2 and timeline semaphores\n");
+        std::fprintf(stderr, "[vk] no Vulkan 1.3 GPU with dynamic rendering, synchronization2, timeline semaphores and host query reset\n");
         return false;
     }
     vkGetPhysicalDeviceProperties(d.gpu, &d.props);

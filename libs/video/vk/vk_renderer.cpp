@@ -104,7 +104,8 @@ bool renderer::open(vk_device& d, VkSemaphore timeline, uint64_t* submitted, con
     m_ubo_align = std::max<VkDeviceSize>(16, d.props.limits.minUniformBufferOffsetAlignment);
     m_ssbo_align = std::max<VkDeviceSize>(16, d.props.limits.minStorageBufferOffsetAlignment);
     m_shaders.init(d);
-    return m_ring.create(d, 256ull << 20, timeline) && m_pipelines.create(d, cache_path) && create_dummies();
+    return m_ring.create(d, 256ull << 20, timeline) && m_pipelines.create(d, cache_path) && create_dummies() &&
+           m_occlusion.create(d, timeline);
 }
 
 void renderer::close()
@@ -114,6 +115,7 @@ void renderer::close()
         std::lock_guard<std::mutex> hold(m_d->queue_lock);
         vkQueueWaitIdle(m_d->queue);
     }
+    m_occlusion.destroy();
     for (auto& s : m_surfaces) destroy_image(s->img);
     for (auto& s : m_retired) destroy_image(s->img);
     for (auto& g : m_garbage) destroy_image(g.second);
@@ -215,6 +217,7 @@ void renderer::submit(VkSemaphore wait, VkPipelineStageFlags2 wait_stage, VkSema
     m_submission = (m_submission + 1u) % (u32)m_submissions.size();
     m_recording = false;
     m_ring.close(value);
+    m_occlusion.submitted(value);
 
     uint64_t reached = 0;
     vkGetSemaphoreCounterValue(m_d->dev, m_timeline, &reached);
@@ -475,7 +478,9 @@ void renderer::download_surface(surface& s)
 void renderer::end_rendering()
 {
     if (!m_rendering) return;
-    vkCmdEndRendering(cmd());
+    VkCommandBuffer c = cmd();
+    if (m_occlusion.active()) m_occlusion.end(c);
+    vkCmdEndRendering(c);
     m_rendering = false;
 }
 
@@ -738,19 +743,73 @@ void renderer::on_clear(u32 mask)
 
 void renderer::on_draw(const rsx::draw_clause& clause)
 {
+    const u32 id = m_trace_draws++;
     if (!bind_framebuffer(FB_DRAW)) {
         stats.skipped_fb++;
+        if (m_trace)
+            std::fprintf(stderr, "[trace] %u dropped: no render target (clip %ux%u format %08X target %X color %08X zeta %08X)\n", id,
+                         r(rsx::M_SURFACE_CLIP_H) >> 16, r(rsx::M_SURFACE_CLIP_V) >> 16, r(rsx::M_SURFACE_FORMAT),
+                         r(rsx::M_SURFACE_TARGET), r(rsx::M_SURFACE_COLOR_A), r(rsx::M_SURFACE_ZETA));
         return;
     }
     if (!draw_setup()) {
         stats.skipped_shader++;
+        if (m_trace) std::fprintf(stderr, "[trace] %u dropped: %s program\n", id, m_vp ? "fragment" : "vertex");
         return;
     }
-    draw_execute(clause);
+    draw_execute(clause, id);
+}
+
+void renderer::trace_draw(u32 id, u32 prim, u32 count, bool indexed) const
+{
+    const u32 ch = r(rsx::M_SURFACE_CLIP_H), cv = r(rsx::M_SURFACE_CLIP_V), sh = r(rsx::M_SCISSOR_H), sv = r(rsx::M_SCISSOR_V);
+    const u32 wo = r(rsx::M_WINDOW_OFFSET);
+    std::fprintf(stderr,
+                 "[trace] %u prim %u %s %u | color %08X fmt %d %ux%u aa %ux%u depth %08X fmt %d | clip %u,%u %ux%u win %u,%u scissor %u,%u %ux%u"
+                 " | vp scale %.2f %.2f %.4f offset %.2f %.2f %.4f | z test %u write %u func %X stencil %u | cmask %08X blend %u atest %u func %X ref %X"
+                 " | cull %u face %X | vp %016llX fp %016llX\n",
+                 id, prim, indexed ? "idx" : "arr", count, m_fb.color[0] ? m_fb.color[0]->ea : 0u, (int)m_fb.color_format[0], m_fb.width,
+                 m_fb.height, m_fb.aa_u, m_fb.aa_v, m_fb.depth ? m_fb.depth->ea : 0u, (int)m_fb.depth_format, ch & 0xFFFFu, cv & 0xFFFFu, ch >> 16,
+                 cv >> 16, wo & 0xFFFFu, wo >> 16, sh & 0xFFFFu, sv & 0xFFFFu, sh >> 16, sv >> 16, f(rsx::M_VIEWPORT_SCALE),
+                 f(rsx::M_VIEWPORT_SCALE + 4u), f(rsx::M_VIEWPORT_SCALE + 8u), f(rsx::M_VIEWPORT_OFFSET), f(rsx::M_VIEWPORT_OFFSET + 4u),
+                 f(rsx::M_VIEWPORT_OFFSET + 8u), r(rsx::M_DEPTH_TEST_ENABLE), r(rsx::M_DEPTH_MASK), r(rsx::M_DEPTH_FUNC),
+                 r(rsx::M_STENCIL_TEST_ENABLE), r(rsx::M_COLOR_MASK), r(rsx::M_BLEND_ENABLE), r(rsx::M_ALPHA_TEST_ENABLE), r(rsx::M_ALPHA_FUNC),
+                 r(rsx::M_ALPHA_REF), r(rsx::M_CULL_FACE_ENABLE), r(rsx::M_CULL_FACE), (unsigned long long)(m_vp ? m_vp->hash : 0),
+                 (unsigned long long)(m_fp ? m_fp->hash : 0));
+    const u32 used = m_fp ? m_fp->info.texture_mask : 0u;
+    for (u32 u = 0; u < rsx::TEXTURES; u++) {
+        if (!((used >> u) & 1u) || !m_units[u].valid) continue;
+        const unit_binding& b = m_units[u];
+        std::fprintf(stderr, "[trace] %u   tex%u %s | %08X gcm %02X %ux%u lv %u vk %d %s | filter %08X address %08X ctrl0 %08X remap %08X ctrl3 %08X\n", id, u,
+                     m_texture_path[u] ? m_texture_path[u] : "?", b.desc.offset, b.desc.gcm_format, b.desc.width, b.desc.height, b.desc.levels, (int)b.desc.format,
+                     b.desc.linear ? "lin" : "swz", b.regs.filter, b.regs.address, b.regs.control0, b.regs.control1, b.regs.control3);
+    }
 }
 
 void renderer::on_report(u32 method, u32 value)
 {
+    switch (method) {
+    case rsx::M_ZPASS_PIXEL_COUNT_ENABLE:
+        if (!value && m_occlusion.active()) m_occlusion.end(cmd());
+        m_occlusion.enable(value != 0);
+        break;
+    case rsx::M_CLEAR_REPORT_VALUE:
+        if (value != 1u) break;
+        if (m_occlusion.active()) m_occlusion.end(cmd());
+        m_occlusion.clear();
+        break;
+    default:
+        break;
+    }
+}
+
+bool renderer::report(u32 type, u32 ea)
+{
+    if (type != 1u) return false;
+    if (m_occlusion.active()) m_occlusion.end(cmd());
+    m_occlusion.report(ea);
+    if (!m_recording) m_occlusion.submitted(*m_submitted);
+    return true;
 }
 
 void renderer::present_source(u32 ea, u32 width, u32 height, u32 pitch, image*& out, VkCommandBuffer& c)
@@ -764,9 +823,11 @@ void renderer::present_source(u32 ea, u32 width, u32 height, u32 pitch, image*& 
         if (s->bpp != 4 || s->pitch != pitch) continue;
         out = &s->img;
         stats.present_surface++;
+        if (m_trace) std::fprintf(stderr, "[trace] scanout surface %08X %ux%u image %ux%u\n", ea, width, height, s->img.width, s->img.height);
         return;
     }
     stats.present_memory++;
+    if (m_trace) std::fprintf(stderr, "[trace] scanout memory %08X %ux%u pitch %u\n", ea, width, height, pitch);
     if (m_display.width != width || m_display.height != height) {
         if (m_display.handle) m_garbage.emplace_back(*m_submitted + 1u, m_display);
         m_display = image{};
@@ -794,6 +855,11 @@ void renderer::present_source(u32 ea, u32 width, u32 height, u32 pitch, image*& 
 
 void renderer::read_back(u32 ea, u32 size)
 {
+    if (m_occlusion.outstanding(ea, size)) {
+        if (m_recording) submit(VK_NULL_HANDLE, 0, VK_NULL_HANDLE);
+        else if (m_occlusion.unsubmitted()) m_occlusion.submitted(*m_submitted);
+        m_occlusion.drain();
+    }
     for (auto& p : m_surfaces)
         if (p->gpu_dirty && ranges_overlap(p->ea, p->bytes(), ea, size)) download_surface(*p);
 }
@@ -814,6 +880,10 @@ void renderer::wrote(u32 ea, u32 size)
 
 void renderer::flip_reset()
 {
+    if (m_trace) std::fprintf(stderr, "[trace] frame end, %u draws\n", m_trace_draws);
+    m_trace = trace_request.exchange(false, std::memory_order_relaxed);
+    m_trace_draws = 0;
+    if (m_trace) std::fprintf(stderr, "[trace] frame begin\n");
     m_epoch++;
     end_rendering();
     frontend::reset();

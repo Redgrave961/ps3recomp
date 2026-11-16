@@ -5,9 +5,11 @@
 #include "vk_ring.h"
 #include "vk_pipeline.h"
 #include "vk_shaders.h"
+#include "vk_occlusion.h"
 #include "rsx_texture.h"
 
 #include <array>
+#include <atomic>
 #include <memory>
 #include <unordered_map>
 #include <vector>
@@ -85,6 +87,8 @@ public:
     void read_back(u32 ea, u32 size);
     void wrote(u32 ea, u32 size);
     void flip_reset();
+    bool report(u32 type, u32 ea);
+    std::atomic<bool> trace_request{ false };
 
     static void barrier(VkCommandBuffer cmd, image& img, VkImageLayout layout, VkPipelineStageFlags2 stage, VkAccessFlags2 access);
 
@@ -120,9 +124,13 @@ private:
     std::vector<std::unique_ptr<surface>> m_retired;
     std::vector<std::pair<uint64_t, image>> m_garbage;
     image m_display;
+    occlusion m_occlusion;
 
     bool draw_setup();
-    void draw_execute(const rsx::draw_clause& clause);
+    void draw_execute(const rsx::draw_clause& clause, u32 id);
+    void trace_draw(u32 id, u32 prim, u32 count, bool indexed) const;
+    bool m_trace = false;
+    u32 m_trace_draws = 0;
     bool upload_vertices(const rsx::draw_clause& clause, u32 first, u32 count, u32 vertex_base, VkDescriptorBufferInfo& data,
                          VkDescriptorBufferInfo& layout);
     bool create_dummies();
@@ -166,6 +174,7 @@ private:
     void mark_written(u32 ea, u32 size);
 
     unit_binding m_units[rsx::TEXTURES + rsx::VERTEX_TEXTURES];
+    const char* m_texture_path[rsx::TEXTURES + rsx::VERTEX_TEXTURES]{};
     std::unordered_map<uint64_t, std::unique_ptr<texture_entry>> m_textures;
     std::unordered_map<uint64_t, VkSampler> m_samplers;
     std::vector<u32> m_page_stamp;
