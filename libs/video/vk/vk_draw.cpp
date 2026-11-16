@@ -314,8 +314,24 @@ bool renderer::draw_setup()
     }
     for (u32 k = 0; k < 4; k++)
         if (m_fb.color_format[k] != VK_FORMAT_UNDEFINED) fk.output_mask |= 1u << k;
+    fp_lookup& seen = m_fp_seen[m_fp_ea];
+    if (seen.fp && !std::memcmp(&seen.key, &fk, sizeof fk)) {
+        bool same = true;
+        for (size_t i = 0; i < seen.words.size() && same; i++) same = seen.constant[i] || seen.words[i] == ucode[i];
+        if (same) {
+            m_fp = seen.fp;
+            return true;
+        }
+    }
     m_fp = m_shaders.fragment(ucode, RSX_SPV_FP_MAX_INSTRUCTIONS * 4u, fk, true);
-    return m_fp != nullptr;
+    if (!m_fp) return false;
+    seen.fp = m_fp;
+    seen.key = fk;
+    seen.words.assign(ucode, ucode + m_fp->info.ucode_words);
+    seen.constant.assign(seen.words.size(), 0);
+    for (u32 i = 0; i < m_fp->info.constant_count; i++)
+        for (u32 w = 0; w < 4u && m_fp->info.constant_word[i] + w < seen.constant.size(); w++) seen.constant[m_fp->info.constant_word[i] + w] = 1;
+    return true;
 }
 
 void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)

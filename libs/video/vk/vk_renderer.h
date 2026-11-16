@@ -152,7 +152,13 @@ private:
     VkDescriptorBufferInfo m_constants{};
     const vertex_program* m_vp = nullptr;
     const fragment_program* m_fp = nullptr;
-    u32 m_fp_ea = 0;
+    struct fp_lookup {
+        const fragment_program* fp = nullptr;
+        rsx_spv_fp_key key{};
+        std::vector<u32> words;
+        std::vector<uint8_t> constant;
+    };
+    std::unordered_map<u32, fp_lookup> m_fp_seen;    u32 m_fp_ea = 0;
     VkDeviceSize m_ubo_align = 256;
     VkDeviceSize m_ssbo_align = 256;
     std::vector<uint8_t> m_index_scratch;
