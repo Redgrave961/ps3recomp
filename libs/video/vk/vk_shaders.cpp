@@ -64,7 +64,7 @@ const T* shader_cache::resolve(std::unordered_map<uint64_t, std::unique_ptr<T>>&
         if (auto it = map.find(h); it != map.end()) return it->second.get();
         if (async) {
             if (!m_building.insert(h).second) return nullptr;
-            m_pipes->work([finish, build = std::forward<Build>(build)]() mutable { finish(build()); });
+            m_pipes->work([finish, build = std::forward<Build>(build)]() mutable { finish(build()); }, true);
             return nullptr;
         }
         m_built.wait(hold, [&] { return !m_building.count(h); });

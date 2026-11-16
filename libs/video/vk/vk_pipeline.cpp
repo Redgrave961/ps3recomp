@@ -140,7 +140,8 @@ bool pipelines::create(vk_device& d, const std::string& cache_path)
 
     const size_t slash = m_cache_path.find_last_of("/\\");
     m_db = std::fopen((m_cache_path.substr(0, slash == std::string::npos ? 0 : slash + 1) + "vk_shaders.db").c_str(), "ab+");
-    const unsigned n = std::max(2u, std::thread::hardware_concurrency() / 2u);
+    const unsigned n = std::max(3u, std::thread::hardware_concurrency() / 2u);
+    m_background_limit = n - 2u;
     for (unsigned i = 0; i < n; i++) m_workers.emplace_back(&pipelines::worker, this);
     std::fprintf(stderr, "[vk] pipelines: %s, %u compile threads\n", m_libraries ? "libraries with fast link" : "monolithic", n);
     return true;
@@ -150,22 +151,36 @@ void pipelines::worker()
 {
     for (;;) {
         std::function<void()> task;
+        bool background;
         {
             std::unique_lock<std::mutex> hold(m_work_lock);
-            m_work_cv.wait(hold, [this] { return m_stop || !m_tasks.empty(); });
-            if (m_tasks.empty()) return;
-            task = std::move(m_tasks.front());
-            m_tasks.pop_front();
+            m_work_cv.wait(hold, [this] {
+                return !m_urgent.empty() || (!m_background.empty() && m_background_running < m_background_limit) ||
+                       (m_stop && m_background.empty());
+            });
+            background = m_urgent.empty();
+            if (background && m_background.empty()) return;
+            std::deque<std::function<void()>>& q = background ? m_background : m_urgent;
+            task = std::move(q.front());
+            q.pop_front();
+            m_background_running += background;
         }
         task();
+        if (background) {
+            {
+                std::lock_guard<std::mutex> hold(m_work_lock);
+                m_background_running--;
+            }
+            m_work_cv.notify_one();
+        }
     }
 }
 
-void pipelines::work(std::function<void()> task)
+void pipelines::work(std::function<void()> task, bool urgent)
 {
     {
         std::lock_guard<std::mutex> hold(m_work_lock);
-        m_tasks.push_back(std::move(task));
+        (urgent ? m_urgent : m_background).push_back(std::move(task));
     }
     m_work_cv.notify_one();
 }
@@ -281,7 +296,7 @@ void pipelines::precompile(shader_cache& shaders)
                         std::lock_guard<std::mutex> hold(done->first);
                         done->second.notify_all();
                     }
-                });
+                }, false);
             }
             std::unique_lock<std::mutex> hold(done->first);
             done->second.wait(hold, [&] { return pending->load() == 0; });
@@ -312,7 +327,7 @@ void pipelines::precompile(shader_cache& shaders)
             if (vs && fs) get(k, vs->code, fs->code);
         });
         std::fprintf(stderr, "[vk] precompiled %zu shaders and pipelines\n", recs.size());
-    });
+    }, false);
 }
 
 void pipelines::fill_raster(const pipeline_key& k, VkPipelineRasterizationStateCreateInfo& rs, VkPipelineRasterizationDepthClipStateCreateInfoEXT& clip,
@@ -532,7 +547,7 @@ VkPipeline pipelines::get(const pipeline_key& key, const shader& vs, const shade
             e->pipe.store(p, std::memory_order_release);
             e->done.store(true, std::memory_order_release);
             e->done.notify_all();
-        });
+        }, true);
         return VK_NULL_HANDLE;
     }
     const bool fast = m_libraries && !g_replay;
@@ -546,7 +561,7 @@ VkPipeline pipelines::get(const pipeline_key& key, const shader& vs, const shade
         work([this, k, v = vs, f = fs, e] {
             if (m_stopping.load(std::memory_order_relaxed)) return;
             if (VkPipeline opt = link(k, v, f, true)) e->pipe.store(opt, std::memory_order_release);
-        });
+        }, false);
     return p;
 }
 

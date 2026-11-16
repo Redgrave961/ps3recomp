@@ -72,7 +72,7 @@ public:
     pipeline_key normalize(const pipeline_key& key) const;
 
     bool shader_library(shader& s, VkShaderStageFlagBits stage);
-    void work(std::function<void()> task);
+    void work(std::function<void()> task, bool urgent);
     void record_vertex(const uint32_t* program, const rsx_spv_vp_key& key);
     void record_fragment(const uint32_t* ucode, uint32_t words, const rsx_spv_fp_key& key);
 
@@ -118,7 +118,10 @@ private:
 
     std::mutex m_work_lock;
     std::condition_variable m_work_cv;
-    std::deque<std::function<void()>> m_tasks;
+    std::deque<std::function<void()>> m_urgent;
+    std::deque<std::function<void()>> m_background;
+    unsigned m_background_running = 0;
+    unsigned m_background_limit = 1;
     std::vector<std::thread> m_workers;
     bool m_stop = false;
     std::atomic<bool> m_stopping{ false };
