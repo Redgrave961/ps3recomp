@@ -784,6 +784,27 @@ void renderer::trace_draw(u32 id, u32 prim, u32 count, bool indexed) const
                  r(rsx::M_STENCIL_TEST_ENABLE), r(rsx::M_COLOR_MASK), r(rsx::M_BLEND_ENABLE), r(rsx::M_ALPHA_TEST_ENABLE), r(rsx::M_ALPHA_FUNC),
                  r(rsx::M_ALPHA_REF), r(rsx::M_CULL_FACE_ENABLE), r(rsx::M_CULL_FACE), (unsigned long long)(m_vp ? m_vp->hash : 0),
                  (unsigned long long)(m_fp ? m_fp->hash : 0));
+    for (u32 k = 0; k < rsx::ATTRIBS; k++) {
+        const u32 fmt = r(rsx::M_VERTEX_ARRAY_FORMAT + k * 4u), off = r(rsx::M_VERTEX_ARRAY_OFFSET + k * 4u);
+        if (!((fmt >> 4) & 0xFu)) continue;
+        const u32 ea = rsx_address((off >> 31) ? RSX_DMA_MAIN : RSX_DMA_LOCAL, off & 0x7FFFFFFFu, 16);
+        u32 w[2] = {};
+        if (ea) std::memcpy(w, vm_base + ea, 8);
+        std::fprintf(stderr, "[trace] %u   attr%u type %u size %u stride %u offset %08X first %08X %08X\n", id, k, fmt & 0xFu, (fmt >> 4) & 0xFu,
+                     (fmt >> 8) & 0xFFu, off, __builtin_bswap32(w[0]), __builtin_bswap32(w[1]));
+    }
+    if (m_fp) {
+        const u32* ucode = reinterpret_cast<const u32*>(vm_base + m_fp_ea);
+        for (u32 i = 0; i < m_fp->info.constant_count; i++) {
+            float c[4];
+            for (u32 w = 0; w < 4; w++) {
+                u32 v = __builtin_bswap32(ucode[m_fp->info.constant_word[i] + w]);
+                v = (v << 16) | (v >> 16);
+                std::memcpy(&c[w], &v, 4);
+            }
+            std::fprintf(stderr, "[trace] %u   fpconst%u %.4f %.4f %.4f %.4f\n", id, i, c[0], c[1], c[2], c[3]);
+        }
+    }
     const u32 used = m_fp ? m_fp->info.texture_mask : 0u;
     for (u32 u = 0; u < rsx::TEXTURES; u++) {
         if (!((used >> u) & 1u) || !m_units[u].valid) continue;

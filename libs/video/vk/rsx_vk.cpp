@@ -819,6 +819,25 @@ void vk_wrote(void*, u32 ea, u32 size)
     g.r.wrote(ea, size);
 }
 
+void write_bmp(const char* path, const uint8_t* bgra, uint32_t w, uint32_t h)
+{
+    FILE* f = std::fopen(path, "wb");
+    if (!f) return;
+    const uint32_t bytes = w * h * 4u;
+    uint8_t hdr[54] = { 'B', 'M' };
+    const uint32_t fields[] = { 54u + bytes, 0, 54, 40, w, (uint32_t)-(int32_t)h };
+    std::memcpy(hdr + 2, &fields[0], 4);
+    std::memcpy(hdr + 10, &fields[2], 4);
+    std::memcpy(hdr + 14, &fields[3], 4);
+    std::memcpy(hdr + 18, &fields[4], 4);
+    std::memcpy(hdr + 22, &fields[5], 4);
+    hdr[26] = 1;
+    hdr[28] = 32;
+    std::fwrite(hdr, 1, sizeof hdr, f);
+    std::fwrite(bgra, 1, bytes, f);
+    std::fclose(f);
+}
+
 void vk_present(void*, u32, const rsx_display_buffer* db)
 {
     const uint32_t w = db->width, h = db->height, pitch = db->pitch;
@@ -883,8 +902,46 @@ void vk_present(void*, u32, const rsx_display_buffer* db)
     b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     vkCmdPipelineBarrier2(cmd, &di);
+    static const char* capture = std::getenv("PS3_VK_CAPTURE");
+    static uint64_t flips;
+    const char* capture_path = nullptr;
+    if (capture && ++flips == std::strtoull(capture, const_cast<char**>(&capture_path), 10) && *capture_path == ':') capture_path++;
+    else capture_path = nullptr;
+    VkBuffer cap_buf = VK_NULL_HANDLE;
+    VmaAllocation cap_mem = nullptr;
+    VmaAllocationInfo cap_info{};
+    if (capture_path) {
+        VkBufferCreateInfo bi{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+        bi.size = (VkDeviceSize)w * h * 4u;
+        bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        VmaAllocationCreateInfo ai{};
+        ai.usage = VMA_MEMORY_USAGE_AUTO;
+        ai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+        if (vmaCreateBuffer(g.d.vma, &bi, &ai, &cap_buf, &cap_mem, &cap_info) == VK_SUCCESS) {
+            VkBufferImageCopy rg{};
+            rg.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            rg.imageExtent = { w, h, 1 };
+            vkCmdCopyImageToBuffer(cmd, s.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, cap_buf, 1, &rg);
+            VkMemoryBarrier2 mb{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+            mb.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+            mb.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            mb.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+            mb.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+            VkDependencyInfo hd{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+            hd.memoryBarrierCount = 1;
+            hd.pMemoryBarriers = &mb;
+            vkCmdPipelineBarrier2(cmd, &hd);
+        }
+    }
     g.r.submit(VK_NULL_HANDLE, 0, VK_NULL_HANDLE);
     s.rendered = g.submitted;
+    if (cap_buf) {
+        timeline_wait(g.timeline, s.rendered);
+        vmaInvalidateAllocation(g.d.vma, cap_mem, 0, VK_WHOLE_SIZE);
+        write_bmp(capture_path, static_cast<const uint8_t*>(cap_info.pMappedData), w, h);
+        vmaDestroyBuffer(g.d.vma, cap_buf, cap_mem);
+        std::fprintf(stderr, "[vk] captured flip %llu to %s\n", (unsigned long long)flips, capture_path);
+    }
     {
         std::lock_guard<std::mutex> hold(g.queue_lock);
         g.queued = (int)i;

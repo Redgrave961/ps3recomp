@@ -37,9 +37,7 @@ uint32_t shader_cache::fragment_extent(const uint32_t* ucode, uint32_t max_words
 {
     rsx_spv_fp_info scan{};
     if (rsx_spv_fragment_scan(ucode, max_words, &scan) != 0) return 0;
-    uint32_t end = scan.instructions * 4u;
-    for (uint32_t i = 0; i < scan.constant_count; i++) end = std::max(end, scan.constant_word[i] + 4u);
-    return std::min(end, max_words);
+    return std::min(scan.ucode_words, max_words);
 }
 
 bool shader_cache::make_module(shader& s, const rsx_spv_blob& blob, VkShaderStageFlagBits stage)
