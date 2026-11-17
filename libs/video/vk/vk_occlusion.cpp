@@ -60,17 +60,17 @@ uint32_t occlusion::allocate()
     return q;
 }
 
-void occlusion::begin(VkCommandBuffer cmd)
+void occlusion::begin(VkCommandBuffer cmd, uint32_t scale)
 {
     const uint32_t q = allocate();
     vkCmdBeginQuery(cmd, m_pool, q, m_control);
-    m_segments.push_back(q);
+    m_segments.push_back({ q, scale * scale });
     m_active = true;
 }
 
 void occlusion::end(VkCommandBuffer cmd)
 {
-    vkCmdEndQuery(cmd, m_pool, m_segments.back());
+    vkCmdEndQuery(cmd, m_pool, m_segments.back().query);
     m_active = false;
 }
 
@@ -136,19 +136,19 @@ void occlusion::worker()
         wi.pValues = &j.value;
         vkWaitSemaphores(m_d->dev, &wi, UINT64_MAX);
         if (j.release) {
-            for (uint32_t q : j.queries) vkResetQueryPool(m_d->dev, m_pool, q, 1);
+            for (const segment& g : j.queries) vkResetQueryPool(m_d->dev, m_pool, g.query, 1);
             {
                 std::lock_guard<std::mutex> hold(m_lock);
-                m_free.insert(m_free.end(), j.queries.begin(), j.queries.end());
+                for (const segment& g : j.queries) m_free.push_back(g.query);
             }
             m_freed.notify_all();
             continue;
         }
         uint64_t sum = 0;
-        for (uint32_t q : j.queries) {
+        for (const segment& g : j.queries) {
             uint64_t n = 0;
-            vkGetQueryPoolResults(m_d->dev, m_pool, q, 1, sizeof n, &n, sizeof n, VK_QUERY_RESULT_64_BIT);
-            sum += n;
+            vkGetQueryPoolResults(m_d->dev, m_pool, g.query, 1, sizeof n, &n, sizeof n, VK_QUERY_RESULT_64_BIT);
+            sum += n ? std::max<uint64_t>(n / g.area, 1u) : 0u;
         }
         write_report(j.ea, sum);
         {

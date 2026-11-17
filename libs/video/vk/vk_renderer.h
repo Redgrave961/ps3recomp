@@ -50,6 +50,7 @@ struct surface {
     u32 bpp = 0;
     u32 aa_u = 1;
     u32 aa_v = 1;
+    u32 scale = 1;
     surface_state state = SURFACE_UNINITIALIZED;
     bool gpu_dirty = false;
     u64 last_use = 0;
@@ -66,6 +67,7 @@ struct framebuffer {
     u32 height = 0;
     u32 aa_u = 1;
     u32 aa_v = 1;
+    u32 scale = 1;
     u32 count = 0;
     surface* color[4] = {};
     surface* depth = nullptr;
@@ -88,13 +90,14 @@ public:
     void close();
 
     void flush();
-    void present_source(u32 ea, u32 width, u32 height, u32 pitch, image*& out, VkCommandBuffer& cmd);
+    void present_source(u32 ea, u32 width, u32 height, u32 pitch, image*& out, u32& scale, VkCommandBuffer& cmd);
     void submit(VkSemaphore wait, VkPipelineStageFlags2 wait_stage, VkSemaphore signal);
     void read_back(u32 ea, u32 size);
     void wrote(u32 ea, u32 size);
     void flip_reset();
     bool report(u32 type, u32 ea);
     std::atomic<bool> trace_request{ false };
+    u32 resolution_scale = 1;
 
     static void barrier(VkCommandBuffer cmd, image& img, VkImageLayout layout, VkPipelineStageFlags2 stage, VkAccessFlags2 access);
 
@@ -113,6 +116,7 @@ private:
     void destroy_image(image& img);
     void retire(surface* s);
     void load_surface(surface& s);
+    void scale_blit(VkCommandBuffer c, image& src, image& dst, VkFilter filter);
     void download_surface(surface& s);
 
     vk_device* m_d = nullptr;

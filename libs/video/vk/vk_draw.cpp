@@ -266,6 +266,8 @@ bool renderer::upload_vertices(const rsx::draw_clause& clause, u32 first, u32 co
     }
     layout.clip_planes = planes;
     layout.transform_branch_bits = r(rsx::M_TRANSFORM_BRANCH_BITS);
+    layout.point_size = f(rsx::M_POINT_SIZE);
+    layout.point_scale = (float)m_fb.scale;
 
     data = { slice.buffer, slice.offset, total };
     vk_slice ls = m_ring.alloc(sizeof layout, m_ubo_align);
@@ -484,7 +486,7 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
     fs.fog_param[0] = f(rsx::M_FOG_PARAMS);
     fs.fog_param[1] = f(rsx::M_FOG_PARAMS + 4u);
     const bool bottom = ((window >> 12) & 0xFu) != 0;
-    fs.wpos_scale = bottom ? -1.f : 1.f;
+    fs.wpos_scale = (bottom ? -1.f : 1.f) / (float)m_fb.scale;
     fs.wpos_bias = bottom ? (float)(window & 0xFFFu) : 0.f;
     VkDescriptorImageInfo images[rsx::TEXTURES + rsx::VERTEX_TEXTURES];
     for (u32 u = 0; u < rsx::TEXTURES + rsx::VERTEX_TEXTURES; u++) {
@@ -512,8 +514,9 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
     draw_target t{};
     t.width = m_fb.width;
     t.height = m_fb.height;
-    t.aa_u = m_fb.aa_u;
-    t.aa_v = m_fb.aa_v;
+    t.aa_u = m_fb.aa_u * m_fb.scale;
+    t.aa_v = m_fb.aa_v * m_fb.scale;
+    t.scale = m_fb.scale;
     t.depth = m_fb.depth != nullptr;
     t.stencil = m_fb.depth && (m_fb.depth->img.aspect & VK_IMAGE_ASPECT_STENCIL_BIT);
     for (u32 k = 0; k < 4; k++) t.color_format[k] = m_fb.color_format[k];
@@ -532,7 +535,7 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
 
     begin_rendering();
     VkCommandBuffer c = cmd();
-    if (m_occlusion.enabled() && !m_occlusion.active()) m_occlusion.begin(c);
+    if (m_occlusion.enabled() && !m_occlusion.active()) m_occlusion.begin(c, m_fb.scale);
     vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     set_dynamic_state(c, *this, *m_d, m_pipelines, t, prim, restart && clause.kind == rsx::draw_kind::indexed, key);
 

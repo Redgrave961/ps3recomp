@@ -22,7 +22,8 @@ extern "C" {
 #define SYS_MEMORY_PAGE_SIZE_64K  0x200
 
 /* Maximum tracked allocations */
-#define SYS_MEMORY_ALLOC_MAX      1024
+#define SYS_MEM_USER_TOTAL        (213u * 1024u * 1024u)
+#define SYS_MEMORY_ALLOC_MAX      (SYS_MEM_USER_TOTAL / 0x10000u)
 #define SYS_MEMORY_CONTAINER_MAX  16
 #define SYS_MMAPPER_SHARED_MAX    64
 

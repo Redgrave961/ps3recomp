@@ -427,6 +427,10 @@ bool presenter_build()
     }
     const char* base = SDL_GetBasePath();
     const std::string cache = std::string(base ? base : "") + "vk_pipelines.bin";
+    const char* forced = std::getenv("PS3_RESOLUTION_SCALE");
+    const uint32_t requested = forced ? (uint32_t)std::strtoul(forced, nullptr, 10) : 0u;
+    g.r.resolution_scale = requested ? std::clamp(requested, 1u, 8u) : std::max(1u, (g.pixel_h.load() + 719u) / 720u);
+    std::fprintf(stderr, "[vk] resolution scale %ux (%ux%u for a 1280x720 frame)\n", g.r.resolution_scale, 1280u * g.r.resolution_scale, 720u * g.r.resolution_scale);
     return g.r.open(g.d, g.timeline, &g.submitted, cache.c_str());
 }
 
@@ -870,15 +874,12 @@ void vk_present(void*, u32, const rsx_display_buffer* db)
     }
     slot& s = g.slots[i];
     timeline_wait(g.present_timeline, s.released);
-    if (!slot_reserve(s, w, h)) {
-        g.r.flush();
-        return;
-    }
-
     vk::image* src = nullptr;
+    u32 scale = 1;
     VkCommandBuffer cmd = VK_NULL_HANDLE;
-    g.r.present_source(ea, w, h, pitch, src, cmd);
-    if (!src) {
+    g.r.present_source(ea, w, h, pitch, src, scale, cmd);
+    const uint32_t sw = std::min(w * scale, src ? src->width : 0u), sh = std::min(h * scale, src ? src->height : 0u);
+    if (!src || !slot_reserve(s, sw, sh)) {
         g.r.flush();
         return;
     }
@@ -899,9 +900,9 @@ void vk_present(void*, u32, const rsx_display_buffer* db)
     vkCmdPipelineBarrier2(cmd, &di);
     VkImageBlit region{};
     region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-    region.srcOffsets[1] = { (int32_t)w, (int32_t)h, 1 };
+    region.srcOffsets[1] = { (int32_t)sw, (int32_t)sh, 1 };
     region.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-    region.dstOffsets[1] = { (int32_t)w, (int32_t)h, 1 };
+    region.dstOffsets[1] = { (int32_t)sw, (int32_t)sh, 1 };
     vkCmdBlitImage(cmd, src->handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region,
                    VK_FILTER_NEAREST);
     b.srcStageMask = VK_PIPELINE_STAGE_2_BLIT_BIT;
@@ -921,7 +922,7 @@ void vk_present(void*, u32, const rsx_display_buffer* db)
     VmaAllocationInfo cap_info{};
     if (capture_path) {
         VkBufferCreateInfo bi{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
-        bi.size = (VkDeviceSize)w * h * 4u;
+        bi.size = (VkDeviceSize)sw * sh * 4u;
         bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
         VmaAllocationCreateInfo ai{};
         ai.usage = VMA_MEMORY_USAGE_AUTO;
@@ -929,7 +930,7 @@ void vk_present(void*, u32, const rsx_display_buffer* db)
         if (vmaCreateBuffer(g.d.vma, &bi, &ai, &cap_buf, &cap_mem, &cap_info) == VK_SUCCESS) {
             VkBufferImageCopy rg{};
             rg.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-            rg.imageExtent = { w, h, 1 };
+            rg.imageExtent = { sw, sh, 1 };
             vkCmdCopyImageToBuffer(cmd, s.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, cap_buf, 1, &rg);
             VkMemoryBarrier2 mb{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
             mb.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
@@ -947,7 +948,7 @@ void vk_present(void*, u32, const rsx_display_buffer* db)
     if (cap_buf) {
         timeline_wait(g.timeline, s.rendered);
         vmaInvalidateAllocation(g.d.vma, cap_mem, 0, VK_WHOLE_SIZE);
-        write_bmp(capture_path, static_cast<const uint8_t*>(cap_info.pMappedData), w, h);
+        write_bmp(capture_path, static_cast<const uint8_t*>(cap_info.pMappedData), sw, sh);
         vmaDestroyBuffer(g.d.vma, cap_buf, cap_mem);
         std::fprintf(stderr, "[vk] captured flip %llu to %s\n", (unsigned long long)flips, capture_path);
     }

@@ -11,6 +11,8 @@ namespace {
 
 enum fb_context : u32 { FB_DRAW = 0, FB_CLEAR_COLOR = 1, FB_CLEAR_DEPTH = 2 };
 
+constexpr u32 k_min_scalable = 16;
+
 enum : u32 {
     CLEAR_Z = 0x01u, CLEAR_S = 0x02u, CLEAR_R = 0x10u, CLEAR_G = 0x20u, CLEAR_B = 0x40u, CLEAR_A = 0x80u,
     CLEAR_RGBA = 0xF0u, CLEAR_ANY = 0xF3u,
@@ -77,7 +79,7 @@ bool ranges_overlap(u32 a, u32 an, u32 b, u32 bn)
 
 bool framebuffer::operator==(const framebuffer& o) const
 {
-    if (width != o.width || height != o.height || aa_u != o.aa_u || aa_v != o.aa_v || count != o.count || depth != o.depth ||
+    if (width != o.width || height != o.height || aa_u != o.aa_u || aa_v != o.aa_v || scale != o.scale || count != o.count || depth != o.depth ||
         depth_write != o.depth_write)
         return false;
     for (u32 i = 0; i < 4; i++)
@@ -291,11 +293,12 @@ void renderer::retire(surface* s)
 
 surface* renderer::surface_for(u32 ea, u32 pitch, u32 width, u32 height, u32 format, bool depth, u32 aa_u, u32 aa_v)
 {
+    const u32 scale = std::max(width, height) > k_min_scalable ? resolution_scale : 1u;
     surface* grow_from = nullptr;
     for (auto& p : m_surfaces) {
         surface* s = p.get();
         if (s->ea != ea || s->depth != depth) continue;
-        if (s->gcm_format == format && s->pitch == pitch && s->aa_u == aa_u && s->aa_v == aa_v) {
+        if (s->gcm_format == format && s->pitch == pitch && s->aa_u == aa_u && s->aa_v == aa_v && s->scale == scale) {
             if (s->width >= width && s->height >= height) return s;
             grow_from = s;
         }
@@ -311,6 +314,7 @@ surface* renderer::surface_for(u32 ea, u32 pitch, u32 width, u32 height, u32 for
     s->depth = depth;
     s->aa_u = aa_u;
     s->aa_v = aa_v;
+    s->scale = scale;
     s->bpp = depth ? (format == 1 ? 2u : 4u) : color_bpp(format);
     const bool depth_float = (r(rsx::M_CONTROL0) >> 12) & 1u;
     s->depth_float = depth && depth_float;
@@ -326,7 +330,7 @@ surface* renderer::surface_for(u32 ea, u32 pitch, u32 width, u32 height, u32 for
         aspect = VK_IMAGE_ASPECT_COLOR_BIT;
         usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     }
-    if (!create_image(s->img, vf, s->width * aa_u, s->height * aa_v, usage, aspect)) return nullptr;
+    if (!create_image(s->img, vf, s->width * aa_u * scale, s->height * aa_v * scale, usage, aspect)) return nullptr;
 
     VkCommandBuffer c = cmd();
     if (grow_from) {
@@ -359,11 +363,23 @@ surface* renderer::surface_for(u32 ea, u32 pitch, u32 width, u32 height, u32 for
     return s;
 }
 
+void renderer::scale_blit(VkCommandBuffer c, image& src, image& dst, VkFilter filter)
+{
+    barrier(c, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+    barrier(c, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    VkImageBlit region{};
+    region.srcSubresource = { src.aspect, 0, 0, 1 };
+    region.srcOffsets[1] = { (int32_t)src.width, (int32_t)src.height, 1 };
+    region.dstSubresource = { dst.aspect, 0, 0, 1 };
+    region.dstOffsets[1] = { (int32_t)dst.width, (int32_t)dst.height, 1 };
+    vkCmdBlitImage(c, src.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, filter);
+}
+
 void renderer::load_surface(surface& s)
 {
     VkCommandBuffer c = cmd();
     end_rendering();
-    const u32 w = s.img.width, h = s.img.height;
+    const u32 w = s.img.width / s.scale, h = s.img.height / s.scale;
     const u32 row = w * s.bpp;
     if (!s.depth) {
         const uint8_t* src = vm_base + s.ea;
@@ -402,12 +418,23 @@ void renderer::load_surface(surface& s)
                     break;
                 }
             }
-            barrier(c, s.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+            image native{};
+            image* target = &s.img;
+            if (s.scale > 1u) {
+                if (!create_image(native, s.img.format, w, h, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT))
+                    return;
+                target = &native;
+            }
+            barrier(c, *target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
             VkBufferImageCopy region{};
             region.bufferOffset = slice.offset;
             region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
             region.imageExtent = { w, h, 1 };
-            vkCmdCopyBufferToImage(c, slice.buffer, s.img.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+            vkCmdCopyBufferToImage(c, slice.buffer, target->handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+            if (target == &native) {
+                scale_blit(c, native, s.img, VK_FILTER_LINEAR);
+                m_garbage.emplace_back(*m_submitted + 1u, native);
+            }
             s.state = SURFACE_VALID;
             return;
         }
@@ -429,15 +456,24 @@ void renderer::download_surface(surface& s)
     if (!s.gpu_dirty || s.depth) return;
     VkCommandBuffer c = cmd();
     end_rendering();
-    const u32 w = s.img.width, h = s.img.height, row = w * s.bpp;
+    const u32 w = s.img.width / s.scale, h = s.img.height / s.scale, row = w * s.bpp;
     vk_slice slice = m_ring.alloc((VkDeviceSize)row * h, 16);
     if (!slice.ptr) return;
-    barrier(c, s.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+    image native{};
+    image* source = &s.img;
+    if (s.scale > 1u) {
+        if (!create_image(native, s.img.format, w, h, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT))
+            return;
+        scale_blit(c, s.img, native, VK_FILTER_LINEAR);
+        source = &native;
+    }
+    barrier(c, *source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
     VkBufferImageCopy region{};
     region.bufferOffset = slice.offset;
     region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
     region.imageExtent = { w, h, 1 };
-    vkCmdCopyImageToBuffer(c, s.img.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, slice.buffer, 1, &region);
+    vkCmdCopyImageToBuffer(c, source->handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, slice.buffer, 1, &region);
+    if (source == &native) m_garbage.emplace_back(*m_submitted + 1u, native);
     VkMemoryBarrier2 mb{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
     mb.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
     mb.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
@@ -624,12 +660,16 @@ bool renderer::bind_framebuffer(u32 context)
         fb.color[k] = surface_for(ea, color_pitch[k], width, height, color_fmt, false, aa_u, aa_v);
         if (!fb.color[k]) continue;
         fb.color_format[k] = fb.color[k]->img.format;
+        fb.scale = fb.color[k]->scale;
         fb.count = k + 1u;
     }
     if (zeta_ea) {
         const u32 ea = zeta_ea + zeta_pitch * woy + depth_texel * wox;
         fb.depth = surface_for(ea, zeta_pitch, width, height, depth_fmt ? depth_fmt : 2u, true, aa_u, aa_v);
-        if (fb.depth) fb.depth_format = fb.depth->img.format;
+        if (fb.depth) {
+            fb.depth_format = fb.depth->img.format;
+            fb.scale = fb.depth->scale;
+        }
     }
     if (!(fb == m_fb) || !m_fb_valid) {
         end_rendering();
@@ -670,7 +710,7 @@ void renderer::begin_rendering()
         if (s->img.aspect & VK_IMAGE_ASPECT_STENCIL_BIT) stencil = depth;
     }
     VkRenderingInfo ri{ VK_STRUCTURE_TYPE_RENDERING_INFO };
-    ri.renderArea = { { 0, 0 }, { m_fb.width * m_fb.aa_u, m_fb.height * m_fb.aa_v } };
+    ri.renderArea = { { 0, 0 }, { m_fb.width * m_fb.aa_u * m_fb.scale, m_fb.height * m_fb.aa_v * m_fb.scale } };
     ri.layerCount = 1;
     ri.colorAttachmentCount = m_fb.count;
     ri.pColorAttachments = color;
@@ -742,8 +782,8 @@ void renderer::on_clear(u32 mask)
     }
     if (!count) return;
     begin_rendering();
-    const VkClearRect rect{ { { (int32_t)(x0 * m_fb.aa_u), (int32_t)(y0 * m_fb.aa_v) },
-                              { (x1 - x0) * m_fb.aa_u, (y1 - y0) * m_fb.aa_v } }, 0, 1 };
+    const u32 hx = m_fb.aa_u * m_fb.scale, hy = m_fb.aa_v * m_fb.scale;
+    const VkClearRect rect{ { { (int32_t)(x0 * hx), (int32_t)(y0 * hy) }, { (x1 - x0) * hx, (y1 - y0) * hy } }, 0, 1 };
     vkCmdClearAttachments(cmd(), count, att, 1, &rect);
     stats.clears++;
     m_draw_counter++;
@@ -841,16 +881,18 @@ bool renderer::report(u32 type, u32 ea)
     return true;
 }
 
-void renderer::present_source(u32 ea, u32 width, u32 height, u32 pitch, image*& out, VkCommandBuffer& c)
+void renderer::present_source(u32 ea, u32 width, u32 height, u32 pitch, image*& out, u32& scale, VkCommandBuffer& c)
 {
     c = cmd();
     end_rendering();
     out = nullptr;
+    scale = 1;
     for (auto& p : m_surfaces) {
         surface* s = p.get();
         if (s->depth || s->ea != ea || s->state != SURFACE_VALID) continue;
         if (s->bpp != 4 || s->pitch != pitch) continue;
         out = &s->img;
+        scale = s->scale;
         stats.present_surface++;
         if (m_trace) std::fprintf(stderr, "[trace] scanout surface %08X %ux%u image %ux%u\n", ea, width, height, s->img.width, s->img.height);
         return;

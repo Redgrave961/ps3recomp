@@ -10,6 +10,7 @@ struct draw_target {
     uint32_t height;
     uint32_t aa_u;
     uint32_t aa_v;
+    uint32_t scale;
     bool depth;
     bool stencil;
     bool depth_float;

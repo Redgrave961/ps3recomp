@@ -126,7 +126,9 @@ typedef struct rsx_spv_vertex_layout {
     u32 clip_planes;
     u32 flags;
     u32 transform_branch_bits;
-    u32 reserved[3];
+    float point_size;
+    float point_scale;
+    u32 reserved;
 } rsx_spv_vertex_layout;
 
 typedef struct rsx_spv_texture_state {

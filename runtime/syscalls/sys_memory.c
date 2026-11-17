@@ -19,7 +19,6 @@ sys_mmapper_shared_info  g_sys_mmapper_shared[SYS_MMAPPER_SHARED_MAX];
 uint32_t g_sys_mem_bump_ptr = 0;
 
 /* Total user memory size (default 213 MB, after kernel reservation) */
-#define SYS_MEM_USER_TOTAL  (213 * 1024 * 1024)
 #define SYS_MEMORY_CONTAINER_DEFAULT 0xFFFFFFFFu   /* SYS_MEMORY_CONTAINER_ID_INVALID: the default container */
 
 /* LV2 user memory and mapper reservations occupy separate address domains.

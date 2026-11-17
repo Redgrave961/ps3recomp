@@ -782,9 +782,9 @@ static u32 vp_layout(vpc* c)
     deco1(s, av, DEC_ArrayStride, 16);
     deco1(s, as, DEC_ArrayStride, 16);
     u32 u = tu(s);
-    u32 st_ = intern(s, OpTypeStruct, 0, (const u32[]){ au, av, as, u, u, u, u, u }, 8, 1);
-    static const u32 offs[8] = { 0, 256, 512, 576, 580, 584, 588, 592 };
-    for (u32 m = 0; m < 8; m++) mdeco(s, st_, m, DEC_Offset, offs[m]);
+    u32 st_ = intern(s, OpTypeStruct, 0, (const u32[]){ au, av, as, u, u, u, u, u, tf(s), tf(s) }, 10, 1);
+    static const u32 offs[10] = { 0, 256, 512, 576, 580, 584, 588, 592, 596, 600 };
+    for (u32 m = 0; m < 10; m++) mdeco(s, st_, m, DEC_Offset, offs[m]);
     deco(s, st_, DEC_Block);
     c->ubo_l = gvar(s, st_, SC_Uniform, 0);
     deco1(s, c->ubo_l, DEC_DescriptorSet, 0);
@@ -1298,10 +1298,13 @@ static void vp_epilogue(vpc* c)
         }
         st(s, ov, val);
     }
-    if ((mask & RSX_SPV_VPOUT_POINTSIZE) && (c->written & (1u << 6))) {
+    {
         u32 ps = gvar(s, tf(s), SC_Output, 0);
         deco1(s, ps, DEC_BuiltIn, BI_PointSize);
-        st(s, ps, exf(s, ld(s, T4, c->o[6]), 0));
+        u32 pf = tptr(s, SC_Uniform, tf(s));
+        u32 size = ((mask & RSX_SPV_VPOUT_POINTSIZE) && (c->written & (1u << 6))) ? exf(s, ld(s, T4, c->o[6]), 0)
+                                                                                    : ld(s, tf(s), I(s, OpAccessChain, pf, vp_layout(c), ci(s, 8)));
+        st(s, ps, fmul(s, tf(s), size, ld(s, tf(s), I(s, OpAccessChain, pf, vp_layout(c), ci(s, 9)))));
     }
     u32 qual = 0;
     for (u32 p = 0; p < 6; p++) {

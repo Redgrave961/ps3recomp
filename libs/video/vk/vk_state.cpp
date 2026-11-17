@@ -170,7 +170,7 @@ void set_dynamic_state(VkCommandBuffer cmd, const frontend& f, const vk_device& 
     vkCmdSetScissorWithCount(cmd, 1, &sc);
 
     const uint32_t lw = f.r(rsx::M_LINE_WIDTH);
-    float width = (float)(lw >> 3) + (float)(lw & 7u) / 8.f;
+    float width = ((float)(lw >> 3) + (float)(lw & 7u) / 8.f) * (float)t.scale;
     width = d.features.features.wideLines ? std::clamp(width, d.props.limits.lineWidthRange[0], d.props.limits.lineWidthRange[1]) : 1.f;
     vkCmdSetLineWidth(cmd, width);
 

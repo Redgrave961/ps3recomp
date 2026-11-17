@@ -19,7 +19,7 @@ public:
     bool enabled() const { return m_enabled; }
     bool active() const { return m_active; }
     void enable(bool on) { m_enabled = on; }
-    void begin(VkCommandBuffer cmd);
+    void begin(VkCommandBuffer cmd, uint32_t scale);
     void end(VkCommandBuffer cmd);
     void clear();
     void report(uint32_t ea);
@@ -29,11 +29,15 @@ public:
     void drain();
 
 private:
+    struct segment {
+        uint32_t query;
+        uint32_t area;
+    };
     struct job {
         uint32_t ea;
         bool release;
         uint64_t value;
-        std::vector<uint32_t> queries;
+        std::vector<segment> queries;
     };
 
     void worker();
@@ -45,7 +49,7 @@ private:
     VkQueryControlFlags m_control = 0;
     bool m_enabled = false;
     bool m_active = false;
-    std::vector<uint32_t> m_segments;
+    std::vector<segment> m_segments;
     std::vector<job> m_pending;
 
     std::mutex m_lock;
