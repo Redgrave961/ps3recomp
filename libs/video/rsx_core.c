@@ -64,6 +64,7 @@ static struct {
     volatile u32 flip_status;
     volatile u64 last_flip_time;
     volatile u32 frames;
+    int free_flips;
 
     SRWLOCK vblank_lock;
     CONDITION_VARIABLE vblank_cv;
@@ -652,6 +653,7 @@ void rsx_core_init(u32 local_size, u32 main_size)
     s.sema4097_ctx = RSX_DMA_SEMAPHORE_RW;
     s.report_ctx = RSX_DMA_REPORT_LOCAL;
     s.vsync = 1;
+    s.free_flips = getenv("PS3_FREE_FLIPS") != NULL;
     s.flip_status = 0;
     memset(s.display, 0, sizeof s.display);
     s.display_mask = 0;
@@ -668,6 +670,7 @@ void rsx_core_init(u32 local_size, u32 main_size)
 }
 
 void rsx_core_set_renderer(const rsx_renderer* renderer) { s.renderer = renderer; }
+int rsx_core_free_flips(void) { return s.free_flips; }
 void rsx_core_set_event_sink(rsx_event_sink sink) { s.sink = sink; }
 
 static void rsx_thread(LPTHREAD_START_ROUTINE fn, SIZE_T stack, int priority, const wchar_t* name)
@@ -729,6 +732,11 @@ void rsx_core_read_back(u32 ea, u32 size)
 void rsx_core_wrote(u32 ea, u32 size)
 {
     if (s.renderer && s.renderer->wrote) s.renderer->wrote(s.renderer->user, ea, size);
+}
+
+int rsx_core_blit(const rsx_blit* b)
+{
+    return s.renderer && s.renderer->blit && s.renderer->blit(s.renderer->user, b);
 }
 
 int rsx_io_map(u32 ea, u32 io, u32 size)

@@ -51,6 +51,17 @@ typedef struct rsx_display_buffer {
     u32 height;
 } rsx_display_buffer;
 
+typedef struct rsx_blit {
+    u32 src_ea;
+    u32 src_pitch;
+    float src_x0, src_y0, src_x1, src_y1;
+    u32 dst_ea;
+    u32 dst_pitch;
+    u32 dst_x, dst_y, dst_w, dst_h;
+    u32 bpp;
+    int bilinear;
+} rsx_blit;
+
 typedef struct rsx_renderer {
     void* user;
     int  (*open)(void* user);
@@ -62,6 +73,7 @@ typedef struct rsx_renderer {
     void (*present)(void* user, u32 buffer, const rsx_display_buffer* display);
     void (*read_back)(void* user, u32 ea, u32 size);
     void (*wrote)(void* user, u32 ea, u32 size);
+    int  (*blit)(void* user, const rsx_blit* b);
     void (*vblank)(void* user, u64 count);
     void (*close)(void* user);
 } rsx_renderer;
@@ -91,6 +103,7 @@ int  rsx_core_display_buffer(u32 id, rsx_display_buffer* out);
 u32  rsx_core_display_buffer_count(void);
 u32  rsx_core_current_display_buffer(void);
 void rsx_core_set_vsync(int vsync);
+int  rsx_core_free_flips(void);
 void rsx_core_flip_immediate(u32 buffer);
 u32  rsx_core_flip_status(void);
 void rsx_core_set_flip_status(u32 status);
@@ -106,6 +119,7 @@ void rsx_core_raise(enum rsx_event event, u32 arg);
 void rsx_mem_store(u32 ea, const void* src, u32 size);
 void rsx_core_read_back(u32 ea, u32 size);
 void rsx_core_wrote(u32 ea, u32 size);
+int rsx_core_blit(const rsx_blit* b);
 
 #ifdef __cplusplus
 }
