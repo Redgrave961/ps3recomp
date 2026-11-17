@@ -1009,11 +1009,10 @@ static void resv_check_reg(ppu_context* self)
 extern "C" void ppu_ww_note_atomic(uint32_t ea, uint32_t val, int width, void* ra);
 extern "C" uint32_t g_ww_lo, g_ww_hi;
 
-extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
+extern "C" int ppu_stwcx32(ppu_context* self, uint64_t ea, uint32_t expected, uint32_t val)
 {
     uint32_t exp_raw = __builtin_bswap32(expected);
     uint32_t new_raw = __builtin_bswap32(val);
-    ppu_context* self = g_active_ctx;
     if (resv_diag() && self) resv_check_reg(self);
     volatile LONG* L = resv_slot(ea);
     resv_lock(L);
@@ -1097,11 +1096,10 @@ extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
         ppu_ww_note_atomic((uint32_t)ea, val, 4, __builtin_return_address(0));
     return ok;
 }
-extern "C" int ppu_stdcx64(uint64_t ea, uint64_t expected, uint64_t val)
+extern "C" int ppu_stdcx64(ppu_context* self, uint64_t ea, uint64_t expected, uint64_t val)
 {
     uint64_t exp_raw = __builtin_bswap64(expected);
     uint64_t new_raw = __builtin_bswap64(val);
-    ppu_context* self = g_active_ctx;
     if (resv_diag() && self) resv_check_reg(self);
     volatile LONG* L = resv_slot(ea);   /* ea and ea+4 share a 16-byte-block slot */
     resv_lock(L);
