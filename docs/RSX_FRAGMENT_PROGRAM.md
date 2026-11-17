@@ -1,7 +1,7 @@
 # RSX Fragment Program (NV40 ISA) → HLSL
 
-Reference + status for the RSX fragment-program decompiler
-(`libs/video/rsx_fp_decompiler.{h,c}`). The RSX fragment shader ISA is the
+Encoding reference for the RSX fragment-program translator
+(`libs/video/rsx_spirv.c`). The RSX fragment shader ISA is the
 NVIDIA NV40 ("nvfx") fragment program encoding. Authoritative source for the
 bit layout: Mesa/nouveau `src/gallium/drivers/nouveau/nv30/nvfx_shader.h`.
 

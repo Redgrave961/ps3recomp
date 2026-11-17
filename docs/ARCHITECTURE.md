@@ -139,7 +139,7 @@ cellGcmSys (HLE)  →  RSX Command Processor  →  Renderer
 
 1. **cellGcmSys** manages the interface between game code and the GPU: command buffer control, display buffers, memory mapping, flip/VBlank, tile/zcull configuration.
 
-2. **RSX Command Processor** (`rsx_commands.c`) parses the NV47xx FIFO command buffer and tracks GPU state: surfaces, viewport, blend, depth/stencil, textures (16 units), vertex attributes (16), shader programs, draw commands.
+2. **RSX Command Processor** (`rsx_core.c`, `vk/rsx_frontend.cpp`) parses the NV47xx FIFO command buffer and tracks GPU state: surfaces, viewport, blend, depth/stencil, textures (16 units), vertex attributes (16), shader programs, draw commands.
 
 3. **Renderer** receives state changes and draw calls from the command processor.
 

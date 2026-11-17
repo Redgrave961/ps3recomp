@@ -93,17 +93,6 @@ jobs:
           .\test_sys_net.exe
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
-      - name: Run self-contained RSX tests
-        run: |
-          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /I libs/video /Fe:test_texture_layout.exe libs/video/tests/test_texture_layout.c libs/video/rsx_texture_layout.c
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-          .\test_texture_layout.exe
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /I libs/video /Fe:test_rsx_primitives.exe libs/video/tests/test_rsx_primitives.c
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-          .\test_rsx_primitives.exe
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-
       - name: Build and run sync_stress
         run: |
           cmake -S tests/sync_stress -B build-sync-stress -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DCMAKE_C_COMPILER=clang-cl

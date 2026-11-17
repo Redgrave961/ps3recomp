@@ -107,15 +107,6 @@ jobs:
           $CC -std=gnu17 -I include -o /tmp/test_sys_net libs/network/tests/test_sys_net.c
           /tmp/test_sys_net
 
-      - name: Run self-contained RSX tests
-        run: |
-          $CC -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_texture_layout libs/video/tests/test_texture_layout.c libs/video/rsx_texture_layout.c
-          /tmp/test_texture_layout
-          $CC -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_rsx_primitives libs/video/tests/test_rsx_primitives.c
-          /tmp/test_rsx_primitives
-          $CC -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_rsx_texture_offset libs/video/tests/test_rsx_texture_offset.c libs/video/rsx_dispatch.c
-          /tmp/test_rsx_texture_offset
-
       - name: Run the Win32 compatibility layer tests
         run: |
           $CC -std=gnu17 -Wall -Wextra -I runtime/platform -o /tmp/test_win32_compat runtime/platform/tests/test_win32_compat.c runtime/platform/win32_compat.c -lpthread

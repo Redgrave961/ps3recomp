@@ -7,4 +7,3 @@
 # if a name collides across modules with different correctness, split the
 # heuristic rather than fight the collision here.
 
-rsx_dsp_fragment_program	host-only internal RSX-dispatch accessor (libs/video/rsx_dispatch.c); `location` out-param is filled from register state and never written to or read from guest vm memory, so guest-endianness does not apply.
