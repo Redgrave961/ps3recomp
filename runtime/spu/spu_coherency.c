@@ -25,9 +25,23 @@ extern "C" {
 
 #include "../platform/ps3_sync.h"
 
-static ps3_lock g_lockline;
-void spu_lockline_lock(void)   { ps3_lock_acquire(&g_lockline); }
-void spu_lockline_unlock(void) { ps3_lock_release(&g_lockline); }
+static struct { ps3_lock lock; uint32_t seq; } g_lockline;
+void spu_lockline_lock(void)
+{
+    ps3_lock_acquire(&g_lockline.lock);
+    __atomic_store_n(&g_lockline.seq, g_lockline.seq + 1, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+}
+void spu_lockline_unlock(void)
+{
+    __atomic_store_n(&g_lockline.seq, g_lockline.seq + 1, __ATOMIC_RELEASE);
+    ps3_lock_release(&g_lockline.lock);
+}
+int spu_lockline_unchanged(uint32_t seq)
+{
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    return __atomic_load_n(&g_lockline.seq, __ATOMIC_RELAXED) == seq;
+}
 
 /* ===========================================================================
  * The reserved-line bitmap
@@ -232,13 +246,9 @@ __attribute__((weak)) void ppu_resv_break_line(uint32_t ea) { (void)ea; }
  * store and the load on both sides, the two fences are ordered, so at least
  * one side sees the other. Either the reader's copy already holds the write
  * (an ordinary GETLLAR after the store), or the writer sees the reservation
- * and ends it -- the reader may then hold a stale or torn copy, but its
- * PUTLLC fails and it has SPU_EVENT_LR, exactly as for a write landing just
- * after a locked GETLLAR. A writer that loads stale resv_valid/resv_ea is one
- * whose fence came first, so the copy already holds its data; at worst it
- * ends the new reservation spuriously. What the reader gives up is a copy
- * atomic against a writer's multi-store critical section, but such a copy is
- * always followed by that writer's notify, so the reservation is ended.
+ * and ends it. A writer that loads stale resv_valid/resv_ea is one whose fence
+ * came first, so the copy already holds its data; at worst it ends the new
+ * reservation spuriously.
  *
  * Two preconditions keep every writer of the line on that right-hand side:
  *  - the line is already marked. Marks are never cleared, so every store path
@@ -249,8 +259,7 @@ __attribute__((weak)) void ppu_resv_break_line(uint32_t ea) { (void)ea; }
  * Anything else takes the lock and spu_coh_reserve as before.
  *
  * Writers still hold the lock-line lock, so they stay serialized with each
- * other and with PUTLLC's compare-and-commit; only the reader stopped
- * waiting. resv_valid and resv_ea are accessed atomically on both sides of
+ * other and with PUTLLC's compare-and-commit. resv_valid and resv_ea are accessed atomically on both sides of
  * the race; everything else about a reservation is still only touched by the
  * owning thread or under the lock.
  * ===========================================================================*/
@@ -262,7 +271,7 @@ static inline int spu_coh_holds(const spu_context* c, uint32_t line)
            (__atomic_load_n(&c->resv_ea, __ATOMIC_RELAXED) & ~127u) == line;
 }
 
-int spu_coh_reserve_fast(spu_context* ctx, uint32_t ea)
+int spu_coh_reserve_fast(spu_context* ctx, uint32_t ea, uint32_t* seq)
 {
     if (!ctx || !__atomic_load_n(&ctx->coh_listed, __ATOMIC_RELAXED) ||
         !spu_coh_is_reserved(ea))
@@ -273,7 +282,8 @@ int spu_coh_reserve_fast(spu_context* ctx, uint32_t ea)
     __atomic_store_n(&ctx->resv_ea, ea, __ATOMIC_RELAXED);
     __atomic_store_n(&ctx->resv_valid, 1, __ATOMIC_RELAXED);
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    return 1;
+    *seq = __atomic_load_n(&g_lockline.seq, __ATOMIC_ACQUIRE);
+    return !(*seq & 1u);
 }
 
 void spu_coh_notify_write_except(uint32_t ea, const void* self)

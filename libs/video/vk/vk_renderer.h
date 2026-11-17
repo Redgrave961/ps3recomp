@@ -170,7 +170,7 @@ private:
         image img;
         u32 stamp = 0;
         u64 checked = 0;
-        uint64_t content = 0;
+        u64 used = 0;
     };
     struct unit_binding {
         bool valid = false;
@@ -192,6 +192,7 @@ private:
     std::vector<u32> m_page_stamp;
     u32 m_stamp = 1;
     u64 m_epoch = 1;
+    u64 m_flips = 0;
     std::vector<rsx::texture_copy> m_copies;
 
 public:

@@ -7,6 +7,13 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <fcntl.h>
+#include <linux/fs.h>
+#include <linux/userfaultfd.h>
+#include <sys/ioctl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #endif
 
 namespace vk {
@@ -31,6 +38,69 @@ u32 texel_bytes(VkFormat f)
     }
 }
 
+#ifdef _WIN32
+bool scan_writes(u32 base, u32 bytes, std::vector<u32>& stamps, u32& clock)
+{
+    thread_local std::vector<PVOID> pages(1u << 16);
+    for (;;) {
+        ULONG_PTR count = pages.size();
+        DWORD granularity = 0;
+        if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, vm_base + base, bytes, pages.data(), &count, &granularity) != 0) return false;
+        if (count) {
+            const u32 s = ++clock;
+            for (ULONG_PTR i = 0; i < count; i++) stamps[(u32)(static_cast<uint8_t*>(pages[i]) - vm_base) >> k_page_shift] = s;
+        }
+        if (count < pages.size()) return true;
+    }
+}
+#else
+struct write_tracker {
+    int uffd = -1;
+    int pagemap = -1;
+    bool ok = false;
+
+    write_tracker()
+    {
+        constexpr uint64_t span = 1ull << 32;
+        uffd = (int)syscall(__NR_userfaultfd, O_CLOEXEC | O_NONBLOCK);
+        if (uffd < 0) return;
+        uffdio_api api{ UFFD_API, UFFD_FEATURE_WP_ASYNC | UFFD_FEATURE_WP_UNPOPULATED, 0 };
+        uffdio_register reg{ { (uintptr_t)vm_base, span }, UFFDIO_REGISTER_MODE_WP, 0 };
+        uffdio_writeprotect wp{ { (uintptr_t)vm_base, span }, UFFDIO_WRITEPROTECT_MODE_WP };
+        if (ioctl(uffd, UFFDIO_API, &api) || ioctl(uffd, UFFDIO_REGISTER, &reg) || ioctl(uffd, UFFDIO_WRITEPROTECT, &wp)) return;
+        pagemap = open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
+        ok = pagemap >= 0;
+    }
+};
+
+bool scan_writes(u32 base, u32 bytes, std::vector<u32>& stamps, u32& clock)
+{
+    static const write_tracker tracker;
+    if (!tracker.ok) return false;
+    page_region regions[32];
+    pm_scan_arg arg{};
+    arg.size = sizeof arg;
+    arg.flags = PM_SCAN_WP_MATCHING | PM_SCAN_CHECK_WPASYNC;
+    arg.start = (uintptr_t)(vm_base + base);
+    arg.end = arg.start + bytes;
+    arg.vec = (uintptr_t)regions;
+    arg.vec_len = 32;
+    arg.category_mask = PAGE_IS_WRITTEN;
+    arg.return_mask = PAGE_IS_WRITTEN;
+    for (;;) {
+        const long n = ioctl(tracker.pagemap, PAGEMAP_SCAN, &arg);
+        if (n < 0) return false;
+        if (n) {
+            const u32 s = ++clock;
+            for (long i = 0; i < n; i++)
+                for (uint64_t a = regions[i].start; a < regions[i].end; a += 1u << k_page_shift)
+                    stamps[(u32)(a - (uintptr_t)vm_base) >> k_page_shift] = s;
+        }
+        if (arg.walk_end >= arg.end) return true;
+        arg.start = arg.walk_end;
+    }
+}
+#endif
 uint64_t mix(uint64_t h, uint64_t v)
 {
     h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
@@ -65,37 +135,13 @@ void renderer::mark_written(u32 ea, u32 size)
 
 bool renderer::memory_changed(u32 ea, u32 size, u32 stamp)
 {
-#ifdef _WIN32
     if (m_page_stamp.empty()) m_page_stamp.assign(1u << (32 - k_page_shift), 0u);
-    static thread_local std::vector<PVOID> pages(1u << 16);
-    auto scan = [&](u32 base, u32 bytes) {
-        for (;;) {
-            ULONG_PTR count = pages.size();
-            DWORD granularity = 0;
-            if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, vm_base + base, bytes, pages.data(), &count, &granularity) != 0) return false;
-            if (count) {
-                const u32 s = ++m_stamp;
-                for (ULONG_PTR i = 0; i < count; i++) {
-                    const uint64_t page = (uint64_t)(static_cast<uint8_t*>(pages[i]) - vm_base) >> k_page_shift;
-                    if (page < m_page_stamp.size()) m_page_stamp[page] = s;
-                }
-            }
-            if (count < pages.size()) return true;
-        }
-    };
     const u32 mask = (1u << k_page_shift) - 1u;
-    if (!scan(ea & ~mask, ((ea & mask) + size + mask) & ~mask)) return true;
+    if (!scan_writes(ea & ~mask, ((ea & mask) + size + mask) & ~mask, m_page_stamp, m_stamp)) return true;
     for (uint64_t p = ea >> k_page_shift; p <= ((uint64_t)ea + size - 1u) >> k_page_shift; p++)
         if (m_page_stamp[p] > stamp) return true;
     return false;
-#else
-    if (m_page_stamp.empty()) return false;
-    for (uint64_t p = ea >> k_page_shift; p <= ((uint64_t)ea + size - 1u) >> k_page_shift && p < m_page_stamp.size(); p++)
-        if (m_page_stamp[p] > stamp) return true;
-    return false;
-#endif
 }
-
 VkImageView renderer::view_for(image& img, VkImageViewType type, VkFormat format, VkImageAspectFlags aspect, const VkComponentMapping& swizzle)
 {
     const uint64_t key = swizzle_key(type, format, aspect, swizzle);
@@ -318,11 +364,13 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
     const uint64_t key = texture_key(d, ea);
     auto it = m_textures.find(key);
     texture_entry* e = it != m_textures.end() ? it->second.get() : nullptr;
+    if (e) e->used = m_flips;
     bool upload = false;
     if (!e) {
         auto made = std::make_unique<texture_entry>();
         e = made.get();
         e->ea = ea;
+        e->used = m_flips;
         e->size = d.guest_size;
         e->key = key;
         VkImageCreateInfo ii{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };

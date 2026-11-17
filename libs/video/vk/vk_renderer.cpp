@@ -917,6 +917,15 @@ void renderer::flip_reset()
     end_rendering();
     frontend::reset();
     m_fb_valid = false;
+    if ((++m_flips & 255u) == 0)
+        for (auto it = m_textures.begin(); it != m_textures.end();) {
+            if (m_flips - it->second->used <= 1800u) {
+                ++it;
+                continue;
+            }
+            m_garbage.emplace_back(*m_submitted + 1u, it->second->img);
+            it = m_textures.erase(it);
+        }
 }
 
 }

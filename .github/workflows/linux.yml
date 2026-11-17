@@ -142,7 +142,7 @@ jobs:
         run: |
           $CC -std=gnu17 -I include -I runtime/spu -o /tmp/test_spu_coherency runtime/spu/tests/test_spu_coherency.c
           /tmp/test_spu_coherency
-          for t in test_spu_lockline_peer test_spu_mfc_slots; do
+          for t in test_spu_lockline_peer test_spu_getllar_snapshot test_spu_mfc_slots; do
             $CC -std=gnu17 -I include -I runtime/spu -I runtime/platform -o /tmp/$t \
               runtime/spu/tests/$t.c \
               runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c runtime/spu/spu_coherency.c \
