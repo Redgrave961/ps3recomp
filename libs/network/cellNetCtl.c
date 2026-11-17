@@ -156,12 +156,10 @@ s32 cellNetCtlGetState(s32* state)
 
     if (!netctl_online()) {
         vm_write32((uint32_t)(uintptr_t)state, CELL_NET_CTL_STATE_Disconnected);
-        printf("[cellNetCtl] GetState() -> Disconnected\n");
         return CELL_OK;
     }
 
     vm_write32((uint32_t)(uintptr_t)state, CELL_NET_CTL_STATE_IPObtained);
-    printf("[cellNetCtl] GetState() -> IPObtained\n");
     return CELL_OK;
 }
 

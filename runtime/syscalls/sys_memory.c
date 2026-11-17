@@ -167,7 +167,6 @@ static int64_t memory_allocate(const ppu_context* ctx, uint64_t requested, uint3
     if (ct) ct->used_size += size;
     if (addr + size > g_sys_mem_bump_ptr) g_sys_mem_bump_ptr = addr + size;
     bump_unlock();
-    fprintf(stderr, "[sys_memory] allocate(size=0x%X, flags=0x%X, cid=%u) -> 0x%08X\n", size, flags, cid, addr);
     if (addr_out) write_be32(addr_out, addr);
     return CELL_OK;
 }

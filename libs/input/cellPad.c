@@ -92,6 +92,7 @@ typedef struct {
     u8   press_square;
     u8   press_l1;
     u8   press_r1;
+    u16  sensor[4];
 } PadHostState;
 
 static int           s_pad_initialized = 0;
@@ -122,9 +123,11 @@ static int s_sdl_inited = 0;
  * A pad unplugged mid-game kept its last report the same way. */
 static void pad_host_release(PadHostState* hs)
 {
+    static const u16 sensor_rest[4] = { 512, 399, 512, 512 };
     memset(hs, 0, sizeof(*hs));
     hs->analog_lx = hs->analog_ly = 128;
     hs->analog_rx = hs->analog_ry = 128;
+    memcpy(hs->sensor, sensor_rest, sizeof hs->sensor);
 }
 
 /* One poll at a time: the guest polls from several threads, and a poll that
@@ -520,6 +523,20 @@ static u8 pad_sdl_trigger_to_u8(int raw)
     return (u8)val;
 }
 
+static u16 pad_sensor_word(float v)
+{
+    return (u16)fminf(fmaxf(v, 0.0f), 1023.0f);
+}
+
+static void pad_sdl_sensors(SDL_Gamepad* gp, u16* s)
+{
+    float a[3], g[3];
+    if (SDL_GetGamepadSensorData(gp, SDL_SENSOR_ACCEL, a, 3))
+        for (int k = 0; k < 3; k++) s[k] = pad_sensor_word(a[k] / SDL_STANDARD_GRAVITY * -113.0f + 512.0f);
+    if (SDL_GetGamepadSensorData(gp, SDL_SENSOR_GYRO, g, 3))
+        s[3] = pad_sensor_word(g[1] * (180.0f / SDL_PI_F) * (123.0f / 90.0f) + 512.0f);
+}
+
 /* Send port i's rumble state to its controller, with a fresh duration. */
 static void pad_sdl_rumble_send(int i)
 {
@@ -595,6 +612,8 @@ static void pad_sdl_scan(void)
         s_sdl_had[port] = 1;
         memset(&s_rumble[port], 0, sizeof s_rumble[port]);   /* nothing left over from before */
         SDL_RumbleGamepad(gp, 0, 0, 0);
+        SDL_SetGamepadSensorEnabled(gp, SDL_SENSOR_ACCEL, true);
+        SDL_SetGamepadSensorEnabled(gp, SDL_SENSOR_GYRO, true);
         const char* name = SDL_GetGamepadName(gp);
         const bool rumble = SDL_GetBooleanProperty(SDL_GetGamepadProperties(gp),
                                                    SDL_PROP_GAMEPAD_CAP_RUMBLE_BOOLEAN, false);
@@ -697,6 +716,9 @@ static void pad_poll_sdl(void)
         s_host_state[i].press_square   = (btns & CELL_PAD_CTRL_SQUARE)   ? 255 : 0;
         s_host_state[i].press_l1       = (btns & CELL_PAD_CTRL_L1)       ? 255 : 0;
         s_host_state[i].press_r1       = (btns & CELL_PAD_CTRL_R1)       ? 255 : 0;
+
+        if (s_port_setting[i] & CELL_PAD_SETTING_SENSOR_ON)
+            pad_sdl_sensors(gp, s_host_state[i].sensor);
     }
 }
 
@@ -1086,14 +1108,8 @@ s32 cellPadGetData(u32 port_no, CellPadData* data_guest)
                 data->button[pm[k].off] = 255;
     }
 
-    /* Sensor data (only meaningful if SENSOR_ON) */
-    if (setting & CELL_PAD_SETTING_SENSOR_ON) {
-        /* Default sensor values: accelerometer at rest (512 = 1g center) */
-        data->button[CELL_PAD_BTN_OFFSET_SENSOR_X] = 512;
-        data->button[CELL_PAD_BTN_OFFSET_SENSOR_Y] = 399; /* gravity */
-        data->button[CELL_PAD_BTN_OFFSET_SENSOR_Z] = 512;
-        data->button[CELL_PAD_BTN_OFFSET_SENSOR_G] = 512;
-    }
+    if (setting & CELL_PAD_SETTING_SENSOR_ON)
+        memcpy(&data->button[CELL_PAD_BTN_OFFSET_SENSOR_X], hs->sensor, sizeof hs->sensor);
     }  /* end connected block */
 
 emit:
