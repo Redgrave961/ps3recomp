@@ -14,6 +14,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include "ps3emu/log_first.h"
+#include <errno.h>
 #ifdef __APPLE__
 #include <mach/mach_time.h>
 #endif
@@ -34,22 +35,6 @@ static void ensure_qpc_init(void)
         QueryPerformanceFrequency(&s_qpc_freq);
         s_qpc_init = 1;
     }
-}
-
-int64_t lv2_usec_deadline(uint64_t usec)
-{
-    LARGE_INTEGER now;
-    ensure_qpc_init();
-    QueryPerformanceCounter(&now);
-    return now.QuadPart +
-        (int64_t)((usec * (uint64_t)s_qpc_freq.QuadPart) / 1000000ULL);
-}
-
-int lv2_deadline_passed(int64_t deadline)
-{
-    LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
-    return now.QuadPart >= deadline;
 }
 #endif
 

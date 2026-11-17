@@ -1,7 +1,7 @@
 """spbalance.py - find stack-imbalance bugs in lifted PPU output.
 
 Lifted functions form "logical functions": an entry (with a prologue
-`gpr[1] += -N`) plus tail-entry continuations reached via `g_trampoline_fn`.
+`gpr[1] += -N`) plus tail-entry continuations reached via `PPU_TAIL` tail calls.
 Only the entry allocates the frame; some continuation restores it before a real
 `return`. A balanced logical function restores exactly what the entry allocated
 on every real-return path.
@@ -17,7 +17,7 @@ import glob, os, re, sys, collections
 ALLOC = re.compile(r'ctx->gpr\[1\] \+= -(0x[0-9A-Fa-f]+);')
 REST  = re.compile(r'ctx->gpr\[1\] = \(int64_t\)\(int32_t\)\(ctx->gpr\[1\] \+ (0x[0-9A-Fa-f]+)\)')
 SIG   = re.compile(r'^void (func_[0-9A-Fa-f]{8})\(ppu_context\* ctx\) \{')
-TRAMP = re.compile(r'g_trampoline_fn = \(void\(\*\)\(void\*\)\)(func_[0-9A-Fa-f]{8})')
+TRAMP = re.compile(r'PPU_TAIL return (func_[0-9A-Fa-f]{8})\(ctx\)')
 
 def parse(d):
     """name -> dict(alloc, real_restores=[ints], tramps=set(names), has_real_ret)"""
@@ -30,13 +30,13 @@ def parse(d):
                 alloc += int(m.group(1), 16)
             tramps = set(TRAMP.findall('\n'.join(body)))
             real = []
-            # a `return;` not on a line that set g_trampoline_fn is a real return;
+            # a `return;` not on a tail-call line is a real return;
             # capture the most recent restore before it
             last_rest = 0
             for ln in body:
                 rm = REST.search(ln)
                 if rm: last_rest = int(rm.group(1), 16)
-                if re.search(r'\breturn;', ln) and 'g_trampoline_fn' not in ln:
+                if re.search(r'\breturn;', ln) and 'PPU_TAIL' not in ln:
                     real.append(last_rest); last_rest = 0
             funcs[name] = dict(alloc=alloc, real=real, tramps=tramps,
                                has_real=bool(real))

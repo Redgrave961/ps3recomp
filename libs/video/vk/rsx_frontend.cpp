@@ -3,14 +3,34 @@
 
 #include <algorithm>
 #include <cstring>
+#include <iterator>
 
 namespace rsx {
 
 namespace {
 
+struct vertex_method {
+    u32 base;
+    u32 regs_per_attribute;
+    u32 size;
+    u32 type;
+    u32 bytes;
+};
+
+const vertex_method k_vertex_methods[] = {
+    { M_VERTEX_DATA_SCALED4S, 2u, 4u, VT_S1, 2u },
+    { M_VERTEX_DATA3F, 4u, 3u, VT_F, 4u },
+    { M_VERTEX_DATA2F, 2u, 2u, VT_F, 4u },
+    { M_VERTEX_DATA2S, 1u, 2u, VT_S32K, 2u },
+    { M_VERTEX_DATA4UB, 1u, 4u, VT_UB, 1u },
+    { M_VERTEX_DATA4S, 2u, 4u, VT_S32K, 2u },
+    { M_VERTEX_DATA4F, 4u, 4u, VT_F, 4u },
+    { M_VERTEX_DATA1F, 1u, 1u, VT_F, 4u },
+};
+
 struct groups {
     u16 bits[REG_COUNT] = {};
-    u8 texture[REG_COUNT] = {};
+    u8 vertex[REG_COUNT] = {};
 
     void mark(u32 first, u32 last, u32 bit)
     {
@@ -82,15 +102,19 @@ struct groups {
         mark(M_TEXTURE_CONTROL3, M_TEXTURE_CONTROL3 + 0x3Cu, D_TEXTURES);
         mark(M_TEXTURE_CONTROL2, M_TEXTURE_CONTROL2 + 0x3Cu, D_TEXTURES);
         mark(M_VTEX_OFFSET, M_VTEX_OFFSET + 0x7Cu, D_VERTEX_TEXTURES);
-        for (u32 u = 0; u < TEXTURES; u++) {
-            for (u32 w = 0; w < 8u; w++) texture[(M_TEXTURE_OFFSET >> 2) + u * 8u + w] = (u8)(u + 1u);
-            texture[(M_TEXTURE_CONTROL3 >> 2) + u] = (u8)(u + 1u);
-            texture[(M_TEXTURE_CONTROL2 >> 2) + u] = (u8)(u + 1u);
-        }
+        for (u32 v = 0; v < std::size(k_vertex_methods); v++)
+            for (u32 m = k_vertex_methods[v].base; m < k_vertex_methods[v].base + ATTRIBS * k_vertex_methods[v].regs_per_attribute * 4u; m += 4u)
+                vertex[m >> 2] = (u8)(v + 1u);
     }
 };
 
 const groups k_groups;
+
+const vertex_method* find_vertex_method(u32 m)
+{
+    const u8 v = k_groups.vertex[m >> 2];
+    return v ? &k_vertex_methods[v - 1u] : nullptr;
+}
 
 u32 swap(u32 v) { return __builtin_bswap32(v); }
 
@@ -103,31 +127,6 @@ u32 words_per_vertex(u32 type, u32 size)
     }
 }
 
-struct vertex_method {
-    u32 base;
-    u32 regs_per_attribute;
-    u32 size;
-    u32 type;
-    u32 bytes;
-};
-
-const vertex_method k_vertex_methods[] = {
-    { M_VERTEX_DATA_SCALED4S, 2u, 4u, VT_S1, 2u },
-    { M_VERTEX_DATA3F, 4u, 3u, VT_F, 4u },
-    { M_VERTEX_DATA2F, 2u, 2u, VT_F, 4u },
-    { M_VERTEX_DATA2S, 1u, 2u, VT_S32K, 2u },
-    { M_VERTEX_DATA4UB, 1u, 4u, VT_UB, 1u },
-    { M_VERTEX_DATA4S, 2u, 4u, VT_S32K, 2u },
-    { M_VERTEX_DATA4F, 4u, 4u, VT_F, 4u },
-    { M_VERTEX_DATA1F, 1u, 1u, VT_F, 4u },
-};
-
-const vertex_method* find_vertex_method(u32 m)
-{
-    for (const vertex_method& v : k_vertex_methods)
-        if (m >= v.base && m < v.base + ATTRIBS * v.regs_per_attribute * 4u) return &v;
-    return nullptr;
-}
 
 }
 
@@ -148,7 +147,6 @@ void frontend::reset()
     flush_ranges();
     for (const reg_default& d : k_flip_defaults) reg[d.method >> 2] = d.value;
     dirty = D_ALL;
-    texture_dirty = 0xFFFFu;
 }
 
 void frontend::flush_ranges()
@@ -166,7 +164,6 @@ void frontend::store(u32 method, u32 value)
     if (in_begin_end && bits) flush_ranges();
     reg[i] = value;
     dirty |= bits;
-    if (const u32 unit = k_groups.texture[i]) texture_dirty |= 1u << (unit - 1u);
 }
 
 void frontend::push_vertex(u32 index, u32 sub, u32 size, u32 type, u32 value)
@@ -278,8 +275,6 @@ u32 frontend::constant_methods(u32 index, u32 inc, const u32* be, u32 count)
     if (!changed) return count;
     if (in_begin_end) flush_ranges();
     for (u32 i = 0; i < w; i++) constants[first + i] = swap(be[skip + i]);
-    constants_lo = std::min(constants_lo, first >> 2);
-    constants_hi = std::max(constants_hi, (first + w + 3u) >> 2);
     dirty |= D_VERTEX_CONSTANTS;
     return count;
 }

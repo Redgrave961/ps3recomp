@@ -17,9 +17,8 @@ root = Path(__file__).resolve().parents[1]
 sources = ['runtime/spu/tests/test_spu_channel_semantics.c',
            'runtime/spu/spu_drain.c', 'runtime/spu/spu_lockstep.c',
            'runtime/spu/spu_coherency.c', 'runtime/spu/spu_workload.c',
-           'runtime/spu/spu_vm_pagemap.c',
            'runtime/spu/spu_interp.c',
-           'runtime/platform/win32_compat.c']
+           'runtime/platform/win32_compat.c', 'runtime/platform/ps3_sync.c', 'runtime/spu/tests/spu_fixture_ppu.c']
 env = {k: v for k, v in os.environ.items()
        if not k.startswith(('SPU_', 'SPURS_'))}
 with tempfile.TemporaryDirectory(prefix='spu-channel-semantics-') as tmp:

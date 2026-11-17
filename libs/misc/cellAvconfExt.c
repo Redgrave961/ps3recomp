@@ -17,7 +17,6 @@
  * are all-u8, so translation alone is correct for them; the float needs a
  * byte-swapped store. */
 extern u8* vm_base;
-#define GUEST_PTR(p, T) ((T)((p) ? (void*)(vm_base + (uint32_t)(uintptr_t)(p)) : (void*)0))
 #include <stdio.h>
 #include <string.h>
 

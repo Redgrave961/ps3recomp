@@ -21,6 +21,7 @@ uint32_t vm_read32(uint64_t a)         /* guest words are big-endian (sys_ppu_th
 void ppu_resv_register(ppu_context* c) { (void)c; }
 int ps3_intr_is_handler(unsigned long long tid) { (void)tid; return 0; }
 int ps3_intr_wait(unsigned long long tid) { (void)tid; return 0; }
+PPU_THREAD_LOCAL ppu_context* g_active_ctx;
 
 enum { ARG_RETURN = 0, ARG_EXIT = 1, ARG_GATED = 2 };
 static volatile int s_gate;            /* a gated thread returns once this is set */

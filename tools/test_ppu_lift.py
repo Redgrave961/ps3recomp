@@ -888,9 +888,9 @@ extern "C" { uint8_t* vm_base = g_vm_stub; }
 /* A template, not a statement expression: cl builds this driver on Windows. */
 template <class T> static inline T vm_raw_ld_(uint64_t ea) { T v; memcpy(&v, g_vm_stub + VMOFF(ea), sizeof(T)); return v; }
 #define VM_RAW_LD(T, ea) vm_raw_ld_<T>(ea)
-#define VM_RAW_ST(T, ea, val) do { T _v = (val); memcpy(g_vm_stub + VMOFF(ea), &_v, sizeof(T)); } while (0)
 static inline void vm_raw_ld16(void* dst, uint64_t ea) { memcpy(dst, g_vm_stub + VMOFF(ea), 16); }
-static inline void vm_raw_st16(uint64_t ea, const void* src) { memcpy(g_vm_stub + VMOFF(ea), src, 16); }
+static inline void vm_write_raw(uint64_t ea, const void* src, uint32_t n) { memcpy(g_vm_stub + VMOFF(ea), src, n); }
+static inline void vm_write128(uint64_t ea, const void* src) { memcpy(g_vm_stub + VMOFF(ea), src, 16); }
 /* Trap guard. A "may_trap" case exists to prove lifted code does NOT fault --
  * e.g. divw by zero must be lowered to a defined result, not a hardware trap.
  * MSVC catches that with SEH. POSIX has no SEH, so arm a signal handler and

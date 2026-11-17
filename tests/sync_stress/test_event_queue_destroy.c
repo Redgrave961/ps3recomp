@@ -83,10 +83,19 @@ static uint32_t make_queue(void)
     return be_read(0x200);
 }
 /* Wait until `n` receivers are inside the queue. */
+static int waiters(uint32_t q)
+{
+    sys_event_queue_info* e = &g_sys_event_queues[q - 1];
+    ps3_lock_acquire(&e->lock);
+    int n = 0;
+    for (ps3_waiter* w = e->q.head; w; w = w->next) n++;
+    ps3_lock_release(&e->lock);
+    return n;
+}
 static void wait_waiters(uint32_t q, int n)
 {
-    for (int i = 0; i < 3000 && g_sys_event_queues[q - 1].waiters != n; i++) Sleep(1);
-    CHECK(g_sys_event_queues[q - 1].waiters == n);
+    for (int i = 0; i < 3000 && waiters(q) != n; i++) Sleep(1);
+    CHECK(waiters(q) == n);
 }
 
 static void test_destroy_modes(void)
@@ -147,11 +156,9 @@ static DWORD WINAPI waker(void* unused)
     while (!s_stop_wakes) {
         Sleep(25);
         sys_event_queue_info* q = &g_sys_event_queues[s_wake_q - 1];
-#ifdef _WIN32
-        WakeAllConditionVariable(&q->not_empty);
-#else
-        pthread_cond_broadcast(&q->not_empty);
-#endif
+        ps3_lock_acquire(&q->lock);
+        for (ps3_waiter* w = q->q.head; w; w = w->next) ps3_futex_wake_all(&w->done);
+        ps3_lock_release(&q->lock);
     }
     return 0;
 }

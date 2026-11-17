@@ -60,7 +60,7 @@ int main(void) {
         const u128 a = rv(), b = rv(), c = rv();
         const int imm = (int)(rnd() % 3 == 0 ? (int32_t)rword() : (int32_t)(rnd() % 256) - 128);
         T2(spu_a); T2(spu_sf); T2(spu_and); T2(spu_or); T2(spu_xor);
-        T2(spu_ceq); T2(spu_cgt); T2(spu_clgt); T3(spu_selb);
+        T2(spu_ceq); T2(spu_cgt); T2(spu_clgt); T3(spu_selb); T3(spu_shufb);
         TI(spu_ai); TI(spu_sfi); TI(spu_andi); TI(spu_ori); TI(spu_xori);
         TI(spu_ceqi); TI(spu_cgti); TI(spu_clgti);
         TI(spu_shlqbyi); TI(spu_rotqbyi); TI(spu_rotqmbyi);

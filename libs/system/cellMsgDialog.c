@@ -45,7 +45,6 @@ static s32 queue_dialog_callback(CellMsgDialogCallback cb, int32_t result,
 static int                   s_dialog_open = 0;
 static CellMsgDialogCallback s_callback    = NULL;
 static void*                 s_userdata    = NULL;
-static CellMsgDialogType     s_type        = 0;
 
 /* Deadline for auto-dismissing a no-button dialog; 0 = not armed.
  *
@@ -123,7 +122,6 @@ s32 cellMsgDialogOpen2(CellMsgDialogType type, const char* msgString,
     s_dialog_open = 1;
     s_callback    = callback;
     s_userdata    = userdata;
-    s_type        = type;
     memset(s_progress, 0, sizeof(s_progress));
 
     /* Print the message so developers can see it */

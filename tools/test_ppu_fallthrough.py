@@ -60,7 +60,7 @@ def main() -> int:
     check("bdnz is not a terminator",
           _last_line_is_terminator(["        if (((ctx->ctr = (uint32_t)(ctx->ctr - 1)) != 0)) goto loc_00010000;"]), False)
     check("guarded tail call is not a terminator",
-          _last_line_is_terminator(["        if (((ctx->cr >> 0) & 2)) { g_trampoline_fn = (void(*)(void*))func_00010100; return; }"]), False)
+          _last_line_is_terminator(["        if (((ctx->cr >> 0) & 2)) { PPU_TAIL return func_00010100(ctx); }"]), False)
     check("unconditional goto is a terminator",
           _last_line_is_terminator(["        goto loc_00010000;"]), True)
     check("return is a terminator", _last_line_is_terminator(["        return;"]), True)

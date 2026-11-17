@@ -155,7 +155,6 @@ static void drain_guest_completions(void)
 }
 
 static char s_cache_path[CELL_SYSCACHE_PATH_MAX];
-static int s_cache_mounted = 0;
 
 
 /* ---------------------------------------------------------------------------
@@ -216,9 +215,6 @@ s32 cellSysutilCheckCallback(void)
      * its dismissal. Done before the drain so the callback it queues is
      * delivered on this same poll. */
     { extern void cellMsgDialog_tick(void); cellMsgDialog_tick(); }
-    /* Turn psnr replies and pushes into queued NP callbacks first, so this
-     * same poll delivers them. A no-op when no psnr server is configured. */
-    { extern void np_psnr_pump(void); np_psnr_pump(); }
     drain_guest_completions();
     {
       if (!s_pump_seen) {
@@ -507,7 +503,6 @@ s32 cellSysCacheMount(char* param)
     if (n > 135) n = 135;
     memcpy(vm_base + ea + 0x20, s_cache_path, n);
     vm_base[ea + 0x20 + n] = '\0';
-    s_cache_mounted = 1;
 
     /* The guest path above is only half the mount: /dev_hdd1 must also exist as
      * a WRITABLE host directory, or a title's first cache open fails against the

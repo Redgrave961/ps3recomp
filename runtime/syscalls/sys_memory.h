@@ -29,7 +29,6 @@ extern "C" {
 
 /* Allocation record */
 typedef struct sys_mem_alloc_info {
-    int      active;
     uint32_t addr;
     uint32_t size;
     int32_t  container_id;  /* 0 = main pool */

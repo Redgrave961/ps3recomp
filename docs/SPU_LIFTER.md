@@ -38,28 +38,6 @@ Targets the ABI in `runtime/spu/spu_context.h` (`u128 gpr[128]`, 256 KB
 local store, channels, MFC staging) and the `u128` union in
 `include/ps3emu/ps3types.h`.
 
-## Relationship to the PPU fallback approach (read `SPU_FALLBACK.md` first)
-
-The project's **current** SPU strategy is *not* execution — it is the
-PPU-side fallback registry (`SPU_FALLBACK.md`): per game, you hand-write a C
-function that reproduces each SPU job's output, keyed on the SPU image entry
-point. That is pragmatic and gets specific games running fast, but it is
-**manual and per-job** — every game re-pays the cost, and jobs whose logic is
-non-trivial (decompressors, mixers, physics) are hard to reimplement by hand.
-
-This lifter is the **general, automated** path: translate the SPU ISA once and
-run the real job. The two are complementary, and they can coexist:
-
-- Use a **fallback** when the job is simple to reproduce or when the lifted
-  output isn't trusted yet.
-- Use the **lifted SPU function** when the job is complex or unknown.
-
-A clean integration: have `spu_indirect_branch` / the group-start dispatcher
-first consult `spu_lookup_ppu_fallback(entry_point)`, and only fall through to
-the lifted `spu_func_*` (via `spu_function_table[]`) when no fallback is
-registered. That makes lifting an opt-in upgrade over the existing shim
-mechanism rather than a replacement.
-
 ### Implemented instructions (Phase 1)
 
 - **Immediates:** il, ila, ilh, ilhu, iohl

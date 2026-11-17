@@ -3,6 +3,7 @@
 #define main allsize_unused_mfc_main
 #include "allsize_fixture.h"
 #undef main
+#include <sys/mman.h>
 
 static spu_context* signature_ctx;
 static int publication_checks;
@@ -46,6 +47,7 @@ static void residency_and_epochs(spu_context* c)
     const spu_overlay_code_segment seg={base,sizeof code,code};
     spu_begin_image(701);spu_register_function(base,lifted);spu_begin_image(0);
     CHECK(spu_overlay_register_verified_region(source,base,0x400,701,&seg,1));
+    memcpy(vm_base+source,code,sizeof code);
     memcpy(c->ls+base,code,sizeof code);
     spu_overlay_note_get(c,source,c->ls+base,512);
     CHECK(spu_lifted_lookup(c,base)==lifted);
@@ -63,6 +65,7 @@ static void residency_and_epochs(spu_context* c)
     CHECK(spu_lifted_lookup(c,base)==lifted);
     /* Partial foreign overwrite starts below the resident range. */
     epoch=c->dcache_residency;
+    memset(c->ls+base-16,0x33,512);
     spu_overlay_note_get(c,0x79000000,c->ls+base-16,512);
     CHECK(!c->resident_code[0].image_id);CHECK(c->dcache_residency!=epoch);
 
@@ -90,7 +93,7 @@ static void old_matcher_edges(spu_context* c)
 }
 static void list_resume(spu_context* c)
 {
-    memset(guest_memory+0x21000,0x51,512);memset(guest_memory+0x22000,0x62,512);
+    memset(vm_base+0x21000,0x51,512);memset(vm_base+0x22000,0x62,512);
     spu_ls_write32(c,0x3000,512);spu_ls_write32(c,0x3004,0x21000);
     spu_ls_write32(c,0x3008,0x80000000);spu_ls_write32(c,0x300c,0);
     spu_ls_write32(c,0x3010,512);spu_ls_write32(c,0x3014,0x22000);
@@ -115,13 +118,14 @@ static void signatures(spu_context* c)
     CHECK(c->resident_ovl==19);
     spu_overlay_note_get(c,0x77000040,c->ls+0x20000,512);
     CHECK(c->resident_ovl==777);
-    CHECK(spu_overlay_match_sig(signature)==777);
     /* Known EA and signature both match: registration order remains exact. */
     spu_overlay_note_get(c,0x70000000,c->ls+0x20000,512);
     CHECK(c->resident_ovl==600);
 }
 int main(int argc,char** argv)
 {
+    vm_base=mmap(NULL,1ull<<32,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE,-1,0);
+    CHECK(vm_base!=MAP_FAILED);
     spu_context* c=fresh();
     if(argc>1 && !strcmp(argv[1],"full")){
         for(unsigned i=0;i<128;++i)spu_overlay_register_source(0x70000000+i*0x10000,600+i);

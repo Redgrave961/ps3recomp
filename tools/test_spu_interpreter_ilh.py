@@ -18,5 +18,6 @@ with tempfile.TemporaryDirectory(prefix='spu-ilh-') as tmp:
         subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-UNDEBUG',
                         '-I'+str(root/'include'), '-I'+str(spu),
                         str(spu/'tests'/f'{name}.c'), str(spu/'spu_interp.c'),
+                        str(root/'runtime/platform/ps3_sync.c'), str(spu/'tests/spu_fixture_ppu.c'),
                         '-lm', '-o', str(binary)], check=True)
         subprocess.run([str(binary)], check=True, timeout=5, env=env, cwd=tmp)

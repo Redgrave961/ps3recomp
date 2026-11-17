@@ -591,7 +591,6 @@ Module: EBOOT.ELF
 2. Extracts function signatures, NID registrations, and error code patterns
 3. Generates standalone C stubs compatible with ps3recomp's module framework
 4. Produces a header file with all function declarations
-5. Generates a registration block (`DECLARE_PS3_MODULE` + `REGISTER_FUNC`)
 
 ### Usage
 
@@ -635,7 +634,6 @@ int32_t cellFsRead(/* params */);
 **Implementation (`.c`):**
 ```c
 #include "cellFs.h"
-#include "ps3emu/module.h"
 
 int32_t cellFsOpen(/* params */)
 {
@@ -644,13 +642,6 @@ int32_t cellFsOpen(/* params */)
 }
 
 // ...
-
-DECLARE_PS3_MODULE(cellFs, "cellFs")
-{
-    REGISTER_FUNC(cellFsOpen);
-    REGISTER_FUNC(cellFsRead);
-    // ...
-}
 ```
 
 ---

@@ -147,9 +147,6 @@ public:
     push_attribute push[ATTRIBS];
     draw_clause draw;
     u32 dirty = D_ALL;
-    u32 texture_dirty = 0xFFFFu;
-    u32 constants_lo = 0;
-    u32 constants_hi = VP_CONSTANTS;
     bool in_begin_end = false;
 
     frontend();

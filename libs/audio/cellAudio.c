@@ -48,19 +48,9 @@
   #include <process.h>
 
   /* Define WASAPI COM GUIDs (avoids needing uuid.lib linkage for these) */
-  #ifdef __cplusplus
-    #define GUID_SECT
-  #else
-    #define GUID_SECT
-  #endif
   #ifndef DEFINE_AUDIO_GUID
-    #ifdef INITGUID
-      #define DEFINE_AUDIO_GUID(name, l, w1, w2, b1, b2, b3, b4, b5, b6, b7, b8) \
-              const GUID name = { l, w1, w2, { b1, b2, b3, b4, b5, b6, b7, b8 } }
-    #else
-      #define DEFINE_AUDIO_GUID(name, l, w1, w2, b1, b2, b3, b4, b5, b6, b7, b8) \
-              const GUID name = { l, w1, w2, { b1, b2, b3, b4, b5, b6, b7, b8 } }
-    #endif
+    #define DEFINE_AUDIO_GUID(name, l, w1, w2, b1, b2, b3, b4, b5, b6, b7, b8) \
+            const GUID name = { l, w1, w2, { b1, b2, b3, b4, b5, b6, b7, b8 } }
   #endif
   DEFINE_AUDIO_GUID(ps3r_CLSID_MMDeviceEnumerator, 0xBCDE0395,0xE52F,0x467C,0x8E,0x3D,0xC4,0x57,0x92,0x91,0x69,0x2E);
   DEFINE_AUDIO_GUID(ps3r_IID_IMMDeviceEnumerator,  0xA95664D2,0x9614,0x4F35,0xA7,0x46,0xDE,0x8D,0xB6,0x36,0x17,0xE6);
@@ -106,8 +96,6 @@
 /* Per-port audio buffer allocated on the host side.
  * In a full emulator these would be in guest VM memory; here we allocate
  * host buffers and expose their addresses through portAddr/readIndexAddr. */
-#define AUDIO_PORT_BUF_MAX  (CELL_AUDIO_BLOCK_32 * CELL_AUDIO_BLOCK_SAMPLES * CELL_AUDIO_PORT_8CH)
-
 typedef struct {
     int                  in_use;
     int                  running;

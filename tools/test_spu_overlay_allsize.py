@@ -14,14 +14,16 @@ parser.add_argument('--output-dir',type=pathlib.Path)
 parser.add_argument('--source',type=pathlib.Path)
 parser.add_argument('--mutants',action='store_true')
 args=parser.parse_args()
-units=['spu_drain','spu_lockstep','spu_coherency','spu_workload','spu_vm_pagemap','spu_interp']
+units=['spu_drain','spu_lockstep','spu_coherency','spu_workload','spu_interp']
 env={k:v for k,v in os.environ.items() if not k.startswith(('SPU_','SPURS_'))}
 source=(args.source or SPU/'spu_channels.c').read_text()
 def instrument(text):
     text=text.replace('#include "../','#include "'+str(SPU.parent)+'/')
+    start=text.index('void spu_overlay_note_get(')
     needle='for (int i = 0; i < nsrc; i++) {'
-    assert text.count(needle)==1
-    text=text.replace(needle,needle+'\n        ++allsize_scans;')
+    at=text.index(needle,start)
+    assert text.find(needle,at+1)==-1
+    text=text[:at]+needle+'\n        ++allsize_scans;'+text[at+len(needle):]
     start=text.index('void spu_overlay_register_sig(')
     end=text.index('\n}',start)
     body=text[start:end]
@@ -42,7 +44,7 @@ def run(work):
         exe=where/'fixture'
         cmd=[os.environ.get('CC','cc'),'-std=gnu17','-O2','-UNDEBUG']
         if sanitize:cmd+=['-fsanitize=undefined','-fno-sanitize-recover=all']
-        cmd+=['-I'+str(where),'-I'+str(work),'-I'+str(ROOT/'include'),'-I'+str(SPU),'-I'+str(ROOT/'runtime/platform'),str(SPU/'tests/test_spu_overlay_allsize.c'),*[str(SPU/(u+'.c')) for u in units],str(ROOT/'runtime/platform/win32_compat.c'),'-pthread','-lm','-o',str(exe)]
+        cmd+=['-I'+str(where),'-I'+str(work),'-I'+str(ROOT/'include'),'-I'+str(SPU),'-I'+str(ROOT/'runtime/platform'),str(SPU/'tests/test_spu_overlay_allsize.c'),*[str(SPU/(u+'.c')) for u in units],str(ROOT/'runtime/platform/win32_compat.c'),str(ROOT/'runtime/platform/ps3_sync.c'),str(ROOT/'runtime/spu/tests/spu_fixture_ppu.c'),'-pthread','-lm','-o',str(exe)]
         (where/'build-argv.json').write_text(json.dumps(cmd,indent=2)+'\n')
         build=subprocess.run(cmd,capture_output=True,text=True,timeout=60)
         (where/'build.stdout').write_text(build.stdout);(where/'build.stderr').write_text(build.stderr)

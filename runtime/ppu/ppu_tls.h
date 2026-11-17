@@ -18,10 +18,15 @@
 #define PS3RECOMP_PPU_TLS_H
 
 #ifndef PPU_THREAD_LOCAL
-#  ifdef _MSC_VER
-#    define PPU_THREAD_LOCAL __declspec(thread)
+#  if defined(__cpp_constinit)
+#    define PPU_TLS_CONSTINIT constinit
 #  else
-#    define PPU_THREAD_LOCAL __thread
+#    define PPU_TLS_CONSTINIT
+#  endif
+#  ifdef _MSC_VER
+#    define PPU_THREAD_LOCAL PPU_TLS_CONSTINIT __declspec(thread)
+#  else
+#    define PPU_THREAD_LOCAL PPU_TLS_CONSTINIT __thread
 #  endif
 #endif
 

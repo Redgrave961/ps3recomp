@@ -23,10 +23,15 @@ extern "C" {
  * built against a generated ppu_recomp.h. The #ifndef makes including both
  * harmless. */
 #ifndef PPU_THREAD_LOCAL
-#  ifdef _MSC_VER
-#    define PPU_THREAD_LOCAL __declspec(thread)
+#  if defined(__cpp_constinit)
+#    define PPU_TLS_CONSTINIT constinit
 #  else
-#    define PPU_THREAD_LOCAL __thread
+#    define PPU_TLS_CONSTINIT
+#  endif
+#  ifdef _MSC_VER
+#    define PPU_THREAD_LOCAL PPU_TLS_CONSTINIT __declspec(thread)
+#  else
+#    define PPU_THREAD_LOCAL PPU_TLS_CONSTINIT __thread
 #  endif
 #endif
 
@@ -45,7 +50,6 @@ extern "C" {
 
 /* VSCR bits */
 #define PPU_VSCR_NJ  (1u << 16)  /* Non-Java mode */
-#define PPU_VSCR_SAT (1u << 0)   /* Saturation */
 
 /* ---------------------------------------------------------------------------
  * PPU thread context
@@ -106,6 +110,7 @@ typedef struct ppu_context {
 static inline void ppu_context_init(ppu_context* ctx)
 {
     memset(ctx, 0, sizeof(*ctx));
+    ctx->vscr = PPU_VSCR_NJ;
     /* r1 (stack pointer) gets set during thread creation.
      * r2 (TOC) gets set from the ELF entry descriptor.
      * r13 (SDA base) gets set from the module loader. */
@@ -115,12 +120,6 @@ static inline void ppu_context_init(ppu_context* ctx)
  * Condition Register helpers
  * -----------------------------------------------------------------------*/
 
-/* Get a 4-bit CR field (0-7). */
-static inline uint8_t ppu_cr_get(const ppu_context* ctx, int field)
-{
-    return (uint8_t)((ctx->cr >> (28 - field * 4)) & 0xF);
-}
-
 /* Set a 4-bit CR field (0-7). */
 static inline void ppu_cr_set(ppu_context* ctx, int field, uint8_t value)
 {
@@ -128,63 +127,10 @@ static inline void ppu_cr_set(ppu_context* ctx, int field, uint8_t value)
     ctx->cr = (ctx->cr & ~(0xFu << shift)) | ((uint32_t)(value & 0xF) << shift);
 }
 
-/* Set a CR field from a signed 64-bit comparison result. */
-static inline void ppu_cr_set_s64(ppu_context* ctx, int field, int64_t a, int64_t b)
-{
-    uint8_t val;
-    if (a < b)      val = PPU_CR_LT;
-    else if (a > b) val = PPU_CR_GT;
-    else            val = PPU_CR_EQ;
-    if (ctx->xer & PPU_XER_SO) val |= PPU_CR_SO;
-    ppu_cr_set(ctx, field, val);
-}
-
-/* Set a CR field from an unsigned 64-bit comparison result. */
-static inline void ppu_cr_set_u64(ppu_context* ctx, int field, uint64_t a, uint64_t b)
-{
-    uint8_t val;
-    if (a < b)      val = PPU_CR_LT;
-    else if (a > b) val = PPU_CR_GT;
-    else            val = PPU_CR_EQ;
-    if (ctx->xer & PPU_XER_SO) val |= PPU_CR_SO;
-    ppu_cr_set(ctx, field, val);
-}
-
-/* Set a CR field from a signed 32-bit comparison. */
-static inline void ppu_cr_set_s32(ppu_context* ctx, int field, int32_t a, int32_t b)
-{
-    ppu_cr_set_s64(ctx, field, (int64_t)a, (int64_t)b);
-}
-
-static inline void ppu_cr_set_u32(ppu_context* ctx, int field, uint32_t a, uint32_t b)
-{
-    ppu_cr_set_u64(ctx, field, (uint64_t)a, (uint64_t)b);
-}
-
 /* ---------------------------------------------------------------------------
  * XER helpers
  * -----------------------------------------------------------------------*/
 static inline int ppu_xer_get_so(const ppu_context* ctx) { return (ctx->xer & PPU_XER_SO) != 0; }
-static inline int ppu_xer_get_ov(const ppu_context* ctx) { return (ctx->xer & PPU_XER_OV) != 0; }
-static inline int ppu_xer_get_ca(const ppu_context* ctx) { return (ctx->xer & PPU_XER_CA) != 0; }
-
-static inline void ppu_xer_set_ca(ppu_context* ctx, int ca)
-{
-    if (ca) ctx->xer |= PPU_XER_CA;
-    else    ctx->xer &= ~PPU_XER_CA;
-}
-
-static inline void ppu_xer_set_ov(ppu_context* ctx, int ov)
-{
-    if (ov) { ctx->xer |= PPU_XER_OV | PPU_XER_SO; }
-    else    { ctx->xer &= ~PPU_XER_OV; }
-}
-
-/* XER[24:31] byte count field for lswx/stswx */
-static inline uint8_t ppu_xer_get_byte_count(const ppu_context* ctx)
-{
-    return (uint8_t)(ctx->xer & 0x7F);
-}
 
 /* ---------------------------------------------------------------------------
  * Stack pointer management
@@ -199,27 +145,6 @@ static inline void ppu_set_stack(ppu_context* ctx, uint64_t stack_top, uint64_t 
     uint64_t sp = (stack_top + stack_size - 48) & ~(uint64_t)0xF;
     ctx->gpr[1] = sp;
 }
-
-/* Get current stack pointer. */
-static inline uint64_t ppu_get_sp(const ppu_context* ctx)
-{
-    return ctx->gpr[1];
-}
-
-/* ---------------------------------------------------------------------------
- * Register accessors by ABI name
- * -----------------------------------------------------------------------*/
-#define PPU_SP(ctx)   ((ctx)->gpr[1])
-#define PPU_TOC(ctx)  ((ctx)->gpr[2])
-#define PPU_ARG0(ctx) ((ctx)->gpr[3])
-#define PPU_ARG1(ctx) ((ctx)->gpr[4])
-#define PPU_ARG2(ctx) ((ctx)->gpr[5])
-#define PPU_ARG3(ctx) ((ctx)->gpr[6])
-#define PPU_ARG4(ctx) ((ctx)->gpr[7])
-#define PPU_ARG5(ctx) ((ctx)->gpr[8])
-#define PPU_ARG6(ctx) ((ctx)->gpr[9])
-#define PPU_ARG7(ctx) ((ctx)->gpr[10])
-#define PPU_RET(ctx)  ((ctx)->gpr[3])
 
 #ifdef __cplusplus
 } /* extern "C" */

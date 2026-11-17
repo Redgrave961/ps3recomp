@@ -12,7 +12,7 @@ static unsigned checks;
 #define CHECK(x) do { ++checks; if (!(x)) { fprintf(stderr,"FAIL line %d: %s\n",__LINE__,#x); return 1; } } while (0)
 static uint32_t out(void) { uint8_t* p=vm_base+0x10000; return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3]; }
 static int64_t allocate(uint64_t size,uint64_t flags) {
- ppu_context c={0};c.gpr[3]=size;c.gpr[4]=flags;c.gpr[5]=0x10000;return sys_memory_allocate(&c);
+ ppu_context c={0};c.gpr[1]=VM_STACK_BASE;c.gpr[3]=size;c.gpr[4]=flags;c.gpr[5]=0x10000;return sys_memory_allocate(&c);
 }
 static int64_t reserve(uint64_t size,uint64_t align) {
  ppu_context c={0};c.gpr[3]=size;c.gpr[5]=align;c.gpr[6]=0x10000;return sys_mmapper_allocate_address(&c);
@@ -51,8 +51,10 @@ int main(void) {
  CHECK(allocate(0x10000,0x200)==CELL_OK);CHECK(out()>=0x11000000u);
  ppu_hle_inject_base=0x20000000u;
  reset();
- CHECK(reserve(0x50000000ull,0x10000000)==CELL_OK); CHECK(out()==0x70000000u);
- CHECK(reserve(0x10000000ull,0x10000000)!=(int64_t)CELL_OK);
+ CHECK(reserve(0x60000000ull,0x10000000)==CELL_OK); CHECK(out()==0x40000000u);
+ CHECK(reserve(0x01000000ull,0x01000000)==CELL_OK); CHECK(out()==0xB9000000u);
+ CHECK(reserve(0x06000000ull,0x01000000)==CELL_OK); CHECK(out()==0xBA000000u);
+ CHECK(reserve(0x10000ull,0x10000)!=(int64_t)CELL_OK);
  CHECK(reserve(UINT64_MAX,0x10000000)!=(int64_t)CELL_OK);
  reset(); CHECK(reserve(0x100000,3)!=(int64_t)CELL_OK);
  reset(); CHECK(allocate(0x10000,0x200)==CELL_OK);CHECK(out()==a);

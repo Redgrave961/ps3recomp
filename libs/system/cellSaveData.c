@@ -459,13 +459,8 @@ static u32 enumerate_save_files(const char* save_path,
             HOST_STAT_T st;
             if (HOST_STAT(full, &st) != 0)
                 continue;
-#ifdef _WIN32
-            if (st.st_mode & _S_IFDIR)
-                continue;
-#else
             if (S_ISDIR(st.st_mode))
                 continue;
-#endif
             if (count < max && fileList) {
                 memset(&fileList[count], 0, sizeof(CellSaveDataFileStat));
                 fileList[count].fileType = savedata_file_type(save_path, de->d_name);
@@ -842,9 +837,6 @@ static s32 savedata_execute_run(const char* dirName, int is_save,
 /* ---------------------------------------------------------------------------
  * API implementations
  * -----------------------------------------------------------------------*/
-
-#define SAVEDATA_REJECT(rc, why) \
-    do { savedata_reject_log(__func__, (why), (rc)); return (rc); } while (0)
 
 s32 cellSaveDataAutoLoad2(u32 version, const char* dirName,
                            u32 errDialog,

@@ -20,6 +20,7 @@ namespace vk {
 namespace {
 
 constexpr u32 k_page_shift = 12;
+constexpr u32 k_region_shift = 20;
 
 u32 texel_bytes(VkFormat f)
 {
@@ -100,8 +101,6 @@ bool scan_writes(u32 base, u32 bytes, std::vector<u32>& stamps, u32& clock)
     }
 }
 #endif
-constexpr u32 k_watch_gap = 64u * 1024u;
-
 uint64_t mix(uint64_t h, uint64_t v)
 {
     h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
@@ -134,36 +133,58 @@ void renderer::mark_written(u32 ea, u32 size)
         m_page_stamp[p] = stamp;
 }
 
-bool renderer::watch(u32 ea, u32 size)
+void renderer::watch(u32 ea, u32 size)
 {
-    if (m_page_stamp.empty()) m_page_stamp.assign(1u << (32 - k_page_shift), 0u);
-    const u32 mask = (1u << k_page_shift) - 1u;
-    return scan_writes(ea & ~mask, ((ea & mask) + size + mask) & ~mask, m_page_stamp, m_stamp);
+    await_writes(ea, size);
+    stats.watch_calls++;
+    stats.watch_bytes += size;
+    if (m_page_stamp.empty()) {
+        m_page_stamp.assign(1u << (32 - k_page_shift), 0u);
+        m_region_batch.assign(1u << (32 - k_region_shift), ~0ull);
+    }
+    const u64 batch = rsx_core_batch();
+    const u32 last = (u32)(((uint64_t)ea + size - 1u) >> k_region_shift);
+    for (u32 r = ea >> k_region_shift; r <= last; r++) {
+        if (m_region_batch[r] == batch) continue;
+        u32 end = r;
+        while (end + 1 <= last && m_region_batch[end + 1] != batch) end++;
+        stats.scans++;
+        if (!scan_writes(r << k_region_shift, (end - r + 1) << k_region_shift, m_page_stamp, m_stamp)) {
+            mark_written(ea, size);
+            return;
+        }
+        for (u32 k = r; k <= end; k++) m_region_batch[k] = batch;
+        r = end;
+    }
 }
 
 bool renderer::memory_changed(u32 ea, u32 size, u32 stamp)
 {
-    if (m_watch_dirty) {
-        m_watch.clear();
-        for (const auto& [k, e] : m_textures) m_watch.push_back({ e->ea, e->ea + e->size, 0 });
-        std::sort(m_watch.begin(), m_watch.end(), [](const watch_range& a, const watch_range& b) { return a.start < b.start; });
-        size_t n = 0;
-        for (const watch_range& r : m_watch) {
-            if (n && r.start <= m_watch[n - 1].end + k_watch_gap) m_watch[n - 1].end = std::max(m_watch[n - 1].end, r.end);
-            else m_watch[n++] = r;
-        }
-        m_watch.resize(n);
-        m_watch_dirty = false;
-    }
-    auto it = std::upper_bound(m_watch.begin(), m_watch.end(), ea, [](u32 a, const watch_range& r) { return a < r.start; });
-    if (it == m_watch.begin() || (--it)->end < ea + size) return true;
-    if (it->scanned != m_epoch) {
-        if (!watch(it->start, it->end - it->start)) return true;
-        it->scanned = m_epoch;
-    }
+    watch(ea, size);
     for (uint64_t p = ea >> k_page_shift; p <= ((uint64_t)ea + size - 1u) >> k_page_shift; p++)
         if (m_page_stamp[p] > stamp) return true;
     return false;
+}
+
+u32 renderer::refresh(u32 ea, u32 size, u32 stamp, uint8_t* dst)
+{
+    if (!stamp) {
+        std::memcpy(dst, vm_base + ea, size);
+        return size;
+    }
+    u32 copied = 0;
+    const u32 last = (u32)(((uint64_t)ea + size - 1u) >> k_page_shift);
+    for (u32 p = ea >> k_page_shift; p <= last; p++) {
+        if (m_page_stamp[p] <= stamp) continue;
+        u32 q = p;
+        while (q < last && m_page_stamp[q + 1u] > stamp) q++;
+        const uint64_t lo = std::max<uint64_t>(ea, (uint64_t)p << k_page_shift);
+        const uint64_t hi = std::min<uint64_t>((uint64_t)ea + size, (uint64_t)(q + 1u) << k_page_shift);
+        std::memcpy(dst + (lo - ea), vm_base + lo, hi - lo);
+        copied += (u32)(hi - lo);
+        p = q;
+    }
+    return copied;
 }
 VkImageView renderer::view_for(image& img, VkImageViewType type, VkFormat format, VkImageAspectFlags aspect, const VkComponentMapping& swizzle)
 {
@@ -242,19 +263,21 @@ image* renderer::depth_as_color(surface& s, VkFormat format)
 {
     image& dst = s.as_color;
     if (dst.width != s.img.width || dst.height != s.img.height || dst.format != format) {
-        if (dst.handle) m_garbage.emplace_back(*m_submitted + 1u, dst);
-        dst = image{};
+        discard(dst);
         if (!create_image(dst, format, s.img.width, s.img.height, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                           VK_IMAGE_ASPECT_COLOR_BIT))
             return nullptr;
-        s.as_color_draw = ~0ull;
+        s.as_color_version = ~0ull;
     }
-    if (s.as_color_draw == m_draw_counter) return &dst;
+    if (s.as_color_version == s.version) return &dst;
     const bool d16 = s.bpp == 2;
     const u32 w = s.img.width, h = s.img.height, row = d16 ? (w + 1u) & ~1u : w;
     const VkDeviceSize bytes = (VkDeviceSize)row * h * s.bpp;
-    vk_slice slice = m_ring.alloc(bytes, m_ssbo_align);
-    if (!slice.ptr) return nullptr;
+    if (m_pack.size < bytes) {
+        if (m_pack.buffer) m_scratch_garbage.emplace_back(*m_submitted + 1u, m_pack);
+        m_pack = scratch{};
+        if (!create_scratch(m_pack, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) return nullptr;
+    }
     const VkComponentMapping identity{};
     const VkImageView dv = view_for(s.img, VK_IMAGE_VIEW_TYPE_2D, s.img.format, VK_IMAGE_ASPECT_DEPTH_BIT, identity);
     const VkImageView sv = d16 ? dv : view_for(s.img, VK_IMAGE_VIEW_TYPE_2D, s.img.format, VK_IMAGE_ASPECT_STENCIL_BIT, identity);
@@ -262,25 +285,51 @@ image* renderer::depth_as_color(surface& s, VkFormat format)
     VkCommandBuffer c = cmd();
     end_rendering();
     barrier(c, s.img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
-    m_depth_pack.record(c, dv, sv, slice.buffer, slice.offset, bytes, w, h, d16, s.depth_float);
-    VkMemoryBarrier2 mb{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-    mb.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    mb.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-    mb.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
-    mb.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
-    VkDependencyInfo di{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-    di.memoryBarrierCount = 1;
-    di.pMemoryBarriers = &mb;
-    vkCmdPipelineBarrier2(c, &di);
+    m_depth_pack.record(c, dv, sv, m_pack.buffer, 0, bytes, w, h, d16, s.depth_float);
+    memory_barrier(c, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT,
+                   VK_ACCESS_2_TRANSFER_READ_BIT);
     barrier(c, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
     VkBufferImageCopy region{};
-    region.bufferOffset = slice.offset;
     region.bufferRowLength = row;
     region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
     region.imageExtent = { w, h, 1 };
-    vkCmdCopyBufferToImage(c, slice.buffer, dst.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-    s.as_color_draw = m_draw_counter;
+    vkCmdCopyBufferToImage(c, m_pack.buffer, dst.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    s.as_color_version = s.version;
     return &dst;
+}
+
+image* renderer::native_image(surface& s, image& source)
+{
+    image& low = s.native;
+    const u32 w = s.width * s.aa_u, h = s.height * s.aa_v;
+    if (low.width != w || low.height != h || low.format != s.img.format) {
+        discard(low);
+        if (!create_image(low, s.img.format, w, h, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                          VK_IMAGE_ASPECT_COLOR_BIT))
+            return nullptr;
+        s.native_version = ~0ull;
+    }
+    if (s.native_version == s.version) return &low;
+    if (m_box.width < w || m_box.height < h) {
+        discard(m_box);
+        if (!create_image(m_box, VK_FORMAT_R32G32B32A32_SFLOAT, w, h, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                          VK_IMAGE_ASPECT_COLOR_BIT))
+            return nullptr;
+    }
+    VkCommandBuffer c = cmd();
+    barrier(c, source, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    barrier(c, m_box, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+    m_downscale.record(c, source.view, m_box.view, w, h, source.width, source.height);
+    barrier(c, m_box, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+    barrier(c, low, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    VkImageBlit region{};
+    region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    region.srcOffsets[1] = { (int32_t)w, (int32_t)h, 1 };
+    region.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    region.dstOffsets[1] = { (int32_t)w, (int32_t)h, 1 };
+    vkCmdBlitImage(c, m_box.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, low.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, VK_FILTER_NEAREST);
+    s.native_version = s.version;
+    return &low;
 }
 
 bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out, rsx_spv_texture_state& state)
@@ -353,8 +402,7 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
             image& snap = s->snapshot;
             path = "dummy: snapshot creation failed";
             if (snap.width != s->img.width || snap.height != s->img.height || snap.format != s->img.format) {
-                if (snap.handle) m_garbage.emplace_back(*m_submitted + 1u, snap);
-                snap = image{};
+                discard(snap);
                 if (!create_image(snap, s->img.format, s->img.width, s->img.height,
                                   VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, s->img.aspect))
                     return false;
@@ -374,39 +422,9 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
             source = &snap;
         }
         if (!s->depth && s->scale > m_fb.scale) {
-            image& low = s->native;
-            const u32 w = s->img.width / s->scale, h = s->img.height / s->scale;
             path = "dummy: rescale creation failed";
-            if (low.width != w || low.height != h || low.format != s->img.format) {
-                if (low.handle) m_garbage.emplace_back(*m_submitted + 1u, low);
-                low = image{};
-                if (!create_image(low, s->img.format, w, h, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT))
-                    return false;
-                s->native_version = ~0ull;
-            }
-            if (s->native_version != s->version) {
-                if (m_box.width < w || m_box.height < h) {
-                    if (m_box.handle) m_garbage.emplace_back(*m_submitted + 1u, m_box);
-                    m_box = image{};
-                    if (!create_image(m_box, VK_FORMAT_R32G32B32A32_SFLOAT, w, h, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-                                      VK_IMAGE_ASPECT_COLOR_BIT))
-                        return false;
-                }
-                barrier(c, *source, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
-                barrier(c, m_box, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
-                m_downscale.record(c, source->view, m_box.view, w, h);
-                barrier(c, m_box, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
-                barrier(c, low, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
-                VkImageBlit region{};
-                region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-                region.srcOffsets[1] = { (int32_t)w, (int32_t)h, 1 };
-                region.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-                region.dstOffsets[1] = { (int32_t)w, (int32_t)h, 1 };
-                vkCmdBlitImage(c, m_box.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, low.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region,
-                               VK_FILTER_NEAREST);
-                s->native_version = s->version;
-            }
-            source = &low;
+            source = native_image(*s, *source);
+            if (!source) return false;
         }
         barrier(c, *source, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                 VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
@@ -448,7 +466,6 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
         e->img.width = ii.extent.width;
         e->img.height = ii.extent.height;
         m_textures.emplace(key, std::move(made));
-        m_watch_dirty = true;
         watch(ea, d.guest_size);
         upload = true;
     } else if (e->checked != m_epoch) {

@@ -65,14 +65,14 @@ int main(void)
     /* sys_vm: a covered address answers EPERM, a hole in the mapped region
      * EINVAL, and the empty region EINVAL (nothing mapped). */
     g_sys_vm_maps[0].active = 1;
-    g_sys_vm_maps[0].addr   = 0x60000000u;
+    g_sys_vm_maps[0].addr   = 0xA0000000u;
     g_sys_vm_maps[0].vsize  = 0x02000000u;   /* 32 MB */
     g_sys_vm_maps[0].psize  = 0x00010000u;
-    expect("sys_vm start",  0x60000000u, 0x2, E_PERM);
-    expect("sys_vm end",    0x61FFFFFFu, 0x2, E_PERM);
-    expect("sys_vm hole",   0x62000000u, 0x2, E_INVAL);
+    expect("sys_vm start",  0xA0000000u, 0x2, E_PERM);
+    expect("sys_vm end",    0xA1FFFFFFu, 0x2, E_PERM);
+    expect("sys_vm hole",   0xA2000000u, 0x2, E_INVAL);
     g_sys_vm_maps[0].active = 0;
-    expect("sys_vm empty",  0x60000000u, 0x2, E_INVAL);
+    expect("sys_vm empty",  0xA0000000u, 0x2, E_INVAL);
 
     /* Outside every known window: EINVAL. */
     expect("unmapped 0x3", 0x30000000u, 0x2, E_INVAL);

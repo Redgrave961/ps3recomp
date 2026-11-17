@@ -18,6 +18,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <math.h>
+#include <immintrin.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -26,6 +27,30 @@ extern "C" {
 #define VMX_SAT 0x00000001u
 #define VMX_NJ  0x00010000u
 #define VMX_INL static inline
+
+VMX_INL __m128i vmx_ld(const void* p) { return _mm_loadu_si128((const __m128i*)p); }
+VMX_INL void vmx_st(void* p, __m128i v) { _mm_storeu_si128((__m128i*)p, v); }
+VMX_INL __m128i vmx_bsw32(void) { return _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12); }
+VMX_INL __m128i vmx_bsw16(void) { return _mm_setr_epi8(1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14); }
+VMX_INL __m128i vmx_ldw(const void* p) { return _mm_shuffle_epi8(vmx_ld(p), vmx_bsw32()); }
+VMX_INL void vmx_stw(void* p, __m128i v) { vmx_st(p, _mm_shuffle_epi8(v, vmx_bsw32())); }
+VMX_INL __m128i vmx_ldh(const void* p) { return _mm_shuffle_epi8(vmx_ld(p), vmx_bsw16()); }
+VMX_INL void vmx_sth(void* p, __m128i v) { vmx_st(p, _mm_shuffle_epi8(v, vmx_bsw16())); }
+VMX_INL __m128 vmx_ldf(const void* p) { return _mm_castsi128_ps(vmx_ldw(p)); }
+VMX_INL void vmx_stf(void* p, __m128 v) { vmx_stw(p, _mm_castps_si128(v)); }
+VMX_INL __m128 vmx_k(uint32_t u) { return _mm_castsi128_ps(_mm_set1_epi32((int)u)); }
+
+VMX_INL __m128 vmx_flushv(__m128 x, uint32_t vscr) {
+    if (!(vscr & VMX_NJ)) return x;
+    const __m128 den = _mm_castsi128_ps(_mm_cmpeq_epi32(_mm_and_si128(_mm_castps_si128(x), _mm_set1_epi32(0x7F800000)),
+                                                        _mm_setzero_si128()));
+    return _mm_andnot_ps(_mm_and_ps(den, vmx_k(0x7FFFFFFFu)), x);
+}
+VMX_INL __m128 vmx_fixv(__m128 r) { return _mm_blendv_ps(r, vmx_k(0x7FC00000u), _mm_cmpunord_ps(r, r)); }
+VMX_INL __m128 vmx_nanv(__m128 r, __m128 x) {
+    return _mm_blendv_ps(r, _mm_or_ps(x, vmx_k(0x7FC00000u)), _mm_cmpunord_ps(x, x));
+}
+VMX_INL uint32_t vmx_cr6(int mask, int full) { return (uint32_t)((mask == full) << 3 | (mask == 0) << 1); }
 
 /* ---- element access (big-endian) ---- */
 VMX_INL uint16_t vmx_h(const uint8_t* v, int i) { return (uint16_t)(v[2 * i] << 8 | v[2 * i + 1]); }
@@ -60,21 +85,7 @@ VMX_INL uint32_t vmx_sat_u(int64_t x, int64_t hi, uint32_t* vscr) {
 }
 
 /* ---- float helpers ---- */
-VMX_INL uint32_t vmx_flush(uint32_t x, uint32_t vscr) {
-    return ((vscr & VMX_NJ) && (x & 0x7F800000u) == 0) ? (x & 0x80000000u) : x;
-}
-VMX_INL int vmx_isnan(uint32_t x) { return (x & 0x7FFFFFFFu) > 0x7F800000u; }
-VMX_INL uint32_t vmx_fix(uint32_t r) { return vmx_isnan(r) ? 0x7FC00000u : r; }
-/* NaN precedence: A, B (quieted), else the fixed result */
-VMX_INL uint32_t vmx_vnan2(uint32_t r, uint32_t a, uint32_t b) {
-    if (vmx_isnan(a)) return a | 0x7FC00000u;
-    if (vmx_isnan(b)) return b | 0x7FC00000u;
-    return vmx_fix(r);
-}
-VMX_INL uint32_t vmx_vnan1(uint32_t r, uint32_t b) {
-    if (vmx_isnan(b)) return b | 0x7FC00000u;
-    return vmx_fix(r);
-}
+VMX_INL uint32_t vmx_fix(uint32_t r) { return (r & 0x7FFFFFFFu) > 0x7F800000u ? 0x7FC00000u : r; }
 
 /* ======================================================================
  * integer element-wise
@@ -89,16 +100,50 @@ VMX_INL void vmx_sb(uint8_t* v, int i, uint8_t x) { v[i] = x; }
 /* rotates / shifts: count from the low bits of the matching element of B */
 VMX_BIN(vmx_vrlb, 16, vmx_b, vmx_sb, (uint8_t)((x << (y & 7)) | (x >> ((8 - (y & 7)) & 7))))
 VMX_BIN(vmx_vrlh, 8, vmx_h, vmx_sh, (uint16_t)((x << (y & 15)) | (x >> ((16 - (y & 15)) & 15))))
-VMX_BIN(vmx_vrlw, 4, vmx_w, vmx_sw, (uint32_t)((x << (y & 31)) | (x >> ((32 - (y & 31)) & 31))))
 VMX_BIN(vmx_vslb, 16, vmx_b, vmx_sb, (uint8_t)(x << (y & 7)))
 VMX_BIN(vmx_vslh, 8, vmx_h, vmx_sh, (uint16_t)(x << (y & 15)))
-VMX_BIN(vmx_vslw, 4, vmx_w, vmx_sw, (uint32_t)(x << (y & 31)))
 VMX_BIN(vmx_vsrb, 16, vmx_b, vmx_sb, (uint8_t)(x >> (y & 7)))
 VMX_BIN(vmx_vsrh, 8, vmx_h, vmx_sh, (uint16_t)(x >> (y & 15)))
-VMX_BIN(vmx_vsrw, 4, vmx_w, vmx_sw, (uint32_t)(x >> (y & 31)))
 VMX_BIN(vmx_vsrab, 16, vmx_b, vmx_sb, (uint8_t)((int8_t)x >> (y & 7)))
 VMX_BIN(vmx_vsrah, 8, vmx_h, vmx_sh, (uint16_t)((int16_t)x >> (y & 15)))
-VMX_BIN(vmx_vsraw, 4, vmx_w, vmx_sw, (uint32_t)((int32_t)x >> (y & 31)))
+VMX_INL __m128i vmx_cnt(const void* b_) { return _mm_and_si128(vmx_ldw(b_), _mm_set1_epi32(31)); }
+VMX_INL void vmx_vslw(VMX_D, VMX_A, VMX_B) { vmx_stw(d_, _mm_sllv_epi32(vmx_ldw(a_), vmx_cnt(b_))); }
+VMX_INL void vmx_vsrw(VMX_D, VMX_A, VMX_B) { vmx_stw(d_, _mm_srlv_epi32(vmx_ldw(a_), vmx_cnt(b_))); }
+VMX_INL void vmx_vsraw(VMX_D, VMX_A, VMX_B) { vmx_stw(d_, _mm_srav_epi32(vmx_ldw(a_), vmx_cnt(b_))); }
+VMX_INL void vmx_vrlw(VMX_D, VMX_A, VMX_B) { const __m128i x = vmx_ldw(a_), n = vmx_cnt(b_);
+    vmx_stw(d_, _mm_or_si128(_mm_sllv_epi32(x, n), _mm_srlv_epi32(x, _mm_sub_epi32(_mm_set1_epi32(32), n)))); }
+
+VMX_INL void vmx_vaddubm(VMX_D, VMX_A, VMX_B) { vmx_st(d_, _mm_add_epi8(vmx_ld(a_), vmx_ld(b_))); }
+VMX_INL void vmx_vsububm(VMX_D, VMX_A, VMX_B) { vmx_st(d_, _mm_sub_epi8(vmx_ld(a_), vmx_ld(b_))); }
+VMX_INL void vmx_vadduhm(VMX_D, VMX_A, VMX_B) { vmx_sth(d_, _mm_add_epi16(vmx_ldh(a_), vmx_ldh(b_))); }
+VMX_INL void vmx_vsubuhm(VMX_D, VMX_A, VMX_B) { vmx_sth(d_, _mm_sub_epi16(vmx_ldh(a_), vmx_ldh(b_))); }
+VMX_INL void vmx_vadduwm(VMX_D, VMX_A, VMX_B) { vmx_stw(d_, _mm_add_epi32(vmx_ldw(a_), vmx_ldw(b_))); }
+VMX_INL void vmx_vsubuwm(VMX_D, VMX_A, VMX_B) { vmx_stw(d_, _mm_sub_epi32(vmx_ldw(a_), vmx_ldw(b_))); }
+VMX_INL void vmx_vmaxub(VMX_D, VMX_A, VMX_B) { vmx_st(d_, _mm_max_epu8(vmx_ld(a_), vmx_ld(b_))); }
+VMX_INL void vmx_vminub(VMX_D, VMX_A, VMX_B) { vmx_st(d_, _mm_min_epu8(vmx_ld(a_), vmx_ld(b_))); }
+VMX_INL void vmx_vmaxsb(VMX_D, VMX_A, VMX_B) { vmx_st(d_, _mm_max_epi8(vmx_ld(a_), vmx_ld(b_))); }
+VMX_INL void vmx_vminsb(VMX_D, VMX_A, VMX_B) { vmx_st(d_, _mm_min_epi8(vmx_ld(a_), vmx_ld(b_))); }
+VMX_INL void vmx_vmaxuh(VMX_D, VMX_A, VMX_B) { vmx_sth(d_, _mm_max_epu16(vmx_ldh(a_), vmx_ldh(b_))); }
+VMX_INL void vmx_vminuh(VMX_D, VMX_A, VMX_B) { vmx_sth(d_, _mm_min_epu16(vmx_ldh(a_), vmx_ldh(b_))); }
+VMX_INL void vmx_vmaxsh(VMX_D, VMX_A, VMX_B) { vmx_sth(d_, _mm_max_epi16(vmx_ldh(a_), vmx_ldh(b_))); }
+VMX_INL void vmx_vminsh(VMX_D, VMX_A, VMX_B) { vmx_sth(d_, _mm_min_epi16(vmx_ldh(a_), vmx_ldh(b_))); }
+VMX_INL void vmx_vmaxuw(VMX_D, VMX_A, VMX_B) { vmx_stw(d_, _mm_max_epu32(vmx_ldw(a_), vmx_ldw(b_))); }
+VMX_INL void vmx_vminuw(VMX_D, VMX_A, VMX_B) { vmx_stw(d_, _mm_min_epu32(vmx_ldw(a_), vmx_ldw(b_))); }
+VMX_INL void vmx_vmaxsw(VMX_D, VMX_A, VMX_B) { vmx_stw(d_, _mm_max_epi32(vmx_ldw(a_), vmx_ldw(b_))); }
+VMX_INL void vmx_vminsw(VMX_D, VMX_A, VMX_B) { vmx_stw(d_, _mm_min_epi32(vmx_ldw(a_), vmx_ldw(b_))); }
+
+VMX_INL void vmx_vperm(VMX_D, VMX_A, VMX_B, VMX_C) {
+    const __m128i c = vmx_ld(c_), i = _mm_and_si128(c, _mm_set1_epi8(0x0F));
+    vmx_st(d_, _mm_blendv_epi8(_mm_shuffle_epi8(vmx_ld(a_), i), _mm_shuffle_epi8(vmx_ld(b_), i), _mm_slli_epi16(c, 3)));
+}
+VMX_INL __m128i vmx_iota(void) { return _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15); }
+VMX_INL void vmx_lvlx(VMX_D, uint64_t lo, uint64_t hi, uint32_t sh) {
+    const __m128i i = _mm_add_epi8(vmx_iota(), _mm_set1_epi8((char)sh));
+    vmx_st(d_, _mm_shuffle_epi8(_mm_set_epi64x((long long)hi, (long long)lo), _mm_or_si128(i, _mm_cmpgt_epi8(i, _mm_set1_epi8(15)))));
+}
+VMX_INL void vmx_lvrx(VMX_D, uint64_t lo, uint64_t hi, uint32_t sh) {
+    vmx_st(d_, _mm_shuffle_epi8(_mm_set_epi64x((long long)hi, (long long)lo), _mm_add_epi8(vmx_iota(), _mm_set1_epi8((char)(sh - 16)))));
+}
 
 /* averages: (a + b + 1) >> 1 without overflow */
 VMX_BIN(vmx_vavgub, 16, vmx_b, vmx_sb, (uint8_t)((x + y + 1) >> 1))
@@ -138,10 +183,12 @@ VMX_MUL(vmx_vmuleub, 8, vmx_b, vmx_sh, uint8_t, 0)
 VMX_MUL(vmx_vmuloub, 8, vmx_b, vmx_sh, uint8_t, 1)
 VMX_MUL(vmx_vmulesb, 8, vmx_b, vmx_sh, int8_t, 0)
 VMX_MUL(vmx_vmulosb, 8, vmx_b, vmx_sh, int8_t, 1)
-VMX_MUL(vmx_vmuleuh, 4, vmx_h, vmx_sw, uint16_t, 0)
-VMX_MUL(vmx_vmulouh, 4, vmx_h, vmx_sw, uint16_t, 1)
-VMX_MUL(vmx_vmulesh, 4, vmx_h, vmx_sw, int16_t, 0)
-VMX_MUL(vmx_vmulosh, 4, vmx_h, vmx_sw, int16_t, 1)
+VMX_INL void vmx_vmuleuh(VMX_D, VMX_A, VMX_B) { vmx_stw(d_, _mm_mullo_epi32(_mm_srli_epi32(vmx_ldw(a_), 16), _mm_srli_epi32(vmx_ldw(b_), 16))); }
+VMX_INL void vmx_vmulesh(VMX_D, VMX_A, VMX_B) { vmx_stw(d_, _mm_mullo_epi32(_mm_srai_epi32(vmx_ldw(a_), 16), _mm_srai_epi32(vmx_ldw(b_), 16))); }
+VMX_INL void vmx_vmulouh(VMX_D, VMX_A, VMX_B) { const __m128i m = _mm_set1_epi32(0xFFFF);
+    vmx_stw(d_, _mm_mullo_epi32(_mm_and_si128(vmx_ldw(a_), m), _mm_and_si128(vmx_ldw(b_), m))); }
+VMX_INL void vmx_vmulosh(VMX_D, VMX_A, VMX_B) {
+    vmx_stw(d_, _mm_mullo_epi32(_mm_srai_epi32(_mm_slli_epi32(vmx_ldw(a_), 16), 16), _mm_srai_epi32(_mm_slli_epi32(vmx_ldw(b_), 16), 16))); }
 
 /* ---- multiply-add / multiply-sum (VA-form) ---- */
 VMX_INL void vmx_vmhaddshs(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t* vscr) { VMX_ARGS_PREP; const uint8_t* c = (const uint8_t*)c_;
@@ -164,20 +211,15 @@ VMX_INL void vmx_vmsummbm(VMX_D, VMX_A, VMX_B, VMX_C) { VMX_ARGS_PREP; const uin
     for (int i = 0; i < 4; i++) { uint32_t s = vmx_w(c, i);
         for (int j = 0; j < 4; j++) s += (uint32_t)((int32_t)(int8_t)a[4 * i + j] * (int32_t)b[4 * i + j]);
         vmx_sw(r, i, s); } VMX_OUT; }
-VMX_INL void vmx_vmsumuhm(VMX_D, VMX_A, VMX_B, VMX_C) { VMX_ARGS_PREP; const uint8_t* c = (const uint8_t*)c_;
-    for (int i = 0; i < 4; i++) vmx_sw(r, i, vmx_w(c, i) + (uint32_t)vmx_h(a, 2 * i) * vmx_h(b, 2 * i)
-                                                        + (uint32_t)vmx_h(a, 2 * i + 1) * vmx_h(b, 2 * i + 1));
-    VMX_OUT; }
+VMX_INL void vmx_vmsumuhm(VMX_D, VMX_A, VMX_B, VMX_C) { const __m128i a = vmx_ldw(a_), b = vmx_ldw(b_), m = _mm_set1_epi32(0xFFFF);
+    vmx_stw(d_, _mm_add_epi32(vmx_ldw(c_), _mm_add_epi32(_mm_mullo_epi32(_mm_srli_epi32(a, 16), _mm_srli_epi32(b, 16)),
+                                                         _mm_mullo_epi32(_mm_and_si128(a, m), _mm_and_si128(b, m))))); }
 VMX_INL void vmx_vmsumuhs(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t* vscr) { VMX_ARGS_PREP; const uint8_t* c = (const uint8_t*)c_;
     for (int i = 0; i < 4; i++) {
         int64_t s = (int64_t)vmx_w(c, i) + (int64_t)vmx_h(a, 2 * i) * vmx_h(b, 2 * i)
                   + (int64_t)vmx_h(a, 2 * i + 1) * vmx_h(b, 2 * i + 1);
         vmx_sw(r, i, vmx_sat_u(s, 0xFFFFFFFFll, vscr)); } VMX_OUT; }
-VMX_INL void vmx_vmsumshm(VMX_D, VMX_A, VMX_B, VMX_C) { VMX_ARGS_PREP; const uint8_t* c = (const uint8_t*)c_;
-    for (int i = 0; i < 4; i++) vmx_sw(r, i, (uint32_t)((int32_t)vmx_w(c, i)
-        + (int32_t)(int16_t)vmx_h(a, 2 * i) * (int16_t)vmx_h(b, 2 * i)
-        + (int32_t)(int16_t)vmx_h(a, 2 * i + 1) * (int16_t)vmx_h(b, 2 * i + 1)));
-    VMX_OUT; }
+VMX_INL void vmx_vmsumshm(VMX_D, VMX_A, VMX_B, VMX_C) { vmx_stw(d_, _mm_add_epi32(vmx_ldw(c_), _mm_madd_epi16(vmx_ldw(a_), vmx_ldw(b_)))); }
 VMX_INL void vmx_vmsumshs(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t* vscr) { VMX_ARGS_PREP; const uint8_t* c = (const uint8_t*)c_;
     for (int i = 0; i < 4; i++) {
         int64_t s = (int64_t)(int32_t)vmx_w(c, i) + (int64_t)(int16_t)vmx_h(a, 2 * i) * (int16_t)vmx_h(b, 2 * i)
@@ -255,122 +297,91 @@ VMX_INL void vmx_vsro(VMX_D, VMX_A, VMX_B) { VMX_ARGS_PREP; int n = (b[15] >> 3)
  * ==================================================================== */
 
 #define VMX_FBIN(name, op, flush_in) \
-VMX_INL void name(VMX_D, VMX_A, VMX_B, uint32_t vscr) { VMX_ARGS_PREP; \
-    for (int i = 0; i < 4; i++) { uint32_t x = vmx_w(a, i), y = vmx_w(b, i); \
-        if (flush_in) { x = vmx_flush(x, vscr); y = vmx_flush(y, vscr); } \
-        uint32_t z = vmx_u(op); vmx_sw(r, i, vmx_flush(vmx_vnan2(z, x, y), vscr)); } VMX_OUT; }
+VMX_INL void name(VMX_D, VMX_A, VMX_B, uint32_t vscr) { \
+    __m128 x = vmx_ldf(a_), y = vmx_ldf(b_); \
+    if (flush_in) { x = vmx_flushv(x, vscr); y = vmx_flushv(y, vscr); } \
+    vmx_stf(d_, vmx_flushv(vmx_nanv(vmx_nanv(vmx_fixv(op), y), x), vscr)); }
+VMX_FBIN(vmx_vaddfp, _mm_add_ps(x, y), 1)
+VMX_FBIN(vmx_vsubfp, _mm_sub_ps(x, y), 1)
+VMX_FBIN(vmx_vmaxfp, _mm_and_ps(_mm_max_ps(x, y), _mm_max_ps(y, x)), 0)
+VMX_FBIN(vmx_vminfp, _mm_or_ps(_mm_min_ps(x, y), _mm_min_ps(y, x)), 0)
 
-VMX_INL float vmx_maxf(float x, float y) {
-    if (x != x || y != y) return x + y;
-    if (x == 0 && y == 0) return signbit(x) ? y : x;      /* max(-0,+0) = +0 */
-    return x > y ? x : y;
-}
-VMX_INL float vmx_minf(float x, float y) {
-    if (x != x || y != y) return x + y;
-    if (x == 0 && y == 0) return signbit(x) ? x : y;      /* min(-0,+0) = -0 */
-    return x < y ? x : y;
-}
-VMX_FBIN(vmx_vaddfp, vmx_f(x) + vmx_f(y), 1)
-VMX_FBIN(vmx_vsubfp, vmx_f(x) - vmx_f(y), 1)
-VMX_FBIN(vmx_vmaxfp, vmx_maxf(vmx_f(x), vmx_f(y)), 0)
-VMX_FBIN(vmx_vminfp, vmx_minf(vmx_f(x), vmx_f(y)), 0)
+#define VMX_FMA(name, expr) \
+VMX_INL void name(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) { \
+    const __m128 x = vmx_flushv(vmx_ldf(a_), vscr), y = vmx_flushv(vmx_ldf(b_), vscr), z = vmx_flushv(vmx_ldf(c_), vscr); \
+    vmx_stf(d_, vmx_flushv(vmx_fixv(expr), vscr)); }
+VMX_FMA(vmx_vmaddfp, _mm_fmadd_ps(x, z, y))
+VMX_FMA(vmx_vnmsubfp, _mm_xor_ps(_mm_fmsub_ps(x, z, y), vmx_k(0x80000000u)))
 
-/* Fused multiply-add without a libm call per lane. Without -mfma, fmaf is a
- * software routine on MinGW, and vmaddfp/vnmsubfp called it once per lane. The
- * product of two floats is exact in double, so s = x*z + y has one double
- * rounding; rounding s to float then equals the correctly rounded fused result
- * unless s sits exactly on a float rounding midpoint (low 29 bits 0x10000000)
- * or outside the normal float range (zero, subnormal, overflow, inf, NaN).
- * Those rare cases still call fmaf, so every lane is bit-identical to fmaf.
- * ASSUMPTION: the host rounding mode is round-to-nearest (nothing in the
- * runtime changes MXCSR). */
-VMX_INL float vmx_fmaf(float x, float z, float y) {
-#if defined(__FMA__)
-    return fmaf(x, z, y);   /* one instruction with -mfma */
-#else
-    const double s = (double)x * (double)z + (double)y;
-    uint64_t u; memcpy(&u, &s, sizeof u);
-    const uint32_t e = (uint32_t)(u >> 52) & 0x7FFu;
-    if ((u & 0x1FFFFFFFull) != 0x10000000ull && e - (1023u - 126u) < 254u)
-        return (float)s;
-    return fmaf(x, z, y);
-#endif
-}
-VMX_INL void vmx_vmaddfp(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) { VMX_ARGS_PREP; const uint8_t* c = (const uint8_t*)c_;
-    for (int i = 0; i < 4; i++) {
-        float x = vmx_f(vmx_flush(vmx_w(a, i), vscr)), y = vmx_f(vmx_flush(vmx_w(b, i), vscr)),
-              z = vmx_f(vmx_flush(vmx_w(c, i), vscr));
-        vmx_sw(r, i, vmx_flush(vmx_fix(vmx_u(vmx_fmaf(x, z, y))), vscr)); } VMX_OUT; }
-VMX_INL void vmx_vnmsubfp(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) { VMX_ARGS_PREP; const uint8_t* c = (const uint8_t*)c_;
-    for (int i = 0; i < 4; i++) {
-        float x = vmx_f(vmx_flush(vmx_w(a, i), vscr)), y = vmx_f(vmx_flush(vmx_w(b, i), vscr)),
-              z = vmx_f(vmx_flush(vmx_w(c, i), vscr));
-        vmx_sw(r, i, vmx_flush(vmx_fix(vmx_u(-vmx_fmaf(x, z, -y))), vscr)); } VMX_OUT; }
+#define VMX_FUN(name, expr, flush_in) \
+VMX_INL void name(VMX_D, VMX_B, uint32_t vscr) { __m128 f = vmx_ldf(b_); if (flush_in) f = vmx_flushv(f, vscr); \
+    vmx_stf(d_, vmx_flushv(vmx_nanv(vmx_fixv(expr), f), vscr)); }
+VMX_FUN(vmx_vrefp, _mm_div_ps(_mm_set1_ps(1.0f), f), 1)
+VMX_FUN(vmx_vrsqrtefp, _mm_div_ps(_mm_set1_ps(1.0f), _mm_sqrt_ps(f)), 1)
+VMX_FUN(vmx_vrfin, _mm_round_ps(f, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC), 0)
+VMX_FUN(vmx_vrfiz, _mm_round_ps(f, _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC), 0)
+VMX_FUN(vmx_vrfip, _mm_round_ps(f, _MM_FROUND_TO_POS_INF | _MM_FROUND_NO_EXC), 1)
+VMX_FUN(vmx_vrfim, _mm_round_ps(f, _MM_FROUND_TO_NEG_INF | _MM_FROUND_NO_EXC), 1)
 
-#define VMX_FUN(name, expr, flush_in, nanmode) \
-VMX_INL void name(VMX_D, VMX_B, uint32_t vscr) { const uint8_t* b = (const uint8_t*)b_; uint8_t r[16]; \
-    for (int i = 0; i < 4; i++) { uint32_t y = vmx_w(b, i); if (flush_in) y = vmx_flush(y, vscr); \
-        float f = vmx_f(y); uint32_t z = vmx_u(expr); \
-        vmx_sw(r, i, nanmode == 2 ? vmx_flush(vmx_vnan1(z, y), vscr) : vmx_fix(z)); } VMX_OUT; }
-VMX_FUN(vmx_vrefp, 1.0f / f, 1, 2)
-VMX_FUN(vmx_vrsqrtefp, 1.0f / sqrtf(f), 1, 2)
-VMX_FUN(vmx_vexptefp, exp2f(f), 0, 1)
-VMX_FUN(vmx_vlogefp, log2f(f), 0, 1)
-VMX_FUN(vmx_vrfin, nearbyintf(f), 0, 2)      /* host default rounding: to nearest even */
-VMX_FUN(vmx_vrfiz, truncf(f), 0, 2)
-VMX_FUN(vmx_vrfip, ceilf(f), 1, 2)
-VMX_FUN(vmx_vrfim, floorf(f), 1, 2)
+#define VMX_LIBM(name, fn) \
+VMX_INL void name(VMX_D, VMX_B, uint32_t vscr) { (void)vscr; const uint8_t* b = (const uint8_t*)b_; uint8_t r[16]; \
+    for (int i = 0; i < 4; i++) { uint32_t z = vmx_u(fn(vmx_f(vmx_w(b, i)))); vmx_sw(r, i, vmx_fix(z)); } VMX_OUT; }
+VMX_LIBM(vmx_vexptefp, exp2f)
+VMX_LIBM(vmx_vlogefp, log2f)
 
 /* int <-> float with a 2^uimm scale. uimm is 5 bits, so 2^-uimm and 2^uimm are
- * normal floats and the scaling is exact: the same results as ldexpf, without
- * a libm call per lane (which also kept these helpers out of line). */
-VMX_INL float vmx_pow2(int e) { return vmx_f((uint32_t)(127 + e) << 23); }
-VMX_INL void vmx_vcfux(VMX_D, VMX_B, unsigned uimm) { const uint8_t* b = (const uint8_t*)b_; uint8_t r[16];
-    const float s = vmx_pow2(-(int)(uimm & 31u));
-    for (int i = 0; i < 4; i++) vmx_sw(r, i, vmx_u((float)vmx_w(b, i) * s)); VMX_OUT; }
-VMX_INL void vmx_vcfsx(VMX_D, VMX_B, unsigned uimm) { const uint8_t* b = (const uint8_t*)b_; uint8_t r[16];
-    const float s = vmx_pow2(-(int)(uimm & 31u));
-    for (int i = 0; i < 4; i++) vmx_sw(r, i, vmx_u((float)(int32_t)vmx_w(b, i) * s)); VMX_OUT; }
-VMX_INL void vmx_vctsxs(VMX_D, VMX_B, unsigned uimm, uint32_t* vscr) { const uint8_t* b = (const uint8_t*)b_; uint8_t r[16];
-    for (int i = 0; i < 4; i++) { float f = vmx_f(vmx_w(b, i)) * vmx_pow2((int)(uimm & 31u)); int32_t v;
-        if (f != f) v = 0;
-        else if (f < -2147483648.0f) { v = INT32_MIN; *vscr |= VMX_SAT; }
-        else if (f >= 2147483648.0f) { v = INT32_MAX; *vscr |= VMX_SAT; }
-        else v = (int32_t)f;
-        vmx_sw(r, i, (uint32_t)v); } VMX_OUT; }
-VMX_INL void vmx_vctuxs(VMX_D, VMX_B, unsigned uimm, uint32_t* vscr) { const uint8_t* b = (const uint8_t*)b_; uint8_t r[16];
-    for (int i = 0; i < 4; i++) { float f = vmx_f(vmx_w(b, i)) * vmx_pow2((int)(uimm & 31u)); uint32_t v;
-        if (f != f) v = 0;
-        else if (f < 0.0f) { v = 0; *vscr |= VMX_SAT; }
-        else if (f >= 4294967296.0f) { v = 0xFFFFFFFFu; *vscr |= VMX_SAT; }
-        else v = (uint32_t)f;
-        vmx_sw(r, i, v); } VMX_OUT; }
+ * normal floats and the scaling is exact. */
+VMX_INL __m128 vmx_pow2v(int e) { return vmx_k((uint32_t)(127 + e) << 23); }
+VMX_INL void vmx_vcfsx(VMX_D, VMX_B, unsigned uimm) {
+    vmx_stf(d_, _mm_mul_ps(_mm_cvtepi32_ps(vmx_ldw(b_)), vmx_pow2v(-(int)(uimm & 31u)))); }
+VMX_INL void vmx_vcfux(VMX_D, VMX_B, unsigned uimm) { const __m128i u = vmx_ldw(b_);
+    const __m128 f = _mm_add_ps(_mm_mul_ps(_mm_cvtepi32_ps(_mm_srli_epi32(u, 16)), _mm_set1_ps(65536.0f)),
+                                _mm_cvtepi32_ps(_mm_and_si128(u, _mm_set1_epi32(0xFFFF))));
+    vmx_stf(d_, _mm_mul_ps(f, vmx_pow2v(-(int)(uimm & 31u)))); }
+VMX_INL void vmx_vctsxs(VMX_D, VMX_B, unsigned uimm, uint32_t* vscr) {
+    const __m128 f = _mm_mul_ps(vmx_ldf(b_), vmx_pow2v((int)(uimm & 31u)));
+    const __m128 hi = _mm_cmp_ps(f, _mm_set1_ps(2147483648.0f), _CMP_GE_OQ);
+    const __m128 lo = _mm_cmp_ps(f, _mm_set1_ps(-2147483648.0f), _CMP_LT_OQ);
+    __m128i r = _mm_blendv_epi8(_mm_cvttps_epi32(f), _mm_set1_epi32(INT32_MAX), _mm_castps_si128(hi));
+    r = _mm_andnot_si128(_mm_castps_si128(_mm_cmpunord_ps(f, f)), r);
+    if (_mm_movemask_ps(_mm_or_ps(hi, lo))) *vscr |= VMX_SAT;
+    vmx_stw(d_, r); }
+VMX_INL void vmx_vctuxs(VMX_D, VMX_B, unsigned uimm, uint32_t* vscr) {
+    const __m128 f = _mm_mul_ps(vmx_ldf(b_), vmx_pow2v((int)(uimm & 31u))), two31 = _mm_set1_ps(2147483648.0f);
+    const __m128 hi = _mm_cmp_ps(f, _mm_set1_ps(4294967296.0f), _CMP_GE_OQ);
+    const __m128 neg = _mm_cmp_ps(f, _mm_setzero_ps(), _CMP_LT_OQ);
+    const __m128 big = _mm_cmp_ps(f, two31, _CMP_GE_OQ);
+    const __m128i t = _mm_cvttps_epi32(_mm_sub_ps(f, _mm_and_ps(big, two31)));
+    __m128i r = _mm_xor_si128(t, _mm_and_si128(_mm_castps_si128(big), _mm_set1_epi32(INT32_MIN)));
+    r = _mm_or_si128(r, _mm_castps_si128(hi));
+    r = _mm_andnot_si128(_mm_castps_si128(_mm_or_ps(neg, _mm_cmpunord_ps(f, f))), r);
+    if (_mm_movemask_ps(_mm_or_ps(hi, neg))) *vscr |= VMX_SAT;
+    vmx_stw(d_, r); }
 
 /* ---- compares; record forms return the CR6 nibble [all, 0, none, 0] ---- */
-#define VMX_CMP(name, cnt, get, set, test) \
-VMX_INL uint32_t name(VMX_D, VMX_A, VMX_B) { VMX_ARGS_PREP; int all = 1, none = 1; \
-    for (int i = 0; i < cnt; i++) { uint64_t x = get(a, i), y = get(b, i); (void)x; (void)y; int t = (test); \
-        all &= t; none &= !t; set(r, i, t ? ~0ull : 0); } VMX_OUT; return (uint32_t)(all << 3 | none << 1); }
-VMX_INL void vmx_sb64(uint8_t* v, int i, uint64_t x) { v[i] = (uint8_t)x; }
-VMX_INL void vmx_sh64(uint8_t* v, int i, uint64_t x) { vmx_sh(v, i, (uint16_t)x); }
-VMX_INL void vmx_sw64(uint8_t* v, int i, uint64_t x) { vmx_sw(v, i, (uint32_t)x); }
-VMX_CMP(vmx_vcmpequb, 16, vmx_b, vmx_sb64, x == y)
-VMX_CMP(vmx_vcmpequh, 8, vmx_h, vmx_sh64, x == y)
-VMX_CMP(vmx_vcmpequw, 4, vmx_w, vmx_sw64, x == y)
-VMX_CMP(vmx_vcmpgtub, 16, vmx_b, vmx_sb64, x > y)
-VMX_CMP(vmx_vcmpgtuh, 8, vmx_h, vmx_sh64, x > y)
-VMX_CMP(vmx_vcmpgtuw, 4, vmx_w, vmx_sw64, x > y)
-VMX_CMP(vmx_vcmpgtsb, 16, vmx_b, vmx_sb64, (int8_t)x > (int8_t)y)
-VMX_CMP(vmx_vcmpgtsh, 8, vmx_h, vmx_sh64, (int16_t)x > (int16_t)y)
-VMX_CMP(vmx_vcmpgtsw, 4, vmx_w, vmx_sw64, (int32_t)x > (int32_t)y)
-VMX_CMP(vmx_vcmpeqfp, 4, vmx_w, vmx_sw64, vmx_f((uint32_t)x) == vmx_f((uint32_t)y))
-VMX_CMP(vmx_vcmpgefp, 4, vmx_w, vmx_sw64, vmx_f((uint32_t)x) >= vmx_f((uint32_t)y))
-VMX_CMP(vmx_vcmpgtfp, 4, vmx_w, vmx_sw64, vmx_f((uint32_t)x) > vmx_f((uint32_t)y))
+VMX_INL uint32_t vmx_cmpout(void* d_, __m128i m) { vmx_st(d_, m); return vmx_cr6(_mm_movemask_epi8(m), 0xFFFF); }
+VMX_INL __m128i vmx_ub(__m128i x) { return _mm_xor_si128(x, _mm_set1_epi8((char)0x80)); }
+VMX_INL __m128i vmx_uh(__m128i x) { return _mm_xor_si128(x, _mm_set1_epi16((short)0x8000)); }
+VMX_INL __m128i vmx_uw(__m128i x) { return _mm_xor_si128(x, _mm_set1_epi32(INT32_MIN)); }
+VMX_INL uint32_t vmx_vcmpequb(VMX_D, VMX_A, VMX_B) { return vmx_cmpout(d_, _mm_cmpeq_epi8(vmx_ld(a_), vmx_ld(b_))); }
+VMX_INL uint32_t vmx_vcmpequh(VMX_D, VMX_A, VMX_B) { return vmx_cmpout(d_, _mm_cmpeq_epi16(vmx_ld(a_), vmx_ld(b_))); }
+VMX_INL uint32_t vmx_vcmpequw(VMX_D, VMX_A, VMX_B) { return vmx_cmpout(d_, _mm_cmpeq_epi32(vmx_ld(a_), vmx_ld(b_))); }
+VMX_INL uint32_t vmx_vcmpgtsb(VMX_D, VMX_A, VMX_B) { return vmx_cmpout(d_, _mm_cmpgt_epi8(vmx_ld(a_), vmx_ld(b_))); }
+VMX_INL uint32_t vmx_vcmpgtub(VMX_D, VMX_A, VMX_B) { return vmx_cmpout(d_, _mm_cmpgt_epi8(vmx_ub(vmx_ld(a_)), vmx_ub(vmx_ld(b_)))); }
+VMX_INL uint32_t vmx_vcmpgtsh(VMX_D, VMX_A, VMX_B) { return vmx_cmpout(d_, _mm_cmpgt_epi16(vmx_ldh(a_), vmx_ldh(b_))); }
+VMX_INL uint32_t vmx_vcmpgtuh(VMX_D, VMX_A, VMX_B) { return vmx_cmpout(d_, _mm_cmpgt_epi16(vmx_uh(vmx_ldh(a_)), vmx_uh(vmx_ldh(b_)))); }
+VMX_INL uint32_t vmx_vcmpgtsw(VMX_D, VMX_A, VMX_B) { return vmx_cmpout(d_, _mm_cmpgt_epi32(vmx_ldw(a_), vmx_ldw(b_))); }
+VMX_INL uint32_t vmx_vcmpgtuw(VMX_D, VMX_A, VMX_B) { return vmx_cmpout(d_, _mm_cmpgt_epi32(vmx_uw(vmx_ldw(a_)), vmx_uw(vmx_ldw(b_)))); }
+VMX_INL uint32_t vmx_vcmpeqfp(VMX_D, VMX_A, VMX_B) { return vmx_cmpout(d_, _mm_castps_si128(_mm_cmp_ps(vmx_ldf(a_), vmx_ldf(b_), _CMP_EQ_OQ))); }
+VMX_INL uint32_t vmx_vcmpgefp(VMX_D, VMX_A, VMX_B) { return vmx_cmpout(d_, _mm_castps_si128(_mm_cmp_ps(vmx_ldf(a_), vmx_ldf(b_), _CMP_GE_OQ))); }
+VMX_INL uint32_t vmx_vcmpgtfp(VMX_D, VMX_A, VMX_B) { return vmx_cmpout(d_, _mm_castps_si128(_mm_cmp_ps(vmx_ldf(a_), vmx_ldf(b_), _CMP_GT_OQ))); }
 /* vcmpbfp: bit 31 = !(a <= b), bit 30 = !(a >= -b); CR6 EQ = every lane in bounds */
-VMX_INL uint32_t vmx_vcmpbfp(VMX_D, VMX_A, VMX_B) { VMX_ARGS_PREP; int inb = 1;
-    for (int i = 0; i < 4; i++) { float x = vmx_f(vmx_w(a, i)), y = vmx_f(vmx_w(b, i));
-        uint32_t v = (!(x <= y) ? 0x80000000u : 0) | (!(x >= -y) ? 0x40000000u : 0);
-        inb &= v == 0; vmx_sw(r, i, v); } VMX_OUT; return (uint32_t)(inb << 1); }
+VMX_INL uint32_t vmx_vcmpbfp(VMX_D, VMX_A, VMX_B) { const __m128 x = vmx_ldf(a_), y = vmx_ldf(b_);
+    const __m128i le = _mm_castps_si128(_mm_cmp_ps(x, y, _CMP_LE_OQ));
+    const __m128i ge = _mm_castps_si128(_mm_cmp_ps(x, _mm_xor_ps(y, vmx_k(0x80000000u)), _CMP_GE_OQ));
+    const __m128i v = _mm_or_si128(_mm_andnot_si128(le, _mm_set1_epi32(INT32_MIN)), _mm_andnot_si128(ge, _mm_set1_epi32(0x40000000)));
+    vmx_stw(d_, v);
+    return (uint32_t)(_mm_testz_si128(v, v) << 1); }
 
 #ifdef __cplusplus
 }

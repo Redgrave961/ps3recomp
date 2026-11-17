@@ -74,9 +74,7 @@ static const char* content_root(void)
 static char s_content_info_path[CELL_GAME_PATH_MAX] = "";
 static char s_usrdir_path[CELL_GAME_PATH_MAX] = "";
 static char s_tmp_path[CELL_GAME_PATH_MAX] = "";
-static char s_exit_param[256] = "";
 
-static int  s_boot_checked = 0;
 static u32  s_game_type = CELL_GAME_GAMETYPE_DISC;
 
 /* Current content-check session. BootCheck/DataCheck open a session naming
@@ -422,7 +420,6 @@ s32 cellGameBootCheck(u32* type, u32* attributes, CellGameContentSize* size,
         vm_base[dir_ea + len] = '\0';
     }
 
-    s_boot_checked = 1;
     /* Open a check session for the BOOT content (disc titles boot from
      * /dev_bdvd, not from the game-data dir). */
     s_check_is_disc = (s_game_type == CELL_GAME_GAMETYPE_DISC);
@@ -517,20 +514,6 @@ s32 cellGameDataCheck(u32 type, const char* dirName, CellGameContentSize* size)
         vm_write32(size_ea + 4, 0);   /* sizeKB = 0 (no data yet) */
     return CELL_GAME_RET_NONE;
 }
-
-/* cellGameDataCheckCreate2 (NID 0xC9645C41) -- check/prepare game data, invoking the
- * title's funcStat callback (CellGameDataStatCallback) exactly like firmware so the
- * save/boot state machine advances. Struct layout + behavior cross-referenced against
- * RPCS3 cellGame.cpp. Demon's Souls's DsSaveLoadMan thread calls this; without the
- * callback firing, its game-data check never completes, the sema/SLSession chain
- * stalls, and the cellSaveDataAutoLoad2 (auto-save notice) dialog never appears.
- *
- * funcStat(cbResult, get, set): the title reads `get` (isNewData, free space, params)
- * and writes cbResult->result. We report existing data (isNewData=0) + ample space;
- * DeS's callback returns CELL_GAMEDATA_CBRESULT_OK_CANCEL (check-only) -> CELL_OK. */
-#define GAMEDATA_CB_BASE   0x02520000u   /* guest scratch (distinct from savedata's) */
-#define CELL_GAMEDATA_CBRESULT_OK_CANCEL  1
-#define CELL_GAMEDATA_CBRESULT_OK         0
 
 s32 cellGameGetParamString(s32 id, char* buf, u32 bufsize)
 {

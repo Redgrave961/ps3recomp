@@ -180,7 +180,8 @@ extern void spu_overlay_note_get(spu_context*, uint32_t, const uint8_t*, uint32_
 extern void (*spu_lookup(uint32_t addr, int image_id))(spu_context*);
 extern const unsigned char mod_a[], mod_b[];
 extern const unsigned mod_a_len, mod_b_len;
-uint8_t* vm_base;
+static uint8_t guest[1u << 24];
+uint8_t* vm_base = guest;
 uint32_t ppu_vm_size;
 void spu_thread_publish_ctx(uint32_t tid, void* c) { (void)tid; (void)c; abort(); }
 void ppu_resv_break_store(uint64_t ea) { (void)ea; abort(); }
@@ -188,7 +189,6 @@ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (vo
 unsigned long long ps3_ms_now(void) { abort(); }
 uint32_t g_ww_lo = 0xFFFFFFFFu, g_ww_hi;
 int g_resv_store_active;
-uint32_t g_barrier_sync_watch;
 uint32_t g_spu_image_src_ea, g_spu_image_ls_start, g_spu_image_span;
 static int failed;
 static void check(int ok, const char* what) { printf("%s %s\n", ok ? "PASS" : "FAIL", what); failed |= !ok; }
@@ -196,6 +196,9 @@ int main(void)
 {
     static spu_context ctx;
     spu_context_init(&ctx, 0);
+    memcpy(guest + A_EA, mod_a, mod_a_len);
+    memcpy(guest + A2_EA, mod_a, mod_a_len);
+    memcpy(guest + B_EA, mod_b, mod_b_len);
     spu_lifted_fn fa = (spu_lifted_fn)spu_lookup(0x4034, 200);
     spu_lifted_fn fb = (spu_lifted_fn)spu_lookup(0x4034, 201);
     check(fa && fb && fa != fb, "both modules registered their entries");
@@ -210,6 +213,7 @@ int main(void)
     memcpy(ctx.ls + 0x4000, mod_b, mod_b_len);
     spu_overlay_note_get(&ctx, B_EA, ctx.ls + 0x4000, mod_b_len);
     check(spu_lifted_lookup(&ctx, 0x4034) == fb, "GET of module B replaces A");
+    memset(ctx.ls + 0x4040, 0x5A, 0x10);
     spu_overlay_note_get(&ctx, 0x00900000u, ctx.ls + 0x4040, 0x10);
     check(!ctx.resident_code[0].image_id && spu_lifted_lookup(&ctx, 0x4034) != fb,
           "foreign GET into B's code clears residency");
@@ -228,8 +232,7 @@ int main(void)
             f"const unsigned char {n}[] = {{{','.join(str(x) for x in raw)}}};\n"
             f"const unsigned {n}_len = {len(raw)};\n" for n, raw in (("mod_a", A), ("mod_b", B))))
         sources = ["spu_channels.c", "spu_drain.c", "spu_lockstep.c", "spu_coherency.c",
-                   "spu_workload.c",
-                   "spu_vm_pagemap.c", "spu_interp.c"]
+                   "spu_workload.c", "spu_interp.c"]
         lifted = [str(tmp / "out" / m["name"] / "spu_recomp.c") for m in manifest]
         binary = tmp / "residency"
         subprocess.run([os.environ.get("CC", "cc"), "-std=gnu17", "-O1", "-UNDEBUG", "-w",
@@ -237,7 +240,7 @@ int main(void)
                         "-I" + str(ROOT / "runtime/platform"),
                         str(driver), str(data), str(tmp / "out/jobmods_register.c"), *lifted,
                         *[str(spu / s) for s in sources],
-                        str(ROOT / "runtime/platform/win32_compat.c"), "-pthread", "-lm",
+                        str(ROOT / "runtime/platform/win32_compat.c"), str(ROOT / "runtime/platform/ps3_sync.c"), str(ROOT / "runtime/spu/tests/spu_fixture_ppu.c"), "-pthread", "-lm",
                         "-o", str(binary)], check=True)
         r = subprocess.run([str(binary)], capture_output=True, text=True, timeout=10, cwd=tmp,
                            env={k: v for k, v in os.environ.items()

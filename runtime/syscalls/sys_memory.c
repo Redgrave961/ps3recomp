@@ -36,6 +36,18 @@ static mapper_reservation s_mapper_reservations[SYS_MEMORY_ALLOC_MAX];
 
 
 static uint32_t s_total_allocated = 0;
+static int s_alloc_count = 0;
+
+static int alloc_after(uint64_t addr)
+{
+    int lo = 0, hi = s_alloc_count;
+    while (lo < hi) {
+        const int mid = (lo + hi) / 2;
+        if ((uint64_t)g_sys_mem_allocs[mid].addr + g_sys_mem_allocs[mid].size > addr) hi = mid;
+        else lo = mid + 1;
+    }
+    return lo;
+}
 static uint64_t (*s_image_query)(uint64_t addr, uint64_t end);
 
 void sys_memory_set_image_query(uint64_t (*query)(uint64_t addr, uint64_t end))
@@ -90,11 +102,9 @@ static uint32_t user_address(uint32_t size, uint32_t alignment)
         if (candidate < (uint64_t)VM_PPU_TLS_BASE + VM_PPU_TLS_SIZE &&
             VM_PPU_TLS_BASE < candidate + size && (uint64_t)VM_PPU_TLS_BASE + VM_PPU_TLS_SIZE > next)
             next = (uint64_t)VM_PPU_TLS_BASE + VM_PPU_TLS_SIZE;
-        for (int i = 0; i < SYS_MEMORY_ALLOC_MAX; ++i) {
-            const sys_mem_alloc_info* a = &g_sys_mem_allocs[i];
-            uint64_t end = (uint64_t)a->addr + a->size;
-            if (a->active && candidate < end && a->addr < candidate + size && end > next)
-                next = end;
+        for (int i = alloc_after(candidate); i < s_alloc_count && g_sys_mem_allocs[i].addr < candidate + size; ++i) {
+            const uint64_t end = (uint64_t)g_sys_mem_allocs[i].addr + g_sys_mem_allocs[i].size;
+            if (end > next) next = end;
         }
         if (next == candidate) return (uint32_t)candidate;
         candidate = next;
@@ -148,20 +158,21 @@ static int64_t memory_allocate(const ppu_context* ctx, uint64_t requested, uint3
             bump_unlock(); return (int64_t)(int32_t)CELL_ENOMEM;
         }
     }
-    int slot = -1;
-    for (int i = 0; i < SYS_MEMORY_ALLOC_MAX; ++i)
-        if (!g_sys_mem_allocs[i].active) { slot = i; break; }
-    uint32_t addr = slot < 0 ? 0 : user_address(size, alignment);
+    const int full = s_alloc_count == SYS_MEMORY_ALLOC_MAX;
+    uint32_t addr = full ? 0 : user_address(size, alignment);
     if (!addr || vm_commit(addr, size) != CELL_OK) {
         bump_unlock();
         fprintf(stderr, "[sys_memory] allocate(size=0x%X) -> ENOMEM (%s)\n", size,
-                slot < 0 ? "allocation table full" : !addr ? "no address range" : "commit failed");
+                full ? "allocation table full" : !addr ? "no address range" : "commit failed");
         log_guest_chain(ctx);
         return (int64_t)(int32_t)CELL_ENOMEM;
     }
     memset(vm_to_host(addr), 0, size);
+    const int slot = alloc_after(addr);
+    memmove(&g_sys_mem_allocs[slot + 1], &g_sys_mem_allocs[slot], (size_t)(s_alloc_count - slot) * sizeof g_sys_mem_allocs[0]);
+    s_alloc_count++;
     sys_mem_alloc_info* a = &g_sys_mem_allocs[slot];
-    a->active = 1; a->addr = addr; a->size = size;
+    a->addr = addr; a->size = size;
     a->container_id = (int32_t)cid; a->page_size = alignment;
     s_total_allocated += size;
     if (ct) ct->used_size += size;
@@ -205,15 +216,15 @@ int64_t sys_memory_free(ppu_context* ctx)
 {
     uint32_t addr = LV2_ARG_U32(ctx, 0);
     bump_lock();
-    for (int i = 0; i < SYS_MEMORY_ALLOC_MAX; i++) {
-        if (g_sys_mem_allocs[i].active && g_sys_mem_allocs[i].addr == addr) {
-            s_total_allocated -= g_sys_mem_allocs[i].size;
-            const int32_t cid = g_sys_mem_allocs[i].container_id;
-            if (cid > 0 && cid <= SYS_MEMORY_CONTAINER_MAX && g_sys_mem_containers[cid - 1].active)
-                g_sys_mem_containers[cid - 1].used_size -= g_sys_mem_allocs[i].size;
-            g_sys_mem_allocs[i].active = 0;
-            bump_unlock(); return CELL_OK;
-        }
+    const int i = alloc_after(addr);
+    if (i < s_alloc_count && g_sys_mem_allocs[i].addr == addr) {
+        s_total_allocated -= g_sys_mem_allocs[i].size;
+        const int32_t cid = g_sys_mem_allocs[i].container_id;
+        if (cid > 0 && cid <= SYS_MEMORY_CONTAINER_MAX && g_sys_mem_containers[cid - 1].active)
+            g_sys_mem_containers[cid - 1].used_size -= g_sys_mem_allocs[i].size;
+        s_alloc_count--;
+        memmove(&g_sys_mem_allocs[i], &g_sys_mem_allocs[i + 1], (size_t)(s_alloc_count - i) * sizeof g_sys_mem_allocs[0]);
+        bump_unlock(); return CELL_OK;
     }
     bump_unlock();
     return (int64_t)(int32_t)CELL_EINVAL;
@@ -262,14 +273,11 @@ int64_t sys_memory_get_page_attribute(ppu_context* ctx)
 
     /* Report the page size of the allocation containing addr. */
     uint32_t page_size = 0x10000;  /* default 64K */
-    for (int i = 0; i < SYS_MEMORY_ALLOC_MAX; i++) {
-        if (g_sys_mem_allocs[i].active &&
-            addr >= g_sys_mem_allocs[i].addr &&
-            addr <  g_sys_mem_allocs[i].addr + g_sys_mem_allocs[i].size) {
-            page_size = g_sys_mem_allocs[i].page_size ? g_sys_mem_allocs[i].page_size : 0x10000;
-            break;
-        }
-    }
+    bump_lock();
+    const int i = alloc_after(addr);
+    if (i < s_alloc_count && addr >= g_sys_mem_allocs[i].addr && g_sys_mem_allocs[i].page_size)
+        page_size = g_sys_mem_allocs[i].page_size;
+    bump_unlock();
 
     if (attr_out != 0) {
         write_be32(attr_out + 0x00, 0);          /* attribute    (hi) */
@@ -632,6 +640,7 @@ void sys_memory_init(lv2_syscall_table* tbl)
 {
     bump_lock();
     memset(g_sys_mem_allocs,     0, sizeof(g_sys_mem_allocs));
+    s_alloc_count = 0;
     memset(g_sys_mem_containers, 0, sizeof(g_sys_mem_containers));
     memset(g_sys_mmapper_shared, 0, sizeof(g_sys_mmapper_shared));
     g_sys_mem_bump_ptr = 0;

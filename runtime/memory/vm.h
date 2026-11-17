@@ -390,56 +390,12 @@ static inline uint32_t vm_stack_allocate(vm_stack_alloc* sa, uint32_t stack_size
 }
 
 /* ---------------------------------------------------------------------------
- * SPU local store allocation
- *
- * Each SPU gets a 256 KB window in the VM_SPU_BASE range, used for
- * raw SPU memory-mapped access from the PPU.
- * -----------------------------------------------------------------------*/
-
-static inline int32_t vm_spu_ls_map(uint32_t spu_index)
-{
-    if (spu_index >= 8) return CELL_EINVAL; /* max 8 SPUs */
-
-    uint32_t addr = VM_SPU_BASE + spu_index * VM_SPU_WINDOW_SIZE;
-    return vm_commit(addr, VM_SPU_WINDOW_SIZE);
-}
-
-static inline uint32_t vm_spu_ls_addr(uint32_t spu_index)
-{
-    return VM_SPU_BASE + spu_index * VM_SPU_WINDOW_SIZE;
-}
-
-static inline uint8_t* vm_spu_ls_host_ptr(uint32_t spu_index)
-{
-    return vm_base + VM_SPU_BASE + spu_index * VM_SPU_WINDOW_SIZE;
-}
-
-/* ---------------------------------------------------------------------------
  * Address translation helpers
  * -----------------------------------------------------------------------*/
 
 static inline void* vm_to_host(uint32_t addr)
 {
     return (void*)(vm_base + addr);
-}
-
-static inline uint32_t vm_to_guest(const void* host_ptr)
-{
-    return (uint32_t)((const uint8_t*)host_ptr - vm_base);
-}
-
-static inline int vm_is_valid_addr(uint32_t addr)
-{
-    /* Check if address falls within a committed region */
-    if (addr >= VM_MAIN_MEM_BASE && addr < VM_MAIN_MEM_BASE + VM_MAIN_MEM_SIZE)
-        return 1;
-    if (addr >= VM_STACK_BASE && addr < VM_STACK_BASE + VM_STACK_REGION)
-        return 1;
-    if (addr >= VM_SPU_BASE && addr < VM_SPU_BASE + 8 * VM_SPU_WINDOW_SIZE)
-        return 1;
-    if (addr >= VM_RSX_BASE && addr < VM_RSX_BASE + VM_RSX_SIZE)
-        return 1;
-    return 0;
 }
 
 #ifdef __cplusplus

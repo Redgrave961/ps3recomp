@@ -67,6 +67,9 @@
 #include <wchar.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#if defined(__linux__)
+#include <linux/membarrier.h>
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -434,6 +437,17 @@ static inline void MemoryBarrier(void)     { __atomic_thread_fence(__ATOMIC_SEQ_
 static inline void _ReadWriteBarrier(void) { __asm__ __volatile__("" ::: "memory"); }
 static inline void _ReadBarrier(void)      { __asm__ __volatile__("" ::: "memory"); }
 static inline void _WriteBarrier(void)     { __asm__ __volatile__("" ::: "memory"); }
+#if defined(__linux__)
+static inline void FlushProcessWriteBuffers(void)
+{
+    static int registered;
+    if (!__atomic_load_n(&registered, __ATOMIC_ACQUIRE)) {
+        if (syscall(__NR_membarrier, MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED, 0, 0)) abort();
+        __atomic_store_n(&registered, 1, __ATOMIC_RELEASE);
+    }
+    if (syscall(__NR_membarrier, MEMBARRIER_CMD_PRIVATE_EXPEDITED, 0, 0)) abort();
+}
+#endif
 
 /* Spin hint: tells the core this is a wait loop, so it can back off rather
  * than burn the pipeline. Purely advisory -- doing nothing is correct, just

@@ -42,13 +42,14 @@
  *         runtime/spu/tests/test_spu_lockline_peer.c \
  *         runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
  *         runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
- *         runtime/spu/spu_vm_pagemap.c runtime/spu/spu_interp.c \
- *         runtime/platform/win32_compat.c -lpthread -lm
+ *         runtime/spu/spu_interp.c \
+ *         runtime/platform/win32_compat.c runtime/platform/ps3_sync.c -lpthread -lm
  *
  * Exit code: 0 if all passed, 1 if any failed. Final line prints a summary.
  */
 
 #include <pthread.h>
+#include <sched.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -368,7 +369,7 @@ static void* race_reader(void* arg)
 {
     (void)arg;
     for (int k = 1; k <= RACE_ROUNDS; k++) {
-        while (atomic_load(&g_race_go) != k) { }
+        while (atomic_load(&g_race_go) != k) sched_yield();
         race_delay((unsigned)(k * 7) & 31u);
         spu_atomic(&g_a, LSA_A, LINE_A, MFC_GETLLAR_CMD);
         atomic_store(&g_race_reader_done, k);
@@ -380,7 +381,7 @@ static void* race_writer(void* arg)
 {
     (void)arg;
     for (int k = 1; k <= RACE_ROUNDS; k++) {
-        while (atomic_load(&g_race_go) != k) { }
+        while (atomic_load(&g_race_go) != k) sched_yield();
         race_delay((unsigned)(k * 13) & 31u);
         const uint8_t v = (uint8_t)(k % 255 + 1);
         if (k & 1) {
@@ -420,7 +421,7 @@ static void test_racing_write_ends_lockfree_reservation(void)
         g_a.event_status = 0;
         atomic_store(&g_race_go, k);
         while (atomic_load(&g_race_reader_done) != k ||
-               atomic_load(&g_race_writer_done) != k) { }
+               atomic_load(&g_race_writer_done) != k) sched_yield();
         const uint8_t v = (uint8_t)(k % 255 + 1);
         int whole = 1;
         for (int i = 0; i < 128; i++)
@@ -715,7 +716,6 @@ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w)
 unsigned long long ps3_ms_now(void)                    { return 0; }
 uint32_t g_ww_lo = 0xFFFFFFFFu, g_ww_hi = 0;
 int      g_resv_store_active = 0;
-uint32_t g_barrier_sync_watch = 0;
 
 void (*g_spurs_kernel_hook)(uint32_t) = 0;
 void spurs_ef_set_from_spu(uint32_t ea, uint16_t bits) { (void)ea; (void)bits; }

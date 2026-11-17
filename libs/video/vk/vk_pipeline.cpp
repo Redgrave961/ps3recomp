@@ -166,6 +166,8 @@ void pipelines::worker()
             m_background_running += background;
         }
         task();
+        m_cache_dirty.store(true, std::memory_order_relaxed);
+        save_cache_periodic();
         if (background) {
             {
                 std::lock_guard<std::mutex> hold(m_work_lock);
@@ -196,19 +198,7 @@ void pipelines::destroy()
     m_work_cv.notify_all();
     for (std::thread& t : m_workers) t.join();
     m_workers.clear();
-    size_t n = 0;
-    if (vkGetPipelineCacheData(m_d->dev, m_cache, &n, nullptr) == VK_SUCCESS && n) {
-        std::vector<uint8_t> blob(n);
-        if (vkGetPipelineCacheData(m_d->dev, m_cache, &n, blob.data()) == VK_SUCCESS)
-            if (FILE* f = std::fopen((m_cache_path + ".tmp").c_str(), "wb")) {
-                const bool ok = std::fwrite(blob.data(), 1, n, f) == n;
-                std::fclose(f);
-                if (ok) {
-                    std::remove(m_cache_path.c_str());
-                    std::rename((m_cache_path + ".tmp").c_str(), m_cache_path.c_str());
-                }
-            }
-    }
+    save_cache();
     for (auto& [k, e] : m_map) {
         const VkPipeline p = e->pipe.load();
         if (p) vkDestroyPipeline(m_d->dev, p, nullptr);
@@ -226,8 +216,35 @@ void pipelines::destroy()
     m_d = nullptr;
 }
 
-pipeline_key pipelines::normalize(const pipeline_key& key) const
+void pipelines::save_cache_periodic()
 {
+    if (!m_cache_dirty.load(std::memory_order_relaxed)) return;
+    {
+        std::lock_guard<std::mutex> hold(m_save_lock);
+        if (std::chrono::steady_clock::now() - m_saved < std::chrono::seconds(30)) return;
+    }
+    save_cache();
+}
+
+void pipelines::save_cache()
+{
+    std::lock_guard<std::mutex> hold(m_save_lock);
+    if (!m_cache_dirty.exchange(false, std::memory_order_relaxed)) return;
+    m_saved = std::chrono::steady_clock::now();
+    size_t n = 0;
+    if (vkGetPipelineCacheData(m_d->dev, m_cache, &n, nullptr) != VK_SUCCESS || !n) return;
+    std::vector<uint8_t> blob(n);
+    if (vkGetPipelineCacheData(m_d->dev, m_cache, &n, blob.data()) != VK_SUCCESS) return;
+    FILE* f = std::fopen((m_cache_path + ".tmp").c_str(), "wb");
+    if (!f) return;
+    const bool ok = std::fwrite(blob.data(), 1, n, f) == n;
+    std::fclose(f);
+    if (!ok) return;
+    std::remove(m_cache_path.c_str());
+    std::rename((m_cache_path + ".tmp").c_str(), m_cache_path.c_str());
+}
+
+pipeline_key pipelines::normalize(const pipeline_key& key) const{
     pipeline_key k = key;
     if (m_dynamic_blend) std::memset(k.blend, 0, sizeof k.blend);
     if (m_dynamic_polygon) k.polygon_mode = 0;

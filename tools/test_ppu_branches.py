@@ -39,12 +39,12 @@ def main() -> int:
     assert blr == "return;", blr
 
     # blrl: dispatch through LR, then CONTINUE (link = call, so no return).
-    assert "ps3_indirect_call" in blrl, blrl
+    assert "ppu_call_ctr" in blrl, blrl
     assert "ctx->lr" in blrl, blrl
     assert "return;" not in blrl, f"blrl must not return -- link = call: {blrl}"
 
     # b<cond>lrl: the conditional LR twin of b<cond>ctrl.
-    assert "ps3_indirect_call" in bnelrl, bnelrl
+    assert "ppu_call_to" in bnelrl, bnelrl
     assert "ctx->lr" in bnelrl, bnelrl
     # LK=1 writes LR = CIA + 4 whether or not the branch is taken (PowerISA
     # Book I 2.4), so the LR update precedes the condition; the call is guarded.
@@ -52,7 +52,7 @@ def main() -> int:
 
     # The CTR-based call it mirrors, unchanged.
     # bctrl links too (LR = CIA + 4) before calling through CTR.
-    assert bctrl == "ctx->lr = 0x00001004; ps3_indirect_call(ctx); DRAIN_TRAMPOLINE(ctx);", bctrl
+    assert bctrl == "ctx->lr = 0x00001004; ppu_call_ctr(ctx);", bctrl
 
     # A chunk that ends on a conditional branch falls through when it is not
     # taken, so it needs the fall-through tail; an unconditional one does not.

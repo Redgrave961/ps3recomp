@@ -278,6 +278,9 @@ typedef struct spu_context {
      * resolutions of this context. */
     uint32_t dcache_id, dcache_residency;
 
+    struct mfc_engine* mfc;
+    volatile int ch_sleeping;
+
     /* --- SPU_DRAIN trampoline execution model (faithful-adopt, canersaka) ---
      * host_depth counts live lifted call frames (matched brsl/bisl). SPU_RET
      * (`bi $r0`) does a host `return` while host_depth>0 (the caller's frame is
@@ -416,11 +419,6 @@ static inline void spu_context_init(spu_context* ctx, uint32_t spu_id)
 /* ---------------------------------------------------------------------------
  * Local store access helpers
  * -----------------------------------------------------------------------*/
-static inline uint8_t* spu_ls_ptr(spu_context* ctx, uint32_t lsa)
-{
-    return &ctx->ls[lsa & SPU_LS_MASK];
-}
-
 static inline uint32_t spu_ls_read32(const spu_context* ctx, uint32_t lsa)
 {
     lsa &= SPU_LS_MASK;
@@ -544,21 +542,6 @@ static inline uint32_t spu_preferred_u32(const u128* reg)
     return reg->_u32[0];
 }
 
-static inline int32_t spu_preferred_s32(const u128* reg)
-{
-    return reg->_s32[0];
-}
-
-static inline float spu_preferred_f32(const u128* reg)
-{
-    return reg->_f32[0];
-}
-
-static inline uint64_t spu_preferred_u64(const u128* reg)
-{
-    return reg->_u64[0];
-}
-
 /* Create a register with a value splatted to the preferred word slot */
 static inline u128 spu_make_preferred_u32(uint32_t val)
 {
@@ -663,14 +646,13 @@ void spu_task_launch_check(spu_context* ctx, void* fn); /* SPURS task-launch    
 /* Complete ordered hop; the launch-only ABI above does not tick lockstep. */
 void spu_drain_hop(spu_context* ctx, void (*fn)(spu_context*));
 extern unsigned g_spu_stack_reset_count; /* read-only outside registration */
+extern uint8_t g_spu_stack_reset_hint[1024];
 static inline int spu_stack_reset_needed(const spu_context* ctx)
 {
     unsigned count = __atomic_load_n(&g_spu_stack_reset_count, __ATOMIC_ACQUIRE);
-    return count && ctx->host_depth;
+    return count && ctx->host_depth && g_spu_stack_reset_hint[(ctx->pc >> 2) & 1023u];
 }
-/* Restore image_id after a call-bracket (adopt-on-serve); re-applies the
- * persistent LS-0xA00 workload module if one is set. */
-void spu_img_restore(spu_context* ctx, int32_t saved_img);
+
 /* Wake a host thread blocked in a channel wait (channel-stall milestone). */
 void spu_ch_wake(spu_context* ctx);
 /* Runaway lifted-call recursion guard. A lifted brsl/bisl nests a real host
@@ -694,8 +676,17 @@ static inline void spu_depth_guard_check(spu_context* ctx)
  * unchanged (interrupt not taken) if LS 0 holds no branch instruction. */
 void (*spu_take_interrupt(spu_context* ctx,
                           void (*tf)(spu_context*)))(spu_context*);
+extern volatile int g_spu_direct;
 /* Drain a translated call up to its explicit architectural return PC. */
 void spu_drain_call(spu_context* ctx, uint32_t return_pc);
+static inline void spu_call_return(spu_context* ctx, uint32_t return_pc)
+{
+    if (__builtin_expect(!g_spu_trampoline_fn && !((ctx->pc ^ return_pc) & SPU_LS_MASK) && g_spu_direct >= 0, 1)) {
+        spu_depth_guard_check(ctx);
+        return;
+    }
+    spu_drain_call(ctx, return_pc);
+}
 /* Drain the pending trampoline chain: run each queued transfer target until
  * none remain. The one central hook site for the faithful execution model. */
 #define SPU_DRAIN(ctx) do {                                    \
@@ -724,8 +715,6 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc);
  * with interrupts enabled. Anything else takes the trampoline as before. Tail calls need
  * clang's musttail; other compilers always take the trampoline. SPU_LOCKSTEP,
  * which watches each drain step, turns it off (spu_drain.c). */
-extern volatile int g_spu_direct;                /* spu_drain.c: -1 unread, 0 off, 1 on */
-extern uint8_t g_spu_stack_reset_hint[1024];     /* spu_channels.c, by (entry >> 2) & 1023 */
 void spu_direct_init(void);
 #if defined(__clang__) && defined(__has_attribute)
 #  if __has_attribute(musttail)

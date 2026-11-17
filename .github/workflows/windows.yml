@@ -8,63 +8,99 @@ on:
 
 jobs:
   build:
-    name: Windows x64 (${{ matrix.build_type }})
+    name: Windows x64 (clang-cl, Debug and Release)
     runs-on: windows-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        build_type: [Debug, Release]
+    env:
+      CI: "1"
+      VCPKG_PACKAGES: sdl3 vulkan-headers volk vulkan-memory-allocator
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\.vcpkg-cache
 
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up MSVC environment
-        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
-        with:
-          arch: x64
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" >nul && set" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          if ($LASTEXITCODE -ne 0) { exit 1 }
 
       - name: Install Ninja
         run: choco install ninja -y --no-progress
 
-      - name: Install dependencies
-        run: |
-          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg" install sdl3 vulkan-headers volk vulkan-memory-allocator --triplet x64-windows-static-md
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-
-      - name: Configure
-        run: >
-          cmake -S . -B build -G Ninja
-          -DCMAKE_C_COMPILER=clang-cl
-          -DCMAKE_CXX_COMPILER=clang-cl
-          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
-          -DCMAKE_PREFIX_PATH="$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows-static-md"
-
-      - name: Build
-        run: cmake --build build
-
-      - name: Verify the library exists
+      - name: vcpkg cache key
+        id: vcpkg
         shell: bash
-        run: test -s build/ps3recomp_runtime.lib
+        run: |
+          mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
+          rev=$(git -C "$VCPKG_INSTALLATION_ROOT" rev-parse --short HEAD)
+          sig=$(printf '%s\n%s\n' "$VCPKG_PACKAGES" "$(cl 2>&1 | head -1)" | sha256sum | cut -c1-16)
+          echo "key=vcpkg-x64-windows-static-md-$rev-$sig" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+      - name: Restore vcpkg binary cache
+        id: vcpkg-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
+          key: ${{ steps.vcpkg.outputs.key }}
+          restore-keys: vcpkg-x64-windows-static-md-
+
+      - name: Install vcpkg dependencies
+        run: |
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg" install $env:VCPKG_PACKAGES.Split(' ') --triplet x64-windows-static-md
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          "CMAKE_PREFIX_PATH=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: Save vcpkg binary cache
+        if: steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
+          key: ${{ steps.vcpkg.outputs.key }}
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
 
-      - name: Run the lifter test suites
+      - name: Install Python packages
+        run: python -m pip install -r requirements.txt
+
+      - name: Configure, build and test (Debug, Release)
+        run: |
+          foreach ($cfg in 'Debug', 'Release') {
+            cmake -S . -B "build-$cfg" -G Ninja -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl `
+              "-DCMAKE_BUILD_TYPE=$cfg" -DPS3RECOMP_BUILD_TESTS=ON
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+            cmake --build "build-$cfg"
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+            ctest --test-dir "build-$cfg" --output-on-failure
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+          }
+
+      - name: Lifter and fixture test suites
+        if: ${{ !cancelled() }}
         shell: bash
         env:
-          CI: "1"
+          CC: clang
+          CXX: clang++
         run: |
-          set -e
+          fail=0
           for t in tools/test_*.py; do
-            echo "--- $t"
-            python "$t"
+            echo "::group::$t"
+            rc=0; out=$(python "$t" 2>&1) || rc=$?
+            echo "$out"
+            echo "::endgroup::"
+            if [ $rc -ne 0 ]; then fail=1; echo "::error::$t failed"; fi
+            skip=$(grep -m1 -E '^SKIP|"status": "SKIP"' <<<"$out") && echo "::notice::$t: $skip"
           done
+          exit $fail
 
-      - name: Check the PPU boot scaffold (ratchet)
-        run: python tools/check_ppu_scaffold.py
+      - name: PPU boot scaffold ratchet
+        if: ${{ !cancelled() }}
+        run: python tools/check_ppu_scaffold.py --verbose
 
-      - name: Run the ps3_env_once test (cl and clang-cl)
+      - name: ps3_env_once (cl and clang-cl)
+        if: ${{ !cancelled() }}
         run: |
           cl /nologo /W3 /WX /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_env_once_cl.exe tests/test_env_once.c
           if ($LASTEXITCODE -ne 0) { exit 1 }
@@ -79,25 +115,42 @@ jobs:
           .\test_env_once_clang.exe
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
-      - name: Run self-contained SPU helper tests
+      - name: Standalone C tests
+        if: ${{ !cancelled() }}
+        shell: bash
         run: |
-          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /I runtime/spu /Fe:test_spu_helpers.exe runtime/spu/tests/test_spu_helpers.c
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-          .\test_spu_helpers.exe
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-
-      - name: Run the sys_net loopback test
-        run: |
-          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_sys_net.exe libs/network/tests/test_sys_net.c ws2_32.lib
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-          .\test_sys_net.exe
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-
-      - name: Build and run sync_stress
-        run: |
-          cmake -S tests/sync_stress -B build-sync-stress -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DCMAKE_C_COMPILER=clang-cl
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-          cmake --build build-sync-stress
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-          ctest --test-dir build-sync-stress --output-on-failure
-          if ($LASTEXITCODE -ne 0) { exit 1 }
+          fail=0
+          t() {
+            name=$1; shift
+            echo "::group::$name"
+            if clang -std=gnu17 -D_CRT_SECURE_NO_WARNINGS -w "$@" -o "$RUNNER_TEMP/$name.exe" && "$RUNNER_TEMP/$name.exe"; then
+              echo "::endgroup::"
+            else
+              echo "::endgroup::"; echo "::error::$name failed"; fail=1
+            fi
+          }
+          spu="-I include -I runtime -I runtime/spu"
+          t test_spu_helpers $spu runtime/spu/tests/test_spu_helpers.c
+          t spu_xswd_test $spu runtime/spu/tests/spu_xswd_test.c
+          t test_spu_numeric_semantics $spu runtime/spu/tests/test_spu_numeric_semantics.c
+          t test_spu_shufb -O2 -msse4.1 $spu runtime/spu/tests/test_spu_shufb.c
+          t test_spu_int_x86_sse41 -O2 -msse4.1 $spu runtime/spu/tests/test_spu_int_x86.c
+          t test_spu_int_x86_avx2 -O2 -march=x86-64-v3 $spu runtime/spu/tests/test_spu_int_x86.c
+          t test_spu_float_neon -O2 -mavx2 -mfma $spu runtime/spu/tests/test_spu_float_neon.c
+          t test_spu_float_est -O2 -mavx2 -mfma $spu runtime/spu/tests/test_spu_float_est.c
+          t test_spu_float_exact -O2 -msse4.1 -ffp-contract=off -UNDEBUG $spu runtime/spu/tests/test_spu_float_exact.c
+          t test_spu_float_vector_scalar -O2 -msse4.1 -ffp-contract=off -UNDEBUG $spu runtime/spu/tests/test_spu_float_vector_scalar.c
+          t test_spu_decode -UNDEBUG $spu runtime/spu/tests/test_spu_decode.c runtime/platform/ps3_sync.c runtime/spu/tests/spu_fixture_ppu.c -lsynchronization
+          t test_spu_group_lifecycle -I include -I runtime -I runtime/syscalls -I runtime/spu -I libs/video \
+            runtime/spu/tests/test_spu_group_lifecycle.c runtime/spu/tests/test_spu_group_lifecycle_win_stubs.c \
+            runtime/spu/spu_lifted_thread.c runtime/platform/ps3_sync.c runtime/spu/tests/spu_fixture_ppu.c -lsynchronization
+          t test_sys_net -I include libs/network/tests/test_sys_net.c -lws2_32
+          t test_np_commerce2 -I include libs/network/tests/test_np_commerce2.c -lws2_32
+          t test_netctl_netstart -I include -I libs/system libs/network/tests/test_netctl_netstart.c -lws2_32
+          t test_dev_flash_path runtime/platform/tests/test_dev_flash_path.c runtime/platform/ps3_dev_flash.c
+          t test_rsx_spirv -O2 -I libs/video -I include libs/video/tests/test_rsx_spirv.c libs/video/rsx_spirv.c
+          echo "::group::test_rsx_texture"
+          if clang++ -std=c++20 -O2 -w -D_CRT_SECURE_NO_WARNINGS -I "$CMAKE_PREFIX_PATH/include" -I include -I libs/video -I libs/video/vk \
+               libs/video/vk/tests/test_rsx_texture.cpp libs/video/vk/rsx_texture.cpp -o "$RUNNER_TEMP/test_rsx_texture.exe" &&
+             "$RUNNER_TEMP/test_rsx_texture.exe"; then echo "::endgroup::"; else echo "::endgroup::"; echo "::error::test_rsx_texture failed"; fail=1; fi
+          exit $fail

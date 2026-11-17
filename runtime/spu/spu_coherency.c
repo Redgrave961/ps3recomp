@@ -14,6 +14,8 @@
 #include <stdlib.h>
 #include "spu_coherency.h"
 #include "spu_coh_bitmap.h"
+#include "../memory/vm_page_map.h"
+#include "../platform/win32_compat.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -63,9 +65,7 @@ static unsigned char s_coh_bitmap[SPU_COH_BITMAP_SZ];
 /* g_spu_coh_bits (spu_coh_bitmap.h) stays NULL until the first GETLLAR
  * anywhere. That keeps the PPU fast path off the bitmap entirely for a title
  * that runs no SPU code, and keeps every existing test that stores through
- * vm_write* paying one compare against a hot global. Written under the lock;
- * read unlocked, where a stale NULL costs at most one missed event on the very
- * first reservation of the run. */
+ * vm_write* paying one compare against a hot global. */
 
 /* Every live virtual context may retain a reservation between scheduling
  * quanta; physical SPU count is not a bound on this set. All access is under
@@ -82,7 +82,6 @@ static inline void spu_coh_prefetch_holder(unsigned i)
 {
     if (i < s_coh_n) __builtin_prefetch(&s_coh_ctxs[i]->resv_valid);
 }
-static spu_coh_watch* s_coh_watches;
 
 unsigned long g_spu_lr_raise = 0;
 
@@ -94,10 +93,13 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
      * the bitmap byte. */
     uint32_t line = ea >> SPU_COH_LINE_SHIFT;
     const unsigned char bit = (unsigned char)(1u << (line & 7));
-    if (!(s_coh_bitmap[line >> 3] & bit))
-        s_coh_bitmap[line >> 3] |= bit;
-    if (!g_spu_coh_bits)
-        g_spu_coh_bits = s_coh_bitmap;
+    if (!(s_coh_bitmap[line >> 3] & bit)) {
+        ppu_slow_pages(line << SPU_COH_LINE_SHIFT, 1u << SPU_COH_LINE_SHIFT);
+        __atomic_store_n(&s_coh_bitmap[line >> 3], (unsigned char)(s_coh_bitmap[line >> 3] | bit), __ATOMIC_RELEASE);
+        __atomic_store_n(&g_spu_coh_bits, (const unsigned char*)s_coh_bitmap, __ATOMIC_RELEASE);
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        FlushProcessWriteBuffers();
+    }
 
     if (!ctx) return;
     for (unsigned i = 0; i < s_coh_n; i++)
@@ -115,35 +117,6 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
     }
     s_coh_ctxs[s_coh_n++] = ctx;
     __atomic_store_n(&ctx->coh_listed, 1, __ATOMIC_RELAXED);
-}
-
-void spu_coh_watch_add(spu_coh_watch* watch, uint32_t ea,
-                       void (*wake)(void*), void* opaque)
-{
-    /* Arming the existing bitmap makes PPU stores/CAS and MFC writes use
-     * the same serialized commit/notify path as SPU reservations. */
-    spu_coh_reserve(NULL, ea);
-    watch->line = ea & ~127u;
-    watch->wake = wake;
-    watch->opaque = opaque;
-    watch->next = s_coh_watches;
-    s_coh_watches = watch;
-}
-
-void spu_coh_watch_remove(spu_coh_watch* watch)
-{
-    for (spu_coh_watch** link = &s_coh_watches; *link; link = &(*link)->next) {
-        if (*link != watch) continue;
-        *link = watch->next;
-        watch->next = NULL;
-        return;
-    }
-}
-
-static void spu_coh_wake_watches(uint32_t line)
-{
-    for (spu_coh_watch* w = s_coh_watches; w; w = w->next)
-        if (w->line == line) w->wake(w->opaque);
 }
 
 /* Drop a context from the reserving set.
@@ -289,9 +262,8 @@ int spu_coh_reserve_fast(spu_context* ctx, uint32_t ea, uint32_t* seq)
 void spu_coh_notify_write_except(uint32_t ea, const void* self)
 {
     uint32_t line = ea & ~127u;
-    ppu_resv_break_line(ea);
     spu_coh_writer_fence();
-    spu_coh_wake_watches(line);
+    ppu_resv_break_line(ea);
     for (unsigned i = 0; i < SPU_COH_PREFETCH; i++) spu_coh_prefetch_holder(i);
     for (unsigned i = 0; i < s_coh_n; i++) {
         spu_coh_prefetch_holder(i + SPU_COH_PREFETCH);
@@ -308,22 +280,7 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
 
 void spu_coh_notify_write(uint32_t ea)
 {
-    uint32_t line = ea & ~127u;
-    ppu_resv_break_line(ea);
-    spu_coh_writer_fence();
-    spu_coh_wake_watches(line);
-    for (unsigned i = 0; i < SPU_COH_PREFETCH; i++) spu_coh_prefetch_holder(i);
-    for (unsigned i = 0; i < s_coh_n; i++) {
-        spu_coh_prefetch_holder(i + SPU_COH_PREFETCH);
-        spu_context* c = s_coh_ctxs[i];
-        if (!c) continue;
-        if (spu_coh_holds(c, line)) {
-            SPU_EVENT_SET(c, SPU_EVENT_LR);
-            __atomic_store_n(&c->resv_valid, 0, __ATOMIC_RELAXED);   /* reservation lost, PUTLLC must fail */
-            g_spu_lr_raise++;
-            spu_ch_wake(c);
-        }
-    }
+    spu_coh_notify_write_except(ea, NULL);
 }
 
 #ifdef __cplusplus

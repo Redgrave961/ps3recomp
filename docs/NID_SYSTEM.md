@@ -11,7 +11,7 @@ Complete reference for how PS3 function linking works, how NIDs are computed, an
 3. [How PS3 Linking Works](#how-ps3-linking-works)
 4. [ps3recomp NID Resolution](#ps3recomp-nid-resolution)
 5. [NID Lookup Table Implementation](#nid-lookup-table-implementation)
-6. [Module Registration Framework](#module-registration-framework)
+6. [Module Registration](#module-registration)
 7. [NID Database Tools](#nid-database-tools)
 8. [Custom NID Suffixes](#custom-nid-suffixes)
 9. [Troubleshooting Unresolved NIDs](#troubleshooting-unresolved-nids)
@@ -225,84 +225,9 @@ The global registry holds up to **128 modules** (`PS3_MAX_MODULES`).
 
 ---
 
-## Module Registration Framework
+## Module Registration
 
-### How Modules Register
-
-The `DECLARE_PS3_MODULE` macro creates a static module instance and a C++ static-initialization constructor that registers it in the global registry before `main()` runs:
-
-```cpp
-DECLARE_PS3_MODULE(cellFs, "cellFs")
-{
-    REGISTER_FUNC(cellFsOpen);        // NID computed from "cellFsOpen"
-    REGISTER_FUNC(cellFsRead);
-    REGISTER_FUNC(cellFsWrite);
-    REGISTER_FUNC(cellFsClose);
-    REGISTER_FNID(0xE2A2D3AB, cellFsStat);  // Explicit NID
-
-    SET_MODULE_INIT(cellFs_init);     // Called on module load
-    SET_MODULE_SHUTDOWN(cellFs_shutdown);  // Called on module unload
-}
-```
-
-### Macro Expansion
-
-`DECLARE_PS3_MODULE(cellFs, "cellFs")` expands to:
-
-```cpp
-static ps3_module cellFs;
-static void _ps3_register_cellFs();
-namespace {
-    struct _ps3_auto_cellFs {
-        _ps3_auto_cellFs() {
-            ps3_module_init(&cellFs, "cellFs");
-            _ps3_register_cellFs();
-            ps3_register_module(&cellFs);
-        }
-    };
-    static _ps3_auto_cellFs _ps3_inst_cellFs;
-}
-static void _ps3_register_cellFs()  // ← the body you write follows
-```
-
-### Registration Macros
-
-| Macro | Purpose |
-|-------|---------|
-| `REGISTER_FUNC(func)` | Register function with auto-computed NID from name |
-| `REGISTER_FNID(nid, func)` | Register function with explicit NID value |
-| `REGISTER_VAR(var)` | Register variable with auto-computed NID |
-| `REGISTER_VAR_FNID(nid, var)` | Register variable with explicit NID |
-| `SET_MODULE_INIT(fn)` | Set the module's initialization callback |
-| `SET_MODULE_SHUTDOWN(fn)` | Set the module's shutdown callback |
-
-### Under the Hood
-
-`REGISTER_FUNC(cellFsOpen)` expands to:
-
-```cpp
-ps3_nid_table_add(&cellFs.func_table,
-                   ps3_compute_nid("cellFsOpen"),  // SHA-1 hash at startup
-                   "cellFsOpen",                    // Name string for debugging
-                   (void*)(cellFsOpen));             // Function pointer
-```
-
-The NID computation happens once during static initialization (before `main()`), so there's no runtime hashing cost.
-
-### Module Lifecycle
-
-```c
-// Loading a module (called by cellSysmodule)
-ps3_module* m = ps3_find_module("cellFs");
-int32_t rc = ps3_module_load(m);
-// Calls m->on_load() if set, marks module as loaded
-
-// Unloading a module
-ps3_module_unload(m);
-// Calls m->on_unload() if set, marks module as unloaded
-```
-
-Modules start unloaded. The `cellSysmodule` HLE module manages loading/unloading in response to game calls.
+`tools/gen_hle_nids.py` (run by the build) registers every non-static `cell*`/`sce*`/`sys*` function in `libs/*/` under its NID; there is no per-module registration code.
 
 ---
 
@@ -404,18 +329,10 @@ In practice, the vast majority of game-facing libraries use the default suffix (
        return CELL_OK;
    }
    ```
-   Then register it:
-   ```cpp
-   DECLARE_PS3_MODULE(cellFoo, "cellFoo")
-   {
-       REGISTER_FUNC(cellFooBarBaz);
-   }
-   ```
 
 ### Common Patterns
 
 - **NID 0x00000000** — usually means the import table was parsed incorrectly; check ELF integrity
-- **Multiple NIDs resolving to the same name** — different suffix versions; use `REGISTER_FNID` with both
 - **NID not in database** — function may be from a debug/dev library or a very niche module; check RPCS3 first, then consider stubbing
 
 ---

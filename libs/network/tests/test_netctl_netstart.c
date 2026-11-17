@@ -29,7 +29,6 @@ void cellSysutilQueueEvent(int slot, u32 status, u32 param)
     (void)slot; (void)param;
     if (status == CELL_SYSUTIL_NET_CTL_NETSTART_UNLOADED) s_unloaded++;
 }
-const char* np_psnr_identity(void) { return "PS3Player"; }
 
 static u32 be32_at(u32 ea)
 {

@@ -26,6 +26,9 @@
  * instead of inventing a second one.
  */
 
+#if !defined(_WIN32) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
 #include "spu_raw.h"
 #include "spu_context.h"
 #include "spu_workload.h"
@@ -38,9 +41,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include "../platform/ps3_sync.h"
+#include "../memory/vm_fault_x86.h"
 
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <signal.h>
+#include <sys/mman.h>
+#include <ucontext.h>
 #endif
 
 extern uint8_t* vm_base;
@@ -97,6 +105,25 @@ typedef struct raw_spu {
 
 static raw_spu s_spu[SPU_RAW_COUNT];
 
+#define SPU_RAW_REG_PAGES 0x43000u
+#define SPU_RAW_REG_SPAN  0x2000u
+
+static uint8_t s_reg_shadow[SPU_RAW_COUNT][SPU_RAW_REG_SPAN];
+static int     s_shadowed[SPU_RAW_COUNT];
+
+uint8_t* spu_raw_shadow(uint32_t ea)
+{
+    const uint32_t off = ea - SPU_RAW_BASE, n = off / SPU_RAW_STRIDE, at = off % SPU_RAW_STRIDE - SPU_RAW_REG_PAGES;
+    if (n >= SPU_RAW_COUNT || at >= SPU_RAW_REG_SPAN || !__atomic_load_n(&s_shadowed[n], __ATOMIC_ACQUIRE)) return NULL;
+    return &s_reg_shadow[n][at];
+}
+
+static uint8_t* raw_mem(uint32_t ea)
+{
+    uint8_t* p = spu_raw_shadow(ea);
+    return p ? p : vm_base + ea;
+}
+
 static int dbg(void)
 {
     static int v = -1;
@@ -114,14 +141,14 @@ static int dbg(void)
 static uint32_t be32_load(uint32_t ea)
 {
     uint32_t b;
-    memcpy(&b, vm_base + ea, 4);
+    memcpy(&b, raw_mem(ea), 4);
     return (b >> 24) | ((b >> 8) & 0xFF00u) | ((b << 8) & 0xFF0000u) | (b << 24);
 }
 
 static void be32_store(uint32_t ea, uint32_t v)
 {
     uint32_t b = (v >> 24) | ((v >> 8) & 0xFF00u) | ((v << 8) & 0xFF0000u) | (v << 24);
-    memcpy(vm_base + ea, &b, 4);
+    memcpy(raw_mem(ea), &b, 4);
 }
 
 static raw_spu* spu_for(uint32_t ea, uint32_t* off_out)
@@ -637,6 +664,109 @@ int spu_raw_reg_load(uint32_t ea, uint32_t* out)
     return 0;
 }
 
+#if defined(__x86_64__) || defined(_M_X64)
+static void raw_read(uint32_t g, int width, uint8_t* out)
+{
+    uint32_t v;
+    if (width == 4 && spu_raw_reg_load(g, &v)) {
+        out[0] = (uint8_t)(v >> 24); out[1] = (uint8_t)(v >> 16); out[2] = (uint8_t)(v >> 8); out[3] = (uint8_t)v;
+        return;
+    }
+    for (int i = 0; i < width; i++) out[i] = *raw_mem(g + (uint32_t)i);
+}
+
+static void raw_fault_fatal(uint64_t g, uint64_t pc)
+{
+    fprintf(stderr, "[spu-raw] unsupported access to raw SPU register page 0x%08X at host pc 0x%llX\n",
+            (uint32_t)g, (unsigned long long)pc);
+    fflush(stderr);
+    abort();
+}
+
+#ifdef _WIN32
+static LONG WINAPI raw_mmio_veh(EXCEPTION_POINTERS* ep)
+{
+    const EXCEPTION_RECORD* er = ep->ExceptionRecord;
+    if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || er->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
+    const uint64_t g = (uint64_t)er->ExceptionInformation[1] - (uintptr_t)vm_base;
+    if (g >= (1ull << 32) || !spu_raw_shadow((uint32_t)g)) return EXCEPTION_CONTINUE_SEARCH;
+    if (er->ExceptionInformation[0] == 0 && vm_emulate_load(&ep->ContextRecord->Rax, &ep->ContextRecord->Rip, vm_base, raw_read))
+        return EXCEPTION_CONTINUE_EXECUTION;
+    raw_fault_fatal(g, ep->ContextRecord->Rip);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void raw_fault_install(void) { AddVectoredExceptionHandler(1, raw_mmio_veh); }
+
+static void raw_protect(uint8_t* p)
+{
+    DWORD old;
+    VirtualAlloc((void*)((uintptr_t)p & ~(uintptr_t)0xFFFF), 0x10000, MEM_COMMIT, PAGE_READWRITE);
+    VirtualProtect(p, SPU_RAW_REG_SPAN, PAGE_NOACCESS, &old);
+}
+#else
+static struct sigaction s_prev_segv;
+static const int s_greg[16] = { REG_RAX, REG_RCX, REG_RDX, REG_RBX, REG_RSP, REG_RBP, REG_RSI, REG_RDI,
+                                REG_R8, REG_R9, REG_R10, REG_R11, REG_R12, REG_R13, REG_R14, REG_R15 };
+
+static void raw_mmio_sigsegv(int sig, siginfo_t* si, void* uc_)
+{
+    ucontext_t* uc = (ucontext_t*)uc_;
+    const uint64_t g = (uint64_t)(uintptr_t)si->si_addr - (uintptr_t)vm_base;
+    if (g < (1ull << 32) && spu_raw_shadow((uint32_t)g)) {
+        uint64_t r[16], rip = (uint64_t)uc->uc_mcontext.gregs[REG_RIP];
+        for (int i = 0; i < 16; i++) r[i] = (uint64_t)uc->uc_mcontext.gregs[s_greg[i]];
+        if (!vm_emulate_load(r, &rip, vm_base, raw_read)) raw_fault_fatal(g, rip);
+        for (int i = 0; i < 16; i++) uc->uc_mcontext.gregs[s_greg[i]] = (greg_t)r[i];
+        uc->uc_mcontext.gregs[REG_RIP] = (greg_t)rip;
+        return;
+    }
+    if (s_prev_segv.sa_flags & SA_SIGINFO) { s_prev_segv.sa_sigaction(sig, si, uc_); return; }
+    if (s_prev_segv.sa_handler == SIG_IGN) return;
+    if (s_prev_segv.sa_handler != SIG_DFL) { s_prev_segv.sa_handler(sig); return; }
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static void raw_fault_install(void)
+{
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = raw_mmio_sigsegv;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, &s_prev_segv);
+}
+
+static void raw_protect(uint8_t* p) { mprotect(p, SPU_RAW_REG_SPAN, PROT_NONE); }
+#endif
+
+static void raw_reset_problem_state(uint32_t n)
+{
+    const uint32_t base = s_spu[n].base;
+    if (__atomic_load_n(&s_shadowed[n], __ATOMIC_ACQUIRE)) {
+        memset(vm_base + base + SPU_RAW_PROB_OFF, 0, SPU_RAW_REG_PAGES - SPU_RAW_PROB_OFF);
+        memset(vm_base + base + SPU_RAW_REG_PAGES + SPU_RAW_REG_SPAN, 0,
+               SPU_RAW_STRIDE - SPU_RAW_REG_PAGES - SPU_RAW_REG_SPAN);
+        memset(s_reg_shadow[n], 0, SPU_RAW_REG_SPAN);
+        return;
+    }
+    memset(vm_base + base + SPU_RAW_PROB_OFF, 0, SPU_RAW_STRIDE - SPU_RAW_PROB_OFF);
+    static int installed;
+    if (!__atomic_exchange_n(&installed, 1, __ATOMIC_ACQ_REL)) raw_fault_install();
+    __atomic_store_n(&s_shadowed[n], 1, __ATOMIC_RELEASE);
+    raw_protect(vm_base + base + SPU_RAW_REG_PAGES);
+}
+#else
+static void raw_reset_problem_state(uint32_t n)
+{
+    (void)n;
+    fprintf(stderr, "[spu-raw] raw SPU MMIO needs an x86-64 host (lifted loads fault into the emulator)\n");
+    fflush(stderr);
+    abort();
+}
+#endif
+
 /* ---------------------------------------------------------------------------
  * Syscalls
  * -----------------------------------------------------------------------*/
@@ -651,8 +781,7 @@ static int64_t sc_raw_spu_create(ppu_context* ctx)
 
         /* Zero the problem state. Local store is left alone: the guest may have
          * already staged code there, and hardware does not clear it either. */
-        memset(vm_base + s_spu[n].base + SPU_RAW_PROB_OFF, 0,
-               SPU_RAW_STRIDE - SPU_RAW_PROB_OFF);
+        raw_reset_problem_state(n);
         be32_store(s_spu[n].base + SPU_RAW_MBOX_STATUS,
                    MBOX_STATUS(0, SPU_MBOX_DEPTH, 0));
 

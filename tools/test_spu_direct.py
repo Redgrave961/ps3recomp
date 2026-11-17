@@ -11,8 +11,7 @@ if os.name == 'nt':
 root = Path(__file__).resolve().parents[1]
 spu = root / 'runtime/spu'
 sources = ['spu_channels.c', 'spu_drain.c', 'spu_lockstep.c', 'spu_coherency.c',
-           'spu_workload.c',
-           'spu_vm_pagemap.c', 'spu_interp.c']
+           'spu_workload.c', 'spu_interp.c']
 with tempfile.TemporaryDirectory(prefix='spu-direct-') as tmp:
     binary = Path(tmp) / 'test'
     subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-UNDEBUG',
@@ -20,14 +19,14 @@ with tempfile.TemporaryDirectory(prefix='spu-direct-') as tmp:
                     '-I'+str(root/'runtime/platform'),
                     str(spu/'tests/test_spu_direct.c'),
                     *[str(spu / name) for name in sources],
-                    str(root/'runtime/platform/win32_compat.c'), '-pthread', '-lm',
+                    str(root/'runtime/platform/win32_compat.c'), str(root/'runtime/platform/ps3_sync.c'), str(root/'runtime/spu/tests/spu_fixture_ppu.c'), '-pthread', '-lm',
                     '-o', str(binary)], check=True)
     failed = []
     for mode in ['direct', 'off', 'irq', 'reset-hint', 'ls0', 'nested']:
         env = {k: v for k, v in os.environ.items()
                if not k.startswith(('SPU_', 'SPURS_', 'PS3_SPU_'))}
         if mode == 'off':
-            env['PS3_SPU_DIRECT'] = '0'
+            env['SPU_LOCKSTEP'] = '1'
         result = subprocess.run([str(binary), mode], capture_output=True,
                                 text=True, timeout=60, cwd=tmp, env=env)
         print(result.stdout.strip())

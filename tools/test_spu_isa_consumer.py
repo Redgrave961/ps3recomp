@@ -73,7 +73,7 @@ endif()
                 suffix=Path(row['file']).suffix
                 exe=out/(label+('-cxx' if suffix=='.cpp' else '-c')+('.exe' if os.name=='nt' else ''))
                 if msvc:run([a.cxx,'/nologo','/MT',str(build/obj),'/Fe'+str(exe)])
-                else:run([a.cxx,str(build/obj),'-pthread','-lm','-o',str(exe)])
+                else:run([a.cxx,str(build/obj),*([] if os.name=='nt' else ['-pthread','-lm']),'-o',str(exe)])
                 result=run([str(exe)])
                 print(label,suffix,result.stdout.strip(),flush=True)
                 assert ('-msse4.1' in cmd)==enabled,cmd

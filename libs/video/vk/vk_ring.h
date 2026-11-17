@@ -12,12 +12,15 @@ struct vk_slice {
 
 class vk_ring {
 public:
-    bool create(vk_device& d, VkDeviceSize size, VkSemaphore timeline);
+    bool create(vk_device& d, VkDeviceSize size, VkDeviceSize persistent, VkSemaphore timeline);
     void destroy();
     vk_slice alloc(VkDeviceSize size, VkDeviceSize align);
+    bool hold(VkDeviceSize size, VmaVirtualAllocation& a, VkDeviceSize& offset);
+    void release(VmaVirtualAllocation a) { vmaVirtualFree(m_heap, a); }
     void close(uint64_t value);
     VkBuffer buffer() const { return m_buffer; }
-    VkDeviceSize capacity() const { return m_size; }
+    uint8_t* data() const { return m_ptr; }
+    VkDeviceSize capacity() const { return m_size + m_persistent; }
 
 private:
     void wait_for(VkDeviceSize need);
@@ -32,6 +35,8 @@ private:
     VmaAllocation m_mem = nullptr;
     uint8_t* m_ptr = nullptr;
     VkDeviceSize m_size = 0;
+    VkDeviceSize m_persistent = 0;
+    VmaVirtualBlock m_heap = VK_NULL_HANDLE;
     VkDeviceSize m_head = 0;
     VkDeviceSize m_tail = 0;
     VkDeviceSize m_used = 0;

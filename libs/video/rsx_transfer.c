@@ -31,8 +31,8 @@ static struct {
     u32 sifm_ds_dx, sifm_dt_dy, sifm_in_size, sifm_in_format, sifm_in_offset, sifm_in_point;
 } x;
 
-static u8*    s_scratch[3];
-static size_t s_scratch_cap[3];
+static _Thread_local u8*    s_scratch[3];
+static _Thread_local size_t s_scratch_cap[3];
 
 static u8* scratch(u32 slot, size_t n)
 {
@@ -101,45 +101,30 @@ static void transfer_fault(const char* what, u32 a, u32 b)
     fprintf(stderr, "[rsx] transfer: %s (0x%08X, 0x%08X)\n", what, a, b);
 }
 
-static void m2mf_notify(void)
-{
-    const s32 in_pitch = (s32)x.m2mf_in_pitch, out_pitch = (s32)x.m2mf_out_pitch;
-    const u32 cols = x.m2mf_line_length, rows = x.m2mf_line_count;
-    const u32 in_stride = x.m2mf_format & 0xFFu, out_stride = (x.m2mf_format >> 8) & 0xFFu;
-    if (!cols || !rows) return;
-    if (in_stride < 1u || in_stride > 4u || out_stride < 1u || out_stride > 4u) {
-        transfer_fault("NV0039 stride", in_stride, out_stride);
-        return;
-    }
-    const u32 in_width = cols * in_stride, out_width = cols * out_stride;
-    const s64 in_lo = in_pitch < 0 ? (s64)in_pitch * (rows - 1u) : 0;
-    const s64 out_lo = out_pitch < 0 ? (s64)out_pitch * (rows - 1u) : 0;
-    const u32 in_len = (u32)((u64)(in_pitch < 0 ? -(s64)in_pitch : in_pitch) * (rows - 1u) + in_width);
-    const u32 out_len = (u32)((u64)(out_pitch < 0 ? -(s64)out_pitch : out_pitch) * (rows - 1u) + out_width);
+typedef struct m2mf {
     span src, dst;
-    if (!span_open(&src, x.m2mf_in_dma, (u32)(x.m2mf_in_off + in_lo), in_len)) {
-        transfer_fault("NV0039 source", x.m2mf_in_dma, x.m2mf_in_off);
-        return;
-    }
-    if (!span_open(&dst, x.m2mf_out_dma, (u32)(x.m2mf_out_off + out_lo), out_len)) {
-        transfer_fault("NV0039 destination", x.m2mf_out_dma, x.m2mf_out_off);
-        return;
-    }
-    rsx_core_read_back(src.ea, src.size);
-    const u32 in_base = (u32)(-in_lo), out_base = (u32)(-out_lo);
-    if (in_stride == 1u && out_stride == 1u && !src.tiled && !dst.tiled &&
+    s32 in_pitch, out_pitch;
+    u32 cols, rows, in_stride, out_stride, in_base, out_base;
+} m2mf;
+
+static void m2mf_run(const void* arg)
+{
+    const m2mf* m = (const m2mf*)arg;
+    const s32 in_pitch = m->in_pitch, out_pitch = m->out_pitch;
+    const u32 cols = m->cols, rows = m->rows, in_stride = m->in_stride, out_stride = m->out_stride;
+    const u32 in_width = cols * in_stride, out_width = cols * out_stride;
+    if (in_stride == 1u && out_stride == 1u && !m->src.tiled && !m->dst.tiled &&
         (u32)in_pitch == in_width && (u32)out_pitch == out_width) {
-        rsx_mem_store(dst.ea, vm_base + src.ea, in_len);
-        rsx_core_wrote(dst.ea, dst.size);
+        rsx_mem_store(m->dst.ea, vm_base + m->src.ea, m->src.size);
         return;
     }
     u8* rows_in = NULL;
-    if (spans_overlap(&src, &dst)) {
+    if (spans_overlap(&m->src, &m->dst)) {
         rows_in = scratch(0, (size_t)in_width * rows);
         if (!rows_in) return;
         for (u32 r = 0; r < rows; r++)
             memcpy(rows_in + (size_t)r * in_width,
-                   span_read(&src, in_base + (u32)((s64)in_pitch * r), in_width, scratch(1, in_width)),
+                   span_read(&m->src, m->in_base + (u32)((s64)in_pitch * r), in_width, scratch(1, in_width)),
                    in_width);
     }
     u8* tmp = scratch(1, in_width);
@@ -147,17 +132,53 @@ static void m2mf_notify(void)
     if (!tmp || !out) return;
     for (u32 r = 0; r < rows; r++) {
         const u8* row = rows_in ? rows_in + (size_t)r * in_width
-                                : span_read(&src, in_base + (u32)((s64)in_pitch * r), in_width, tmp);
-        const u32 drel = out_base + (u32)((s64)out_pitch * r);
+                                : span_read(&m->src, m->in_base + (u32)((s64)in_pitch * r), in_width, tmp);
+        const u32 drel = m->out_base + (u32)((s64)out_pitch * r);
         if (in_stride == 1u && out_stride == 1u) {
-            span_write(&dst, drel, row, out_width);
+            span_write(&m->dst, drel, row, out_width);
             continue;
         }
-        memcpy(out, span_read(&dst, drel, out_width, out), out_width);
+        memcpy(out, span_read(&m->dst, drel, out_width, out), out_width);
         for (u32 c = 0; c < cols; c++) out[c * out_stride] = row[c * in_stride];
-        span_write(&dst, drel, out, out_width);
+        span_write(&m->dst, drel, out, out_width);
     }
-    rsx_core_wrote(dst.ea, dst.size);
+}
+
+static void m2mf_notify(void)
+{
+    m2mf m;
+    m.in_pitch = (s32)x.m2mf_in_pitch;
+    m.out_pitch = (s32)x.m2mf_out_pitch;
+    m.cols = x.m2mf_line_length;
+    m.rows = x.m2mf_line_count;
+    m.in_stride = x.m2mf_format & 0xFFu;
+    m.out_stride = (x.m2mf_format >> 8) & 0xFFu;
+    if (!m.cols || !m.rows) return;
+    if (m.in_stride < 1u || m.in_stride > 4u || m.out_stride < 1u || m.out_stride > 4u) {
+        transfer_fault("NV0039 stride", m.in_stride, m.out_stride);
+        return;
+    }
+    const s64 in_lo = m.in_pitch < 0 ? (s64)m.in_pitch * (m.rows - 1u) : 0;
+    const s64 out_lo = m.out_pitch < 0 ? (s64)m.out_pitch * (m.rows - 1u) : 0;
+    const u32 in_len = (u32)((u64)(m.in_pitch < 0 ? -(s64)m.in_pitch : m.in_pitch) * (m.rows - 1u) + m.cols * m.in_stride);
+    const u32 out_len = (u32)((u64)(m.out_pitch < 0 ? -(s64)m.out_pitch : m.out_pitch) * (m.rows - 1u) + m.cols * m.out_stride);
+    if (!span_open(&m.src, x.m2mf_in_dma, (u32)(x.m2mf_in_off + in_lo), in_len)) {
+        transfer_fault("NV0039 source", x.m2mf_in_dma, x.m2mf_in_off);
+        return;
+    }
+    if (!span_open(&m.dst, x.m2mf_out_dma, (u32)(x.m2mf_out_off + out_lo), out_len)) {
+        transfer_fault("NV0039 destination", x.m2mf_out_dma, x.m2mf_out_off);
+        return;
+    }
+    m.in_base = (u32)(-in_lo);
+    m.out_base = (u32)(-out_lo);
+    const rsx_write w = { m.dst.ea, m.dst.size, m.src.ea, m.src.size, 0, m2mf_run, &m, sizeof m };
+    if (m.src.tiled || m.dst.tiled || !rsx_core_defer(&w)) {
+        rsx_core_read_back(m.src.ea, m.src.size);
+        rsx_core_settle(m.dst.ea, m.dst.size);
+        m2mf_run(&m);
+    }
+    rsx_core_wrote(m.dst.ea, m.dst.size);
 }
 
 static u16 argb_to_565(u32 argb)
@@ -196,6 +217,7 @@ static u32 ifc_color(u32 index, u32 inc, const u32* be, u32 n)
         transfer_fault("NV308A destination", x.surf_dst_dma, off);
         return count;
     }
+    rsx_core_settle(dst.ea, dst.size);
     if (bpp == 4u) {
         span_write(&dst, 0, (const u8*)data, words * 4u);
     } else {
@@ -395,6 +417,7 @@ static void sifm_image_in(void)
         if (b.dst_ea && rsx_core_blit(&b)) return;
     }
     rsx_core_read_back(src.ea, src.size);
+    rsx_core_settle(dst.ea, dst.size);
 
     u8* rows = scratch(0, (size_t)in_pitch * (in_h - 1u) + (size_t)in_w * in_bpp);
     if (!rows) return;

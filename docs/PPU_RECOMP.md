@@ -24,7 +24,7 @@ EBOOT.elf (PPC64 ELF, decrypted)
    ├─ ppu_disasm.py ──► PPC64 disassembly
    ├─ ppu_lifter.py ──► ppu_recomp.{c,h}   (one C function per game function)
    │     --functions  <OPD table>          (authoritative function boundaries)
-   │     --imports     <imports.json>       (firmware stubs → ps3_hle_call)
+   │     --hle-stubs   <imports.json>       (firmware stubs → ps3_hle_call)
    │     --names       <ghidra names>       (optional, for readable comments)
    │
    └─ build: ppu_recomp.c + runtime (ppu_loader.cpp, ppu_hle.cpp + generated
@@ -60,7 +60,7 @@ two parts:
 - the address → function registry (populated by `ppu_recomp_register()`),
 - `ps3_indirect_call(ctx)` — dispatches `ctx->ctr` (an already-OPD-resolved code
   address) through the registry,
-- `g_trampoline_fn` (TLS) + `ppu_unlifted_stub` (subset/incremental builds),
+- `g_trampoline_fn` (TLS),
 - `lv2_syscall(ctx)` stub,
 - `ppu_run(entry_opd, stack_top)` — resolves the entry OPD, sets `r1`/`r2`,
   dispatches the entry function.
@@ -78,8 +78,7 @@ holds `gpr[32]`, `fpr[32]`, `vr[32]` VMX, `cr/lr/ctr/xer/...`). Output is C++
 - `bi $r0`-style returns, cross-fragment tail calls via the `g_trampoline_fn`
   TLS mechanism (iterative, avoids deep host recursion).
 - `sc` → `lv2_syscall(ctx)`.
-- Import stubs (with `--imports`) → `func_STUB(ctx) { ps3_hle_call(NID, ctx); }`.
-- Call targets not in this lift → `ppu_unlifted_stub` (a full-image lift has none).
+- Import stubs (with `--hle-stubs`) → `func_STUB(ctx) { ps3_hle_call(NID, ctx); }`.
 - `ppu_recomp_register()` populates the runtime address→function map.
 
 **ISA coverage**: ~99.8% on real Uncharted code (measured by counting
@@ -122,16 +121,12 @@ sysPrxForUser CRT.
 
 ## Boot
 
-`runtime/ppu/tests/boot_main.cpp` links the whole PPU half (lifted code + loader
+A port's main links the whole PPU half (lifted code + loader
 + HLE bridge + HLE libs) and dispatches the entry. The integrated build works;
 running it executes **real Uncharted startup code** until it hits a function
 outside the lifted subset, an unimplemented import, or a syscall — each logged,
 so the boot is a live to-do list. First boot stops at **`sys_initialize_tls`**
 (NID `0x744680A2`), the textbook first CRT call.
-
-**Full-image build** needs the lifter to **split output into multiple TUs**: a
-14,104-function lift is ~88 MB of C in one file, impractical for a single g++
-invocation. That output-splitting is the main scaling task.
 
 ---
 
@@ -140,7 +135,7 @@ invocation. That output-splitting is the main scaling task.
 | File | Role |
 |---|---|
 | `tools/ppu_disasm.py` | PPC64 disassembler |
-| `tools/ppu_lifter.py` | PPC → C lifter (`--functions/--imports/--names`) |
+| `tools/ppu_lifter.py` | PPC → C lifter (`--functions/--hle-stubs/--names`) |
 | `tools/ppu_loader.py` | offline loader: image + OPD + TOC + imports |
 | `tools/elf_parser.py` | ELF/SELF/PRX parsing primitives |
 | `tools/nid_database.py` | NID computation (fixed) + DB tooling |
@@ -150,7 +145,6 @@ invocation. That output-splitting is the main scaling task.
 | `runtime/ppu/ppu_context.h` | `ppu_context` (also emitted into `ppu_recomp.h`) |
 | `runtime/ppu/tests/test_loader.cpp` | loader smoke test (real EBOOT) |
 | `runtime/ppu/tests/test_hle*.cpp` | HLE adapter + real-library integration tests |
-| `runtime/ppu/tests/boot_main.cpp` | integrated first-boot harness |
 
 ## Status
 

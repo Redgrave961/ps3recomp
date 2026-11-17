@@ -10,7 +10,6 @@
 #include <stdint.h>
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
 /* HLE args arrive as guest effective addresses; translate before deref. */
-#define GUEST_PTR(p, T) ((T)((p) ? (void*)(vm_base + (uint32_t)(uintptr_t)(p)) : (void*)0))
 /* The guest is big-endian; u32 fields we write into guest structs must be stored
  * byte-swapped or the guest reads them mangled (e.g. a count of 1 read as
  * 0x01000000 = 16.7M, blowing up the caller's enumeration loop). */
@@ -23,8 +22,6 @@
 
 /* The emulated PS3 has one user */
 #define EMU_USER_ID     CELL_USERINFO_DEFAULT_USER_ID
-#define EMU_USER_NAME   "User"
-#define EMU_HOME_DIR    "/dev_hdd0/home/00000001"
 
 /* ---------------------------------------------------------------------------
  * API implementations

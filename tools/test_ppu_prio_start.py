@@ -15,7 +15,7 @@ with tempfile.TemporaryDirectory(prefix='ppu-prio-start-') as tmp:
     subprocess.run([os.environ.get('CC','cc'),'-std=gnu17','-D_GNU_SOURCE','-O1','-UNDEBUG',
         '-ffunction-sections','-fdata-sections',
         '-I'+str(root/'include'),'-I'+str(root/'runtime'),'-I'+str(root/'runtime/syscalls'),
-        str(root/'tests/test_ppu_prio_start.c'),*linker,'-o',str(binary)],check=True)
+        str(root/'tests/test_ppu_prio_start.c'),str(root/'runtime/platform/ps3_sync.c'),*linker,'-o',str(binary)],check=True)
     quiet=subprocess.PIPE if os.environ.get('CI') else None
     for on in (False, True):
         env={k:v for k,v in os.environ.items() if k!='PS3_PRIO_START'}

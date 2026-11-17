@@ -9,10 +9,10 @@ PlayStation All-Stars Battle Royale (BCUS98472) logs
 "sys_lwmutex_trylock failed on mutex 'dearchiver_opticalFunnel'" on every
 contended poll.
 
-Builds the real sys_lwmutex_trylock (pulled verbatim out of ppu_sysprx.cpp,
-along with its LWM_OWNER / LWM_RECUR / LWM_SELF definitions) into a small host
-program over stubbed guest memory and a single stub semaphore, and checks:
-  - a trylock on a free mutex succeeds and stamps owner/recursion;
+Builds the real lwmutex handlers (the block pulled verbatim out of
+ppu_sysprx.cpp) with the real park/wait layer (runtime/platform/ps3_sync.c)
+into a small host program over guest memory, and checks:
+  - a trylock on a free mutex succeeds and stamps the owner, recursion 0;
   - a trylock by a second thread while it is held returns CELL_EBUSY, not
     CELL_ETIMEDOUT, and leaves the holder's owner/recursion untouched.
 """
@@ -26,55 +26,39 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def extract(src, name):
-    m = re.search(r'static void %s\(ppu_context\* ctx\)\s*\{' % name, src)
-    assert m, name + ' not found'
+def lwmutex_block(src):
+    start = src.index('#define LWM_OWNER')
+    m = re.search(r'static void sys_lwcond_wait\(ppu_context\* ctx\)\s*\{', src)
+    assert m, 'sys_lwcond_wait not found'
     i, depth = m.end(), 1
     while depth:
         depth += {'{': 1, '}': -1}.get(src[i], 0)
         i += 1
-    return src[m.start():i]
-
-
-def define(src, name):
-    m = re.search(r'^#define %s\b.*$' % name, src, re.M)
-    assert m, name + ' not found'
-    return m.group(0)
+    return src[start:i]
 
 
 HARNESS = r'''
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-static uint8_t mem[0x10000];
-static void vm_write32(uint32_t a, uint32_t v) { for (int i = 0; i < 4; i++) mem[a + i] = (uint8_t)(v >> (24 - 8 * i)); }
-static uint32_t vm_read32(uint32_t a) { return (uint32_t)mem[a] << 24 | mem[a + 1] << 16 | mem[a + 2] << 8 | mem[a + 3]; }
+#include "ps3_sync.h"
+alignas(64) static uint8_t mem[0x10000];
+extern "C" uint8_t* vm_base = mem;
+extern "C" void vm_write32(uint64_t a, uint32_t v) { for (int i = 0; i < 4; i++) mem[a + i] = (uint8_t)(v >> (24 - 8 * i)); }
+extern "C" uint32_t vm_read32(uint64_t a) { return (uint32_t)mem[a] << 24 | mem[a + 1] << 16 | mem[a + 2] << 8 | mem[a + 3]; }
+extern "C" int32_t ppu_thread_priority(uint64_t) { return 1000; }
 struct ppu_context { uint64_t gpr[32]; uint64_t thread_id; };
 %s
-%s
-%s
-/* One host-side slot standing in for the semaphore table: lwm_try takes it
- * if free. Hold tracking (lwm_trace) stays off. */
-struct LwmSlot { long holder; long long acq_us; long long acq_fences; unsigned long long acq_cpu_us; int held; };
-static LwmSlot s_slot;
-static struct LwmSlot* lwm_slot(uint32_t) { return &s_slot; }
-static struct LwmSlot* lwm_find(uint32_t) { return &s_slot; }
-static int lwm_try(struct LwmSlot* sl) { if (sl->held) return 0; sl->held = 1; return 1; }
-static int lwm_trace(void) { return 0; }
-static long long lwm_now_us(void) { return 0; }
-static volatile long long g_gcm_ref_pub_count = 0;
-static unsigned long long ppu_thread_cpu_us(unsigned) { return 0; }
-%s
+extern "C" void ppu_thread_note_block(uint64_t) {}
 static int32_t ret(const ppu_context& c) { return (int32_t)(uint32_t)c.gpr[3]; }
 int main() {
     const uint32_t LWM = 0x1000, A = 0x101, B = 0x102;
     int fails = 0, ok;
-    memset(mem, 0, sizeof mem);
 
     ppu_context c = {};
     c.gpr[3] = LWM; c.thread_id = A;
     sys_lwmutex_trylock(&c);
-    ok = ret(c) == 0 && vm_read32(LWM + LWM_OWNER) == A && vm_read32(LWM + LWM_RECUR) == 1;
+    ok = ret(c) == 0 && vm_read32(LWM + LWM_OWNER) == A && vm_read32(LWM + LWM_RECUR) == 0;
     printf("[%%s] free mutex: thread A acquires (ret 0x%%08X, owner 0x%%X, recur %%u)\n",
            ok ? "PASS" : "FAIL", (uint32_t)ret(c), vm_read32(LWM + LWM_OWNER), vm_read32(LWM + LWM_RECUR));
     fails += !ok;
@@ -87,7 +71,7 @@ int main() {
            ok ? "PASS" : "FAIL", (uint32_t)ret(c),
            (uint32_t)ret(c) == 0x8001000Bu ? " -- that is CELL_ETIMEDOUT" : "");
     fails += !ok;
-    ok = vm_read32(LWM + LWM_OWNER) == A && vm_read32(LWM + LWM_RECUR) == 1;
+    ok = vm_read32(LWM + LWM_OWNER) == A && vm_read32(LWM + LWM_RECUR) == 0;
     printf("[%%s] held by A: owner and recursion unchanged (owner 0x%%X, recur %%u)\n",
            ok ? "PASS" : "FAIL", vm_read32(LWM + LWM_OWNER), vm_read32(LWM + LWM_RECUR));
     fails += !ok;
@@ -96,22 +80,33 @@ int main() {
 '''
 
 
-def main():
+def build(tmp, code):
+    cc = os.environ.get('CC') or shutil.which('cc') or shutil.which('gcc') or shutil.which('clang')
     cxx = os.environ.get('CXX') or shutil.which('c++') or shutil.which('g++') or shutil.which('clang++')
-    if not cxx:
-        print('SKIP: no C++ compiler')
-        return
-    src = (ROOT / 'runtime/ppu/ppu_sysprx.cpp').read_text()
-    code = HARNESS % (define(src, 'LWM_OWNER'), define(src, 'LWM_RECUR'), define(src, 'LWM_SELF'),
-                      extract(src, 'sys_lwmutex_trylock'))
-    with tempfile.TemporaryDirectory() as tmp:
-        c = Path(tmp) / 't.cpp'
-        exe = Path(tmp) / 't'
-        c.write_text(code)
-        r = subprocess.run([cxx, '-std=c++17', '-O1', '-w', str(c), '-o', str(exe)], capture_output=True, text=True)
+    if not cc or not cxx:
+        return None
+    c = Path(tmp) / 't.cpp'
+    obj = Path(tmp) / 'ps3_sync.o'
+    exe = Path(tmp) / 't'
+    c.write_text(code)
+    platform = ROOT / 'runtime/platform'
+    libs = ['-lsynchronization'] if os.name == 'nt' else ['-lpthread']
+    for cmd in ([cc, '-std=gnu17', '-O1', '-w', '-c', str(platform / 'ps3_sync.c'), '-o', str(obj)],
+                [cxx, '-std=c++17', '-O1', '-w', '-I' + str(platform), str(c), str(obj), '-o', str(exe), *libs]):
+        r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode:
             print(r.stderr[-2000:])
             raise SystemExit('FAIL: harness did not compile')
+    return exe
+
+
+def main():
+    src = (ROOT / 'runtime/ppu/ppu_sysprx.cpp').read_text()
+    with tempfile.TemporaryDirectory() as tmp:
+        exe = build(tmp, HARNESS % lwmutex_block(src))
+        if not exe:
+            print('SKIP: no C/C++ compiler')
+            return
         r = subprocess.run([str(exe)], capture_output=True, text=True)
         print(r.stdout, end='')
         if r.returncode:

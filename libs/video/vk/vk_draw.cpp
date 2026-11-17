@@ -218,25 +218,37 @@ bool renderer::upload_vertices(const rsx::draw_clause& clause, u32 first, u32 co
     }
 
     for (u32 i = 0; i < nregions; i++) {
-        regions[i].dst = total;
-        total += ((regions[i].end - regions[i].src) + 15u) & ~15u;
+        const u32 bytes = regions[i].end - regions[i].src;
+        cached& e = m_vertex_cache[(uint64_t)regions[i].src << 32 | bytes];
+        u32 fresh = 0;
+        if (!cached_clean(e, regions[i].src, bytes)) {
+            uint8_t* out = cache_slot(e, bytes);
+            if (!out) return false;
+            fresh = refresh(regions[i].src, bytes, e.stamp, out);
+            e.stamp = m_stamp;
+        }
+        stats.copy_bytes += fresh;
+        stats.reuse_bytes += bytes - fresh;
+        regions[i].dst = e.offset;
     }
     const u32 reg_base = total;
     total += (u32)regbytes.size();
-    total = std::max(total, 16u);
 
-    vk_slice slice = m_ring.alloc(total, m_ssbo_align);
-    if (!slice.ptr) return false;
-    if (src[rsx::ATTRIBS].ptr) std::memcpy(slice.ptr + dst_offset[rsx::ATTRIBS], src[rsx::ATTRIBS].ptr, src[rsx::ATTRIBS].bytes);
-    for (u32 i = 0; i < nregions; i++) std::memcpy(slice.ptr + regions[i].dst, vm_base + regions[i].src, regions[i].end - regions[i].src);
-    if (!regbytes.empty()) std::memcpy(slice.ptr + reg_base, regbytes.data(), regbytes.size());
+    u32 transient = 0;
+    if (total) {
+        const vk_slice slice = m_ring.alloc(total, 16);
+        if (!slice.ptr) return false;
+        transient = (u32)slice.offset;
+        if (src[rsx::ATTRIBS].ptr) std::memcpy(slice.ptr + dst_offset[rsx::ATTRIBS], src[rsx::ATTRIBS].ptr, src[rsx::ATTRIBS].bytes);
+        if (!regbytes.empty()) std::memcpy(slice.ptr + reg_base, regbytes.data(), regbytes.size());
+    }
 
     for (u32 k = 0; k < rsx::ATTRIBS; k++)
-        if (slot_of[k] == rsx::ATTRIBS) layout.attrib[k].offset += dst_offset[rsx::ATTRIBS];
+        if (slot_of[k] == rsx::ATTRIBS) layout.attrib[k].offset += transient + dst_offset[rsx::ATTRIBS];
     for (u32 i = 0; i < npend; i++) {
         const pending_attr& p = pend[i];
         rsx_spv_vertex_attrib& a = layout.attrib[p.k];
-        a.offset = p.region == -2 ? reg_base + p.inner : regions[p.region].dst + p.inner;
+        a.offset = p.region == -2 ? transient + reg_base + p.inner : regions[p.region].dst + p.inner;
         a.stride = p.stride;
         a.format = p.type | (p.size << RSX_SPV_VFMT_SIZE_SHIFT) | p.format_bits;
         a.frequency = p.freq;
@@ -266,18 +278,96 @@ bool renderer::upload_vertices(const rsx::draw_clause& clause, u32 first, u32 co
     layout.clip_planes = planes;
     layout.transform_branch_bits = r(rsx::M_TRANSFORM_BRANCH_BITS);
     layout.point_size = f(rsx::M_POINT_SIZE);
-    layout.point_scale = (float)m_fb.scale;
+    layout.point_scale = m_fb.scale.value();
 
-    data = { slice.buffer, slice.offset, total };
-    vk_slice ls = m_ring.alloc(sizeof layout, m_ubo_align);
-    if (!ls.ptr) return false;
-    std::memcpy(ls.ptr, &layout, sizeof layout);
-    layout_info = { ls.buffer, ls.offset, sizeof layout };
+    data = { m_ring.buffer(), 0, m_ring.capacity() };
+    return upload(m_layout_upload, &layout, sizeof layout, layout_info);
+}
+
+bool renderer::upload(reused_upload& u, const void* data, u32 size, VkDescriptorBufferInfo& out)
+{
+    const uint64_t submission = *m_submitted + 1u;
+    if (u.submission != submission || u.bytes.size() != size || std::memcmp(u.bytes.data(), data, size) != 0) {
+        const vk_slice s = m_ring.alloc(size, m_ubo_align);
+        if (!s.ptr) return false;
+        std::memcpy(s.ptr, data, size);
+        u.bytes.assign(static_cast<const uint8_t*>(data), static_cast<const uint8_t*>(data) + size);
+        u.submission = submission;
+        u.info = { s.buffer, s.offset, size };
+    }
+    out = u.info;
     return true;
+}
+
+bool renderer::cached_clean(cached& e, u32 ea, u32 size)
+{
+    const bool changed = size && memory_changed(ea, size, e.stamp);
+    if (!e.alloc || changed) return false;
+    e.submission = *m_submitted + 1u;
+    e.used = m_flips;
+    return true;
+}
+
+uint8_t* renderer::cache_slot(cached& e, u32 size)
+{
+    e.used = m_flips;
+    if (e.alloc && e.submission > m_reached) vkGetSemaphoreCounterValue(m_d->dev, m_timeline, &m_reached);
+    if (!e.alloc || e.submission > m_reached) {
+        if (e.alloc) m_held_garbage.emplace_back(e.submission, e.alloc);
+        e.alloc = VK_NULL_HANDLE;
+        e.stamp = 0;
+        VkDeviceSize offset = 0;
+        bool held = m_ring.hold(size, e.alloc, offset);
+        for (u64 age = 64; !held && age; age /= 2) {
+            evict(age);
+            held = m_ring.hold(size, e.alloc, offset);
+        }
+        if (!held) {
+            const vk_slice s = m_ring.alloc(size, 16);
+            if (!s.ptr) return nullptr;
+            offset = s.offset;
+        }
+        e.offset = (u32)offset;
+    }
+    e.submission = *m_submitted + 1u;
+    return m_ring.data() + e.offset;
+}
+
+void renderer::evict(u64 age)
+{
+    const auto drop = [&](auto& cache) {
+        for (auto it = cache.begin(); it != cache.end();) {
+            if (m_flips - it->second.used < age) {
+                ++it;
+                continue;
+            }
+            if (it->second.alloc) m_held_garbage.emplace_back(it->second.submission, it->second.alloc);
+            it = cache.erase(it);
+        }
+    };
+    drop(m_vertex_cache);
+    drop(m_index_cache);
+    vkGetSemaphoreCounterValue(m_d->dev, m_timeline, &m_reached);
+    release_held();
+}
+
+void renderer::release_held()
+{
+    auto keep = std::remove_if(m_held_garbage.begin(), m_held_garbage.end(), [&](const std::pair<uint64_t, VmaVirtualAllocation>& g) {
+        if (g.first > m_reached) return false;
+        m_ring.release(g.second);
+        return true;
+    });
+    m_held_garbage.erase(keep, m_held_garbage.end());
 }
 
 bool renderer::draw_setup()
 {
+    if (const u64 progress = rsx_core_progress(); progress != m_progress) {
+        m_progress = progress;
+        m_epoch++;
+        stats.epochs++;
+    }
     describe_units();
     u32 vdims = 0;
     for (u32 u = 0; u < rsx::VERTEX_TEXTURES; u++)
@@ -306,8 +396,11 @@ bool renderer::draw_setup()
         if (n++ < 5) std::fprintf(stderr, "[vk] fragment program address unresolved: 0x%08X\n", sp);
         return false;
     }
+    await_writes(m_fp_ea, RSX_SPV_FP_MAX_INSTRUCTIONS * 16u);
     const u32* ucode = reinterpret_cast<const u32*>(vm_base + m_fp_ea);
-    rsx_spv_fp_key fk{};
+    fp_seen_key seen_key{};
+    seen_key.ea = m_fp_ea;
+    rsx_spv_fp_key& fk = seen_key.key;
     fk.control = r(rsx::M_SHADER_CONTROL);
     for (u32 u = 0; u < rsx::TEXTURES; u++) {
         fk.texture_dims |= texture_dims(m_units[u].desc, m_units[u].valid) << (u * 2u);
@@ -315,8 +408,8 @@ bool renderer::draw_setup()
     }
     for (u32 k = 0; k < 4; k++)
         if (m_fb.color_format[k] != VK_FORMAT_UNDEFINED) fk.output_mask |= 1u << k;
-    fp_lookup& seen = m_fp_seen[m_fp_ea];
-    if (seen.fp && !std::memcmp(&seen.key, &fk, sizeof fk)) {
+    fp_lookup& seen = m_fp_seen[seen_key];
+    if (seen.fp) {
         bool same = true;
         for (size_t i = 0; i < seen.words.size() && same; i++) same = seen.constant[i] || seen.words[i] == ucode[i];
         if (same) {
@@ -327,7 +420,6 @@ bool renderer::draw_setup()
     m_fp = m_shaders.fragment(ucode, RSX_SPV_FP_MAX_INSTRUCTIONS * 4u, fk, true);
     if (!m_fp) return false;
     seen.fp = m_fp;
-    seen.key = fk;
     seen.words.assign(ucode, ucode + m_fp->info.ucode_words);
     seen.constant.assign(seen.words.size(), 0);
     for (u32 i = 0; i < m_fp->info.constant_count; i++)
@@ -346,7 +438,6 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
 
     std::vector<draw_sub>& subs = m_subs;
     subs.clear();
-    vk_slice index_slice{};
     VkIndexType index_type = VK_INDEX_TYPE_UINT32;
     u32 e0 = 0, ecount = 0, vb = 0;
 
@@ -355,6 +446,7 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
         const bool wide = clause.immediate || ((dma >> 4) & 0xFu) == k_index_type_u32;
         const u32 isize = wide ? 4u : 2u;
         const uint8_t* base = nullptr;
+        u32 source = 0;
         if (clause.immediate) {
             m_index_scratch.resize(clause.elements.size() * 4u);
             for (size_t i = 0; i < clause.elements.size(); i++) {
@@ -365,22 +457,43 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
         } else {
             const u32 ea = rsx_address((dma & 0xFu) ? RSX_DMA_MAIN : RSX_DMA_LOCAL, r(rsx::M_INDEX_ARRAY_ADDRESS), 0);
             if (!ea) return;
-            base = vm_base + (ea & ~(isize - 1u));
+            source = ea & ~(isize - 1u);
+            base = vm_base + source;
         }
-        u32 total = 0;
-        for (const rsx::draw_range& rg : clause.ranges) total += expanded_index_count(prim, rg.count) + 1u;
-        index_slice = m_ring.alloc((VkDeviceSize)total * isize, 16);
-        if (!index_slice.ptr) return;
         index_type = wide ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
-        u32 lo = 0xFFFFFFFFu, hi = 0, at = 0;
-        for (const rsx::draw_range& rg : clause.ranges) {
-            const index_result res = convert_indices(prim, wide, base + (size_t)rg.first * isize, rg.count, restart, restart_index,
-                                                     index_slice.ptr + (size_t)at * isize);
-            if (!res.count || res.min > res.max) continue;
-            lo = std::min(lo, res.min);
-            hi = std::max(hi, res.max);
-            subs.push_back({ at, res.count, 0, true });
-            at += res.count;
+        cached* e = nullptr;
+        bool hit = false;
+        if (source && clause.ranges.size() == 1) {
+            const rsx::draw_range& rg = clause.ranges[0];
+            e = &m_index_cache[index_key{ source, rg.first, rg.count, prim, restart_index, (u32)wide | (u32)restart << 1 }];
+            hit = cached_clean(*e, source + rg.first * isize, rg.count * isize);
+        }
+        u32 lo = hit ? e->min : 0xFFFFFFFFu, hi = hit ? e->max : 0;
+        if (hit) {
+            subs.push_back({ e->offset / isize, e->count, 0, true });
+        } else {
+            u32 total = 0;
+            for (const rsx::draw_range& rg : clause.ranges) total += expanded_index_count(prim, rg.count) + 1u;
+            const vk_slice transient = e ? vk_slice{} : m_ring.alloc((VkDeviceSize)total * isize, 16);
+            uint8_t* out = e ? cache_slot(*e, total * isize) : transient.ptr;
+            if (!out) return;
+            const u32 first = (e ? e->offset : (u32)transient.offset) / isize;
+            u32 at = 0;
+            for (const rsx::draw_range& rg : clause.ranges) {
+                const index_result res = convert_indices(prim, wide, base + (size_t)rg.first * isize, rg.count, restart, restart_index,
+                                                         out + (size_t)at * isize);
+                if (!res.count || res.min > res.max) continue;
+                lo = std::min(lo, res.min);
+                hi = std::max(hi, res.max);
+                subs.push_back({ first + at, res.count, 0, true });
+                at += res.count;
+            }
+            if (e) {
+                e->stamp = m_stamp;
+                e->count = at;
+                e->min = lo;
+                e->max = hi;
+            }
         }
         if (subs.empty() || lo > hi) return;
         const u32 base_index = r(rsx::M_VERTEX_BASE_INDEX);
@@ -412,19 +525,18 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
         ecount = last - first;
         vb = first;
         if (emulated) {
-            u32 total = 0;
-            for (const draw_sub& s : subs) total += expanded_index_count(prim, s.count) + 1u;
-            index_slice = m_ring.alloc((VkDeviceSize)total * 4u, 16);
-            if (!index_slice.ptr) return;
-            u32 at = 0;
             for (draw_sub& s : subs) {
                 const u32 n = expanded_index_count(prim, s.count);
-                generate_indices(prim, s.count, reinterpret_cast<u32*>(index_slice.ptr) + at);
+                cached& e = m_index_cache[index_key{ 0u, 0u, s.count, prim, 0u, 0u }];
+                if (!cached_clean(e, 0, 0)) {
+                    uint8_t* out = cache_slot(e, (n + 1u) * 4u);
+                    if (!out) return;
+                    generate_indices(prim, s.count, reinterpret_cast<u32*>(out));
+                }
                 s.vertex_offset = (int32_t)s.first;
-                s.first = at;
+                s.first = e.offset / 4u;
                 s.count = n;
                 s.indexed = true;
-                at += n;
             }
         }
     }
@@ -455,16 +567,15 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
 
     const rsx_spv_fp_info& fi = m_fp->info;
     const u32 nconst = std::max(fi.constant_count, 1u);
-    vk_slice fc = m_ring.alloc((VkDeviceSize)nconst * 16u, m_ubo_align);
-    if (!fc.ptr) return;
-    std::memset(fc.ptr, 0, (size_t)nconst * 16u);
+    m_fp_constants.assign((size_t)nconst * 4u, 0u);
     const u32* ucode = reinterpret_cast<const u32*>(vm_base + m_fp_ea);
     for (u32 i = 0; i < fi.constant_count; i++)
         for (u32 w = 0; w < 4; w++) {
-            u32 v = __builtin_bswap32(ucode[fi.constant_word[i] + w]);
-            v = (v << 16) | (v >> 16);
-            std::memcpy(fc.ptr + i * 16u + w * 4u, &v, 4);
+            const u32 v = __builtin_bswap32(ucode[fi.constant_word[i] + w]);
+            m_fp_constants[i * 4u + w] = (v << 16) | (v >> 16);
         }
+    VkDescriptorBufferInfo fp_consts{};
+    if (!upload(m_fp_constant_upload, m_fp_constants.data(), nconst * 16u, fp_consts)) return;
 
     rsx_spv_fragment_state fs{};
     if (r(rsx::M_ALPHA_TEST_ENABLE)) fs.flags |= RSX_SPV_FPF_ALPHA_TEST;
@@ -481,7 +592,7 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
     fs.fog_param[0] = f(rsx::M_FOG_PARAMS);
     fs.fog_param[1] = f(rsx::M_FOG_PARAMS + 4u);
     const bool bottom = ((window >> 12) & 0xFu) != 0;
-    fs.wpos_scale = (bottom ? -1.f : 1.f) / (float)m_fb.scale;
+    fs.wpos_scale = (bottom ? -(float)m_fb.scale.den : (float)m_fb.scale.den) / (float)m_fb.scale.num;
     fs.wpos_bias = bottom ? (float)(window & 0xFFFu) : 0.f;
     VkDescriptorImageInfo images[rsx::TEXTURES + rsx::VERTEX_TEXTURES];
     for (u32 u = 0; u < rsx::TEXTURES + rsx::VERTEX_TEXTURES; u++) {
@@ -502,15 +613,14 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
     const u32 sprite = r(rsx::M_POINT_SPRITE_CONTROL);
     if (sprite & 1u) tcc |= ((sprite >> 8) & 0x3FFu) << 16;
     fs.texcoord_control = tcc;
-    vk_slice fss = m_ring.alloc(sizeof fs, m_ubo_align);
-    if (!fss.ptr) return;
-    std::memcpy(fss.ptr, &fs, sizeof fs);
+    VkDescriptorBufferInfo fp_state{};
+    if (!upload(m_fp_state_upload, &fs, sizeof fs, fp_state)) return;
 
     draw_target t{};
     t.width = m_fb.width;
     t.height = m_fb.height;
-    t.aa_u = m_fb.aa_u * m_fb.scale;
-    t.aa_v = m_fb.aa_v * m_fb.scale;
+    t.aa_u = m_fb.aa_u;
+    t.aa_v = m_fb.aa_v;
     t.scale = m_fb.scale;
     t.depth = m_fb.depth != nullptr;
     t.stencil = m_fb.depth && (m_fb.depth->img.aspect & VK_IMAGE_ASPECT_STENCIL_BIT);
@@ -523,7 +633,6 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
     fill_pipeline_state(*this, *m_d, t, prim, key);
     const VkPipeline pipe = m_pipelines.get(key, m_vp->code, m_fp->code);
     if (!pipe) {
-        stats.skipped_pipeline++;
         if (m_trace) std::fprintf(m_trace, "[trace] %u skipped: pipeline compiling or failed\n", id);
         return;
     }
@@ -531,38 +640,46 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
     begin_rendering();
     VkCommandBuffer c = cmd();
     if (m_occlusion.enabled() && !m_occlusion.active()) m_occlusion.begin(c, m_fb.scale);
-    vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
-    set_dynamic_state(c, *this, *m_d, m_pipelines, t, prim, restart && clause.kind == rsx::draw_kind::indexed, key);
+    if (pipe != m_bound.pipeline) {
+        vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+        m_bound.pipeline = pipe;
+    }
+    set_dynamic_state(c, *this, *m_d, m_pipelines, t, prim, restart && clause.kind == rsx::draw_kind::indexed, key, m_dynamic);
 
-    VkDescriptorBufferInfo fp_consts{ fc.buffer, fc.offset, (VkDeviceSize)nconst * 16u };
-    VkDescriptorBufferInfo fp_state{ fss.buffer, fss.offset, sizeof fs };
     VkWriteDescriptorSet w[5 + rsx::TEXTURES + rsx::VERTEX_TEXTURES]{};
     u32 nw = 0;
-    auto buffer_write = [&](u32 binding, VkDescriptorType type, const VkDescriptorBufferInfo* info) {
+    const bool all = !m_bound.valid;
+    const auto buffer_write = [&](u32 slot, u32 binding, VkDescriptorType type, const VkDescriptorBufferInfo& info) {
+        VkDescriptorBufferInfo& last = m_bound.buffers[slot];
+        if (!all && !std::memcmp(&last, &info, sizeof info)) return;
+        last = info;
         VkWriteDescriptorSet& x = w[nw++];
         x.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         x.dstBinding = binding;
         x.descriptorCount = 1;
         x.descriptorType = type;
-        x.pBufferInfo = info;
+        x.pBufferInfo = &last;
     };
-    buffer_write(RSX_SPV_BIND_VP_CONSTANTS, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, &m_constants);
-    buffer_write(RSX_SPV_BIND_VERTEX_LAYOUT, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, &vlayout);
-    buffer_write(RSX_SPV_BIND_VERTEX_DATA, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, &vdata);
-    buffer_write(RSX_SPV_BIND_FP_CONSTANTS, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, &fp_consts);
-    buffer_write(RSX_SPV_BIND_FP_STATE, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, &fp_state);
+    buffer_write(0, RSX_SPV_BIND_VP_CONSTANTS, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, m_constants);
+    buffer_write(1, RSX_SPV_BIND_VERTEX_LAYOUT, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, vlayout);
+    buffer_write(2, RSX_SPV_BIND_VERTEX_DATA, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, vdata);
+    buffer_write(3, RSX_SPV_BIND_FP_CONSTANTS, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, fp_consts);
+    buffer_write(4, RSX_SPV_BIND_FP_STATE, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, fp_state);
     for (u32 u = 0; u < rsx::TEXTURES + rsx::VERTEX_TEXTURES; u++) {
-        const bool vertex_unit = u >= rsx::TEXTURES;
+        VkDescriptorImageInfo& last = m_bound.images[u];
+        if (!all && last.sampler == images[u].sampler && last.imageView == images[u].imageView && last.imageLayout == images[u].imageLayout) continue;
+        last = images[u];
         VkWriteDescriptorSet& x = w[nw++];
         x.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        x.dstBinding = vertex_unit ? RSX_SPV_BIND_VERTEX_TEXTURE0 + (u - rsx::TEXTURES) : RSX_SPV_BIND_TEXTURE0 + u;
+        x.dstBinding = u >= rsx::TEXTURES ? RSX_SPV_BIND_VERTEX_TEXTURE0 + (u - rsx::TEXTURES) : RSX_SPV_BIND_TEXTURE0 + u;
         x.descriptorCount = 1;
         x.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        x.pImageInfo = &images[u];
+        x.pImageInfo = &last;
     }
-    vkCmdPushDescriptorSetKHR(c, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelines.layout(), 0, nw, w);
+    m_bound.valid = true;
+    if (nw) vkCmdPushDescriptorSetKHR(c, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelines.layout(), 0, nw, w);
 
-    if (index_slice.ptr) vkCmdBindIndexBuffer(c, index_slice.buffer, index_slice.offset, index_type);
+    if (subs.front().indexed) vkCmdBindIndexBuffer(c, m_ring.buffer(), 0, index_type);
     for (const draw_sub& s : subs) {
         if (s.indexed) vkCmdDrawIndexed(c, s.count, 1, s.first, s.vertex_offset, 0);
         else vkCmdDraw(c, s.count, 1, s.first, 0);
@@ -579,7 +696,7 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
     if (m_trace) {
         u32 n = 0;
         for (const draw_sub& s : subs) n += s.count;
-        trace_draw(id, prim, n, index_slice.ptr != nullptr);
+        trace_draw(id, prim, n, subs.front().indexed);
     }
 }
 

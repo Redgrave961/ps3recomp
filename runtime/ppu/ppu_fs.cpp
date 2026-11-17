@@ -45,7 +45,6 @@
 #  define FS_TELL64(f)       ((int64_t)_ftelli64(f))
 typedef struct _stat64 fs_stat64_t;
 /* _stat64 rejects a trailing slash (MinGW's stat wrapper stripped it). */
-extern "C" unsigned long long ps3_ms_now(void);
 
 static int FS_STAT64(const char* p, fs_stat64_t* s)
 {
@@ -68,6 +67,7 @@ extern "C" void     ps3_hle_register_ctx(uint32_t nid, const char* name, void (*
 extern "C" void     vm_write32(uint64_t a, uint32_t v);
 extern "C" void     vm_write64(uint64_t a, uint64_t v);
 extern "C" void     sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size);
+extern "C" unsigned long long ps3_ms_now(void);
 #include "ps3emu/log_first.h"
 #include "ps3emu/ps3_env_once.h"   /* ps3_env_once: each switch looked up once */
 

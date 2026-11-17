@@ -52,7 +52,6 @@ typedef struct ppu_thread_info {
     uint32_t     stack_size;
     uint64_t     entry_addr;   /* guest entry point */
     uint64_t     tls_addr;
-    uint32_t     prof_pc;      /* last syscall/HLE callsite (sampling profiler) */
     int          blocked;      /* reached a blocking call (ppu_thread_note_block); atomic access only */
 
 #ifdef _WIN32

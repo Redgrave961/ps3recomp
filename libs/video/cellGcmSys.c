@@ -10,7 +10,6 @@
 #include "../../runtime/platform/win32_compat.h"
 #endif
 
-#include <stdio.h>
 #include <string.h>
 
 #define GCM_SEGMENT        0x8000u
@@ -21,8 +20,6 @@
 #define GCM_TILE_EA        (RSX_GCM_BLOCK_EA + 0x0C0u)
 #define GCM_ZCULL_EA       (RSX_GCM_BLOCK_EA + 0x1C0u)
 
-#define GCM_METHOD_SEMAPHORE_OFFSET 0x0064u
-#define GCM_METHOD_USER_COMMAND     0xEB00u
 #define GCM_METHOD_FLIP             0xFEACu
 
 extern uint32_t g_ps3_sdk_version;
@@ -38,20 +35,14 @@ typedef struct gcm_tile {
 
 static struct {
     int initialized;
-    u32 system_mode;
     u32 local_size;
     u32 main_size;
-    u32 reserved;
     u32 io_address;
     u32 io_size;
     u32 cmd_fragments;
     u32 command_words;
     u32 segment_words;
-    u32 ctx_out;
-    u32 debug_level;
     volatile u32 handler[RSX_EVENT_COUNT];
-    u32 second_v_handler;
-    u32 graphics_handler;
     u8 map_pages[4096];
     gcm_tile tile[CELL_GCM_MAX_TILE_COUNT];
     SRWLOCK io_lock;
@@ -140,7 +131,7 @@ s32 _cellGcmInitBody(u32 context, u32 cmdSize, u32 ioSize, u32 ioAddress)
 {
     if (g.initialized) return (s32)CELL_GCM_ERROR_FAILURE;
     g.local_size = gcm_local_size(g_ps3_sdk_version);
-    g.main_size = g.system_mode == CELL_GCM_SYSTEM_MODE_IOMAP_512MB ? 0x20000000u : 0x10000000u;
+    g.main_size = 0x10000000u;
     rsx_core_init(g.local_size, g.main_size);
     rsx_core_set_event_sink(gcm_event);
     memset(g.map_pages, 0, sizeof g.map_pages);
@@ -159,7 +150,6 @@ s32 _cellGcmInitBody(u32 context, u32 cmdSize, u32 ioSize, u32 ioAddress)
     vm_write32(GCM_CONTEXT_EA + 8u, ioAddress + 0x1000u);
     vm_write32(GCM_CONTEXT_EA + 12u, GCM_CALLBACK_OPD);
     vm_write32(context, GCM_CONTEXT_EA);
-    g.ctx_out = context;
     rsx_core_start();
     g.initialized = 1;
     return CELL_OK;
@@ -226,8 +216,8 @@ void _cellGcmSetFlipCommand(u32 ctx, u32 id) { gcm_prepare_flip(ctx, id, 0); }
 void cellGcmSetFlipHandler(u32 handler) { __atomic_store_n(&g.handler[RSX_EVENT_FLIP], handler, __ATOMIC_RELEASE); }
 void cellGcmSetVBlankHandler(u32 handler) { __atomic_store_n(&g.handler[RSX_EVENT_VBLANK], handler, __ATOMIC_RELEASE); }
 void cellGcmSetUserHandler(u32 handler) { __atomic_store_n(&g.handler[RSX_EVENT_USER], handler, __ATOMIC_RELEASE); }
-s32 cellGcmSetSecondVHandler(u32 handler) { g.second_v_handler = handler; return CELL_OK; }
-void cellGcmSetGraphicsHandler(u32 handler) { g.graphics_handler = handler; }
+s32 cellGcmSetSecondVHandler(u32 handler) { return CELL_OK; }
+void cellGcmSetGraphicsHandler(u32 handler) {}
 void cellGcmSetSecondVFrequency(u32 freq) { (void)freq; }
 
 u32 cellGcmGetLabelAddress(u8 index) { return RSX_SEMAPHORE_EA + 0x10u * index; }
@@ -284,7 +274,7 @@ s32 cellGcmMapMainMemory(u32 ea, u32 size, u32 offset)
 {
     if (!size || (ea & 0xFFFFFu) || (size & 0xFFFFFu)) return (s32)CELL_GCM_ERROR_FAILURE;
     AcquireSRWLockExclusive(&g.io_lock);
-    const u32 pages = size >> 20, end = (g.main_size - g.reserved) >> 20;
+    const u32 pages = size >> 20, end = g.main_size >> 20;
     s32 r = (s32)CELL_GCM_ERROR_NO_IO_PAGE_TABLE;
     for (u32 io = 0, run = 0; io < end; io++) {
         run = rsx_io_to_ea(io << 20) ? 0 : run + 1u;

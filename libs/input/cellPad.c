@@ -656,10 +656,14 @@ static void pad_poll_sdl(void)
 {
     SDL_UpdateGamepads();
     pad_sdl_hotplug(0);
+    static int was_focused = 1;
+    const int focused = pad_host_window_focused(), lost = was_focused && !focused;
+    was_focused = focused;
 
     for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
         SDL_Gamepad* gp = s_sdl_controllers[i];
-        if (!gp) {
+        if (!gp || !focused) {
+            if (gp && lost) SDL_RumbleGamepad(gp, 0, 0, 0);
             pad_host_release(&s_host_state[i]);
             memset(&s_rumble[i], 0, sizeof s_rumble[i]);
             continue;
@@ -747,12 +751,6 @@ static void pad_init_backend(void)
 
     /* Open any gamepads already connected */
     pad_sdl_hotplug(1);
-}
-
-static void pad_shutdown_backend(void)
-{
-    for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) pad_sdl_close(i, 0);
-    memset(s_rumble, 0, sizeof s_rumble);
 }
 
 #endif /* PAD_BACKEND_SDL */

@@ -1,9 +1,0 @@
-# ps3recomp tools dependencies
-#
-# Install with: pip install -r requirements.txt
-
-# ELF/SELF decryption
-pycryptodome>=3.19
-
-# PowerPC disassembly
-capstone>=5.0

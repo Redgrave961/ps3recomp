@@ -12,7 +12,6 @@ if os.name == 'nt':
 root = Path(__file__).resolve().parents[1]
 spu = root / 'runtime/spu'
 common = ['spu_drain.c', 'spu_lockstep.c', 'spu_coherency.c', 'spu_workload.c',
-          'spu_vm_pagemap.c',
           'spu_interp.c']
 failed = []
 with tempfile.TemporaryDirectory(prefix='spu-context-registry-') as tmp:
@@ -26,6 +25,7 @@ with tempfile.TemporaryDirectory(prefix='spu-context-registry-') as tmp:
             command += [str(spu / c) for c in common if not
                         (name == 'test_spu_registry_allocation' and c == 'spu_coherency.c')]
             command += [str(root / 'runtime/platform/win32_compat.c'), '-pthread', '-lm']
+        command += [str(root / 'runtime/platform/ps3_sync.c'), str(spu / 'tests/spu_fixture_ppu.c')]
         subprocess.run(command + ['-o', str(binary)], check=True)
         if name == 'test_spu_registry_allocation':
             for mode, diagnostic in [('mfc', 'cannot allocate private MFC engine'),

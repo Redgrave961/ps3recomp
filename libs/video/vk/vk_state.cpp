@@ -156,105 +156,127 @@ void fill_pipeline_state(const frontend& f, const vk_device& d, const draw_targe
 }
 
 void set_dynamic_state(VkCommandBuffer cmd, const frontend& f, const vk_device& d, const pipelines& p, const draw_target& t,
-                       uint32_t prim, bool restart, const pipeline_key& key)
+                       uint32_t prim, bool restart, const pipeline_key& key, dynamic_cache& cache)
 {
-    const float sx = (float)t.aa_u, sy = (float)t.aa_v;
-    VkViewport vp{ 0.f, 0.f, (float)t.width * sx, (float)t.height * sy, 0.f, 1.f };
-    vkCmdSetViewportWithCount(cmd, 1, &vp);
+    dynamic_state s{};
+    s.viewport = { 0.f, 0.f, t.scale.exact(t.width * t.aa_u), t.scale.exact(t.height * t.aa_v), 0.f, 1.f };
 
     const uint32_t sh = f.r(rsx::M_SCISSOR_H), sv = f.r(rsx::M_SCISSOR_V);
     const uint32_t x0 = std::min(sh & 0xFFFFu, t.width), y0 = std::min(sv & 0xFFFFu, t.height);
     const uint32_t x1 = std::min((sh & 0xFFFFu) + (sh >> 16), t.width), y1 = std::min((sv & 0xFFFFu) + (sv >> 16), t.height);
-    VkRect2D sc{ { (int32_t)(x0 * t.aa_u), (int32_t)(y0 * t.aa_v) },
-                 { x1 > x0 ? (x1 - x0) * t.aa_u : 0u, y1 > y0 ? (y1 - y0) * t.aa_v : 0u } };
-    vkCmdSetScissorWithCount(cmd, 1, &sc);
+    const uint32_t ex = t.scale.edge(x0 * t.aa_u), ey = t.scale.edge(y0 * t.aa_v);
+    s.scissor = { { (int32_t)ex, (int32_t)ey }, { t.scale.edge(x1 * t.aa_u) - ex, t.scale.edge(y1 * t.aa_v) - ey } };
 
     const uint32_t lw = f.r(rsx::M_LINE_WIDTH);
-    float width = ((float)(lw >> 3) + (float)(lw & 7u) / 8.f) * (float)t.scale;
-    width = d.features.features.wideLines ? std::clamp(width, d.props.limits.lineWidthRange[0], d.props.limits.lineWidthRange[1]) : 1.f;
-    vkCmdSetLineWidth(cmd, width);
+    const float width = ((float)(lw >> 3) + (float)(lw & 7u) / 8.f) * t.scale.value();
+    s.line_width = d.features.features.wideLines ? std::clamp(width, d.props.limits.lineWidthRange[0], d.props.limits.lineWidthRange[1]) : 1.f;
 
     const uint32_t cls = topology_class(prim);
     const uint32_t bias_reg = cls == 0 ? rsx::M_POLY_OFFSET_POINT : cls == 1 ? rsx::M_POLY_OFFSET_LINE : rsx::M_POLY_OFFSET_FILL;
-    const bool bias = t.depth && f.r(bias_reg) != 0;
-    vkCmdSetDepthBiasEnable(cmd, bias);
-    if (bias) vkCmdSetDepthBias(cmd, f.f(rsx::M_POLY_OFFSET_BIAS), 0.f, f.f(rsx::M_POLY_OFFSET_SCALE));
-
-    const bool fp_target = t.color_format[0] == VK_FORMAT_R16G16B16A16_SFLOAT;
-    float bc[4];
-    const uint32_t c1 = f.r(rsx::M_BLEND_COLOR);
-    if (fp_target) {
-        const uint32_t c2 = f.r(rsx::M_BLEND_COLOR2);
-        bc[0] = half_to_float((uint16_t)(c1 & 0xFFFFu));
-        bc[1] = half_to_float((uint16_t)(c1 >> 16));
-        bc[2] = half_to_float((uint16_t)(c2 & 0xFFFFu));
-        bc[3] = half_to_float((uint16_t)(c2 >> 16));
-    } else {
-        bc[0] = (float)((c1 >> 16) & 0xFFu) / 255.f;
-        bc[1] = (float)((c1 >> 8) & 0xFFu) / 255.f;
-        bc[2] = (float)(c1 & 0xFFu) / 255.f;
-        bc[3] = (float)(c1 >> 24) / 255.f;
+    s.bias_enable = t.depth && f.r(bias_reg) != 0;
+    if (s.bias_enable) {
+        s.bias[0] = f.f(rsx::M_POLY_OFFSET_BIAS);
+        s.bias[2] = f.f(rsx::M_POLY_OFFSET_SCALE);
     }
-    vkCmdSetBlendConstants(cmd, bc);
 
-    const bool depth_test = t.depth && f.r(rsx::M_DEPTH_TEST_ENABLE) != 0;
-    vkCmdSetDepthTestEnable(cmd, depth_test);
-    vkCmdSetDepthWriteEnable(cmd, depth_test && f.r(rsx::M_DEPTH_MASK) != 0);
-    vkCmdSetDepthCompareOp(cmd, compare_op(f.r(rsx::M_DEPTH_FUNC)));
-    const bool bounds = t.depth && d.features.features.depthBounds && f.r(rsx::M_DEPTH_BOUNDS_ENABLE) != 0;
-    vkCmdSetDepthBoundsTestEnable(cmd, bounds);
-    if (bounds) vkCmdSetDepthBounds(cmd, std::clamp(f.f(rsx::M_DEPTH_BOUNDS_MIN), 0.f, 1.f), std::clamp(f.f(rsx::M_DEPTH_BOUNDS_MAX), 0.f, 1.f));
+    const uint32_t c1 = f.r(rsx::M_BLEND_COLOR);
+    if (t.color_format[0] == VK_FORMAT_R16G16B16A16_SFLOAT) {
+        const uint32_t c2 = f.r(rsx::M_BLEND_COLOR2);
+        s.blend_constants[0] = half_to_float((uint16_t)(c1 & 0xFFFFu));
+        s.blend_constants[1] = half_to_float((uint16_t)(c1 >> 16));
+        s.blend_constants[2] = half_to_float((uint16_t)(c2 & 0xFFFFu));
+        s.blend_constants[3] = half_to_float((uint16_t)(c2 >> 16));
+    } else {
+        s.blend_constants[0] = (float)((c1 >> 16) & 0xFFu) / 255.f;
+        s.blend_constants[1] = (float)((c1 >> 8) & 0xFFu) / 255.f;
+        s.blend_constants[2] = (float)(c1 & 0xFFu) / 255.f;
+        s.blend_constants[3] = (float)(c1 >> 24) / 255.f;
+    }
 
-    const bool stencil = t.stencil && f.r(rsx::M_STENCIL_TEST_ENABLE) != 0;
-    vkCmdSetStencilTestEnable(cmd, stencil);
-    const bool two = f.r(rsx::M_TWO_SIDED_STENCIL) != 0;
-    const uint32_t front_base = rsx::M_STENCIL_MASK, back_base = two ? rsx::M_BACK_STENCIL_MASK : rsx::M_STENCIL_MASK;
+    s.depth_test = t.depth && f.r(rsx::M_DEPTH_TEST_ENABLE) != 0;
+    s.depth_write = s.depth_test && f.r(rsx::M_DEPTH_MASK) != 0;
+    s.depth_op = compare_op(f.r(rsx::M_DEPTH_FUNC));
+    s.bounds_enable = t.depth && d.features.features.depthBounds && f.r(rsx::M_DEPTH_BOUNDS_ENABLE) != 0;
+    if (s.bounds_enable) {
+        s.bounds[0] = std::clamp(f.f(rsx::M_DEPTH_BOUNDS_MIN), 0.f, 1.f);
+        s.bounds[1] = std::clamp(f.f(rsx::M_DEPTH_BOUNDS_MAX), 0.f, 1.f);
+    }
+
+    s.stencil_test = t.stencil && f.r(rsx::M_STENCIL_TEST_ENABLE) != 0;
+    const uint32_t back_base = f.r(rsx::M_TWO_SIDED_STENCIL) != 0 ? rsx::M_BACK_STENCIL_MASK : rsx::M_STENCIL_MASK;
     for (int side = 0; side < 2; side++) {
-        const uint32_t base = side ? back_base : front_base;
-        const VkStencilFaceFlags face = side ? VK_STENCIL_FACE_BACK_BIT : VK_STENCIL_FACE_FRONT_BIT;
-        vkCmdSetStencilWriteMask(cmd, face, f.r(base) & 0xFFu);
-        vkCmdSetStencilCompareMask(cmd, face, f.r(base + 12u) & 0xFFu);
-        vkCmdSetStencilReference(cmd, face, f.r(base + 8u) & 0xFFu);
-        vkCmdSetStencilOp(cmd, face, stencil_op(f.r(base + 16u)), stencil_op(f.r(base + 24u)), stencil_op(f.r(base + 20u)),
-                          compare_op(f.r(base + 4u)));
+        const uint32_t base = side ? back_base : rsx::M_STENCIL_MASK;
+        s.faces[side] = { f.r(base) & 0xFFu, f.r(base + 12u) & 0xFFu, f.r(base + 8u) & 0xFFu, stencil_op(f.r(base + 16u)),
+                          stencil_op(f.r(base + 24u)), stencil_op(f.r(base + 20u)), compare_op(f.r(base + 4u)) };
     }
 
     const uint32_t cull = f.r(rsx::M_CULL_FACE);
-    VkCullModeFlags cm = VK_CULL_MODE_NONE;
-    if (f.r(rsx::M_CULL_FACE_ENABLE))
-        cm = cull == 0x404u ? VK_CULL_MODE_FRONT_BIT : cull == 0x408u ? VK_CULL_MODE_FRONT_AND_BACK : VK_CULL_MODE_BACK_BIT;
-    vkCmdSetCullMode(cmd, cm);
-    vkCmdSetFrontFace(cmd, f.r(rsx::M_FRONT_FACE) == 0x901u ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE);
+    s.cull = VK_CULL_MODE_NONE;
+    if (f.r(rsx::M_CULL_FACE_ENABLE)) s.cull = cull == 0x404u ? VK_CULL_MODE_FRONT_BIT : cull == 0x408u ? VK_CULL_MODE_FRONT_AND_BACK : VK_CULL_MODE_BACK_BIT;
+    s.front = f.r(rsx::M_FRONT_FACE) == 0x901u ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
     bool emulated;
-    vkCmdSetPrimitiveTopology(cmd, primitive_topology(prim, emulated));
-    vkCmdSetPrimitiveRestartEnable(cmd, restart && restart_capable(prim));
-    vkCmdSetRasterizerDiscardEnable(cmd, VK_FALSE);
-
-    if (p.dynamic_polygon_mode()) vkCmdSetPolygonModeEXT(cmd, (VkPolygonMode)key.polygon_mode);
-    if (p.dynamic_depth_clamp()) vkCmdSetDepthClampEnableEXT(cmd, key.depth_clamp);
-    if (p.dynamic_depth_clip()) vkCmdSetDepthClipEnableEXT(cmd, key.depth_clip);
-    if (p.dynamic_provoking())
-        vkCmdSetProvokingVertexModeEXT(cmd, key.provoking_last ? VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT : VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT);
+    s.topology = primitive_topology(prim, emulated);
+    s.restart = restart && restart_capable(prim);
+    s.polygon_mode = key.polygon_mode;
+    s.depth_clamp = key.depth_clamp;
+    s.depth_clip = key.depth_clip;
+    s.provoking = key.provoking_last ? VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT : VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT;
     if (p.dynamic_blend()) {
-        uint32_t count = 0;
         for (uint32_t k = 0; k < 4; k++)
-            if (t.color_format[k] != VK_FORMAT_UNDEFINED) count = k + 1u;
-        if (count) {
-            VkBool32 en[4];
-            VkColorBlendEquationEXT eqs[4];
-            VkColorComponentFlags masks[4];
-            for (uint32_t k = 0; k < count; k++) {
-                const blend_attachment& b = key.blend[k];
-                en[k] = b.enable;
-                eqs[k] = { (VkBlendFactor)b.src_color, (VkBlendFactor)b.dst_color, (VkBlendOp)b.color_op,
-                           (VkBlendFactor)b.src_alpha, (VkBlendFactor)b.dst_alpha, (VkBlendOp)b.alpha_op };
-                masks[k] = b.write_mask;
-            }
-            vkCmdSetColorBlendEnableEXT(cmd, 0, count, en);
-            vkCmdSetColorBlendEquationEXT(cmd, 0, count, eqs);
-            vkCmdSetColorWriteMaskEXT(cmd, 0, count, masks);
+            if (t.color_format[k] != VK_FORMAT_UNDEFINED) s.blend_count = k + 1u;
+        for (uint32_t k = 0; k < s.blend_count; k++) {
+            const blend_attachment& b = key.blend[k];
+            s.blend_enable[k] = b.enable;
+            s.equation[k] = { (VkBlendFactor)b.src_color, (VkBlendFactor)b.dst_color, (VkBlendOp)b.color_op,
+                              (VkBlendFactor)b.src_alpha, (VkBlendFactor)b.dst_alpha, (VkBlendOp)b.alpha_op };
+            s.write_mask[k] = b.write_mask;
         }
     }
+
+    const bool all = !cache.valid;
+    const dynamic_state& o = cache.last;
+    const auto changed = [all](const auto& a, const auto& b) { return all || std::memcmp(&a, &b, sizeof a) != 0; };
+    if (all) vkCmdSetRasterizerDiscardEnable(cmd, VK_FALSE);
+    if (changed(s.viewport, o.viewport)) vkCmdSetViewportWithCount(cmd, 1, &s.viewport);
+    if (changed(s.scissor, o.scissor)) vkCmdSetScissorWithCount(cmd, 1, &s.scissor);
+    if (changed(s.line_width, o.line_width)) vkCmdSetLineWidth(cmd, s.line_width);
+    if (changed(s.bias_enable, o.bias_enable)) vkCmdSetDepthBiasEnable(cmd, s.bias_enable);
+    if (s.bias_enable && changed(s.bias, o.bias)) vkCmdSetDepthBias(cmd, s.bias[0], s.bias[1], s.bias[2]);
+    if (changed(s.blend_constants, o.blend_constants)) vkCmdSetBlendConstants(cmd, s.blend_constants);
+    if (changed(s.depth_test, o.depth_test)) vkCmdSetDepthTestEnable(cmd, s.depth_test);
+    if (changed(s.depth_write, o.depth_write)) vkCmdSetDepthWriteEnable(cmd, s.depth_write);
+    if (changed(s.depth_op, o.depth_op)) vkCmdSetDepthCompareOp(cmd, (VkCompareOp)s.depth_op);
+    if (changed(s.bounds_enable, o.bounds_enable)) vkCmdSetDepthBoundsTestEnable(cmd, s.bounds_enable);
+    if (s.bounds_enable && changed(s.bounds, o.bounds)) vkCmdSetDepthBounds(cmd, s.bounds[0], s.bounds[1]);
+    if (changed(s.stencil_test, o.stencil_test)) vkCmdSetStencilTestEnable(cmd, s.stencil_test);
+    for (int side = 0; side < 2; side++) {
+        const dynamic_state::face& n = s.faces[side];
+        const dynamic_state::face& l = o.faces[side];
+        const VkStencilFaceFlags face = side ? VK_STENCIL_FACE_BACK_BIT : VK_STENCIL_FACE_FRONT_BIT;
+        if (changed(n.write, l.write)) vkCmdSetStencilWriteMask(cmd, face, n.write);
+        if (changed(n.compare, l.compare)) vkCmdSetStencilCompareMask(cmd, face, n.compare);
+        if (changed(n.reference, l.reference)) vkCmdSetStencilReference(cmd, face, n.reference);
+        if (all || n.fail != l.fail || n.pass != l.pass || n.depth_fail != l.depth_fail || n.op != l.op)
+            vkCmdSetStencilOp(cmd, face, n.fail, n.pass, n.depth_fail, n.op);
+    }
+    if (changed(s.cull, o.cull)) vkCmdSetCullMode(cmd, s.cull);
+    if (changed(s.front, o.front)) vkCmdSetFrontFace(cmd, (VkFrontFace)s.front);
+    if (changed(s.topology, o.topology)) vkCmdSetPrimitiveTopology(cmd, (VkPrimitiveTopology)s.topology);
+    if (changed(s.restart, o.restart)) vkCmdSetPrimitiveRestartEnable(cmd, s.restart);
+    if (p.dynamic_polygon_mode() && changed(s.polygon_mode, o.polygon_mode)) vkCmdSetPolygonModeEXT(cmd, (VkPolygonMode)s.polygon_mode);
+    if (p.dynamic_depth_clamp() && changed(s.depth_clamp, o.depth_clamp)) vkCmdSetDepthClampEnableEXT(cmd, s.depth_clamp);
+    if (p.dynamic_depth_clip() && changed(s.depth_clip, o.depth_clip)) vkCmdSetDepthClipEnableEXT(cmd, s.depth_clip);
+    if (p.dynamic_provoking() && changed(s.provoking, o.provoking)) vkCmdSetProvokingVertexModeEXT(cmd, (VkProvokingVertexModeEXT)s.provoking);
+    if (s.blend_count) {
+        if (all || s.blend_count != o.blend_count || std::memcmp(s.blend_enable, o.blend_enable, s.blend_count * sizeof s.blend_enable[0]))
+            vkCmdSetColorBlendEnableEXT(cmd, 0, s.blend_count, s.blend_enable);
+        if (all || s.blend_count != o.blend_count || std::memcmp(s.equation, o.equation, s.blend_count * sizeof s.equation[0]))
+            vkCmdSetColorBlendEquationEXT(cmd, 0, s.blend_count, s.equation);
+        if (all || s.blend_count != o.blend_count || std::memcmp(s.write_mask, o.write_mask, s.blend_count * sizeof s.write_mask[0]))
+            vkCmdSetColorWriteMaskEXT(cmd, 0, s.blend_count, s.write_mask);
+    }
+    cache.last = s;
+    cache.valid = true;
 }
 
 }

@@ -3,7 +3,7 @@
 #define VMA_STATIC_VULKAN_FUNCTIONS 0
 #define VMA_DYNAMIC_VULKAN_FUNCTIONS 1
 #include <volk.h>
-#include <vma/vk_mem_alloc.h>
+#include <vk_mem_alloc.h>
 
 #include <cstdint>
 #include <cstdio>
@@ -55,4 +55,3 @@ struct vk_device {
 
 bool vk_instance_create(vk_device& d, const char* const* extensions, uint32_t count);
 bool vk_device_create(vk_device& d, VkSurfaceKHR surface);
-void vk_device_destroy(vk_device& d);

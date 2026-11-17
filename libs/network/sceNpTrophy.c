@@ -30,12 +30,11 @@ void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_
 
 static int s_trophy_initialized = 0;
 static char s_storage_path[512] = "gamedata/trophies";
-static int  s_storage_path_set = 0;
 
 static void trophy_adopt_gamedata_root(void)
 {
     static int s_done = 0;
-    if (s_done || s_storage_path_set) return;
+    if (s_done) return;
     s_done = 1;
     const char* env = getenv("PS3_GAMEDATA_ROOT");
     if (env && *env)

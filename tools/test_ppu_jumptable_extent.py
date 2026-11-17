@@ -171,7 +171,7 @@ def main():
     check("the shared epilogue past the first blr is inside the function",
           f"loc_{at['done']:08X}:" in fn)
     check("no unresolved indirect call outside the switch default",
-          "ps3_indirect_call" not in fn.replace("default: ps3_indirect_call(ctx); return; }", ""))
+          "ps3_indirect_call" not in fn.replace(f"default: {ppu_lifter._JUMP_CTR}", ""))
     check("the next function stays its own function", body(src, at["next"]) is not None)
     if FAILS:
         print(f"FAILED: {', '.join(FAILS)}")

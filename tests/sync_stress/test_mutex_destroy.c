@@ -4,7 +4,7 @@
  * initialised a new mutex over it, and the blocked thread waited on the dead
  * one for good.
  *
- * The blocked acquires are counted in sys_mutex_info.waiters: sys_mutex_lock
+ * The blocked acquires are queued on sys_mutex_info.q: sys_mutex_lock
  * (both timeouts give the count back) and sys_cond_wait's re-lock. */
 #include "runtime/platform/win32_compat.h"
 #include "runtime/syscalls/sys_cond.h"
@@ -24,7 +24,14 @@ static uint32_t be_read(unsigned off) {
     uint8_t* p=vm_base+off;
     return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3];
 }
-static int waiters(void) { return __atomic_load_n(&g_sys_mutexes[mid-1].waiters, __ATOMIC_SEQ_CST); }
+static int waiters(void) {
+    sys_mutex_info* m=&g_sys_mutexes[mid-1];
+    ps3_lock_acquire(&m->lock);
+    int n=0;
+    for (ps3_waiter* w=m->q.head; w; w=w->next) n++;
+    ps3_lock_release(&m->lock);
+    return n;
+}
 static int wait_waiters(int want) {
     for (int i=0;i<2000 && waiters()!=want;i++) Sleep(1);
     return waiters()==want;
@@ -76,25 +83,7 @@ int main(void) {
     CHECK(s_rc==(int32_t)CELL_ETIMEDOUT && waiters()==0);
     CHECK(call(sys_mutex_unlock,&c,mid,0,0)==CELL_OK);
 
-    /* 4. A thread blocked on the host lock while the guest count is 0 (the
-     *    window in which a released mutex passes to a waiter): EBUSY. */
-    sys_mutex_info* m=&g_sys_mutexes[mid-1];
-#ifdef _WIN32
-    EnterCriticalSection(&m->cs);
-#else
-    pthread_mutex_lock(&m->mtx);
-#endif
-    h=CreateThread(NULL,0,locker,NULL,0,NULL);
-    CHECK(wait_waiters(1) && m->lock_count==0);
-    CHECK(call(sys_mutex_destroy,&c,mid,0,0)==(int32_t)CELL_EBUSY);
-#ifdef _WIN32
-    LeaveCriticalSection(&m->cs);
-#else
-    pthread_mutex_unlock(&m->mtx);
-#endif
-    CHECK(WaitForSingleObject(h,2000)==WAIT_OBJECT_0); CloseHandle(h);
-
-    /* 5. sys_cond_wait's re-lock counts as a waiter. */
+    /* 4. sys_cond_wait's re-lock counts as a waiter. */
     CHECK(call(sys_cond_create,&c,0x204,mid,0)==CELL_OK);
     cid=be_read(0x204);
     CHECK(call(sys_mutex_lock,&c,mid,0,0)==CELL_OK);
@@ -104,7 +93,7 @@ int main(void) {
     CHECK(call(sys_mutex_unlock,&c,mid,0,0)==CELL_OK);
     CHECK(call(sys_cond_destroy,&c,cid,0,0)==CELL_OK);
 
-    /* 6. Free and uncontended: destroyed. */
+    /* 5. Free and uncontended: destroyed. */
     CHECK(waiters()==0);
     CHECK(call(sys_mutex_destroy,&c,mid,0,0)==CELL_OK);
     CHECK(call(sys_mutex_destroy,&c,mid,0,0)==(int32_t)CELL_ESRCH);

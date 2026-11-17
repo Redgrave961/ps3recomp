@@ -264,18 +264,3 @@ bool vk_device_create(vk_device& d, VkSurfaceKHR surface)
                  d.caps.pipeline_library, d.caps.shader_object, d.caps.local_read, d.caps.host_memory, d.caps.fifo_latest_ready);
     return true;
 }
-
-void vk_device_destroy(vk_device& d)
-{
-    if (d.vma) vmaDestroyAllocator(d.vma);
-    if (d.dev) vkDestroyDevice(d.dev, nullptr);
-    if (d.messenger) vkDestroyDebugUtilsMessengerEXT(d.instance, d.messenger, nullptr);
-    if (d.instance) vkDestroyInstance(d.instance, nullptr);
-    d.instance = VK_NULL_HANDLE;
-    d.messenger = VK_NULL_HANDLE;
-    d.gpu = VK_NULL_HANDLE;
-    d.dev = VK_NULL_HANDLE;
-    d.queue = VK_NULL_HANDLE;
-    d.vma = nullptr;
-    d.chain.clear();
-}

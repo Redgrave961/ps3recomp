@@ -182,7 +182,6 @@ typedef struct rsx_spv_fp_info {
 typedef struct rsx_spv_vp_info {
     u32 instructions;
     u32 input_mask;
-    u32 output_mask;
     u32 texture_mask;
     u32 constants_used[(RSX_SPV_VP_CONSTANTS + 31u) / 32u];
     int constants_relative;
@@ -193,7 +192,7 @@ int  rsx_spv_fragment(const u32* ucode, u32 max_words, const rsx_spv_fp_key* key
 int  rsx_spv_fragment_scan(const u32* ucode, u32 max_words, rsx_spv_fp_info* info);
 int  rsx_spv_vertex_reach(const u32* ucode, u32 start, u8* reach);
 int  rsx_spv_depth_pack(int d16, rsx_spv_blob* out);
-int  rsx_spv_box_down(u32 k, rsx_spv_blob* out);
+int  rsx_spv_box_down(rsx_spv_blob* out);
 void rsx_spv_blob_free(rsx_spv_blob* blob);
 
 #ifdef __cplusplus

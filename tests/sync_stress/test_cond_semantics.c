@@ -21,11 +21,10 @@ static DWORD WINAPI signaler(void* raw) {
     Sleep(20);
     if (raw) {
         /* Host spurious wake: no guest signal has selected this waiter. */
-#ifdef _WIN32
-        WakeAllConditionVariable(&g_sys_conds[cid-1].cv);
-#else
-        pthread_cond_broadcast(&g_sys_conds[cid-1].cv);
-#endif
+        sys_cond_info* cond=&g_sys_conds[cid-1];
+        ps3_lock_acquire(&cond->lock);
+        for (ps3_waiter* w=cond->q.head; w; w=w->next) ps3_futex_wake_all(&w->done);
+        ps3_lock_release(&cond->lock);
     } else {
         int32_t rc=call(sys_mutex_lock,&c,mid,200000,0);
         if (rc==CELL_OK) {
@@ -54,7 +53,7 @@ int main(int argc, char** argv) {
         CHECK(h!=NULL);
         int32_t rc=call(sys_cond_wait,&c,cid,100000,0);
         CHECK(rc==(spurious?(int32_t)CELL_ETIMEDOUT:CELL_OK));
-        CHECK(g_sys_mutexes[mid-1].owner_tid==1);
+        CHECK(lv2_mutex_owner(&g_sys_mutexes[mid-1])==1);
         CHECK(g_sys_mutexes[mid-1].lock_count==(spurious?1:2));
         CHECK(call(sys_mutex_unlock,&c,mid,0,0)==CELL_OK);
         if (!spurious) CHECK(call(sys_mutex_unlock,&c,mid,0,0)==CELL_OK);

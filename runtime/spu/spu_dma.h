@@ -135,16 +135,6 @@ static inline int mfc_is_list(uint32_t cmd)
     return (cmd & 0x04) != 0; /* list variants have bit 2 set */
 }
 
-static inline int mfc_is_barrier(uint32_t cmd)
-{
-    return (cmd & 0x01) != 0; /* barrier variants have bit 0 set */
-}
-
-static inline int mfc_is_fence(uint32_t cmd)
-{
-    return (cmd & 0x02) != 0; /* fence variants have bit 1 set */
-}
-
 /*
  * Execute a single DMA transfer between local store and main memory.
  * Returns 0 on success, -1 on error.
@@ -489,16 +479,6 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
 #define MFC_TAG_UPDATE_IMMEDIATE  0  /* return status immediately */
 #define MFC_TAG_UPDATE_ANY        1  /* wait for any tag in mask */
 #define MFC_TAG_UPDATE_ALL        2  /* wait for all tags in mask */
-
-/*
- * Query tag status.  Returns the bitmask of completed tags that match
- * the tag mask.  In synchronous mode, all submitted DMAs are already
- * complete, so this just returns the intersection.
- */
-static inline uint32_t mfc_read_tag_status(const mfc_engine* mfc, uint32_t tag_mask)
-{
-    return mfc->tag_completed & tag_mask;
-}
 
 /*
  * Poll for tag completion.

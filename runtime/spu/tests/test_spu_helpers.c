@@ -15,7 +15,6 @@
  */
 
 #include "../spu_helpers.h"
-#include "../../../tests/spu_ls_watch_fixture.h"
 #include <stdio.h>
 #include <string.h>
 

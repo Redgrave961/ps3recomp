@@ -18,7 +18,7 @@ import os, re, sys, json, collections
 
 DEF = re.compile(r'^void (func_[0-9A-Fa-f]+)\(ppu_context\*')
 CALL = re.compile(r'\b(func_[0-9A-Fa-f]+)\(ctx\)')
-TRAMP = re.compile(r'g_trampoline_fn\s*=\s*\(void\(\*\)\(void\*\)\)(func_[0-9A-Fa-f]+)')
+TRAMP = re.compile(r'PPU_TAIL return (func_[0-9A-Fa-f]+)\(ctx\)')
 
 def build(d):
     callers = collections.defaultdict(set)   # callee -> callers

@@ -22,6 +22,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 option(PS3RECOMP_BUILD_TESTS "Build unit tests" OFF)
 set(PS3RECOMP_OPT_FLAG "-O2" CACHE STRING "Optimisation flag for every non-Debug configuration of the runtime and the lifted SPU code")
 
+# x86-64-v3 (AVX2, FMA) is the baseline: runtime/ppu/ppu_vmx.h maps VMX onto it.
+# A -march / /arch already in the flags (e.g. native) takes precedence.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64" AND NOT "${CMAKE_C_FLAGS} ${CMAKE_C_FLAGS_RELEASE}" MATCHES "march|/arch")
+    add_compile_options($<IF:$<STREQUAL:${CMAKE_C_COMPILER_FRONTEND_VARIANT},MSVC>,/arch:AVX2,-march=x86-64-v3>)
+endif()
+
 # ---------------------------------------------------------------------------
 # Collect source files
 # ---------------------------------------------------------------------------
@@ -101,7 +107,6 @@ if(WIN32)
     target_link_libraries(ps3recomp_runtime PRIVATE
         ws2_32
         ole32
-        bcrypt
         synchronization
         dxgi
     )
@@ -230,7 +235,9 @@ if(PS3RECOMP_BUILD_TESTS)
         # The interpreter's op/immediate decode at the opcode-width and
         # immediate-form boundaries, against ISA-layout encodings.
         add_executable(test_spu_decode
-            runtime/spu/tests/test_spu_decode.c)
+            runtime/spu/tests/test_spu_decode.c
+            runtime/platform/ps3_sync.c
+            runtime/spu/tests/spu_fixture_ppu.c)
         target_include_directories(test_spu_decode PRIVATE include runtime/spu)
         target_compile_options(test_spu_decode PRIVATE -UNDEBUG)
         target_link_libraries(test_spu_decode PRIVATE m)
@@ -248,7 +255,9 @@ if(PS3RECOMP_BUILD_TESTS)
         set_tests_properties(spu_fi_cflts_neon PROPERTIES TIMEOUT 300)
 
         add_executable(test_spu_lockline_wait
-            runtime/spu/tests/test_spu_lockline_wait.c)
+            runtime/spu/tests/test_spu_lockline_wait.c
+            runtime/platform/ps3_sync.c
+            runtime/spu/tests/spu_fixture_ppu.c)
         target_include_directories(test_spu_lockline_wait PRIVATE include)
         target_compile_options(test_spu_lockline_wait PRIVATE -UNDEBUG)
         target_link_libraries(test_spu_lockline_wait PRIVATE Threads::Threads)
@@ -257,13 +266,9 @@ if(PS3RECOMP_BUILD_TESTS)
 
     endif()
 
-    # vmx_fmaf (fused multiply-add without a libm call per lane) against fmaf.
-    # Without -mfma it takes the double-rounding path; with it, the builtin.
+    # vmaddfp / vnmsubfp against fmaf, lane by lane.
     add_executable(test_vmx_fmaf tests/test_vmx_fmaf.c)
     target_compile_options(test_vmx_fmaf PRIVATE -UNDEBUG)
-    if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
-        target_compile_options(test_vmx_fmaf PRIVATE -mno-fma)
-    endif()
     if(NOT WIN32)
         target_link_libraries(test_vmx_fmaf PRIVATE m)
     endif()
@@ -272,9 +277,6 @@ if(PS3RECOMP_BUILD_TESTS)
 
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
-        add_test(NAME spinlock_word_width
-            COMMAND "${Python3_EXECUTABLE}"
-                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spinlock_word_width.py")
         add_test(NAME spu_sdcrz
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_sdcrz.py")

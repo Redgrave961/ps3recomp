@@ -650,14 +650,6 @@ cellVdec behaves as before.
 *rendering correctly with no per-title overrides. Thirty-odd pull requests from*
 *six people since v0.12.1.*
 
-**Online**
-- **NP online over [psnr](https://github.com/sp00nznet/psnr)** (#196, #200) —
-  real host sockets behind `PS3_NET_ONLINE`; sceNpMatching2 rooms, signaling and
-  callbacks, sceNpScore leaderboards, sceNpLookup, cellSysutilAvc2; NAT probes,
-  hole punching and a relay for peers that cannot reach each other.
-  `--psnr host --username NAME` on the runtime's command line. Offline is still
-  the default and unchanged. See [docs/ONLINE.md](docs/ONLINE.md).
-
 **Rendering**
 - **A Vulkan backend for Linux** — *[@gabryboy12-ai](https://github.com/gabryboy12-ai)*
   (#182, #192). Opt-in; runs the guest's own shaders on the shared register-file

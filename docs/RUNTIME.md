@@ -36,7 +36,6 @@ All runtime components are header-only with `static inline` functions, meaning z
 | `runtime/memory/vm.h` | Virtual memory manager |
 | `runtime/ppu/ppu_context.h` | PPU register file and helpers |
 | `runtime/ppu/ppu_memory.h` | Memory access macros |
-| `runtime/ppu/ppu_ops.h` | Instruction operation helpers |
 | `runtime/spu/spu_context.h` | SPU register file and local store |
 | `runtime/spu/spu_dma.h` | MFC DMA transfer engine |
 | `runtime/syscalls/lv2_syscall_table.h` | Syscall numbers and dispatch |
@@ -64,7 +63,7 @@ On Windows, `VirtualAlloc` with `MEM_RESERVE` reserves the 4 GB range without co
 |---|---|---|---|
 | `0x00010000 – 0x0FFFFFFF` | 256 MB | User ELF text + data (main memory) | `vm_init()` |
 | `0x10000000 – 0x1FFFFFFF` | 256 MB | RSX mapped memory / PRX module space | On demand via `vm_commit()` |
-| `0x30000000 – 0x3001FFFF` | 8 × 256 KB | SPU local store windows (raw SPU) | `vm_spu_ls_map()` |
+| `0x30000000 – 0x3001FFFF` | 8 × 256 KB | SPU local store windows (raw SPU) | `vm_commit()` |
 | `0xD0000000 – 0xDFFFFFFF` | 256 MB | Stack region | `vm_init()` |
 
 ### Key Constants
@@ -105,13 +104,9 @@ Commits pages within the reserved range, making them readable and writable. Used
 
 Changes page protection for a committed region. Used for guard pages, read-only data segments, and executable code regions.
 
-#### `vm_to_host(addr)` / `vm_to_guest(host_ptr)`
+#### `vm_to_host(addr)`
 
-Convert between PS3 guest addresses (32-bit) and host pointers. These are the fundamental translation primitives.
-
-#### `vm_is_valid_addr(addr)`
-
-Checks if a guest address falls within any committed memory region (main memory, stack, SPU LS, or RSX).
+Converts a PS3 guest address (32-bit) to a host pointer.
 
 ### Stack Allocator
 
@@ -128,17 +123,6 @@ uint32_t stack_base = vm_stack_allocate(&sa, VM_PPU_STACK_SIZE);
 ```
 
 Each allocation includes a **guard page** (4 KB, `PAGE_NOACCESS`) at the bottom of the stack to detect overflow. The allocator returns the address *above* the guard page.
-
-### SPU Local Store Mapping
-
-For raw SPU access (PPU reading/writing SPU local store via memory-mapped IO), each SPU's 256 KB local store is mapped into the guest address space:
-
-```c
-vm_spu_ls_map(2);  // Commit SPU 2's LS window
-
-// SPU 2's LS is now accessible at 0x30000000 + 2 * 0x40000 = 0x30080000
-uint8_t* ls = vm_spu_ls_host_ptr(2);
-```
 
 ---
 
@@ -188,18 +172,6 @@ typedef struct ppu_context {
 | `vr0–vr19` | — | Volatile VMX |
 | `vr20–vr31` | — | Non-volatile VMX |
 
-Convenience macros provide named access:
-
-```c
-PPU_SP(ctx)     // ctx->gpr[1]  — stack pointer
-PPU_TOC(ctx)    // ctx->gpr[2]  — table of contents
-PPU_ARG0(ctx)   // ctx->gpr[3]  — first argument
-PPU_ARG1(ctx)   // ctx->gpr[4]  — second argument
-// ...
-PPU_ARG7(ctx)   // ctx->gpr[10] — eighth argument
-PPU_RET(ctx)    // ctx->gpr[3]  — return value
-```
-
 ### Condition Register
 
 The 32-bit CR is divided into eight 4-bit fields (CR0–CR7). Each field contains:
@@ -214,12 +186,7 @@ The 32-bit CR is divided into eight 4-bit fields (CR0–CR7). Each field contain
 **Helper functions:**
 
 ```c
-ppu_cr_get(ctx, field)              // Read 4-bit CR field (0–7)
 ppu_cr_set(ctx, field, value)       // Write 4-bit CR field
-ppu_cr_set_s64(ctx, field, a, b)    // Set CR field from signed comparison
-ppu_cr_set_u64(ctx, field, a, b)    // Set CR field from unsigned comparison
-ppu_cr_set_s32(ctx, field, a, b)    // Set CR field from 32-bit signed comparison
-ppu_cr_set_u32(ctx, field, a, b)    // Set CR field from 32-bit unsigned comparison
 ```
 
 ### XER (Fixed-Point Exception Register)
@@ -233,11 +200,6 @@ ppu_cr_set_u32(ctx, field, a, b)    // Set CR field from 32-bit unsigned compari
 
 ```c
 ppu_xer_get_so(ctx)         // Read SO flag
-ppu_xer_get_ov(ctx)         // Read OV flag
-ppu_xer_get_ca(ctx)         // Read CA flag
-ppu_xer_set_ca(ctx, ca)     // Set/clear CA
-ppu_xer_set_ov(ctx, ov)     // Set/clear OV (also sets SO if ov=1)
-ppu_xer_get_byte_count(ctx) // Read string instruction byte count
 ```
 
 ### VSCR (Vector Status and Control Register)
@@ -316,7 +278,6 @@ typedef struct spu_context {
 All local store access uses a mask (`SPU_LS_MASK = 0x3FFFF`) to wrap addresses within the 256 KB range:
 
 ```c
-spu_ls_ptr(ctx, lsa)            // Get host pointer to LS address
 spu_ls_read32(ctx, lsa)         // Read 32-bit big-endian value
 spu_ls_write32(ctx, lsa, val)   // Write 32-bit big-endian value
 spu_ls_read128(ctx, lsa)        // Read 128-bit value (16-byte aligned)
@@ -329,9 +290,6 @@ SPU instructions operate on the "preferred slot" of a 128-bit register — the l
 
 ```c
 spu_preferred_u32(&reg)         // Extract preferred word (uint32_t)
-spu_preferred_s32(&reg)         // Extract preferred word (int32_t)
-spu_preferred_f32(&reg)         // Extract preferred word (float)
-spu_preferred_u64(&reg)         // Extract preferred doubleword
 spu_make_preferred_u32(val)     // Create register with value in preferred slot
 ```
 
@@ -497,15 +455,6 @@ The byte-swap primitives use compiler builtins for maximum performance:
 | **Portable** | Shift/mask fallback | Shift/mask fallback | Shift/mask fallback |
 
 These compile to single instructions on x86 (`bswap`), ARM (`rev`), etc.
-
-### 128-bit Swap
-
-For VMX/AltiVec 128-bit values, a swap reverses both 64-bit halves and exchanges them:
-
-```c
-ps3_u128 ps3_bswap128(ps3_u128 v);
-// Equivalent to: { bswap64(v.lo), bswap64(v.hi) }
-```
 
 ### C++ Template API
 
@@ -731,5 +680,4 @@ Each HLE module defines errors as `(base | local_code)`:
 CELL_IS_ERROR(code)             // True if high bit is set
 CELL_RETURN_IF_ERROR(expr)      // Early return if expression returns an error
 CELL_MODULE_ERROR(base, code)   // Build module-specific error code
-cell_error_name(code)           // Pretty-print error code for logging (C++ only)
 ```

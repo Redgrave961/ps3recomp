@@ -182,33 +182,4 @@
 /* Build a module-specific error code. */
 #define CELL_MODULE_ERROR(base, code)  ((int32_t)((base) | (code)))
 
-#ifdef __cplusplus
-#include <cstdio>
-
-/* Pretty-print an error code for debug logging. */
-static inline const char* cell_error_name(int32_t code)
-{
-    static thread_local char buf[32];
-    switch ((uint32_t)code)
-    {
-    case CELL_OK:          return "CELL_OK";
-    case CELL_EAGAIN:      return "CELL_EAGAIN";
-    case CELL_EINVAL:      return "CELL_EINVAL";
-    case CELL_ENOSYS:      return "CELL_ENOSYS";
-    case CELL_ENOMEM:      return "CELL_ENOMEM";
-    case CELL_ESRCH:       return "CELL_ESRCH";
-    case CELL_ENOENT:      return "CELL_ENOENT";
-    case CELL_EPERM:       return "CELL_EPERM";
-    case CELL_EBUSY:       return "CELL_EBUSY";
-    case CELL_ETIMEDOUT:   return "CELL_ETIMEDOUT";
-    case CELL_EABORT:      return "CELL_EABORT";
-    case CELL_EFAULT:      return "CELL_EFAULT";
-    case CELL_EEXIST:      return "CELL_EEXIST";
-    default:
-        snprintf(buf, sizeof(buf), "0x%08X", (unsigned)code);
-        return buf;
-    }
-}
-#endif /* __cplusplus */
-
 #endif /* PS3EMU_ERROR_CODES_H */

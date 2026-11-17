@@ -2,6 +2,8 @@
 
 
 #include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <cstring>
 
 namespace vk {
@@ -72,6 +74,23 @@ bool ranges_overlap(u32 a, u32 an, u32 b, u32 bn)
     return a < b + bn && b < a + an;
 }
 
+bool scaled_edge(float x, const ratio& s, int32_t& out)
+{
+    if (x >= 0.f && x == std::floor(x)) {
+        out = (int32_t)s.edge((u32)x);
+        return true;
+    }
+    const float v = x * s.value();
+    out = (int32_t)std::lround(v);
+    return std::fabs(v - (float)out) <= 1e-3f;
+}
+
+VkImageUsageFlags surface_usage(bool depth)
+{
+    return VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+           (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+}
+
 }
 
 bool framebuffer::operator==(const framebuffer& o) const
@@ -101,10 +120,9 @@ bool renderer::open(vk_device& d, VkSemaphore timeline, uint64_t* submitted, con
         VK_TRY(vkAllocateCommandBuffers(d.dev, &ai, &s.cmd));
     }
     m_ubo_align = std::max<VkDeviceSize>(16, d.props.limits.minUniformBufferOffsetAlignment);
-    m_ssbo_align = std::max<VkDeviceSize>(16, d.props.limits.minStorageBufferOffsetAlignment);
     m_shaders.init(d, m_pipelines);
-    if (!m_ring.create(d, 256ull << 20, timeline) || !m_pipelines.create(d, cache_path) || !create_dummies() ||
-        !m_occlusion.create(d, timeline) || !m_depth_pack.create(d) || !m_downscale.create(d, resolution_scale))
+    if (!m_ring.create(d, 256ull << 20, 256ull << 20, timeline) || !m_pipelines.create(d, cache_path) || !create_dummies() ||
+        !m_occlusion.create(d, timeline) || !m_depth_pack.create(d) || !m_downscale.create(d))
         return false;
     m_pipelines.precompile(m_shaders);
     return true;
@@ -120,6 +138,10 @@ void renderer::close()
     m_occlusion.destroy();
     m_depth_pack.destroy();
     m_downscale.destroy();
+    for (auto& g : m_scratch_garbage) vmaDestroyBuffer(m_d->vma, g.second.buffer, g.second.mem);
+    m_scratch_garbage.clear();
+    if (m_pack.buffer) vmaDestroyBuffer(m_d->vma, m_pack.buffer, m_pack.mem);
+    m_pack = scratch{};
     destroy_image(m_box);
     for (auto& s : m_surfaces) {
         destroy_image(s->img);
@@ -174,6 +196,20 @@ void renderer::barrier(VkCommandBuffer cmd, image& img, VkImageLayout layout, Vk
     img.access = access;
 }
 
+void renderer::memory_barrier(VkCommandBuffer cmd, VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access, VkPipelineStageFlags2 dst_stage,
+                              VkAccessFlags2 dst_access)
+{
+    VkMemoryBarrier2 mb{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+    mb.srcStageMask = src_stage;
+    mb.srcAccessMask = src_access;
+    mb.dstStageMask = dst_stage;
+    mb.dstAccessMask = dst_access;
+    VkDependencyInfo di{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+    di.memoryBarrierCount = 1;
+    di.pMemoryBarriers = &mb;
+    vkCmdPipelineBarrier2(cmd, &di);
+}
+
 VkCommandBuffer renderer::cmd()
 {
     submission& s = m_submissions[m_submission];
@@ -187,6 +223,9 @@ VkCommandBuffer renderer::cmd()
     VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(s.cmd, &bi);
+    m_dynamic.valid = false;
+    m_bound.valid = false;
+    m_bound.pipeline = VK_NULL_HANDLE;
     m_recording = true;
     return s.cmd;
 }
@@ -226,19 +265,24 @@ void renderer::submit(VkSemaphore wait, VkPipelineStageFlags2 wait_stage, VkSema
     m_ring.close(value);
     m_occlusion.submitted(value);
 
-    uint64_t reached = 0;
-    vkGetSemaphoreCounterValue(m_d->dev, m_timeline, &reached);
+    vkGetSemaphoreCounterValue(m_d->dev, m_timeline, &m_reached);
+    release_held();
     auto keep = std::remove_if(m_garbage.begin(), m_garbage.end(), [&](std::pair<uint64_t, image>& g) {
-        if (g.first > reached) return false;
+        if (g.first > m_reached) return false;
         destroy_image(g.second);
         return true;
     });
     m_garbage.erase(keep, m_garbage.end());
+    auto kept = std::remove_if(m_scratch_garbage.begin(), m_scratch_garbage.end(), [&](std::pair<uint64_t, scratch>& g) {
+        if (g.first > m_reached) return false;
+        vmaDestroyBuffer(m_d->vma, g.second.buffer, g.second.mem);
+        return true;
+    });
+    m_scratch_garbage.erase(kept, m_scratch_garbage.end());
 }
 
 void renderer::flush()
 {
-    m_epoch++;
     if (m_recording) submit(VK_NULL_HANDLE, 0, VK_NULL_HANDLE);
 }
 
@@ -257,12 +301,15 @@ bool renderer::create_image(image& img, VkFormat format, u32 width, u32 height, 
     VmaAllocationCreateInfo ai{};
     ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
     VK_TRY(vmaCreateImage(m_d->vma, &ii, &ai, &img.handle, &img.mem, nullptr));
-    VkImageViewCreateInfo vi{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
-    vi.image = img.handle;
-    vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    vi.format = format;
-    vi.subresourceRange = { aspect, 0, 1, 0, 1 };
-    VK_TRY(vkCreateImageView(m_d->dev, &vi, nullptr, &img.view));
+    img.view = VK_NULL_HANDLE;
+    if (usage & (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT)) {
+        VkImageViewCreateInfo vi{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+        vi.image = img.handle;
+        vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vi.format = format;
+        vi.subresourceRange = { aspect, 0, 1, 0, 1 };
+        VK_TRY(vkCreateImageView(m_d->dev, &vi, nullptr, &img.view));
+    }
     img.format = format;
     img.aspect = aspect;
     img.width = width;
@@ -270,6 +317,18 @@ bool renderer::create_image(image& img, VkFormat format, u32 width, u32 height, 
     img.layout = VK_IMAGE_LAYOUT_UNDEFINED;
     img.stage = VK_PIPELINE_STAGE_2_NONE;
     img.access = 0;
+    return true;
+}
+
+bool renderer::create_scratch(scratch& s, VkDeviceSize size, VkBufferUsageFlags usage)
+{
+    VkBufferCreateInfo bi{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    bi.size = size;
+    bi.usage = usage;
+    VmaAllocationCreateInfo ai{};
+    ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    VK_TRY(vmaCreateBuffer(m_d->vma, &bi, &ai, &s.buffer, &s.mem, nullptr));
+    s.size = size;
     return true;
 }
 
@@ -281,20 +340,31 @@ void renderer::destroy_image(image& img)
     img = image{};
 }
 
+void renderer::discard(image& img)
+{
+    if (img.handle) m_garbage.emplace_back(*m_submitted + 1u, img);
+    img = image{};
+}
+
 void renderer::retire(surface* s)
 {
-    m_garbage.emplace_back(*m_submitted + 1u, s->img);
-    if (s->snapshot.handle) m_garbage.emplace_back(*m_submitted + 1u, s->snapshot);
-    if (s->as_color.handle) m_garbage.emplace_back(*m_submitted + 1u, s->as_color);
-    if (s->native.handle) m_garbage.emplace_back(*m_submitted + 1u, s->native);
+    discard(s->img);
+    discard(s->snapshot);
+    discard(s->as_color);
+    discard(s->native);
     auto it = std::find_if(m_surfaces.begin(), m_surfaces.end(), [s](const std::unique_ptr<surface>& p) { return p.get() == s; });
     if (it != m_surfaces.end()) m_surfaces.erase(it);
 }
 
-surface* renderer::surface_for(u32 ea, u32 pitch, u32 width, u32 height, u32 format, bool depth, u32 aa_u, u32 aa_v)
+ratio renderer::scale_for(u32 width, u32 height) const
 {
     rsx_display_buffer db{};
-    const u32 scale = rsx_core_display_buffer(0, &db) && width >= db.width && height >= db.height ? resolution_scale : 1u;
+    return rsx_core_display_buffer(0, &db) && width >= db.width && height >= db.height ? resolution_scale : ratio{};
+}
+
+surface* renderer::surface_for(u32 ea, u32 pitch, u32 width, u32 height, u32 format, bool depth, u32 aa_u, u32 aa_v)
+{
+    const ratio scale = scale_for(width, height);
     surface* grow_from = nullptr;
     for (auto& p : m_surfaces) {
         surface* s = p.get();
@@ -321,17 +391,14 @@ surface* renderer::surface_for(u32 ea, u32 pitch, u32 width, u32 height, u32 for
     s->depth_float = depth && depth_float;
     VkFormat vf;
     VkImageAspectFlags aspect;
-    VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     if (depth) {
         vf = format == 1 ? (depth_float ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_D16_UNORM) : VK_FORMAT_D32_SFLOAT_S8_UINT;
         aspect = format == 1 ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
-        usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
     } else {
         vf = color_format(format);
         aspect = VK_IMAGE_ASPECT_COLOR_BIT;
-        usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     }
-    if (!create_image(s->img, vf, s->width * aa_u * scale, s->height * aa_v * scale, usage, aspect)) return nullptr;
+    if (!create_image(s->img, vf, scale.edge(s->width * aa_u), scale.edge(s->height * aa_v), surface_usage(depth), aspect)) return nullptr;
 
     VkCommandBuffer c = cmd();
     if (grow_from) {
@@ -376,12 +443,55 @@ void renderer::scale_blit(VkCommandBuffer c, image& src, image& dst, VkFilter fi
     vkCmdBlitImage(c, src.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, filter);
 }
 
+bool renderer::scale_depth(VkCommandBuffer c, image& src, image& dst)
+{
+    constexpr VkPipelineStageFlags2 xfer = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+    constexpr VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    for (const VkImageAspectFlags aspect : { VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_ASPECT_STENCIL_BIT }) {
+        if (!(src.aspect & aspect)) continue;
+        const bool d16 = src.format == VK_FORMAT_D16_UNORM, stencil = aspect == VK_IMAGE_ASPECT_STENCIL_BIT;
+        const VkFormat format = stencil ? VK_FORMAT_R8_UINT : d16 ? VK_FORMAT_R16_UINT : VK_FORMAT_R32_UINT;
+        const VkDeviceSize texel = stencil ? 1u : d16 ? 2u : 4u;
+        image from{}, to{};
+        scratch buffer{};
+        const bool made = create_scratch(buffer, texel * std::max(src.width * src.height, dst.width * dst.height),
+                                         VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT) &&
+                          create_image(from, format, src.width, src.height, usage, VK_IMAGE_ASPECT_COLOR_BIT) &&
+                          create_image(to, format, dst.width, dst.height, usage, VK_IMAGE_ASPECT_COLOR_BIT);
+        if (made) {
+            VkBufferImageCopy region{};
+            region.imageSubresource = { aspect, 0, 0, 1 };
+            region.imageExtent = { src.width, src.height, 1 };
+            barrier(c, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+            vkCmdCopyImageToBuffer(c, src.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer.buffer, 1, &region);
+            memory_barrier(c, xfer, VK_ACCESS_2_TRANSFER_WRITE_BIT, xfer, VK_ACCESS_2_TRANSFER_READ_BIT);
+            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            barrier(c, from, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+            vkCmdCopyBufferToImage(c, buffer.buffer, from.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+            scale_blit(c, from, to, VK_FILTER_NEAREST);
+            memory_barrier(c, xfer, 0, xfer, 0);
+            region.imageExtent = { dst.width, dst.height, 1 };
+            barrier(c, to, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+            vkCmdCopyImageToBuffer(c, to.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer.buffer, 1, &region);
+            memory_barrier(c, xfer, VK_ACCESS_2_TRANSFER_WRITE_BIT, xfer, VK_ACCESS_2_TRANSFER_READ_BIT);
+            region.imageSubresource.aspectMask = aspect;
+            barrier(c, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+            vkCmdCopyBufferToImage(c, buffer.buffer, dst.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        }
+        discard(from);
+        discard(to);
+        if (buffer.buffer) m_scratch_garbage.emplace_back(*m_submitted + 1u, buffer);
+        if (!made) return false;
+    }
+    return true;
+}
+
 void renderer::load_surface(surface& s)
 {
     stats.surface_loads++;
     VkCommandBuffer c = cmd();
     end_rendering();
-    const u32 w = s.img.width / s.scale, h = s.img.height / s.scale;
+    const u32 w = s.width * s.aa_u, h = s.height * s.aa_v;
     const u32 row = w * s.bpp;
     if (!s.depth) {
         const uint8_t* src = vm_base + s.ea;
@@ -422,7 +532,7 @@ void renderer::load_surface(surface& s)
             }
             image native{};
             image* target = &s.img;
-            if (s.scale > 1u) {
+            if (!s.scale.unit()) {
                 if (!create_image(native, s.img.format, w, h, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT))
                     return;
                 target = &native;
@@ -435,7 +545,7 @@ void renderer::load_surface(surface& s)
             vkCmdCopyBufferToImage(c, slice.buffer, target->handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
             if (target == &native) {
                 scale_blit(c, native, s.img, VK_FILTER_LINEAR);
-                m_garbage.emplace_back(*m_submitted + 1u, native);
+                discard(native);
             }
             s.state = SURFACE_VALID;
     s.version = ++m_content_clock;
@@ -460,33 +570,18 @@ void renderer::download_surface(surface& s)
     if (!s.gpu_dirty || s.depth) return;
     VkCommandBuffer c = cmd();
     end_rendering();
-    const u32 w = s.img.width / s.scale, h = s.img.height / s.scale, row = w * s.bpp;
+    const u32 w = s.width * s.aa_u, h = s.height * s.aa_v, row = w * s.bpp;
     vk_slice slice = m_ring.alloc((VkDeviceSize)row * h, 16);
     if (!slice.ptr) return;
-    image native{};
-    image* source = &s.img;
-    if (s.scale > 1u) {
-        if (!create_image(native, s.img.format, w, h, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT))
-            return;
-        scale_blit(c, s.img, native, VK_FILTER_LINEAR);
-        source = &native;
-    }
+    image* source = s.scale.unit() ? &s.img : native_image(s, s.img);
+    if (!source) return;
     barrier(c, *source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
     VkBufferImageCopy region{};
     region.bufferOffset = slice.offset;
     region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
     region.imageExtent = { w, h, 1 };
     vkCmdCopyImageToBuffer(c, source->handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, slice.buffer, 1, &region);
-    if (source == &native) m_garbage.emplace_back(*m_submitted + 1u, native);
-    VkMemoryBarrier2 mb{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-    mb.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
-    mb.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-    mb.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
-    mb.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
-    VkDependencyInfo di{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-    di.memoryBarrierCount = 1;
-    di.pMemoryBarriers = &mb;
-    vkCmdPipelineBarrier2(c, &di);
+    memory_barrier(c, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
     stats.downloads++;
     submit(VK_NULL_HANDLE, 0, VK_NULL_HANDLE);
     const uint64_t value = *m_submitted;
@@ -495,7 +590,9 @@ void renderer::download_surface(surface& s)
     wi.pSemaphores = &m_timeline;
     wi.pValues = &value;
     vkWaitSemaphores(m_d->dev, &wi, UINT64_MAX);
+    await_writes(s.ea, s.pitch * h);
     uint8_t* dst = vm_base + s.ea;
+    mark_written(s.ea, s.pitch * h);
     for (u32 y = 0; y < h; y++) {
         const uint8_t* in = slice.ptr + (size_t)y * row;
         uint8_t* out = dst + (size_t)y * s.pitch;
@@ -715,7 +812,7 @@ void renderer::begin_rendering()
         if (s->img.aspect & VK_IMAGE_ASPECT_STENCIL_BIT) stencil = depth;
     }
     VkRenderingInfo ri{ VK_STRUCTURE_TYPE_RENDERING_INFO };
-    ri.renderArea = { { 0, 0 }, { m_fb.width * m_fb.aa_u * m_fb.scale, m_fb.height * m_fb.aa_v * m_fb.scale } };
+    ri.renderArea = { { 0, 0 }, { m_fb.scale.edge(m_fb.width * m_fb.aa_u), m_fb.scale.edge(m_fb.height * m_fb.aa_v) } };
     ri.layerCount = 1;
     ri.colorAttachmentCount = m_fb.count;
     ri.pColorAttachments = color;
@@ -789,8 +886,9 @@ void renderer::on_clear(u32 mask)
     }
     if (!count) return;
     begin_rendering();
-    const u32 hx = m_fb.aa_u * m_fb.scale, hy = m_fb.aa_v * m_fb.scale;
-    const VkClearRect rect{ { { (int32_t)(x0 * hx), (int32_t)(y0 * hy) }, { (x1 - x0) * hx, (y1 - y0) * hy } }, 0, 1 };
+    const ratio& sc = m_fb.scale;
+    const u32 rx = sc.edge(x0 * m_fb.aa_u), ry = sc.edge(y0 * m_fb.aa_v);
+    const VkClearRect rect{ { { (int32_t)rx, (int32_t)ry }, { sc.edge(x1 * m_fb.aa_u) - rx, sc.edge(y1 * m_fb.aa_v) - ry } }, 0, 1 };
     vkCmdClearAttachments(cmd(), count, att, 1, &rect);
     stats.clears++;
     m_draw_counter++;
@@ -800,7 +898,6 @@ void renderer::on_draw(const rsx::draw_clause& clause)
 {
     const u32 id = m_trace_draws++;
     if (!bind_framebuffer(FB_DRAW)) {
-        stats.skipped_fb++;
         if (m_trace)
             std::fprintf(m_trace, "[trace] %u dropped: no render target (clip %ux%u format %08X target %X color %08X zeta %08X)\n", id,
                          r(rsx::M_SURFACE_CLIP_H) >> 16, r(rsx::M_SURFACE_CLIP_V) >> 16, r(rsx::M_SURFACE_FORMAT),
@@ -808,7 +905,6 @@ void renderer::on_draw(const rsx::draw_clause& clause)
         return;
     }
     if (!draw_setup()) {
-        stats.skipped_shader++;
         if (m_trace) std::fprintf(m_trace, "[trace] %u skipped: %s program compiling or failed\n", id, m_vp ? "fragment" : "vertex");
         return;
     }
@@ -819,7 +915,7 @@ void renderer::trace_draw(u32 id, u32 prim, u32 count, bool indexed) const
 {
     const u32 ch = r(rsx::M_SURFACE_CLIP_H), cv = r(rsx::M_SURFACE_CLIP_V), sh = r(rsx::M_SCISSOR_H), sv = r(rsx::M_SCISSOR_V);
     const u32 wo = r(rsx::M_WINDOW_OFFSET);
-    std::fprintf(stderr,
+    std::fprintf(m_trace,
                  "[trace] %u prim %u %s %u | color %08X fmt %d %ux%u aa %ux%u depth %08X fmt %d | clip %u,%u %ux%u win %u,%u scissor %u,%u %ux%u"
                  " | vp scale %.2f %.2f %.4f offset %.2f %.2f %.4f | z test %u write %u func %X stencil %u | cmask %08X blend %u atest %u func %X ref %X"
                  " | cull %u face %X | vp %016llX fp %016llX\n",
@@ -840,6 +936,14 @@ void renderer::trace_draw(u32 id, u32 prim, u32 count, bool indexed) const
         std::fprintf(m_trace, "[trace] %u   attr%u type %u size %u stride %u offset %08X first %08X %08X\n", id, k, fmt & 0xFu, (fmt >> 4) & 0xFu,
                      (fmt >> 8) & 0xFFu, off, __builtin_bswap32(w[0]), __builtin_bswap32(w[1]));
     }
+    if (m_vp)
+        for (u32 w = 0; w < std::size(m_vp->info.constants_used); w++)
+            for (u32 bits = m_vp->info.constants_used[w]; bits; bits &= bits - 1u) {
+                const u32 i = w * 32u + (u32)__builtin_ctz(bits);
+                float c[4];
+                std::memcpy(c, constants + (size_t)i * 4u, sizeof c);
+                std::fprintf(m_trace, "[trace] %u   vpconst%u %.4f %.4f %.4f %.4f\n", id, i, c[0], c[1], c[2], c[3]);
+            }
     if (m_fp) {
         const u32* ucode = reinterpret_cast<const u32*>(vm_base + m_fp_ea);
         for (u32 i = 0; i < m_fp->info.constant_count; i++) {
@@ -873,6 +977,7 @@ void renderer::on_report(u32 method, u32 value)
         if (value != 1u) break;
         if (m_occlusion.active()) m_occlusion.end(cmd());
         m_occlusion.clear();
+        queued();
         break;
     default:
         break;
@@ -881,11 +986,28 @@ void renderer::on_report(u32 method, u32 value)
 
 bool renderer::report(u32 type, u32 ea)
 {
-    if (type != 1u) return false;
-    if (m_occlusion.active()) m_occlusion.end(cmd());
-    m_occlusion.report(ea);
-    if (!m_recording) m_occlusion.submitted(*m_submitted);
+    const bool counted = type == 1u;
+    if (counted && m_occlusion.active()) m_occlusion.end(cmd());
+    if (m_occlusion.report(ea, counted) && !hle_window(ea, 16u)) flush();
+    queued();
     return true;
+}
+
+bool renderer::defer(const rsx_write& w)
+{
+    if (!m_occlusion.ordered(w)) return false;
+    download(w.src, w.src_size);
+    m_occlusion.defer(w);
+    if (!hle_window(w.ea, w.size) || !hle_window(w.src, w.src_size)) flush();
+    queued();
+    if (w.barrier) stats.deferred_labels++;
+    else stats.deferred_transfers++;
+    return true;
+}
+
+void renderer::queued()
+{
+    if (!m_recording) m_occlusion.submitted(*m_submitted);
 }
 
 surface* renderer::scanout_surface(u32 ea, u32 pitch) const
@@ -901,24 +1023,21 @@ u64 renderer::content(u32 ea, u32 pitch) const
     return s ? s->version : 0;
 }
 
-void renderer::present_source(u32 ea, u32 width, u32 height, u32 pitch, image*& out, u32& scale, VkCommandBuffer& c)
+void renderer::present_source(u32 ea, u32 width, u32 height, u32 pitch, image*& out, ratio& scale, VkCommandBuffer& c)
 {
     c = cmd();
     end_rendering();
     out = nullptr;
-    scale = 1;
+    scale = {};
     if (surface* s = scanout_surface(ea, pitch)) {
         out = &s->img;
         scale = s->scale;
-        stats.present_surface++;
         if (m_trace) std::fprintf(m_trace, "[trace] scanout surface %08X %ux%u image %ux%u\n", ea, width, height, s->img.width, s->img.height);
         return;
     }
-    stats.present_memory++;
     if (m_trace) std::fprintf(m_trace, "[trace] scanout memory %08X %ux%u pitch %u\n", ea, width, height, pitch);
     if (m_display.width != width || m_display.height != height) {
-        if (m_display.handle) m_garbage.emplace_back(*m_submitted + 1u, m_display);
-        m_display = image{};
+        discard(m_display);
         if (!create_image(m_display, VK_FORMAT_B8G8R8A8_UNORM, width, height,
                           VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                           VK_IMAGE_ASPECT_COLOR_BIT))
@@ -943,13 +1062,57 @@ void renderer::present_source(u32 ea, u32 width, u32 height, u32 pitch, image*& 
 
 void renderer::read_back(u32 ea, u32 size)
 {
-    if (m_occlusion.outstanding(ea, size)) {
-        if (m_recording) submit(VK_NULL_HANDLE, 0, VK_NULL_HANDLE);
-        else if (m_occlusion.unsubmitted()) m_occlusion.submitted(*m_submitted);
-        m_occlusion.drain();
-    }
+    settle(ea, size);
+    download(ea, size);
+}
+
+void renderer::download(u32 ea, u32 size)
+{
+    const auto start = std::chrono::steady_clock::now();
+    bool stalled = false;
     for (auto& p : m_surfaces)
-        if (p->gpu_dirty && ranges_overlap(p->ea, p->bytes(), ea, size)) download_surface(*p);
+        if (p->gpu_dirty && ranges_overlap(p->ea, p->bytes(), ea, size)) {
+            download_surface(*p);
+            stats.surface_stalls++;
+            stats.stall_bytes += p->bytes();
+            stalled = true;
+        }
+    if (stalled) stall(start, ea, size);
+}
+
+void renderer::settle(u32 ea, u32 size)
+{
+    if (!m_occlusion.pending(ea, size)) return;
+    flush();
+    queued();
+    await_writes(ea, size);
+}
+
+void renderer::await_writes(u32 ea, u32 size)
+{
+    if (!m_occlusion.pending(ea, size)) return;
+    const auto start = std::chrono::steady_clock::now();
+    m_occlusion.settle(ea, size);
+    stats.write_stalls++;
+    stall(start, ea, size);
+}
+
+void renderer::drain()
+{
+    if (m_occlusion.idle()) return;
+    flush();
+    queued();
+    const auto start = std::chrono::steady_clock::now();
+    m_occlusion.drain();
+    stats.write_stalls++;
+    stall(start, 0, 0);
+}
+
+void renderer::stall(std::chrono::steady_clock::time_point start, u32 ea, u32 size)
+{
+    stats.stall_ns += (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
+    stats.stall_ea = ea;
+    stats.stall_size = size;
 }
 
 void renderer::wrote(u32 ea, u32 size)
@@ -988,11 +1151,8 @@ bool renderer::blit(const rsx_blit& b)
         return false;
     int32_t so[4];
     const float sf[4] = { (float)sx + b.src_x0, (float)sy + b.src_y0, (float)sx + b.src_x1, (float)sy + b.src_y1 };
-    for (int i = 0; i < 4; i++) {
-        const float v = sf[i] * (float)src->scale;
-        so[i] = (int32_t)std::lround(v);
-        if (std::fabs(v - (float)so[i]) > 1e-3f) return false;
-    }
+    for (int i = 0; i < 4; i++)
+        if (!scaled_edge(sf[i], src->scale, so[i])) return false;
     const u32 dst_bytes = b.dst_pitch * (b.dst_y + b.dst_h);
     if (ranges_overlap(src->ea, src->bytes(), b.dst_ea, dst_bytes)) return false;
     u32 dx = 0, dy = 0;
@@ -1012,14 +1172,14 @@ bool renderer::blit(const rsx_blit& b)
     end_rendering();
     barrier(c, src->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
     barrier(c, dst->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
-    const int32_t ds = (int32_t)dst->scale;
+    const ratio& ds = dst->scale;
     VkImageBlit region{};
     region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
     region.srcOffsets[0] = { so[0], so[1], 0 };
     region.srcOffsets[1] = { so[2], so[3], 1 };
     region.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-    region.dstOffsets[0] = { (int32_t)dx * ds, (int32_t)dy * ds, 0 };
-    region.dstOffsets[1] = { (int32_t)(dx + b.dst_w) * ds, (int32_t)(dy + b.dst_h) * ds, 1 };
+    region.dstOffsets[0] = { (int32_t)ds.edge(dx), (int32_t)ds.edge(dy), 0 };
+    region.dstOffsets[1] = { (int32_t)ds.edge(dx + b.dst_w), (int32_t)ds.edge(dy + b.dst_h), 1 };
     vkCmdBlitImage(c, src->img.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst->img.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region,
                    b.bilinear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
     dst->gpu_dirty = true;
@@ -1042,7 +1202,6 @@ void renderer::flip_reset()
         m_trace = std::fopen(name, "w");
         if (m_trace) std::fprintf(stderr, "[vk] F12 trace -> %s\n", name);
     }
-    m_epoch++;
     end_rendering();
     frontend::reset();
     m_fb_valid = false;
@@ -1052,10 +1211,36 @@ void renderer::flip_reset()
                 ++it;
                 continue;
             }
-            m_garbage.emplace_back(*m_submitted + 1u, it->second->img);
+            discard(it->second->img);
             it = m_textures.erase(it);
-            m_watch_dirty = true;
         }
+}
+
+void renderer::rescale(ratio scale)
+{
+    resolution_scale = scale;
+    VkCommandBuffer c = cmd();
+    end_rendering();
+    for (auto& p : m_surfaces) {
+        surface& s = *p;
+        const ratio to = !s.scale.unit() ? scale : scale_for(s.width, s.height);
+        if (to == s.scale) continue;
+        image img{};
+        if (!create_image(img, s.img.format, to.edge(s.width * s.aa_u), to.edge(s.height * s.aa_v), surface_usage(s.depth), s.img.aspect)) {
+            discard(img);
+            continue;
+        }
+        if (s.state == SURFACE_VALID) {
+            if (!s.depth) scale_blit(c, s.img, img, VK_FILTER_LINEAR);
+            else if (!scale_depth(c, s.img, img)) s.state = SURFACE_UNINITIALIZED;
+        }
+        discard(s.img);
+        discard(s.snapshot);
+        discard(s.as_color);
+        if (to.unit()) discard(s.native);
+        s.img = img;
+        s.scale = to;
+    }
 }
 
 }

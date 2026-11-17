@@ -2,9 +2,12 @@
 
 #include "../rsx_spirv.h"
 
+#include <cstring>
+#include <numeric>
+
 namespace vk {
 
-bool downscale::create(vk_device& d, uint32_t factor)
+bool downscale::create(vk_device& d)
 {
     m_d = &d;
     VkSamplerCreateInfo si{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
@@ -21,7 +24,7 @@ bool downscale::create(vk_device& d, uint32_t factor)
     li.bindingCount = 2;
     li.pBindings = b;
     VK_TRY(vkCreateDescriptorSetLayout(d.dev, &li, nullptr, &m_set));
-    const VkPushConstantRange pc{ VK_SHADER_STAGE_COMPUTE_BIT, 0, 8 };
+    const VkPushConstantRange pc{ VK_SHADER_STAGE_COMPUTE_BIT, 0, 28 };
     VkPipelineLayoutCreateInfo pi{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
     pi.setLayoutCount = 1;
     pi.pSetLayouts = &m_set;
@@ -29,7 +32,7 @@ bool downscale::create(vk_device& d, uint32_t factor)
     pi.pPushConstantRanges = &pc;
     VK_TRY(vkCreatePipelineLayout(d.dev, &pi, nullptr, &m_layout));
     rsx_spv_blob blob{};
-    if (rsx_spv_box_down(factor, &blob) != 0) {
+    if (rsx_spv_box_down(&blob) != 0) {
         rsx_spv_blob_free(&blob);
         return false;
     }
@@ -57,7 +60,8 @@ void downscale::destroy()
     m_d = nullptr;
 }
 
-void downscale::record(VkCommandBuffer cmd, VkImageView src, VkImageView dst, uint32_t width, uint32_t height) const
+void downscale::record(VkCommandBuffer cmd, VkImageView src, VkImageView dst, uint32_t width, uint32_t height, uint32_t src_width,
+                       uint32_t src_height) const
 {
     const VkDescriptorImageInfo images[2] = {
         { m_sampler, src, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
@@ -73,7 +77,10 @@ void downscale::record(VkCommandBuffer cmd, VkImageView src, VkImageView dst, ui
     }
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipe);
     vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_layout, 0, 2, w);
-    const uint32_t pc[2] = { width, height };
+    const uint32_t gx = std::gcd(src_width, width), gy = std::gcd(src_height, height);
+    const float weight = 1.f / ((float)(src_width / gx) * (float)(src_height / gy));
+    uint32_t pc[7] = { width, height, src_width / gx, width / gx, src_height / gy, height / gy };
+    std::memcpy(&pc[6], &weight, sizeof weight);
     vkCmdPushConstants(cmd, m_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
     vkCmdDispatch(cmd, (width + 7u) / 8u, (height + 7u) / 8u, 1);
 }

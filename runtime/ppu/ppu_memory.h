@@ -58,7 +58,6 @@ static inline void* vm_translate(uint32_t addr)
 }
 
 static inline uint8_t* vm_ptr8(uint32_t addr)  { return (uint8_t*)vm_translate(addr); }
-static inline uint16_t* vm_ptr16(uint32_t addr) { return (uint16_t*)vm_translate(addr); }
 static inline uint32_t* vm_ptr32(uint32_t addr) { return (uint32_t*)vm_translate(addr); }
 static inline uint64_t* vm_ptr64(uint32_t addr) { return (uint64_t*)vm_translate(addr); }
 
@@ -89,26 +88,6 @@ static inline uint64_t vm_read64(uint32_t addr)
     uint64_t raw;
     memcpy(&raw, vm_ptr8(addr), sizeof(raw));
     return ps3_bswap64(raw);
-}
-
-static inline float vm_read_f32(uint32_t addr)
-{
-    uint32_t raw;
-    memcpy(&raw, vm_ptr8(addr), sizeof(raw));
-    raw = ps3_bswap32(raw);
-    float result;
-    memcpy(&result, &raw, sizeof(result));
-    return result;
-}
-
-static inline double vm_read_f64(uint32_t addr)
-{
-    uint64_t raw;
-    memcpy(&raw, vm_ptr8(addr), sizeof(raw));
-    raw = ps3_bswap64(raw);
-    double result;
-    memcpy(&result, &raw, sizeof(result));
-    return result;
 }
 
 /* ---------------------------------------------------------------------------
@@ -203,28 +182,6 @@ static inline void vm_write64(uint32_t addr, uint64_t val)
     uint64_t raw = ps3_bswap64(val);
     VM_WRITE_COH(addr, &raw, sizeof(raw));
     if (g_resv_store_active > 0) ppu_resv_break_store(addr);
-}
-
-static inline void vm_write_f32(uint32_t addr, float val)
-{
-    uint32_t tmp;
-    memcpy(&tmp, &val, sizeof(tmp));
-    vm_write32(addr, tmp);
-}
-
-static inline void vm_write_f64(uint32_t addr, double val)
-{
-    uint64_t tmp;
-    memcpy(&tmp, &val, sizeof(tmp));
-    vm_write64(addr, tmp);
-}
-
-/* ---------------------------------------------------------------------------
- * Block copies (for string / bulk data movement)
- * -----------------------------------------------------------------------*/
-static inline void vm_memcpy_from(void* host_dst, uint32_t guest_src, size_t len)
-{
-    memcpy(host_dst, vm_ptr8(guest_src), len);
 }
 
 /* A block store is a store to every 128-byte line it touches, so it breaks

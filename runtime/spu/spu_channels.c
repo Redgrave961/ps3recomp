@@ -168,8 +168,9 @@ void spu_stop(spu_context* ctx)
  * on entry to spu_run_with_halt and the caller's FPCR is put back on the way out: a run can
  * happen synchronously on a PPU thread (a workload dispatched from the PPU caller), whose
  * lifted floating point must keep round to nearest with denormals. Double precision restores
- * the default around itself inside a run. arm64 only; elsewhere the exact forms always run.
- * Returns the FPCR to restore, or ~0 when nothing was changed. */
+ * the default around itself inside a run. x86-64 with AVX2 always runs SPU code in the MXCSR
+ * equivalent (SPU_MXCSR_RZ); other hosts run the exact forms.
+ * Returns the FPCR/MXCSR to restore, or ~0 when nothing was changed. */
 static uint64_t spu_float_mode_enter(void)
 {
 #if defined(__aarch64__) && defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
@@ -186,6 +187,12 @@ static uint64_t spu_float_mode_enter(void)
     if (v == SPU_FPCR_RZFZ) return ~0ull;   /* nested run: the outer one restores */
     __asm__ volatile("msr fpcr, %0" :: "r"((uint64_t)SPU_FPCR_RZFZ));
     return v;
+#elif defined(SPU_MXCSR_RZ)
+    if (g_spu_float_rz) return ~0ull;
+    const uint32_t v = _mm_getcsr();
+    _mm_setcsr(SPU_MXCSR_RZ);
+    g_spu_float_rz = 1;
+    return v;
 #else
     return ~0ull;
 #endif
@@ -194,6 +201,8 @@ static void spu_float_mode_leave(uint64_t outer)
 {
 #if defined(__aarch64__) && defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
     if (outer != ~0ull) __asm__ volatile("msr fpcr, %0" :: "r"(outer));
+#elif defined(SPU_MXCSR_RZ)
+    if (outer != ~0ull) { g_spu_float_rz = 0; _mm_setcsr((uint32_t)outer); }
 #else
     (void)outer;
 #endif
@@ -317,9 +326,9 @@ static DWORD WINAPI spu_pcsample_thread(LPVOID p)
     }
 }
 
-static mfc_engine* mfc_for(spu_context* ctx)
+static mfc_engine* mfc_claim(spu_context* ctx)
 {
-    /* Looked up once. mfc_for runs on every MFC channel access, and with
+    /* Looked up once. mfc_claim runs on a context's first MFC access, and with
      * SPU_PCSAMPLE unset `started` never became 1, so every access paid a
      * getenv: a tenth of all samples in a Twisted Metal profile. */
     { static volatile LONG checked = 0;
@@ -359,9 +368,15 @@ static mfc_engine* mfc_for(spu_context* ctx)
     return &slot->mfc;
 }
 
+static inline mfc_engine* mfc_for(spu_context* ctx)
+{
+    return ctx->mfc ? ctx->mfc : (ctx->mfc = mfc_claim(ctx));
+}
+
 void spu_mfc_release(spu_context* ctx)
 {
     if (!ctx) return;
+    ctx->mfc = NULL;
     AcquireSRWLockExclusive(&s_mfc_claim_lock);
     for (spu_mfc_slot** link = &s_mfc_slots; *link; link = &(*link)->next) {
         if ((*link)->ctx != ctx) continue;
@@ -609,9 +624,12 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
             while (ctx->ch_out_mbox.count >= SPU_MBOX_DEPTH && ctx->status != SPU_STATUS_STOPPED) {
                 spu_honour_stop_request(ctx);
                 AcquireSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
+                __atomic_store_n(&ctx->ch_sleeping, 1, __ATOMIC_SEQ_CST);
+                __atomic_thread_fence(__ATOMIC_SEQ_CST);
                 if (ctx->ch_out_mbox.count >= SPU_MBOX_DEPTH && !ctx->stop_request)
                     SleepConditionVariableSRW((CONDITION_VARIABLE*)&ctx->ch_wait_cv,
                                               (SRWLOCK*)&ctx->ch_wait_lock, INFINITE, 0);
+                __atomic_store_n(&ctx->ch_sleeping, 0, __ATOMIC_RELAXED);
                 ReleaseSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
             }
         spu_channel_write(&ctx->ch_out_mbox, v);
@@ -694,6 +712,8 @@ static int spu_ch_ready(spu_context* ctx, uint32_t channel)
 void spu_ch_wake(spu_context* ctx)
 {
     if (!ctx) return;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if (!__atomic_load_n(&ctx->ch_sleeping, __ATOMIC_SEQ_CST)) return;
     /* Pass through the waiter's lock first. spu_ch_wait tests its predicate and
      * goes to sleep under ch_wait_lock, but a producer makes the predicate true
      * outside it. A wake issued between the waiter's test and its sleep found
@@ -749,9 +769,12 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
             spu_honour_stop_request(ctx);
         }
         AcquireSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
+        __atomic_store_n(&ctx->ch_sleeping, 1, __ATOMIC_SEQ_CST);
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
         if (!spu_ch_ready(ctx, channel) && !ctx->stop_request)
             SleepConditionVariableSRW((CONDITION_VARIABLE*)&ctx->ch_wait_cv,
                                       (SRWLOCK*)&ctx->ch_wait_lock, INFINITE, 0);
+        __atomic_store_n(&ctx->ch_sleeping, 0, __ATOMIC_RELAXED);
         ReleaseSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
     }
     yz_lockstep_block_end(ctx);            /* rejoin the rotation, reacquire the token */
@@ -922,23 +945,6 @@ typedef struct {
 #define SPU_FN_REGISTRY_MAX 262144
 static spu_reg_entry s_registry[SPU_FN_REGISTRY_MAX];
 static uint32_t s_registry_count = 0;
-
-/* Accessor for the sampling profiler in ppu_loader.cpp. Its address->function
- * map is built from the PPU table alone, which leaves the SPU-lifted bodies as
- * unowned gaps -- and an [entry, next_entry) extent then charges every SPU
- * sample to whichever PPU function happens to precede it. That produced a
- * confident and completely wrong "99% of guest time in one PPU function".
- * Handing the SPU host pointers over lets the map cover both, so the gaps are
- * real entries and the extents mean something. */
-uint32_t spu_registry_size(void) { return s_registry_count; }
-
-int spu_registry_entry(uint32_t i, void** host, uint32_t* ls_addr)
-{
-    if (i >= s_registry_count) return 0;
-    if (host)    *host    = (void*)s_registry[i].fn;
-    if (ls_addr) *ls_addr = s_registry[i].addr;
-    return 1;
-}
 
 /* Hash index over the registry. spu_lookup runs on EVERY guest indirect
  * branch -- with the Bink decoder live that is millions of dispatches per

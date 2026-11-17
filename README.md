@@ -105,7 +105,6 @@ SPURS runs as Sony's lifted libsre on real SPU threads and lv2 objects.
 | **[SPU Lifter](docs/SPU_LIFTER.md)** | SPU lifting and the SPU runtime model |
 | **[Firmware LLE](docs/FIRMWARE_LLE.md)** | Running Sony's own firmware modules as lifted code |
 | **[Platform Abstraction](docs/PLATFORM_ABSTRACTION.md)** | Win32 vs POSIX |
-| **[SPU Fallback](docs/SPU_FALLBACK.md)** | The PPU-side fallback registry for SPU jobs |
 | **[Debug Console](docs/DEBUG_CONSOLE.md)** | Query a running title without a rebuild |
 | **[Runtime Diagnostics](docs/DIAGNOSTICS.md)** | Generated index of the runtime's environment variables |
 | **[Prototype & Debug Builds](docs/PROTO_BUILDS.md)** | Unencrypted, symbol-bearing builds as ground truth |

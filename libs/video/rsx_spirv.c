@@ -31,7 +31,7 @@ enum {
     OpImageSampleImplicitLod = 87, OpImageSampleExplicitLod = 88, OpImageSampleDrefImplicitLod = 89,
     OpImageFetch = 95, OpImageWrite = 99, OpImage = 100, OpConvertFToU = 109, OpConvertFToS = 110, OpConvertSToF = 111, OpConvertUToF = 112, OpBitcast = 124,
     OpFNegate = 127, OpIAdd = 128, OpFAdd = 129, OpISub = 130, OpFSub = 131, OpIMul = 132,
-    OpFMul = 133, OpSDiv = 135, OpFDiv = 136, OpUMod = 137, OpVectorTimesScalar = 142, OpDot = 148,
+    OpFMul = 133, OpUDiv = 134, OpSDiv = 135, OpFDiv = 136, OpUMod = 137, OpVectorTimesScalar = 142, OpDot = 148,
     OpAny = 154, OpLogicalOr = 166, OpLogicalAnd = 167, OpLogicalNot = 168, OpSelect = 169,
     OpIEqual = 170, OpINotEqual = 171, OpUGreaterThan = 172, OpSGreaterThan = 173,
     OpUGreaterThanEqual = 174, OpSGreaterThanEqual = 175, OpULessThan = 176, OpSLessThan = 177,
@@ -1465,7 +1465,6 @@ int rsx_spv_vertex(const u32* ucode, const rsx_spv_vp_key* key, rsx_spv_blob* ou
     if (info) {
         info->instructions = c->count;
         info->input_mask = c->inputs | 1u;
-        info->output_mask = c->written;
         info->texture_mask = c->texmask;
         memcpy(info->constants_used, c->cused, sizeof info->constants_used);
         info->constants_relative = c->crel;
@@ -2724,7 +2723,17 @@ int rsx_spv_depth_pack(int d16, rsx_spv_blob* out)
     return spv_finish(s, 5, caps, 1, mainid, NULL, 0, out);
 }
 
-int rsx_spv_box_down(u32 k, rsx_spv_blob* out)
+static u32 box_first(spv* s, u32 a, u32 cell) { return I(s, OpUDiv, tu(s), a, cell); }
+
+static u32 box_end(spv* s, u32 b, u32 cell) { return I(s, OpUDiv, tu(s), I(s, OpIAdd, tu(s), b, I(s, OpISub, tu(s), cell, cu(s, 1))), cell); }
+
+static u32 box_cover(spv* s, u32 j, u32 cell, u32 a, u32 b)
+{
+    u32 lo = I(s, OpIMul, tu(s), j, cell);
+    return I(s, OpISub, tu(s), X(s, tu(s), GL_UMin, I(s, OpIAdd, tu(s), lo, cell), b), X(s, tu(s), GL_UMax, lo, a));
+}
+
+int rsx_spv_box_down(rsx_spv_blob* out)
 {
     spv* s = spv_begin();
     if (!s) return -1;
@@ -2735,8 +2744,8 @@ int rsx_spv_box_down(u32 k, rsx_spv_blob* out)
     u32 dst = gvar(s, oimg, SC_UniformConstant, 0);
     deco1(s, dst, DEC_DescriptorSet, 0);
     deco1(s, dst, DEC_Binding, 1);
-    u32 pst = intern(s, OpTypeStruct, 0, (const u32[]){ tu(s), tu(s) }, 2, 1);
-    for (u32 m = 0; m < 2; m++) mdeco(s, pst, m, DEC_Offset, m * 4u);
+    u32 pst = intern(s, OpTypeStruct, 0, (const u32[]){ tu(s), tu(s), tu(s), tu(s), tu(s), tu(s), tf(s) }, 7, 1);
+    for (u32 m = 0; m < 7; m++) mdeco(s, pst, m, DEC_Offset, m * 4u);
     deco(s, pst, DEC_Block);
     u32 push = gvar(s, pst, SC_PushConstant, 0);
     u32 tu3 = tvec(s, tu(s), 3);
@@ -2744,25 +2753,45 @@ int rsx_spv_box_down(u32 k, rsx_spv_blob* out)
     deco1(s, gvarid, DEC_BuiltIn, BI_GlobalInvocationId);
 
     fn_begin(s, mainid);
+    u32 sum = lvar(s, tv4(s)), n = lvar(s, tu(s));
     u32 gid = ld(s, tu3, gvarid);
     u32 x = ex(s, tu(s), gid, 0), y = ex(s, tu(s), gid, 1);
     u32 pp = tptr(s, SC_PushConstant, tu(s));
-    u32 w = ld(s, tu(s), I(s, OpAccessChain, pp, push, ci(s, 0)));
-    u32 h = ld(s, tu(s), I(s, OpAccessChain, pp, push, ci(s, 1)));
-    u32 inside = band(s, I(s, OpULessThan, tbool(s), x, w), I(s, OpULessThan, tbool(s), y, h));
+    u32 pc[6];
+    for (u32 m = 0; m < 6; m++) pc[m] = ld(s, tu(s), I(s, OpAccessChain, pp, push, ci(s, (s32)m)));
+    u32 inv = ld(s, tf(s), I(s, OpAccessChain, tptr(s, SC_PushConstant, tf(s)), push, ci(s, 6)));
+    u32 inside = band(s, I(s, OpULessThan, tbool(s), x, pc[0]), I(s, OpULessThan, tbool(s), y, pc[1]));
     u32 merge, then_l;
     sel_if(s, inside, &merge, &then_l);
     u32 img = I(s, OpImage, fimg, ld(s, sampler_type(s, 1, 0), src));
     u32 ti2 = tvec(s, ti(s), 2);
-    u32 x0 = I(s, OpIMul, tu(s), x, cu(s, k)), y0 = I(s, OpIMul, tu(s), y, cu(s, k));
-    u32 sum = cv4(s, 0.f, 0.f, 0.f, 0.f);
-    for (u32 j = 0; j < k; j++)
-        for (u32 i = 0; i < k; i++) {
-            u32 coord = I(s, OpCompositeConstruct, ti2, bc(s, ti(s), I(s, OpIAdd, tu(s), x0, cu(s, i))),
-                          bc(s, ti(s), I(s, OpIAdd, tu(s), y0, cu(s, j))));
-            sum = fadd(s, tv4(s), sum, I(s, OpImageFetch, tv4(s), img, coord, IMG_Lod, ci(s, 0)));
-        }
-    u32 avg = I(s, OpVectorTimesScalar, tv4(s), sum, cf(s, 1.f / (float)(k * k)));
+    u32 ax = I(s, OpIMul, tu(s), x, pc[2]), bx = I(s, OpIAdd, tu(s), ax, pc[2]);
+    u32 ay = I(s, OpIMul, tu(s), y, pc[4]), by = I(s, OpIAdd, tu(s), ay, pc[4]);
+    u32 x0 = box_first(s, ax, pc[3]), y0 = box_first(s, ay, pc[5]);
+    u32 cols = I(s, OpISub, tu(s), box_end(s, bx, pc[3]), x0);
+    u32 taps = I(s, OpIMul, tu(s), cols, I(s, OpISub, tu(s), box_end(s, by, pc[5]), y0));
+    st(s, sum, cv4(s, 0.f, 0.f, 0.f, 0.f));
+    st(s, n, cu(s, 0));
+    u32 hdr = newl(s), chk = newl(s), body = newl(s), cont = newl(s), done = newl(s);
+    V(s, OpBranch, hdr);
+    label(s, hdr);
+    V(s, OpLoopMerge, done, cont, 0);
+    V(s, OpBranch, chk);
+    label(s, chk);
+    u32 i = ld(s, tu(s), n);
+    V(s, OpBranchConditional, I(s, OpULessThan, tbool(s), i, taps), body, done);
+    label(s, body);
+    u32 jx = I(s, OpIAdd, tu(s), x0, I(s, OpUMod, tu(s), i, cols)), jy = I(s, OpIAdd, tu(s), y0, I(s, OpUDiv, tu(s), i, cols));
+    u32 coord = I(s, OpCompositeConstruct, ti2, bc(s, ti(s), jx), bc(s, ti(s), jy));
+    u32 weight = I(s, OpConvertUToF, tf(s), I(s, OpIMul, tu(s), box_cover(s, jx, pc[3], ax, bx), box_cover(s, jy, pc[5], ay, by)));
+    u32 texel = I(s, OpVectorTimesScalar, tv4(s), I(s, OpImageFetch, tv4(s), img, coord, IMG_Lod, ci(s, 0)), weight);
+    st(s, sum, fadd(s, tv4(s), ld(s, tv4(s), sum), texel));
+    V(s, OpBranch, cont);
+    label(s, cont);
+    st(s, n, I(s, OpIAdd, tu(s), i, cu(s, 1)));
+    V(s, OpBranch, hdr);
+    label(s, done);
+    u32 avg = I(s, OpVectorTimesScalar, tv4(s), ld(s, tv4(s), sum), inv);
     V(s, OpImageWrite, ld(s, oimg, dst), I(s, OpCompositeConstruct, ti2, bc(s, ti(s), x), bc(s, ti(s), y)), avg);
     sel_end(s, merge);
     sb_ins(s, BODY(s), OpReturn, k_none, 0);

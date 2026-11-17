@@ -22,7 +22,7 @@ The pipeline transforms a PS3 ELF binary into native C/C++ source code that can 
 
 ### Stage 1: ELF Loading and Analysis
 
-1. Decrypt the SELF/ESELF container to obtain the raw ELF (`tools/decrypt_self.py`).
+1. Decrypt the SELF/ESELF container to obtain the raw ELF (`rpcs3 --decrypt` or `tools/unfself.py`).
 2. Parse ELF headers, program headers, and section headers.
 3. Extract the `.text` (code), `.data`, `.rodata`, `.bss` segments.
 4. Parse the `.prx` relocation tables and import/export tables (NIDs).

@@ -49,20 +49,6 @@
   }
 #endif
 
-/* 128-bit byte swap (two-word swap + exchange) */
-typedef struct ps3_u128 {
-    uint64_t hi;
-    uint64_t lo;
-} ps3_u128;
-
-static inline ps3_u128 ps3_bswap128(ps3_u128 v)
-{
-    ps3_u128 r;
-    r.hi = ps3_bswap64(v.lo);
-    r.lo = ps3_bswap64(v.hi);
-    return r;
-}
-
 /* ---------------------------------------------------------------------------
  * C++ template helpers
  * -----------------------------------------------------------------------*/

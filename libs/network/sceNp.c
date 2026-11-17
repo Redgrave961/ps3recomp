@@ -2,7 +2,6 @@
  * ps3recomp - sceNp HLE implementation
  *
  * Provides fake PSN identity so games can proceed through NP checks.
- * The username defaults to "PS3Player" but is configurable.
  */
 
 #include "sceNp.h"
@@ -11,7 +10,6 @@
 #include <stdint.h>
 #include <time.h>
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
-#include "np_psnr.h"
 #include "../system/cellSysutil.h"
 #include "../filesystem/npdrm.h"
 
@@ -21,23 +19,12 @@
  * -----------------------------------------------------------------------*/
 
 static int  s_np_initialized = 0;
-static char s_fake_username[SCE_NP_ONLINEID_MAX_LENGTH + 1] = "PS3Player";
 
-/* ---------------------------------------------------------------------------
- * Configuration
- * -----------------------------------------------------------------------*/
-
-const char* np_fake_username(void)
-{
-    return s_fake_username;
-}
-
-/* Build a fake NP ID from the current username (PS3_NP_ONLINE_ID wins, so
- * two instances on one machine can be two players). */
+/* Build a fake NP ID. */
 static void np_build_fake_id(SceNpId* npId)
 {
     memset(npId, 0, sizeof(SceNpId));
-    strncpy(npId->handle.data, np_psnr_online_id(), SCE_NP_ONLINEID_MAX_LENGTH);
+    strncpy(npId->handle.data, "PS3Player", SCE_NP_ONLINEID_MAX_LENGTH);
     npId->handle.term = '\0';
 }
 
@@ -51,7 +38,7 @@ s32 sceNpInit(u32 poolSize, void* poolPtr)
     (void)poolPtr;
 
     printf("[sceNp] Init(poolSize=%u, username=\"%s\")\n",
-           poolSize, np_psnr_online_id());
+           poolSize, "PS3Player");
 
     if (s_np_initialized)
         return SCE_NP_ERROR_ALREADY_INITIALIZED;
@@ -86,7 +73,7 @@ s32 sceNpGetNpId(s32 userId, SceNpId* npId)
      * time it asked for its NP ID online. */
     npId = GUEST_PTR(npId, SceNpId*);
     np_build_fake_id(npId);
-    printf("[sceNp] GetNpId(user=%d) -> \"%s\"\n", userId, np_psnr_online_id());
+    printf("[sceNp] GetNpId(user=%d) -> \"%s\"\n", userId, "PS3Player");
     return CELL_OK;
 }
 
@@ -110,12 +97,10 @@ s32 sceNpManagerGetStatus(s32* status)
      * parameters straight through as guest values, so dereferencing one
      * writes to whatever host address shares that number. Same trap as
      * cellGcmSys had. Tokyo Jungle calls this during its online init. */
-    /* Signed in when there is a psnr server to be signed in to. */
-    s32 st = np_psnr_enabled() ? SCE_NP_MANAGER_STATUS_ONLINE : SCE_NP_MANAGER_STATUS_OFFLINE;
-    vm_write32((uint32_t)(uintptr_t)status, (uint32_t)st);
-    { static s32 last = -2;
-      if (st != last) printf("[sceNp] ManagerGetStatus() -> %s\n", st < 0 ? "OFFLINE" : "ONLINE");
-      last = st; }
+    vm_write32((uint32_t)(uintptr_t)status, (uint32_t)SCE_NP_MANAGER_STATUS_OFFLINE);
+    { static int logged;
+      if (!logged) printf("[sceNp] ManagerGetStatus() -> OFFLINE\n");
+      logged = 1; }
     return CELL_OK;
 }
 
@@ -136,24 +121,14 @@ s32 sceNpManagerGetContentRatingFlag(s32* isRestricted, s32* age)
  * servers. Unimplemented, these imports answered CELL_OK with nothing
  * written: a title that requested a ticket waited for a GOT_TICKET event
  * that never came, and one that read the region or the time used whatever
- * was in its buffer. Checks and offline answers as RPCS3's sceNp.cpp:
- * without a psnr server the manager is OFFLINE and so are these. Signed in
- * to psnr, which issues no tickets, a request gets a failed GOT_TICKET at
- * once and there is never a ticket to read; the region is the fake
- * account's (US, English) and the time is the host's. */
-#define SCE_NP_COOKIE_MAX_SIZE 1024
-#define SCE_NP_TICKET_PARAM_SERIAL_ID   0
-#define SCE_NP_TICKET_PARAM_SUBJECT_DOB 11
+ * was in its buffer. Checks and offline answers as RPCS3's sceNp.cpp: the
+ * manager is OFFLINE and so are these. */
 
 s32 sceNpManagerGetAccountRegion(u32 countryCode, u32 language)
 {
     if (!s_np_initialized) return SCE_NP_ERROR_NOT_INITIALIZED;
     if (!countryCode || !language) return SCE_NP_ERROR_INVALID_ARGUMENT;
-    if (!np_psnr_enabled()) return SCE_NP_ERROR_OFFLINE;
-    vm_write8(countryCode + 0, 'u'); vm_write8(countryCode + 1, 's');   /* SceNpCountryCode */
-    vm_write8(countryCode + 2, 0);   vm_write8(countryCode + 3, 0);
-    vm_write32(language, 1);         /* CELL_SYSUTIL_LANG_ENGLISH_US */
-    return CELL_OK;
+    return SCE_NP_ERROR_OFFLINE;
 }
 
 void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size);

@@ -2,23 +2,12 @@
  * ps3recomp - cellSsl HLE implementation
  *
  * Stub SSL module. Init/End lifecycle works, certificate functions
- * return empty data, and RNG uses host OS entropy.
+ * return empty data.
  */
 
 #include "cellSsl.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write32 -- out-params are guest EAs */
 #include <stdio.h>
-#include <string.h>
-
-#ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#include <bcrypt.h>
-#pragma comment(lib, "bcrypt.lib")
-#else
-#include <fcntl.h>
-#include <unistd.h>
-#endif
 
 /* ---------------------------------------------------------------------------
  * Internal state

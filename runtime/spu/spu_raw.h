@@ -72,6 +72,7 @@ void spu_raw_reg_store(uint32_t ea, uint32_t val, int width);
  * served from memory alone. Returns 1 and sets *out when it owns the value;
  * 0 leaves the caller's plain memory read alone. */
 int  spu_raw_reg_load(uint32_t ea, uint32_t* out);
+uint8_t* spu_raw_shadow(uint32_t ea);
 
 /* lv2 registration (runtime/syscalls/lv2_register.c). */
 struct lv2_syscall_table;

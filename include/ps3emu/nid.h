@@ -144,26 +144,6 @@ static inline uint32_t ps3_compute_nid(const char* name)
            ((uint32_t)digest[3] << 24);
 }
 
-/*
- * Compute NID with a custom suffix (for libraries that use a non-default salt).
- */
-static inline uint32_t ps3_compute_nid_ex(const char* name, const void* suffix, size_t suffix_len)
-{
-    ps3_sha1_ctx ctx;
-    uint8_t digest[20];
-
-    ps3_sha1_init(&ctx);
-    ps3_sha1_update(&ctx, name, strlen(name));
-    ps3_sha1_update(&ctx, suffix, suffix_len);
-    ps3_sha1_final(&ctx, digest);
-
-    /* Little-endian interpretation of first 4 bytes */
-    return ((uint32_t)digest[0])       |
-           ((uint32_t)digest[1] << 8)  |
-           ((uint32_t)digest[2] << 16) |
-           ((uint32_t)digest[3] << 24);
-}
-
 /* ---------------------------------------------------------------------------
  * NID lookup table
  * -----------------------------------------------------------------------*/
@@ -209,28 +189,5 @@ static inline ps3_nid_entry* ps3_nid_table_find(const ps3_nid_table* t, uint32_t
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
-
-/* ---------------------------------------------------------------------------
- * C++ registration macros (used by module.h)
- * -----------------------------------------------------------------------*/
-#ifdef __cplusplus
-
-/*
- * REG_FNID(module, nid, func)  -- Register handler for a known NID.
- * REG_FUNC(module, func)       -- Register handler; NID is computed from name.
- */
-#define REG_FNID(module_obj, nid_val, func_ptr) \
-    ps3_nid_table_add(&(module_obj).func_table, (nid_val), #func_ptr, (void*)(func_ptr))
-
-#define REG_FUNC(module_obj, func_ptr) \
-    ps3_nid_table_add(&(module_obj).func_table, ps3_compute_nid(#func_ptr), #func_ptr, (void*)(func_ptr))
-
-#define REG_VAR_FNID(module_obj, nid_val, var_ptr) \
-    ps3_nid_table_add(&(module_obj).var_table, (nid_val), #var_ptr, (void*)(var_ptr))
-
-#define REG_VAR(module_obj, var_ptr) \
-    ps3_nid_table_add(&(module_obj).var_table, ps3_compute_nid(#var_ptr), #var_ptr, (void*)(var_ptr))
-
-#endif /* __cplusplus */
 
 #endif /* PS3EMU_NID_H */

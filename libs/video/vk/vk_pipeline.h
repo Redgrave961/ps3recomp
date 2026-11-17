@@ -4,6 +4,7 @@
 #include "../rsx_spirv.h"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -61,6 +62,7 @@ class pipelines {
 public:
     bool create(vk_device& d, const std::string& cache_path);
     void destroy();
+    void save_cache();
     void precompile(shader_cache& shaders);
     VkPipelineLayout layout() const { return m_layout; }
     VkPipeline get(const pipeline_key& key, const shader& vs, const shader& fs);
@@ -125,6 +127,10 @@ private:
     std::vector<std::thread> m_workers;
     bool m_stop = false;
     std::atomic<bool> m_stopping{ false };
+    std::atomic<bool> m_cache_dirty{ false };
+    std::mutex m_save_lock;
+    std::chrono::steady_clock::time_point m_saved{};
+    void save_cache_periodic();
 };
 
 }

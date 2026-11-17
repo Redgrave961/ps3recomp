@@ -1,8 +1,7 @@
 /*
  * ps3recomp - sceNpLookup (player profiles and avatars), answered locally
  *
- * A player's profile is their online ID: that is all psnr knows about anyone,
- * so the lookup needs no server. The name comes back as the NP ID's handle,
+ * A player's profile is their online ID, so the lookup needs no server. The name comes back as the NP ID's handle,
  * with an empty "about me", English, country "us" and no avatar (an image
  * of size 0). Transactions complete immediately; PollAsync reports done.
  *
@@ -27,12 +26,11 @@
 #define TITLE_MAX 8
 #define TRANS_MAX 32
 
-static int s_lookup_init;
 static int s_titles[TITLE_MAX + 1];
 static int s_trans[TRANS_MAX + 1];   /* 0 free, else owning title */
 
-s32 sceNpLookupInit(void)  { s_lookup_init = 1; return CELL_OK; }
-s32 sceNpLookupTerm(void)  { s_lookup_init = 0; return CELL_OK; }
+s32 sceNpLookupInit(void)  { return CELL_OK; }
+s32 sceNpLookupTerm(void)  { return CELL_OK; }
 
 s32 sceNpLookupCreateTitleCtx(u32 commId, u32 selfNpId)
 {

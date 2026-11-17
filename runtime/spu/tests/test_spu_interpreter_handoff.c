@@ -61,15 +61,10 @@ int main(int argc, char** argv) {
     if (strcmp(mode, "nested-return-unlifted"))
         spu_register_function(0x204, wrong_continuation);
     spu_register_function(0x240, finish);
-    if (!strcmp(mode, "top-zero")) spu_register_function(0, finish);
-    if (!strcmp(mode, "negative-stepcap")) {
-        ctx.image_id = -1;
-        spu_begin_image(0);
-        spu_register_function(0x4004, finish); /* wildcard ignored by pure interpretation */
-    }
+    if (!strcmp(mode, "job-ls0")) spu_register_function(0, finish);
     word(0x4000, 0x04000082); /* ori $2,$1,0: force full interpreter */
     void (*entry)(spu_context*) = tail_entry;
-    if (!strcmp(mode, "top-zero")) {
+    if (!strcmp(mode, "job-ls0")) {
         word(0x4004, 0x30000000); /* bra 0: registered, valid lifted entry */
     } else if (!strcmp(mode, "top")) {
         word(0x4004, 0x30004800); /* bra 0x240 */
@@ -109,9 +104,6 @@ int main(int argc, char** argv) {
         word(0x400C, 0x30FE0007); /* lqa  $7,0x3F000 */
         word(0x4010, 0x34008088); /* lqd  $8,0x20($1) */
         word(0x4014, 0x35000180); /* bi   $3 */
-    } else if (!strcmp(mode, "stepcap") || !strcmp(mode, "negative-stepcap")) {
-        word(0x4004, 0x04000082);
-        word(0x4008, 0x30004800);
     } else if (!strcmp(mode, "pure-interpreter")) {
         word(0x4004, 0x30004800);
         uint32_t pc = spu_interp_run_until(&ctx, 0x4000, 0);
@@ -124,10 +116,9 @@ int main(int argc, char** argv) {
            mode, halted, ctx.status, ctx.pc, ctx.gpr[10]._u32[0],
            ctx.gpr[11]._u32[0], ctx.gpr[20]._u32[0], ctx.gpr[21]._u32[0]);
     fflush(stdout);
-    if (!strcmp(mode, "stepcap") || !strcmp(mode, "negative-stepcap")) {
-        assert(halted == 0 && ctx.status == SPU_STATUS_RUNNING);
-        assert(ctx.pc == 0x4004 && ctx.gpr[11]._u32[0] == 0);
-        assert(g_spu_trampoline_fn == NULL);
+    if (!strcmp(mode, "job-ls0")) {
+        assert(halted == 1 && ctx.status == SPU_STATUS_RUNNING);
+        assert((ctx.pc & SPU_LS_MASK) == 0 && ctx.gpr[11]._u32[0] == 0);
         puts("PASS"); return 0;
     }
     assert(ctx.gpr[21]._u32[0] == 0);
@@ -170,6 +161,5 @@ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (vo
 unsigned long long ps3_ms_now(void) { abort(); }
 uint32_t g_ww_lo = 0xFFFFFFFFu, g_ww_hi;
 int g_resv_store_active;
-uint32_t g_barrier_sync_watch;
 void spurs_ef_set_from_spu(uint32_t ea, uint16_t bits) { (void)ea; (void)bits; abort(); }
 uint32_t g_spu_image_src_ea, g_spu_image_ls_start, g_spu_image_span;

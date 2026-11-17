@@ -4,7 +4,7 @@ import os,subprocess,tempfile
 from pathlib import Path
 root=Path(__file__).resolve().parents[1];spu=root/'runtime/spu'
 if os.name=='nt':print('SKIP: POSIX compiler/linker fixture');raise SystemExit(0)
-sources=['spu_channels.c','spu_drain.c','spu_lockstep.c','spu_coherency.c','spu_workload.c','spu_vm_pagemap.c','spu_interp.c']
+sources=['spu_channels.c','spu_drain.c','spu_lockstep.c','spu_coherency.c','spu_workload.c','spu_interp.c']
 env={k:v for k,v in os.environ.items() if not k.startswith(('SPU_','SPURS_'))}
 with tempfile.TemporaryDirectory(prefix='spu-interrupt-branches-') as tmp:
  tmp=Path(tmp)
@@ -27,5 +27,5 @@ with tempfile.TemporaryDirectory(prefix='spu-interrupt-branches-') as tmp:
  (tmp/'interrupt_branches_lifted.h').write_text('\n'.join(body)+'\n')
  for lifted in [False,True]:
   binary=tmp/('lifted' if lifted else 'interp')
-  subprocess.run([os.environ.get('CC','cc'),'-std=gnu17','-O1','-UNDEBUG',*(['-DBRANCH_LIFTED'] if lifted else []),'-I'+str(tmp),'-I'+str(root/'include'),'-I'+str(spu),'-I'+str(root/'runtime/platform'),str(spu/'tests/test_spu_interpreter_interrupt_branches.c'),*[str(spu/x) for x in sources],str(root/'runtime/platform/win32_compat.c'),'-pthread','-lm','-o',str(binary)],check=True)
+  subprocess.run([os.environ.get('CC','cc'),'-std=gnu17','-O1','-UNDEBUG',*(['-DBRANCH_LIFTED'] if lifted else []),'-I'+str(tmp),'-I'+str(root/'include'),'-I'+str(spu),'-I'+str(root/'runtime/platform'),str(spu/'tests/test_spu_interpreter_interrupt_branches.c'),*[str(spu/x) for x in sources],str(root/'runtime/platform/win32_compat.c'),str(root/'runtime/platform/ps3_sync.c'),str(root/'runtime/spu/tests/spu_fixture_ppu.c'),'-pthread','-lm','-o',str(binary)],check=True)
   subprocess.run([str(binary)],check=True,timeout=5,env=env,cwd=tmp)

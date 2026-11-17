@@ -28,7 +28,6 @@
 /* ---- what sys_fs.c links against ---------------------------------------- */
 uint8_t* vm_base;
 uint32_t ppu_vm_size = 0x20000;           /* sys_fs_read clamps to it */
-{ (void)buf; (void)cap; return host_path; }                 /* no EDATs here */
 
 /* ---- harness ------------------------------------------------------------- */
 static int failures;

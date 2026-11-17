@@ -7,8 +7,7 @@ is within bounds. vcmpequb. and vcmpequh. computed vD and left CR6 untouched,
 so the `b[n]e cr6` after them followed whatever compare wrote CR6 last. The
 other forms are covered as controls.
 
-This test lifts each form, compiles the emitted C with the lifter's own lane
-helpers, runs it and checks vD's CR6 effect and that no other CR field moved.
+This test lifts each form, compiles the emitted C with the VMX helpers, runs it and checks vD's CR6 effect and that no other CR field moved.
 It needs a host C compiler (under CI=1 a missing one fails instead of skipping).
 """
 from __future__ import annotations
@@ -38,17 +37,15 @@ def _load(name, rel_path):
 L = _load("ppu_lifter", "tools/ppu_lifter.py")
 
 
+XO = {name: xo for xo, name in L.PPULifter._VMX_VX_NAMES.items()}
+
+
 def _lift_one(mnemonic, operands):
-    insns = [SimpleNamespace(addr=0x1000, mnemonic=mnemonic, operands=operands, raw=None),
-             SimpleNamespace(addr=0x1004, mnemonic="blr", operands="", raw=None)]
+    raw = (4 << 26) | (3 << 21) | (1 << 16) | (2 << 11) | XO[mnemonic]
+    insns = [SimpleNamespace(addr=0x1000, mnemonic=mnemonic, operands=operands, raw=raw),
+             SimpleNamespace(addr=0x1004, mnemonic="blr", operands="", raw=0x4E800020)]
     func = L.PPULifter().lift_function(insns, 0x1000, 0x1008)
     return "\n".join(ln for ln in func.body_lines if "return" not in ln)
-
-
-def _accessors():
-    blob = "\n".join(L.PPULifter()._preamble_lines())
-    start = blob.index("/* AltiVec register byte order")
-    return blob[start:blob.index("/* The guest timebase")]
 
 
 def _be(kind, vals):
@@ -94,7 +91,7 @@ def check_vcmp_record_sets_cr6(cc, mn, kind, a, b, cr6):
     body = _lift_one(mn, "v3,v1,v2")
     src = "\n".join([
         "#include <stdint.h>", "#include <string.h>", "#include <stdio.h>",
-        _accessors(),
+        "#include \"ppu_vmx.h\"",
         "typedef struct { uint8_t vr[32][16]; uint32_t cr; } ctx_t;",
         "int main(void) { static ctx_t c; ctx_t* ctx = &c;",
         "  const unsigned char A[16] = {" + ",".join(str(x) for x in _be(kind, a)) + "};",
@@ -109,7 +106,7 @@ def check_vcmp_record_sets_cr6(cc, mn, kind, a, b, cr6):
         c = Path(td) / "t.c"
         exe = Path(td) / ("t.exe" if os.name == "nt" else "t")
         c.write_text(src)
-        r = subprocess.run([cc, "-std=c11", "-O1", "-o", str(exe), str(c)],
+        r = subprocess.run([cc, "-std=c11", "-O1", "-march=x86-64-v3", "-I" + str(ROOT / "runtime" / "ppu"), "-o", str(exe), str(c)],
                            capture_output=True, text=True)
         assert r.returncode == 0, r.stderr + "\n" + src
         out = subprocess.run([str(exe)], capture_output=True, text=True)

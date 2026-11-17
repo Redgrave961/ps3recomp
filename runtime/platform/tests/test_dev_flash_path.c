@@ -112,9 +112,9 @@ int main(void)
     snprintf(want, sizeof want, "%s/nowhere.bin", b);
     CHECK(!strcmp(out, want), "with no file, the first non-empty entry is the root");
 
-    char small[16];
-    ps3_dev_flash_path(small, sizeof small, a, "a/very/long/relative/path.bin");
-    CHECK(strlen(small) == sizeof small - 1, "a small buffer is cut, not overrun");
+    char tiny[16];
+    ps3_dev_flash_path(tiny, sizeof tiny, a, "a/very/long/relative/path.bin");
+    CHECK(strlen(tiny) == sizeof tiny - 1, "a small buffer is cut, not overrun");
 
     /* clean up */
     const char* dirs[3] = { a, b, c };

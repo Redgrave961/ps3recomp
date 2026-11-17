@@ -183,6 +183,12 @@ def _imm(token: str) -> str:
     return "0"
 
 
+_MFC_LATCH = {c: v for k, v in {(16, "MFC_LSA"): ("mfc_lsa", ""), (17, "MFC_EAH"): ("mfc_eah", ""),
+                                (18, "MFC_EAL"): ("mfc_eal", ""), (19, "MFC_Size"): ("mfc_size", ""),
+                                (20, "MFC_TagID"): ("mfc_tag", " & 0x1F"),
+                                (22, "MFC_WrTagMask"): ("mfc_tag_mask", "")}.items() for c in (str(k[0]), k[1])}
+
+
 def _chan(token: str) -> str:
     """Channel operand -> a C expression (macro name or numeric id)."""
     token = token.strip()
@@ -898,8 +904,12 @@ class SPULifter:
             # (splatting it is the spu_link bug class; RPCS3 = v128::from32r).
             return f"{g(rt())} = spu_pref_u32(spu_rchcnt(ctx, {_chan(ops[1])}));"
         if mn == "wrch":
-            # operands: channel, $rt
-            return f"spu_wrch(ctx, {_chan(ops[0])}, {g(_reg(ops[1]))});"
+            # operands: channel, $rt. The MFC parameter channels only latch a value.
+            ch = _chan(ops[0])
+            latch = _MFC_LATCH.get(ch)
+            if latch:
+                return f"ctx->{latch[0]} = {g(_reg(ops[1]))}._u32[0]{latch[1]};"
+            return f"spu_wrch(ctx, {ch}, {g(_reg(ops[1]))});"
 
         # ---- branches ----
         if mn in ("br", "bra"):
@@ -948,7 +958,7 @@ class SPULifter:
                 rs, rr = ("const int32_t _rd = ctx->reloc_delta; ", " ctx->reloc_delta = _rd;") if self.reloc else ("", "")
                 return (f"{link} {{ int32_t _si = (int32_t)ctx->image_id; {rs}"
                         f"ctx->host_depth++; {self.prefix}spu_func_{tgt:08X}(ctx); "
-                        f"spu_drain_call(ctx, {self._pc(addr + 4)}); ctx->host_depth--; spu_img_restore(ctx, _si);{rr} }}")
+                        f"spu_call_return(ctx, {self._pc(addr + 4)}); ctx->host_depth--; ctx->image_id = _si;{rr} }}")
             return f"{link} /* TODO spu: brsl unresolved target */;"
         if mn in _COND_BR:
             tgt = self._branch_target(insn)
@@ -1014,8 +1024,8 @@ class SPULifter:
             return (f"{{ uint32_t _tg = {g(tgt_reg)}._u32[0]; {g(link_rt)} = spu_link({self._pc((addr + 4) & 0x3FFFC)}); "
                     f"int32_t _si = (int32_t)ctx->image_id; {rs}"
                     f"{_ied}ctx->pc = _tg; ctx->host_depth++; "
-                    f"spu_indirect_branch(ctx); spu_drain_call(ctx, {self._pc(addr + 4)}); "
-                    f"ctx->host_depth--; spu_img_restore(ctx, _si);{rr} }}")
+                    f"spu_indirect_branch(ctx); spu_call_return(ctx, {self._pc(addr + 4)}); "
+                    f"ctx->host_depth--; ctx->image_id = _si;{rr} }}")
         # bisled: set link, branch to RA only if an external event is pending.
         if mn in ("bisled",):
             link_rt = insn.raw & 0x7F            # rt = link
@@ -1099,9 +1109,8 @@ class SPULifter:
 
     def emit_source(self,header_name: str) -> str:
         lines = [SOURCE_PREAMBLE.format(header_name=header_name), ""]
-        weak = "__attribute__((weak)) " if getattr(self, "weak_emit", False) else ""
         for f in self.functions:
-            lines.append(f"void {weak}{f.name}(spu_context* ctx) {{")
+            lines.append(f"void {f.name}(spu_context* ctx) {{")
             for b in f.body_lines:
                 lines.append(b if b.endswith(":") else f"    {b}")
             lines.append("}")

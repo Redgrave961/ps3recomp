@@ -144,21 +144,26 @@ endif()
 add_test(NAME mutex_destroy COMMAND test_mutex_destroy)
 set_tests_properties(mutex_destroy PROPERTIES LABELS "runtime;sync" TIMEOUT 20)
 
-# The focused condition tests use Win32 host threads. POSIX execution also
-# needs the waitable-handle implementation supplied by the native host port.
-if(WIN32)
-    add_executable(test_cond_semantics
-        test_cond_semantics.c test_shims.c
-        "${RUNTIME_SYNC_DIR}/sys_mutex.c"
-        "${RUNTIME_SYNC_DIR}/sys_cond.c")
-    target_include_directories(test_cond_semantics PRIVATE
-        "${PS3RECOMP_TREE_ROOT}" "${PS3RECOMP_TREE_ROOT}/include")
-    target_compile_definitions(test_cond_semantics PRIVATE _CRT_SECURE_NO_WARNINGS)
-    foreach(mode owner recursive spurious)
-        add_test(NAME cond_${mode} COMMAND test_cond_semantics ${mode})
-        set_tests_properties(cond_${mode} PROPERTIES TIMEOUT 10)
-    endforeach()
+# The focused condition tests use Win32 host threads.
+add_executable(test_cond_semantics
+    test_cond_semantics.c test_shims.c
+    "${RUNTIME_SYNC_DIR}/sys_mutex.c"
+    "${RUNTIME_SYNC_DIR}/sys_cond.c")
+if(NOT WIN32)
+    target_sources(test_cond_semantics PRIVATE
+        "${PS3RECOMP_TREE_ROOT}/runtime/platform/win32_compat.c")
+    find_package(Threads REQUIRED)
+    target_link_libraries(test_cond_semantics PRIVATE Threads::Threads)
 endif()
+target_include_directories(test_cond_semantics PRIVATE
+    "${PS3RECOMP_TREE_ROOT}" "${PS3RECOMP_TREE_ROOT}/include")
+if(MSVC)
+    target_compile_definitions(test_cond_semantics PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+foreach(mode owner recursive spurious)
+    add_test(NAME cond_${mode} COMMAND test_cond_semantics ${mode})
+    set_tests_properties(cond_${mode} PROPERTIES TIMEOUT 10)
+endforeach()
 
 # sys_event_queue_destroy modes (EINVAL / EBUSY / FORCE -> ECANCELED), ports
 # disconnected from a destroyed queue, and the absolute deadline of a timed
@@ -183,3 +188,12 @@ else()
 endif()
 add_test(NAME event_queue_destroy COMMAND test_event_queue_destroy)
 set_tests_properties(event_queue_destroy PROPERTIES LABELS "runtime;sync" TIMEOUT 60)
+
+foreach(t sync_stress test_sync_semantics test_mutex_destroy test_event_queue_destroy test_cond_semantics)
+    if(TARGET ${t})
+        target_sources(${t} PRIVATE "${PS3RECOMP_TREE_ROOT}/runtime/platform/ps3_sync.c")
+        if(WIN32)
+            target_link_libraries(${t} PRIVATE synchronization)
+        endif()
+    endif()
+endforeach()

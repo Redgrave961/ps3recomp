@@ -184,8 +184,8 @@ static void test_semaphore(void)
      * token from a post. */
     bg_t w;
     bg_start(&w, sys_semaphore_wait, 2, sid, 0, 0, 0);
-    for (int i = 0; i < 2000 && __atomic_load_n(&s->waiters, __ATOMIC_SEQ_CST) == 0; i++) Sleep(1);
-    CHECK(__atomic_load_n(&s->waiters, __ATOMIC_SEQ_CST) == 1);
+    for (int i = 0; i < 2000 && __atomic_load_n(&s->q.head, __ATOMIC_SEQ_CST) == NULL; i++) Sleep(1);
+    CHECK(s->q.head != NULL && s->q.head->next == NULL);
     CHECK_RC(call(sys_semaphore_destroy, 1, sid, 0, 0, 0), CELL_EBUSY);
     CHECK_RC(call(sys_semaphore_post, 1, sid, 1, 0, 0), CELL_OK);
     bg_join(&w);
@@ -277,7 +277,7 @@ static void test_rwlock(void)
     s_rid_hold = rid;
     for (size_t i = 0; i < sizeof k_huge / sizeof k_huge[0]; i++) {
         HANDLE h = CreateThread(NULL, 0, hold_wlock, (void*)(uintptr_t)120, 0, NULL);
-        for (int j = 0; j < 1000 && !g_sys_rwlocks[rid - 1].writer_tid; j++) Sleep(1);
+        for (int j = 0; j < 1000 && __atomic_load_n(&g_sys_rwlocks[rid - 1].owner, __ATOMIC_ACQUIRE) <= 0; j++) Sleep(1);
         const double t0 = now_ms();
         const int32_t rc = call(sys_rwlock_rlock, 1, rid, k_huge[i], 0, 0);
         const double ms = now_ms() - t0;

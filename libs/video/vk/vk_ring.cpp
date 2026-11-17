@@ -1,12 +1,16 @@
 #include "vk_ring.h"
 
-bool vk_ring::create(vk_device& d, VkDeviceSize size, VkSemaphore timeline)
+bool vk_ring::create(vk_device& d, VkDeviceSize size, VkDeviceSize persistent, VkSemaphore timeline)
 {
     m_d = &d;
     m_size = size;
+    m_persistent = persistent;
     m_timeline = timeline;
+    VmaVirtualBlockCreateInfo vi{};
+    vi.size = persistent;
+    VK_TRY(vmaCreateVirtualBlock(&vi, &m_heap));
     VkBufferCreateInfo bi{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
-    bi.size = size;
+    bi.size = size + persistent;
     bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
     VmaAllocationCreateInfo ai{};
@@ -32,6 +36,21 @@ void vk_ring::destroy()
     if (m_buffer) vmaDestroyBuffer(m_d->vma, m_buffer, m_mem);
     m_buffer = VK_NULL_HANDLE;
     m_mem = nullptr;
+    if (m_heap) {
+        vmaClearVirtualBlock(m_heap);
+        vmaDestroyVirtualBlock(m_heap);
+    }
+    m_heap = VK_NULL_HANDLE;
+}
+
+bool vk_ring::hold(VkDeviceSize size, VmaVirtualAllocation& a, VkDeviceSize& offset)
+{
+    VmaVirtualAllocationCreateInfo ci{};
+    ci.size = size;
+    ci.alignment = 16;
+    if (vmaVirtualAllocate(m_heap, &ci, &a, &offset) != VK_SUCCESS) return false;
+    offset += m_size;
+    return true;
 }
 
 void vk_ring::wait_for(VkDeviceSize need)

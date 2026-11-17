@@ -102,7 +102,7 @@ def test_is_epilogue_restore_helper():
         "    ctx->gpr[27] = vm_read64(ctx->gpr[1] + 0xD0);",
         "    ctx->gpr[28] = vm_read64(ctx->gpr[1] + 0xD8);",
         "    ctx->gpr[1] = ctx->gpr[1] + (int64_t)(0x1C0);",
-        "    { g_trampoline_fn = (void(*)(void*))func_00012345; return; }",
+        "    { PPU_TAIL return func_00012345(ctx); }",
     ]
     assert L._is_epilogue_restore(lines, 0, 27)
     assert L._is_epilogue_restore(["    ctx->gpr[27] = vm_read64(ctx->gpr[1] + 0xD0);",

@@ -9,6 +9,7 @@
 extern "C" {
 uint8_t* vm_base;
 uint32_t ppu_hle_inject_base = 0x20000000u;
+void (*g_rsx_window_write)(void) = nullptr;
 uint32_t ppu_load_elf(const char*);
 /* These subsystems are inactive in a loader-only fixture. */
 int spu_coh_is_reserved(uint32_t) { return 0; }
@@ -24,6 +25,7 @@ int64_t sys_mmapper_allocate_memory(ppu_context*);
 struct func_entry { uint32_t addr; void (*func)(ppu_context*); const char* name; };
 extern const func_entry function_table[] = {{0, nullptr, nullptr}};
 extern const uint64_t function_table_count = 0;
+extern const uint64_t function_table_lifted = 0;
 static lv2_syscall_table table;
 static unsigned checks;
 #define CHECK(x) do { ++checks; if (!(x)) { std::fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #x); return 1; } } while (0)

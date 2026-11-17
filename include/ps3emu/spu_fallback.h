@@ -27,9 +27,6 @@ typedef int32_t (*spu_ppu_fallback_fn)(uint32_t tid, uint32_t args_ea,
  */
 uint8_t* spu_thread_get_local_store(uint32_t tid);
 
-/* Local store size in bytes (always 256 KB to match real SPU). */
-uint32_t spu_thread_local_store_size(void);
-
 #ifdef __cplusplus
 }
 #endif

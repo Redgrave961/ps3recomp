@@ -2,10 +2,11 @@
 """Run real SPU channel event producers against concurrent reservation writes."""
 import os, subprocess, tempfile
 from pathlib import Path
+if os.name=='nt':print('SKIP: POSIX compiler/linker fixture');raise SystemExit(0)
 r=Path(__file__).resolve().parents[1]
 s=r/'runtime/spu'
 with tempfile.TemporaryDirectory(prefix='spu-event-producers-') as tmp:
  b=Path(tmp)/'events'
- units=['spu_drain','spu_lockstep','spu_coherency','spu_workload','spu_vm_pagemap','spu_interp']
- subprocess.run([os.environ.get('CC','cc'),'-std=gnu17','-O1','-UNDEBUG','-I'+str(r/'include'),'-I'+str(s),'-I'+str(r/'runtime/platform'),str(s/'tests/test_spu_lockline_peer.c'),*[str(s/(u+'.c')) for u in units],str(r/'runtime/platform/win32_compat.c'),'-pthread','-lm','-o',str(b)],check=True)
+ units=['spu_drain','spu_lockstep','spu_coherency','spu_workload','spu_interp']
+ subprocess.run([os.environ.get('CC','cc'),'-std=gnu17','-O1','-UNDEBUG','-I'+str(r/'include'),'-I'+str(s),'-I'+str(r/'runtime/platform'),str(s/'tests/test_spu_lockline_peer.c'),*[str(s/(u+'.c')) for u in units],str(r/'runtime/platform/win32_compat.c'),str(r/'runtime/platform/ps3_sync.c'),str(r/'runtime/spu/tests/spu_fixture_ppu.c'),'-pthread','-lm','-o',str(b)],check=True)
  subprocess.run([str(b)],check=True,timeout=30)

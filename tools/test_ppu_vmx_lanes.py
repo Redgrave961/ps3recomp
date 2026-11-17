@@ -58,12 +58,6 @@ def _lift_one(mnemonic, operands):
     return "\n".join(ln for ln in func.body_lines if "return" not in ln)
 
 
-def _accessors():
-    blob = "\n".join(L.PPULifter()._preamble_lines())
-    start = blob.index("/* AltiVec register byte order")
-    return blob[start:blob.index("/* The guest timebase")]
-
-
 # ---- reference model (AltiVec PEM), on big-endian byte strings -------------
 def h(v, signed=False):
     return list(struct.unpack(">8h" if signed else ">8H", v))
@@ -135,7 +129,6 @@ def check_op(cc, mn, rng):
     vecs = _vectors(rng)
     src = "\n".join([
         "#include <stdint.h>", "#include <string.h>", "#include <stdio.h>",
-        _accessors(),
         "#include \"ppu_vmx.h\"",   # the helpers #286 lowers VMX to
         "typedef struct { uint8_t vr[32][16]; uint32_t vscr; } ctx_t;",
         f"static const unsigned char IN[{len(vecs)}][3][16] = {{" +
@@ -152,7 +145,7 @@ def check_op(cc, mn, rng):
         cpath = Path(td) / "t.c"
         exe = Path(td) / ("t.exe" if os.name == "nt" else "t")
         cpath.write_text(src)
-        r = subprocess.run([cc, "-std=c11", "-O1", "-I" + str(ROOT / "runtime" / "ppu"), "-o", str(exe), str(cpath)],
+        r = subprocess.run([cc, "-std=c11", "-O1", "-march=x86-64-v3", "-I" + str(ROOT / "runtime" / "ppu"), "-o", str(exe), str(cpath)],
                            capture_output=True, text=True)
         if r.returncode:
             return f"{mn}: emitted C does not compile: {r.stderr.strip()[:200]}"

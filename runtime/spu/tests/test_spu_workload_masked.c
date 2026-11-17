@@ -14,23 +14,6 @@
 #include "../spu_workload.c"
 #include <assert.h>
 
-/* The rest of spu_workload.c (dispatch, SPURS jobs, the policy-module runner)
- * is outside this fixture. */
-uint8_t* vm_base;
-uint32_t g_barrier_sync_watch;
-void (*g_spu_out_mbox_hook)(uint32_t, uint32_t, int, uint32_t);
-unsigned long long ps3_ms_now(void) { return 0; }
-void spu_coh_notify_write(uint32_t a) { (void)a; }
-void spu_coh_unregister(spu_context* c) { (void)c; }
-void spu_coh_watch_add(spu_coh_watch* w, uint32_t ea, void (*wake)(void*), void* opaque)
-{ (void)w; (void)ea; (void)wake; (void)opaque; }
-void spu_coh_watch_remove(spu_coh_watch* w) { (void)w; }
-void spu_lockline_lock(void) { }
-void spu_lockline_unlock(void) { }
-void spu_mfc_release(spu_context* c) { (void)c; }
-int spu_run_with_halt(void (*f)(spu_context*), spu_context* c) { (void)f; (void)c; return -1; }
-void spu_thread_publish_ctx(uint32_t tid, void* c) { (void)tid; (void)c; }
-
 static void prog_a(spu_context* c) { (void)c; }
 static void prog_b(spu_context* c) { (void)c; }
 

@@ -116,19 +116,6 @@ static inline hle_fast_fn hle_fast(uint32_t nid)
     return nullptr;
 }
 
-/* Is this NID implemented here? Lets a host boot harness that owns its own
- * import table decide, per import, whether to dispatch into these libraries or
- * fall back to its own stub -- without calling ps3_hle_call and getting an
- * "unresolved NID" error it cannot distinguish from a real failure. */
-extern "C" int ps3_hle_has(uint32_t nid)
-{
-    for (uint32_t i = 0; i < g_ctx_count; i++)
-        if (g_ctx[i].nid == nid) return 1;
-    if (!g_hle_inited) return 0;
-    ps3_nid_entry* e = ps3_nid_table_find(&g_hle_nids, nid);
-    return (e && e->handler) ? 1 : 0;
-}
-
 /* Generic PPC integer/pointer ABI adapter. */
 typedef uint64_t (*hle_generic)(uint64_t, uint64_t, uint64_t, uint64_t,
                                 uint64_t, uint64_t, uint64_t, uint64_t);
@@ -162,8 +149,6 @@ extern "C" void     ps3_indirect_call(ppu_context* ctx);
 extern "C" uint32_t vm_read32(uint64_t a);
 #include "../platform/win32_backtrace.h"   /* RtlCaptureStackBackTrace / GetModuleHandleA on POSIX */
 #include "ps3emu/log_first.h"
-
-extern "C" void ppu_prof_stamp(void* ctx, unsigned lr);
 
 /* PS3_HLE_TOP=<seconds>: the most-called HLE imports over each window, with
  * the guest thread and caller of the last call. PS3_HLE_TRACE logs the first N
@@ -203,7 +188,6 @@ static void hle_top_note(uint32_t nid, const char* name, const ppu_context* ctx,
     }
     for (int j = 0; j < ht_used; j++) ht_n[j] = 0;
 }
-extern "C" uint32_t ppu_prof_resolve_host(void* ra);
 extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 {
     if (const hle_fast_fn f = hle_fast(nid))
@@ -253,8 +237,6 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                                  if (t1 - ft0 >= ps3_ft_min_ns())
                                      ps3_ft_span(PS3_FT_HLE, t, nid, lr, ft0, t1); } }
     } _tg{ ctx, ctx->gpr[2], ctx->gpr[1], PS3_FT_ON() ? ps3_ft_now() : 0, nid, (uint32_t)ctx->lr };
-    /* Guest-PC breadcrumb for the sampling profiler (see lv2_syscall). */
-    ppu_prof_stamp(ctx, ppu_prof_resolve_host(__builtin_return_address(0)));
     g_last_hle_nid = nid;
     /* Stamp the NAME here too, not only where a handler is found below.
      *

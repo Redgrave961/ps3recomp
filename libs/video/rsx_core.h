@@ -9,11 +9,9 @@ extern "C" {
 #endif
 
 #define RSX_LOCAL_BASE          0xC0000000u
-#define RSX_LOCAL_SIZE_MAX      0x10000000u
 
 #define RSX_SEMAPHORE_EA        (VM_HLE_INJECT_BASE + 0x0000u)
 #define RSX_SEMAPHORE_SIZE      0x1000u
-#define RSX_NOTIFY_EA           (VM_HLE_INJECT_BASE + 0x1000u)
 #define RSX_REPORT_EA           (VM_HLE_INJECT_BASE + 0x1400u)
 #define RSX_REPORT_SIZE         0x8000u
 #define RSX_CONTROL_EA          (VM_HLE_INJECT_BASE + 0xA000u)
@@ -62,6 +60,19 @@ typedef struct rsx_blit {
     int bilinear;
 } rsx_blit;
 
+typedef void (*rsx_deferred)(const void* arg);
+
+typedef struct rsx_write {
+    u32 ea;
+    u32 size;
+    u32 src;
+    u32 src_size;
+    int barrier;
+    rsx_deferred run;
+    const void* arg;
+    u32 arg_size;
+} rsx_write;
+
 typedef struct rsx_renderer {
     void* user;
     int  (*open)(void* user);
@@ -70,8 +81,10 @@ typedef struct rsx_renderer {
     void (*sync)(void* user);
     void (*reset)(void* user);
     int  (*report)(void* user, u32 type, u32 ea);
+    int  (*defer)(void* user, const rsx_write* w);
     void (*present)(void* user, u32 buffer, const rsx_display_buffer* display);
     void (*read_back)(void* user, u32 ea, u32 size);
+    void (*settle)(void* user, u32 ea, u32 size);
     void (*wrote)(void* user, u32 ea, u32 size);
     int  (*blit)(void* user, const rsx_blit* b);
     void (*vblank)(void* user, u64 count);
@@ -89,27 +102,26 @@ void rsx_core_start(void);
 void rsx_core_fifo_reset(u32 put, u32 get);
 void rsx_core_doorbell(void);
 void rsx_core_wait_get_outside(u32 lo, u32 hi);
+void rsx_core_wait_label(u32 ea, u32 value);
 
-u32  rsx_core_local_size(void);
 int  rsx_io_map(u32 ea, u32 io, u32 size);
 void rsx_io_unmap(u32 io, u32 size);
 u32  rsx_io_to_ea(u32 io);
 u32  rsx_ea_to_io(u32 ea);
 u32  rsx_address(u32 location, u32 offset, u32 size);
-u32  rsx_location_ea(int local, u32 offset);
 
 void rsx_core_set_display_buffer(u32 id, const rsx_display_buffer* buffer);
 int  rsx_core_display_buffer(u32 id, rsx_display_buffer* out);
-u32  rsx_core_display_buffer_count(void);
-u32  rsx_core_current_display_buffer(void);
 void rsx_core_set_vsync(int vsync);
+void rsx_core_set_frame_limit(u32 hz);
 int  rsx_core_free_flips(void);
+u64  rsx_core_progress(void);
+void rsx_core_set_hidden_refresh(u32 hz);
+u64  rsx_core_batch(void);
 void rsx_core_flip_immediate(u32 buffer);
 u32  rsx_core_flip_status(void);
 void rsx_core_set_flip_status(u32 status);
 u64  rsx_core_last_flip_time(void);
-u64  rsx_core_vblank_count(void);
-u64  rsx_core_last_vblank_time(void);
 u64  rsx_core_timestamp(void);
 u64  rsx_core_system_time(void);
 u32  rsx_core_frames_presented(void);
@@ -117,7 +129,9 @@ u32  rsx_core_frames_presented(void);
 void rsx_core_raise(enum rsx_event event, u32 arg);
 
 void rsx_mem_store(u32 ea, const void* src, u32 size);
+int  rsx_core_defer(const rsx_write* w);
 void rsx_core_read_back(u32 ea, u32 size);
+void rsx_core_settle(u32 ea, u32 size);
 void rsx_core_wrote(u32 ea, u32 size);
 int rsx_core_blit(const rsx_blit* b);
 

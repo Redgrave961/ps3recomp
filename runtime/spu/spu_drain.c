@@ -105,13 +105,6 @@ static void spu_task_launch_slow(spu_context* ctx)
     spu_halt(ctx);
 }
 
-/* Restore the active image after a lifted call bracket. The brsl/bisl emission
- * saves image_id in a call-site local and hands it back here so an image
- * adopted inside the callee cannot leak into the caller's continuation. */
-void spu_img_restore(spu_context* ctx, int32_t saved_img)
-{
-    ctx->image_id = saved_img;
-}
 
 /* --- SPU interrupt dispatch (drain-loop hook) ------------------------------
  * Called when int_enable && (event_status & event_mask): architectural SPU

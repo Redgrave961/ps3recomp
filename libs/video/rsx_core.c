@@ -1,6 +1,7 @@
 #include "rsx_core.h"
 #include "rsx_transfer.h"
 #include "../../runtime/ppu/ppu_memory.h"
+#include "../../runtime/memory/vm_page_map.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -41,6 +42,8 @@ static struct {
     volatile u32 bell;
     volatile u32 get_epoch;
     volatile u32 get_waiters;
+    volatile u32 label_epoch;
+    volatile u32 label_waiters;
     volatile u32 immediate_flip;
     u32 get;
     u32 ret;
@@ -59,17 +62,22 @@ static struct {
 
     rsx_display_buffer display[8];
     volatile u32 display_mask;
-    volatile u32 current_display;
     volatile u32 vsync;
     volatile u32 flip_status;
     volatile u64 last_flip_time;
     volatile u32 frames;
     int free_flips;
+    volatile u64 frame_period;
+    volatile u64 hidden_period;
+    u64 frame_due;
+    HANDLE frame_timer;
+    volatile u64 progress;
+    u32 put_seen;
+    u64 batch;
 
     SRWLOCK vblank_lock;
     CONDITION_VARIABLE vblank_cv;
     volatile u64 vblank_count;
-    volatile u64 last_vblank_time;
 
     SRWLOCK irq_lock;
     CONDITION_VARIABLE irq_cv;
@@ -94,6 +102,7 @@ static inline void rsx_store_control(u32 ea, u32 value)
 static void rsx_publish_get(void)
 {
     rsx_store_control(RSX_GET_EA, s.get);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
     if (__atomic_load_n(&s.get_waiters, __ATOMIC_ACQUIRE)) {
         __atomic_add_fetch(&s.get_epoch, 1u, __ATOMIC_RELEASE);
         WakeByAddressAll((PVOID)&s.get_epoch);
@@ -112,10 +121,29 @@ void rsx_core_wait_get_outside(u32 lo, u32 hi)
     __atomic_sub_fetch(&s.get_waiters, 1u, __ATOMIC_ACQ_REL);
 }
 
+static void rsx_label_note(void)
+{
+    __atomic_add_fetch(&s.label_epoch, 1u, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&s.label_waiters, __ATOMIC_SEQ_CST)) WakeByAddressAll((PVOID)&s.label_epoch);
+}
+
+void rsx_core_wait_label(u32 ea, u32 value)
+{
+    __atomic_add_fetch(&s.label_waiters, 1u, __ATOMIC_SEQ_CST);
+    for (;;) {
+        u32 seen = __atomic_load_n(&s.label_epoch, __ATOMIC_SEQ_CST);
+        if (rsx_load(ea) != value) break;
+        WaitOnAddress((volatile VOID*)&s.label_epoch, &seen, sizeof seen, INFINITE);
+    }
+    __atomic_sub_fetch(&s.label_waiters, 1u, __ATOMIC_SEQ_CST);
+}
+
 static void rsx_store_label(u32 ea, u32 value)
 {
+    __atomic_add_fetch(&s.progress, 1u, __ATOMIC_RELAXED);
     __atomic_thread_fence(__ATOMIC_RELEASE);
     vm_write32(ea, value);
+    rsx_label_note();
 }
 
 static u64 rsx_tb_scale(u64 tb, u64 unit)
@@ -130,10 +158,11 @@ u64 rsx_core_system_time(void)
 
 u64 rsx_core_timestamp(void)
 {
-    u64 t = rsx_tb_scale(ppu_timebase_now(), 1000000000ull);
-    if (t <= s.timestamp_last) t = s.timestamp_last + 1u;
-    s.timestamp_last = t;
-    return t;
+    const u64 t = rsx_tb_scale(ppu_timebase_now(), 1000000000ull);
+    u64 last = __atomic_load_n(&s.timestamp_last, __ATOMIC_RELAXED), next;
+    do next = t > last ? t : last + 1u;
+    while (!__atomic_compare_exchange_n(&s.timestamp_last, &last, next, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED));
+    return next;
 }
 
 static void rsx_fault(const char* what, u32 at, u32 word)
@@ -146,6 +175,7 @@ static void rsx_fault(const char* what, u32 at, u32 word)
 
 static void rsx_core_window_written(void)
 {
+    rsx_label_note();
     rsx_core_doorbell();
 }
 
@@ -287,7 +317,6 @@ static DWORD WINAPI rsx_vblank_thread(LPVOID unused)
         }
         AcquireSRWLockExclusive(&s.vblank_lock);
         const u64 count = ++s.vblank_count;
-        s.last_vblank_time = rsx_core_system_time();
         ReleaseSRWLockExclusive(&s.vblank_lock);
         WakeAllConditionVariable(&s.vblank_cv);
         if (s.renderer && s.renderer->vblank) s.renderer->vblank(s.renderer->user, count);
@@ -306,6 +335,11 @@ static void rsx_wait_vblank(void)
 
 static void rsx_sync(void)
 {
+    __atomic_add_fetch(&s.progress, 1u, __ATOMIC_RELAXED);
+}
+
+static void rsx_idle(void)
+{
     if (s.renderer && s.renderer->sync) s.renderer->sync(s.renderer->user);
 }
 
@@ -314,15 +348,28 @@ static void rsx_flush(void)
     if (s.renderer && s.renderer->flush) s.renderer->flush(s.renderer->user);
 }
 
+static void rsx_frame_limit(void)
+{
+    const u64 chosen = __atomic_load_n(&s.frame_period, __ATOMIC_ACQUIRE);
+    const u64 idle = __atomic_load_n(&s.hidden_period, __ATOMIC_ACQUIRE);
+    const u64 period = chosen > idle ? chosen : idle;
+    if (!period) return;
+    if (!s.frame_timer) s.frame_timer = rsx_timer_create();
+    const u64 now = rsx_ticks();
+    s.frame_due = s.frame_due + 2u * period < now ? now : s.frame_due + period;
+    rsx_sleep_until(s.frame_timer, s.frame_due);
+}
+
 static void rsx_scanout(u32 buffer)
 {
+    rsx_frame_limit();
     if (s.renderer && s.renderer->present)
         s.renderer->present(s.renderer->user, buffer, &s.display[buffer]);
 }
 
 static void rsx_flip_done(u32 buffer)
 {
-    __atomic_store_n(&s.current_display, buffer, __ATOMIC_RELEASE);
+    __atomic_add_fetch(&s.progress, 1u, __ATOMIC_RELAXED);
     __atomic_store_n(&s.last_flip_time, rsx_core_system_time(), __ATOMIC_RELEASE);
     __atomic_store_n(&s.flip_status, 0u, __ATOMIC_RELEASE);
     __atomic_add_fetch(&s.frames, 1u, __ATOMIC_RELEASE);
@@ -365,6 +412,7 @@ void rsx_core_flip_immediate(u32 buffer)
 
 static void rsx_semaphore_acquire(u32 value)
 {
+    s.batch++;
     const u32 ea = rsx_address(s.sema406e_ctx, s.sema406e_off, 4);
     if (!ea) {
         rsx_fault("semaphore acquire address", s.get, s.sema406e_off);
@@ -381,7 +429,14 @@ static void rsx_semaphore_acquire(u32 value)
     }
 }
 
-static void rsx_semaphore_release(u32 ctx, u32 off, u32 align, u32 value)
+static void rsx_label_retire(const void* arg)
+{
+    const u32* label = (const u32*)arg;
+    rsx_store_label(label[0], label[1]);
+    rsx_core_doorbell();
+}
+
+static void rsx_semaphore_release(u32 ctx, u32 off, u32 align, u32 value, int back_end)
 {
     if (off % align) {
         rsx_fault("unaligned semaphore release", s.get, off);
@@ -392,8 +447,17 @@ static void rsx_semaphore_release(u32 ctx, u32 off, u32 align, u32 value)
         rsx_fault("semaphore release address", s.get, off);
         return;
     }
+    const u32 label[2] = { ea, value };
+    const rsx_write w = { ea, 4u, 0, 0, 1, rsx_label_retire, label, sizeof label };
+    if (!back_end || !rsx_core_defer(&w)) rsx_store_label(ea, value);
+}
+
+static void rsx_notify_retire(const void* arg)
+{
+    const u32 ea = *(const u32*)arg;
     rsx_sync();
-    rsx_store_label(ea, value);
+    vm_write64(ea, rsx_core_timestamp());
+    vm_write64(ea + 8u, 0);
 }
 
 static void rsx_notify(void)
@@ -404,9 +468,8 @@ static void rsx_notify(void)
         rsx_fault("notify area unmapped", s.get, s.notify_ctx);
         return;
     }
-    rsx_sync();
-    vm_write64(ea, rsx_core_timestamp());
-    vm_write64(ea + 8u, 0);
+    const rsx_write w = { ea, 16u, 0, 0, 1, rsx_notify_retire, &ea, sizeof ea };
+    if (!rsx_core_defer(&w)) rsx_notify_retire(&ea);
 }
 
 static void rsx_get_report(u32 arg)
@@ -427,24 +490,28 @@ static void rsx_core_method(u32 reg, u32 value)
 {
     switch (reg) {
     case 0x0050u:
+        rsx_idle();
         rsx_sync();
         rsx_store_control(RSX_REF_EA, value);
         return;
     case 0x0060u: s.sema406e_ctx = value; return;
     case 0x0064u: s.sema406e_off = value; return;
     case 0x0068u: rsx_semaphore_acquire(value); return;
-    case 0x006Cu: rsx_semaphore_release(s.sema406e_ctx, s.sema406e_off, 4, value); return;
+    case 0x006Cu: rsx_semaphore_release(s.sema406e_ctx, s.sema406e_off, 4, value, 0); return;
     case 0x0104u: rsx_notify(); return;
-    case 0x0110u: rsx_sync(); return;
+    case 0x0110u:
+        rsx_idle();
+        rsx_sync();
+        return;
     case 0x0180u: s.notify_ctx = value; return;
     case 0x01A4u: s.sema4097_ctx = value; return;
     case 0x01A8u: s.report_ctx = value; return;
     case 0x1D6Cu: s.sema4097_off = value; return;
     case 0x1D70u:
         rsx_semaphore_release(s.sema4097_ctx, s.sema4097_off, 16,
-                              (value & 0xFF00FF00u) | ((value & 0xFFu) << 16) | ((value >> 16) & 0xFFu));
+                              (value & 0xFF00FF00u) | ((value & 0xFFu) << 16) | ((value >> 16) & 0xFFu), 1);
         return;
-    case 0x1D74u: rsx_semaphore_release(s.sema4097_ctx, s.sema4097_off, 16, value); return;
+    case 0x1D74u: rsx_semaphore_release(s.sema4097_ctx, s.sema4097_off, 16, value, 1); return;
     case 0x1800u: rsx_get_report(value); return;
     }
 }
@@ -531,6 +598,7 @@ static void rsx_run_args(u32 put)
 
 static void rsx_park(u32 seen)
 {
+    s.batch++;
     const u32 ea = rsx_io_to_ea(s.get);
     const u32 word = rsx_load(ea);
     rsx_publish_get();
@@ -595,6 +663,10 @@ static DWORD WINAPI rsx_fifo_thread(LPVOID unused)
         const u32 seen = __atomic_load_n(&s.bell, __ATOMIC_ACQUIRE);
         rsx_service_immediate();
         const u32 put = rsx_load(RSX_PUT_EA) & ~3u;
+        if (put != s.put_seen) {
+            s.put_seen = put;
+            s.batch++;
+        }
         if (s.get == put) {
             rsx_flush();
             rsx_wait_bell(seen);
@@ -666,11 +738,14 @@ void rsx_core_init(u32 local_size, u32 main_size)
     for (u32 i = 0; i < sizeof core_regs / sizeof core_regs[0]; i++) s_core_regs[core_regs[i] >> 2] = 1;
     rsx_window_clear();
     rsx_transfer_reset();
+    ppu_slow_pages(VM_HLE_INJECT_BASE, 0x10000u);
     g_rsx_window_write = rsx_core_window_written;
 }
 
 void rsx_core_set_renderer(const rsx_renderer* renderer) { s.renderer = renderer; }
 int rsx_core_free_flips(void) { return s.free_flips; }
+u64 rsx_core_progress(void) { return __atomic_load_n(&s.progress, __ATOMIC_RELAXED); }
+u64 rsx_core_batch(void) { return s.batch; }
 void rsx_core_set_event_sink(rsx_event_sink sink) { s.sink = sink; }
 
 static void rsx_thread(LPTHREAD_START_ROUTINE fn, SIZE_T stack, int priority, const wchar_t* name)
@@ -703,8 +778,6 @@ void rsx_core_fifo_reset(u32 put, u32 get)
     rsx_core_doorbell();
 }
 
-u32 rsx_core_local_size(void) { return s.local_size; }
-
 void rsx_mem_store(u32 ea, const void* src, u32 size)
 {
     if (!size) return;
@@ -724,9 +797,19 @@ void rsx_mem_store(u32 ea, const void* src, u32 size)
         for (u32 a = l0; a <= l1; a += 128u) ppu_resv_break_store(a);
 }
 
+int rsx_core_defer(const rsx_write* w)
+{
+    return s.renderer && s.renderer->defer && s.renderer->defer(s.renderer->user, w);
+}
+
 void rsx_core_read_back(u32 ea, u32 size)
 {
     if (s.renderer && s.renderer->read_back) s.renderer->read_back(s.renderer->user, ea, size);
+}
+
+void rsx_core_settle(u32 ea, u32 size)
+{
+    if (s.renderer && s.renderer->settle) s.renderer->settle(s.renderer->user, ea, size);
 }
 
 void rsx_core_wrote(u32 ea, u32 size)
@@ -780,11 +863,6 @@ u32 rsx_ea_to_io(u32 ea)
     return page == 0xFFFFu ? 0xFFFFFFFFu : ((u32)page << 20) | (ea & 0xFFFFFu);
 }
 
-u32 rsx_location_ea(int local, u32 offset)
-{
-    return rsx_address(local ? RSX_DMA_LOCAL : RSX_DMA_MAIN, offset, 0);
-}
-
 u32 rsx_address(u32 location, u32 offset, u32 size)
 {
     switch (location) {
@@ -822,16 +900,10 @@ int rsx_core_display_buffer(u32 id, rsx_display_buffer* out)
     return 1;
 }
 
-u32 rsx_core_display_buffer_count(void)
-{
-    return (u32)__builtin_popcount(__atomic_load_n(&s.display_mask, __ATOMIC_ACQUIRE));
-}
-
-u32 rsx_core_current_display_buffer(void) { return __atomic_load_n(&s.current_display, __ATOMIC_ACQUIRE); }
+void rsx_core_set_hidden_refresh(u32 hz) { __atomic_store_n(&s.hidden_period, hz ? rsx_tick_freq() / hz : 0u, __ATOMIC_RELEASE); }
+void rsx_core_set_frame_limit(u32 hz) { __atomic_store_n(&s.frame_period, hz ? rsx_tick_freq() / hz : 0u, __ATOMIC_RELEASE); }
 void rsx_core_set_vsync(int vsync) { __atomic_store_n(&s.vsync, vsync ? 1u : 0u, __ATOMIC_RELEASE); }
 u32 rsx_core_flip_status(void) { return __atomic_load_n(&s.flip_status, __ATOMIC_ACQUIRE); }
 void rsx_core_set_flip_status(u32 status) { __atomic_store_n(&s.flip_status, status, __ATOMIC_RELEASE); }
 u64 rsx_core_last_flip_time(void) { return __atomic_load_n(&s.last_flip_time, __ATOMIC_ACQUIRE); }
-u64 rsx_core_vblank_count(void) { return __atomic_load_n(&s.vblank_count, __ATOMIC_ACQUIRE); }
-u64 rsx_core_last_vblank_time(void) { return __atomic_load_n(&s.last_vblank_time, __ATOMIC_ACQUIRE); }
 u32 rsx_core_frames_presented(void) { return __atomic_load_n(&s.frames, __ATOMIC_ACQUIRE); }
