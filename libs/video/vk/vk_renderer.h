@@ -7,9 +7,12 @@
 #include "vk_shaders.h"
 #include "vk_occlusion.h"
 #include "vk_depth_pack.h"
+#include "vk_downscale.h"
 #include "rsx_texture.h"
+#include "../rsx_core.h"
 
 #include <array>
+#include <cstdio>
 #include <atomic>
 #include <memory>
 #include <unordered_map>
@@ -59,6 +62,9 @@ struct surface {
     u64 snapshot_draw = ~0ull;
     image as_color;
     u64 as_color_draw = ~0ull;
+    u64 version = 0;
+    image native;
+    u64 native_version = ~0ull;
     u32 bytes() const { return pitch * height * aa_v; }
 };
 
@@ -91,9 +97,11 @@ public:
 
     void flush();
     void present_source(u32 ea, u32 width, u32 height, u32 pitch, image*& out, u32& scale, VkCommandBuffer& cmd);
+    u64 content(u32 ea, u32 pitch) const;
     void submit(VkSemaphore wait, VkPipelineStageFlags2 wait_stage, VkSemaphore signal);
     void read_back(u32 ea, u32 size);
     void wrote(u32 ea, u32 size);
+    bool blit(const rsx_blit& b);
     void flip_reset();
     bool report(u32 type, u32 ea);
     std::atomic<bool> trace_request{ false };
@@ -111,6 +119,8 @@ private:
     void end_rendering();
     bool bind_framebuffer(u32 context);
     void begin_rendering();
+    surface* surface_at(u32 ea, u32 pitch, u32 bpp, u32& x, u32& y);
+    surface* scanout_surface(u32 ea, u32 pitch) const;
     surface* surface_for(u32 ea, u32 pitch, u32 width, u32 height, u32 format, bool depth, u32 aa_u, u32 aa_v);
     bool create_image(image& img, VkFormat format, u32 width, u32 height, VkImageUsageFlags usage, VkImageAspectFlags aspect);
     void destroy_image(image& img);
@@ -135,12 +145,14 @@ private:
     image m_display;
     occlusion m_occlusion;
     depth_pack m_depth_pack;
+    downscale m_downscale;
+    image m_box;
     image* depth_as_color(surface& s, VkFormat format);
 
     bool draw_setup();
     void draw_execute(const rsx::draw_clause& clause, u32 id);
     void trace_draw(u32 id, u32 prim, u32 count, bool indexed) const;
-    bool m_trace = false;
+    std::FILE* m_trace = nullptr;
     u32 m_trace_draws = 0;
     bool upload_vertices(const rsx::draw_clause& clause, u32 first, u32 count, u32 vertex_base, VkDescriptorBufferInfo& data,
                          VkDescriptorBufferInfo& layout);
@@ -166,6 +178,14 @@ private:
     VkDeviceSize m_ubo_align = 256;
     VkDeviceSize m_ssbo_align = 256;
     std::vector<uint8_t> m_index_scratch;
+    std::vector<uint8_t> m_regbytes;
+    struct draw_sub {
+        u32 first;
+        u32 count;
+        int32_t vertex_offset;
+        bool indexed;
+    };
+    std::vector<draw_sub> m_subs;
 
     struct texture_entry {
         u32 ea = 0;
@@ -187,6 +207,7 @@ private:
     VkImageView view_for(image& img, VkImageViewType type, VkFormat format, VkImageAspectFlags aspect, const VkComponentMapping& swizzle);
     VkSampler sampler_for(const VkSamplerCreateInfo& info, const VkSamplerCustomBorderColorCreateInfoEXT* border);
     bool memory_changed(u32 ea, u32 size, u32 stamp);
+    bool watch(u32 ea, u32 size);
     void mark_written(u32 ea, u32 size);
 
     unit_binding m_units[rsx::TEXTURES + rsx::VERTEX_TEXTURES];
@@ -194,14 +215,22 @@ private:
     std::unordered_map<uint64_t, std::unique_ptr<texture_entry>> m_textures;
     std::unordered_map<uint64_t, VkSampler> m_samplers;
     std::vector<u32> m_page_stamp;
+    struct watch_range {
+        u32 start;
+        u32 end;
+        u64 scanned;
+    };
+    std::vector<watch_range> m_watch;
+    bool m_watch_dirty = true;
     u32 m_stamp = 1;
     u64 m_epoch = 1;
     u64 m_flips = 0;
+    u64 m_content_clock = 0;
     std::vector<rsx::texture_copy> m_copies;
 
 public:
     struct counters {
-        u64 draws, clears, skipped_fb, skipped_shader, skipped_pipeline, textures, uploads, present_surface, present_memory;
+        u64 draws, clears, skipped_fb, skipped_shader, skipped_pipeline, textures, uploads, present_surface, present_memory, blits, downloads, surface_loads;
     } stats{};
 };
 

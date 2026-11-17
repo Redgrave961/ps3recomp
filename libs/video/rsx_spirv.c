@@ -29,7 +29,7 @@ enum {
     OpStore = 62, OpAccessChain = 65, OpArrayLength = 68, OpDecorate = 71, OpMemberDecorate = 72,
     OpVectorShuffle = 79, OpCompositeConstruct = 80, OpCompositeExtract = 81, OpCompositeInsert = 82,
     OpImageSampleImplicitLod = 87, OpImageSampleExplicitLod = 88, OpImageSampleDrefImplicitLod = 89,
-    OpImageFetch = 95, OpImage = 100, OpConvertFToU = 109, OpConvertFToS = 110, OpConvertSToF = 111, OpConvertUToF = 112, OpBitcast = 124,
+    OpImageFetch = 95, OpImageWrite = 99, OpImage = 100, OpConvertFToU = 109, OpConvertFToS = 110, OpConvertSToF = 111, OpConvertUToF = 112, OpBitcast = 124,
     OpFNegate = 127, OpIAdd = 128, OpFAdd = 129, OpISub = 130, OpFSub = 131, OpIMul = 132,
     OpFMul = 133, OpSDiv = 135, OpFDiv = 136, OpUMod = 137, OpVectorTimesScalar = 142, OpDot = 148,
     OpAny = 154, OpLogicalOr = 166, OpLogicalAnd = 167, OpLogicalNot = 168, OpSelect = 169,
@@ -2717,6 +2717,53 @@ int rsx_spv_depth_pack(int d16, rsx_spv_blob* out)
     }
     u32 idx = I(s, OpIAdd, tu(s), I(s, OpIMul, tu(s), y, cols), x);
     st(s, I(s, OpAccessChain, tptr(s, SC_StorageBuffer, tu(s)), buf, ci(s, 0), idx), word);
+    sel_end(s, merge);
+    sb_ins(s, BODY(s), OpReturn, k_none, 0);
+    fn_end(s);
+    const u32 caps[1] = { 1 };
+    return spv_finish(s, 5, caps, 1, mainid, NULL, 0, out);
+}
+
+int rsx_spv_box_down(u32 k, rsx_spv_blob* out)
+{
+    spv* s = spv_begin();
+    if (!s) return -1;
+    u32 mainid = newl(s);
+    u32 src = sampler_var(s, 1, 0, 0);
+    const u32 fimg = intern(s, OpTypeImage, 0, (const u32[]){ tf(s), 1, 0, 0, 0, 1, 0 }, 7, 0);
+    const u32 oimg = intern(s, OpTypeImage, 0, (const u32[]){ tf(s), 1, 0, 0, 0, 2, 1 }, 7, 0);
+    u32 dst = gvar(s, oimg, SC_UniformConstant, 0);
+    deco1(s, dst, DEC_DescriptorSet, 0);
+    deco1(s, dst, DEC_Binding, 1);
+    u32 pst = intern(s, OpTypeStruct, 0, (const u32[]){ tu(s), tu(s) }, 2, 1);
+    for (u32 m = 0; m < 2; m++) mdeco(s, pst, m, DEC_Offset, m * 4u);
+    deco(s, pst, DEC_Block);
+    u32 push = gvar(s, pst, SC_PushConstant, 0);
+    u32 tu3 = tvec(s, tu(s), 3);
+    u32 gvarid = gvar(s, tu3, SC_Input, 0);
+    deco1(s, gvarid, DEC_BuiltIn, BI_GlobalInvocationId);
+
+    fn_begin(s, mainid);
+    u32 gid = ld(s, tu3, gvarid);
+    u32 x = ex(s, tu(s), gid, 0), y = ex(s, tu(s), gid, 1);
+    u32 pp = tptr(s, SC_PushConstant, tu(s));
+    u32 w = ld(s, tu(s), I(s, OpAccessChain, pp, push, ci(s, 0)));
+    u32 h = ld(s, tu(s), I(s, OpAccessChain, pp, push, ci(s, 1)));
+    u32 inside = band(s, I(s, OpULessThan, tbool(s), x, w), I(s, OpULessThan, tbool(s), y, h));
+    u32 merge, then_l;
+    sel_if(s, inside, &merge, &then_l);
+    u32 img = I(s, OpImage, fimg, ld(s, sampler_type(s, 1, 0), src));
+    u32 ti2 = tvec(s, ti(s), 2);
+    u32 x0 = I(s, OpIMul, tu(s), x, cu(s, k)), y0 = I(s, OpIMul, tu(s), y, cu(s, k));
+    u32 sum = cv4(s, 0.f, 0.f, 0.f, 0.f);
+    for (u32 j = 0; j < k; j++)
+        for (u32 i = 0; i < k; i++) {
+            u32 coord = I(s, OpCompositeConstruct, ti2, bc(s, ti(s), I(s, OpIAdd, tu(s), x0, cu(s, i))),
+                          bc(s, ti(s), I(s, OpIAdd, tu(s), y0, cu(s, j))));
+            sum = fadd(s, tv4(s), sum, I(s, OpImageFetch, tv4(s), img, coord, IMG_Lod, ci(s, 0)));
+        }
+    u32 avg = I(s, OpVectorTimesScalar, tv4(s), sum, cf(s, 1.f / (float)(k * k)));
+    V(s, OpImageWrite, ld(s, oimg, dst), I(s, OpCompositeConstruct, ti2, bc(s, ti(s), x), bc(s, ti(s), y)), avg);
     sel_end(s, merge);
     sb_ins(s, BODY(s), OpReturn, k_none, 0);
     fn_end(s);

@@ -39,12 +39,6 @@ uint64_t shader_cache::program_hash(const uint32_t* program, uint32_t start)
     return h;
 }
 
-uint32_t shader_cache::fragment_extent(const uint32_t* ucode, uint32_t max_words)
-{
-    rsx_spv_fp_info scan{};
-    if (rsx_spv_fragment_scan(ucode, max_words, &scan) != 0) return 0;
-    return std::min(scan.ucode_words, max_words);
-}
 
 bool shader_cache::make_module(shader& s, const rsx_spv_blob& blob, VkShaderStageFlagBits stage)
 {
@@ -101,15 +95,14 @@ const vertex_program* shader_cache::vertex(const uint32_t* program_in, const rsx
 
 const fragment_program* shader_cache::fragment(const uint32_t* ucode, uint32_t max_words, const rsx_spv_fp_key& key, bool async)
 {
-    const uint32_t end = fragment_extent(ucode, max_words);
+    rsx_spv_fp_info scan{};
+    const uint32_t end = rsx_spv_fragment_scan(ucode, max_words, &scan) == 0 ? std::min(scan.ucode_words, max_words) : 0;
     if (!end) {
         static std::atomic<int> reported{ 0 };
         if (reported.fetch_add(1) < 8)
             std::fprintf(stderr, "[vk] fragment program scan failed: %08X %08X %08X %08X\n", ucode[0], ucode[1], ucode[2], ucode[3]);
         return nullptr;
     }
-    rsx_spv_fp_info scan{};
-    rsx_spv_fragment_scan(ucode, end, &scan);
     thread_local std::vector<uint32_t> scratch;
     scratch.assign(ucode, ucode + end);
     for (uint32_t i = 0; i < scan.constant_count; i++)

@@ -13,7 +13,7 @@
  * clang -std=gnu17 -I include -I libs/video libs/video/tests/test_rsx_tiling.c libs/video/rsx_tiling.c -o /tmp/t
  */
 #include "rsx_tiling.h"
-#include "rsx_dispatch.h"
+#include "rsx_core.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

@@ -2,7 +2,6 @@
 #include "vk_geometry.h"
 #include "vk_state.h"
 
-#include "../rsx_core.h"
 
 #include <algorithm>
 #include <cstring>
@@ -138,7 +137,8 @@ bool renderer::upload_vertices(const rsx::draw_clause& clause, u32 first, u32 co
     };
     pending_attr pend[rsx::ATTRIBS];
     u32 npend = 0;
-    std::vector<uint8_t> regbytes;
+    std::vector<uint8_t>& regbytes = m_regbytes;
+    regbytes.clear();
 
     for (u32 k = 0; k < rsx::ATTRIBS; k++) {
         layout.value[k][3] = 1.0f;
@@ -152,13 +152,12 @@ bool renderer::upload_vertices(const rsx::draw_clause& clause, u32 first, u32 co
             const rsx::push_attribute& p = push[k];
             if (p.vertices > 1 && p.size) {
                 const u32 words = p.type == rsx::VT_F ? p.size : (p.type == rsx::VT_UB || p.type == rsx::VT_UB256) ? 1u : p.size / 2u;
-                std::vector<u32> padded = p.data;
                 const u32 need = push[0].vertices;
-                for (u32 v = p.vertices; v < need; v++)
-                    for (u32 w = 0; w < words; w++) padded.push_back(attribute[k].data[w]);
                 const size_t at = regbytes.size();
-                regbytes.resize(at + padded.size() * 4u);
-                std::memcpy(regbytes.data() + at, padded.data(), padded.size() * 4u);
+                regbytes.resize(at + (p.data.size() + (size_t)(need > p.vertices ? need - p.vertices : 0) * words) * 4u);
+                std::memcpy(regbytes.data() + at, p.data.data(), p.data.size() * 4u);
+                for (u32 v = p.vertices, o = (u32)(at + p.data.size() * 4u); v < need; v++, o += words * 4u)
+                    std::memcpy(regbytes.data() + o, attribute[k].data, words * 4u);
                 pend[npend++] = { k, p.type, p.size, words * 4u, 0u, 0u, -2, (u32)at };
                 continue;
             }
@@ -344,13 +343,9 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
     const bool restart = r(rsx::M_RESTART_INDEX_ENABLE) != 0;
     const u32 restart_index = r(rsx::M_RESTART_INDEX);
 
-    struct sub {
-        u32 first;
-        u32 count;
-        int32_t vertex_offset;
-        bool indexed;
-    };
-    std::vector<sub> subs;
+
+    std::vector<draw_sub>& subs = m_subs;
+    subs.clear();
     vk_slice index_slice{};
     VkIndexType index_type = VK_INDEX_TYPE_UINT32;
     u32 e0 = 0, ecount = 0, vb = 0;
@@ -392,7 +387,7 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
         e0 = lo + base_index;
         ecount = hi - lo + 1u;
         vb = e0;
-        for (sub& s : subs) s.vertex_offset = (int32_t)base_index;
+        for (draw_sub& s : subs) s.vertex_offset = (int32_t)base_index;
     } else {
         u32 first = 0, last = 0;
         if (clause.kind == rsx::draw_kind::inlined) {
@@ -418,11 +413,11 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
         vb = first;
         if (emulated) {
             u32 total = 0;
-            for (const sub& s : subs) total += expanded_index_count(prim, s.count) + 1u;
+            for (const draw_sub& s : subs) total += expanded_index_count(prim, s.count) + 1u;
             index_slice = m_ring.alloc((VkDeviceSize)total * 4u, 16);
             if (!index_slice.ptr) return;
             u32 at = 0;
-            for (sub& s : subs) {
+            for (draw_sub& s : subs) {
                 const u32 n = expanded_index_count(prim, s.count);
                 generate_indices(prim, s.count, reinterpret_cast<u32*>(index_slice.ptr) + at);
                 s.vertex_offset = (int32_t)s.first;
@@ -529,7 +524,7 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
     const VkPipeline pipe = m_pipelines.get(key, m_vp->code, m_fp->code);
     if (!pipe) {
         stats.skipped_pipeline++;
-        if (m_trace) std::fprintf(stderr, "[trace] %u skipped: pipeline compiling or failed\n", id);
+        if (m_trace) std::fprintf(m_trace, "[trace] %u skipped: pipeline compiling or failed\n", id);
         return;
     }
 
@@ -568,19 +563,22 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
     vkCmdPushDescriptorSetKHR(c, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelines.layout(), 0, nw, w);
 
     if (index_slice.ptr) vkCmdBindIndexBuffer(c, index_slice.buffer, index_slice.offset, index_type);
-    for (const sub& s : subs) {
+    for (const draw_sub& s : subs) {
         if (s.indexed) vkCmdDrawIndexed(c, s.count, 1, s.first, s.vertex_offset, 0);
         else vkCmdDraw(c, s.count, 1, s.first, 0);
     }
 
     for (u32 k = 0; k < m_fb.count; k++)
-        if (m_fb.color[k] && m_fb.color_write[k]) m_fb.color[k]->gpu_dirty = true;
+        if (m_fb.color[k] && m_fb.color_write[k]) {
+            m_fb.color[k]->gpu_dirty = true;
+            m_fb.color[k]->version = ++m_content_clock;
+        }
     if (m_fb.depth && m_fb.depth_write) m_fb.depth->gpu_dirty = true;
     m_draw_counter++;
     stats.draws++;
     if (m_trace) {
         u32 n = 0;
-        for (const sub& s : subs) n += s.count;
+        for (const draw_sub& s : subs) n += s.count;
         trace_draw(id, prim, n, index_slice.ptr != nullptr);
     }
 }

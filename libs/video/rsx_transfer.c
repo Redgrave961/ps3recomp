@@ -385,6 +385,15 @@ static void sifm_image_in(void)
     if (src.ea == dst.ea && in_w == clip_w && in_h == clip_h && in_pitch == out_pitch &&
         scale_x == 1.f && scale_y == 1.f)
         return;
+    const u32 img_w = swizzled ? (clip_w < out_w ? clip_w : out_w) : clip_w;
+    const u32 img_h = swizzled ? (clip_h < out_h ? clip_h : out_h) : clip_h;
+    if (!swizzled && !src.tiled && !dst.tiled && in_bpp == out_bpp && scale_x > 0.f && scale_y > 0.f &&
+        clip_x + img_w <= conv_w && clip_y + img_h <= conv_h) {
+        const rsx_blit b = { src.ea, in_pitch, (float)clip_x / ax, (float)clip_y / ay, (float)(clip_x + img_w) / ax,
+                             (float)(clip_y + img_h) / ay, rsx_address(dst_dma, dst_off, 1), out_pitch, out_x, out_y, img_w, img_h,
+                             in_bpp, bilinear };
+        if (b.dst_ea && rsx_core_blit(&b)) return;
+    }
     rsx_core_read_back(src.ea, src.size);
 
     u8* rows = scratch(0, (size_t)in_pitch * (in_h - 1u) + (size_t)in_w * in_bpp);
@@ -398,8 +407,6 @@ static void sifm_image_in(void)
     const sifm_src sr = { rows, in_pitch, in_w, in_h, in_bpp, scale_x < 0.f, scale_y < 0.f };
     const int direct = !bilinear && ax == 1.f && ay == 1.f && in_bpp == out_bpp && !sr.flip_x && !sr.flip_y;
 
-    const u32 img_w = swizzled ? (clip_w < out_w ? clip_w : out_w) : clip_w;
-    const u32 img_h = swizzled ? (clip_h < out_h ? clip_h : out_h) : clip_h;
     const u32 line = (swizzled ? sw_w : clip_w) * out_bpp;
     u8* img = scratch(1, (size_t)line * (swizzled ? sw_h : 1u));
     if (!img) return;

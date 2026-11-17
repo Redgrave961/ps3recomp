@@ -337,6 +337,7 @@ VkPresentModeKHR pick_mode()
     std::vector<VkPresentModeKHR> list(n);
     vkGetPhysicalDeviceSurfacePresentModesKHR(g.d.gpu, g.surface, &n, list.data());
     auto has = [&](VkPresentModeKHR m) { return std::find(list.begin(), list.end(), m) != list.end(); };
+    if (rsx_core_free_flips()) return has(VK_PRESENT_MODE_MAILBOX_KHR) ? VK_PRESENT_MODE_MAILBOX_KHR : VK_PRESENT_MODE_IMMEDIATE_KHR;
     if (g.mode == pacing::vrr || g.mode == pacing::measuring) return VK_PRESENT_MODE_FIFO_KHR;
     if (g.d.caps.fifo_latest_ready && has(VK_PRESENT_MODE_FIFO_LATEST_READY_KHR)) return VK_PRESENT_MODE_FIFO_LATEST_READY_KHR;
     return VK_PRESENT_MODE_FIFO_KHR;
@@ -429,7 +430,7 @@ bool presenter_build()
     const std::string cache = std::string(base ? base : "") + "vk_pipelines.bin";
     const char* forced = std::getenv("PS3_RESOLUTION_SCALE");
     const uint32_t requested = forced ? (uint32_t)std::strtoul(forced, nullptr, 10) : 0u;
-    g.r.resolution_scale = requested ? std::clamp(requested, 1u, 8u) : std::max(1u, (g.pixel_h.load() + 719u) / 720u);
+    g.r.resolution_scale = requested ? std::clamp(requested, 1u, 8u) : 3u;
     std::fprintf(stderr, "[vk] resolution scale %ux (%ux%u for a 1280x720 frame)\n", g.r.resolution_scale, 1280u * g.r.resolution_scale, 720u * g.r.resolution_scale);
     return g.r.open(g.d, g.timeline, &g.submitted, cache.c_str());
 }
@@ -669,6 +670,7 @@ void present_main()
 
 void vk_vblank(void*, u64 count)
 {
+    if (rsx_core_free_flips()) return;
     {
         std::lock_guard<std::mutex> hold(g.queue_lock);
         g.tick = count;
@@ -793,27 +795,34 @@ int vk_open(void*)
     return g.status > 0 ? 0 : -1;
 }
 
-std::atomic<int64_t> g_render_ns{ 0 };
+std::atomic<int64_t> g_rsx_cpu_ns{ 0 };
 
-struct render_timer {
-    const int64_t start = now_ns();
-    ~render_timer() { g_render_ns.fetch_add(now_ns() - start, std::memory_order_relaxed); }
-};
+int64_t thread_cpu_ns()
+{
+#ifdef _WIN32
+    FILETIME created, exited, kernel, user;
+    GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user);
+    return (int64_t)((((uint64_t)kernel.dwHighDateTime << 32) | kernel.dwLowDateTime) + (((uint64_t)user.dwHighDateTime << 32) | user.dwLowDateTime)) * 100;
+#else
+    timespec ts;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return (int64_t)ts.tv_sec * 1000000000ll + ts.tv_nsec;
+#endif
+}
 
 void vk_methods(void*, u32 reg, u32 inc, const u32* be, u32 count)
 {
-    render_timer timer;
     g.r.methods(reg, inc, be, count);
 }
 
 void vk_flush(void*)
 {
-    render_timer timer;
     g.r.flush();
 }
 
 void vk_reset(void*)
 {
+    if (stats_on()) g_rsx_cpu_ns.store(thread_cpu_ns(), std::memory_order_relaxed);
     g.r.flip_reset();
 }
 
@@ -830,6 +839,11 @@ void vk_read_back(void*, u32 ea, u32 size)
 void vk_wrote(void*, u32 ea, u32 size)
 {
     g.r.wrote(ea, size);
+}
+
+int vk_blit(void*, const rsx_blit* b)
+{
+    return g.r.blit(*b) ? 1 : 0;
 }
 
 void write_bmp(const char* path, const uint8_t* bgra, uint32_t w, uint32_t h)
@@ -862,7 +876,9 @@ void vk_present(void*, u32, const rsx_display_buffer* db)
         std::fprintf(stderr, "[vk] display buffer %ux%u pitch %u offset 0x%08X\n", w, h, pitch, db->offset);
     }
     const u32 ea = (w && h && pitch >= w * 4u) ? rsx_address(RSX_DMA_LOCAL, db->offset, pitch * h) : 0u;
-    if (!ea) {
+    static u64 shown;
+    const u64 content = ea ? g.r.content(ea, pitch) : 0;
+    if (!ea || (content && content == shown)) {
         g.r.flush();
         return;
     }
@@ -878,6 +894,7 @@ void vk_present(void*, u32, const rsx_display_buffer* db)
     u32 scale = 1;
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     g.r.present_source(ea, w, h, pitch, src, scale, cmd);
+    shown = content;
     const uint32_t sw = std::min(w * scale, src ? src->width : 0u), sh = std::min(h * scale, src ? src->height : 0u);
     if (!src || !slot_reserve(s, sw, sh)) {
         g.r.flush();
@@ -954,16 +971,26 @@ void vk_present(void*, u32, const rsx_display_buffer* db)
     }
     {
         std::lock_guard<std::mutex> hold(g.queue_lock);
-        g.queued = (int)i;
+        if (rsx_core_free_flips()) {
+            g.latest = (int)i;
+            g.latest_new = true;
+            g.tick++;
+        } else {
+            g.queued = (int)i;
+        }
     }
     g.queue_cv.notify_one();
 
     static uint64_t presents;
     if (stats_on() && ++presents % 600u == 0) {
+        static int64_t last_rsx_cpu;
+        const int64_t rsx_cpu = g_rsx_cpu_ns.load(std::memory_order_relaxed);
         const auto& st = g.r.stats;
-        std::fprintf(stderr, "[vk] frames %llu draws %llu clears %llu uploads %llu, renderer cpu %.3f ms/frame, %s\n", (unsigned long long)presents,
+        std::fprintf(stderr, "[vk] frames %llu draws %llu clears %llu uploads %llu gpu blits %llu surface downloads %llu surface loads %llu, rsx thread cpu %.3f ms/frame, %s\n", (unsigned long long)presents,
                      (unsigned long long)st.draws, (unsigned long long)st.clears, (unsigned long long)st.uploads,
-                     (double)g_render_ns.exchange(0) / 600.0 / 1e6, pacing_name(g.mode));
+                     (unsigned long long)st.blits, (unsigned long long)st.downloads, (unsigned long long)st.surface_loads,
+                     (double)(rsx_cpu - last_rsx_cpu) / 600.0 / 1e6, pacing_name(g.mode));
+        last_rsx_cpu = rsx_cpu;
     }
 }
 
@@ -979,7 +1006,7 @@ void vk_close(void*)
 extern "C" const rsx_renderer* rsx_vk_renderer(const char* title)
 {
     static const rsx_renderer renderer = {
-        nullptr, vk_open, vk_methods, vk_flush, nullptr, vk_reset, vk_report, vk_present, vk_read_back, vk_wrote, vk_vblank, vk_close,
+        nullptr, vk_open, vk_methods, vk_flush, nullptr, vk_reset, vk_report, vk_present, vk_read_back, vk_wrote, vk_blit, vk_vblank, vk_close,
     };
     static std::once_flag started;
     std::call_once(started, [title] {

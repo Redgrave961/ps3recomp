@@ -3,7 +3,7 @@
  * client goes through (rsx_tiling.h).
  */
 #include "rsx_tiling.h"
-#include "rsx_dispatch.h"                     /* RSX_LOCATION_MAIN */
+#include "rsx_core.h"
 #include "../../runtime/platform/win32_compat.h"
 #include "ps3emu/log_first.h"
 #include <stdio.h>
