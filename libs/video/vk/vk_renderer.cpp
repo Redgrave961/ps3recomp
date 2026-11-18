@@ -1,10 +1,11 @@
 #include "vk_renderer.h"
 
-
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdarg>
 #include <cstring>
+#include <functional>
 
 namespace vk {
 
@@ -135,6 +136,8 @@ void renderer::close()
         std::lock_guard<std::mutex> hold(m_d->queue_lock);
         vkQueueWaitIdle(m_d->queue);
     }
+    if (m_trace_pool) vkDestroyQueryPool(m_d->dev, m_trace_pool, nullptr);
+    m_trace_pool = VK_NULL_HANDLE;
     m_occlusion.destroy();
     m_depth_pack.destroy();
     m_downscale.destroy();
@@ -166,11 +169,83 @@ void renderer::close()
     m_d = nullptr;
 }
 
+constexpr VkAccessFlags2 k_writes = VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                                    VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT |
+                                    VK_ACCESS_2_HOST_WRITE_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+constexpr u32 k_trace_queries = 8192;
+
+bool renderer::readable(const image& img)
+{
+    return img.layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL && !(img.access & k_writes);
+}
+
+void renderer::trace_begin(VkCommandBuffer c)
+{
+    if (!m_trace || m_trace_open || !m_trace_pool || (m_trace_spans.size() + 1u) * 2u > k_trace_queries) return;
+    vkCmdWriteTimestamp2(c, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_trace_pool, (u32)m_trace_spans.size() * 2u);
+    m_trace_open = true;
+}
+
+void renderer::trace_end(VkCommandBuffer c, const char* fmt, ...)
+{
+    if (!m_trace_open) return;
+    vkCmdWriteTimestamp2(c, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, m_trace_pool, (u32)m_trace_spans.size() * 2u + 1u);
+    char label[192];
+    va_list args;
+    va_start(args, fmt);
+    std::vsnprintf(label, sizeof label, fmt, args);
+    va_end(args);
+    m_trace_spans.emplace_back(label);
+    m_trace_open = false;
+}
+
+trace_span::trace_span(renderer& r, VkCommandBuffer c, const char* fmt, ...)
+{
+    if (!r.tracing()) return;
+    va_list args;
+    va_start(args, fmt);
+    std::vsnprintf(m_label, sizeof m_label, fmt, args);
+    va_end(args);
+    m_r = &r;
+    m_c = c;
+    r.trace_begin(c);
+}
+
+trace_span::~trace_span()
+{
+    if (m_r) m_r->trace_end(m_c, "%s", m_label);
+}
+
+void renderer::trace_report()
+{
+    const u32 n = (u32)m_trace_spans.size();
+    if (!n) return;
+    flush();
+    std::vector<uint64_t> t((size_t)n * 2u);
+    if (vkGetQueryPoolResults(m_d->dev, m_trace_pool, 0, n * 2u, t.size() * sizeof(uint64_t), t.data(), sizeof(uint64_t),
+                              VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) != VK_SUCCESS)
+        return;
+    const double us = (double)m_d->props.limits.timestampPeriod / 1000.0;
+    std::vector<std::pair<double, u32>> busy(n);
+    uint64_t done = t[0];
+    double total = 0;
+    for (u32 i = 0; i < n; i++) {
+        const uint64_t start = std::max(t[i * 2u], done), end = std::max(t[i * 2u + 1u], start);
+        busy[i] = { (double)(end - start) * us, i };
+        total += busy[i].first;
+        done = end;
+        std::fprintf(m_trace, "[gpu] %u %9.1f us at %9.1f us  %s\n", i, busy[i].first, (double)(start - t[0]) * us, m_trace_spans[i].c_str());
+    }
+    std::fprintf(m_trace, "[gpu] busy %.1f us over %.1f us, %u spans\n", total, (double)(done - t[0]) * us, n);
+    std::sort(busy.begin(), busy.end(), std::greater<>());
+    for (u32 i = 0; i < n && i < 20u; i++)
+        std::fprintf(m_trace, "[gpu] top %2u %9.1f us %5.1f%%  %u %s\n", i + 1u, busy[i].first, total > 0 ? 100.0 * busy[i].first / total : 0.0,
+                     busy[i].second, m_trace_spans[busy[i].second].c_str());
+}
+
 void renderer::barrier(VkCommandBuffer cmd, image& img, VkImageLayout layout, VkPipelineStageFlags2 stage, VkAccessFlags2 access)
 {
-    constexpr VkAccessFlags2 writes = VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
-                                      VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT |
-                                      VK_ACCESS_2_HOST_WRITE_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+    constexpr VkAccessFlags2 writes = k_writes;
     if (img.layout == layout && !(img.access & writes) && !(access & writes)) {
         img.stage |= stage;
         img.access |= access;
@@ -403,6 +478,7 @@ surface* renderer::surface_for(u32 ea, u32 pitch, u32 width, u32 height, u32 for
     VkCommandBuffer c = cmd();
     if (grow_from) {
         end_rendering();
+        const trace_span span(*this, c, "surface grow %ux%u", s->img.width, s->img.height);
         barrier(c, grow_from->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
         barrier(c, s->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
         VkImageCopy region{};
@@ -491,6 +567,7 @@ void renderer::load_surface(surface& s)
     stats.surface_loads++;
     VkCommandBuffer c = cmd();
     end_rendering();
+    const trace_span span(*this, c, "surface load %ux%u %s", s.img.width, s.img.height, s.depth ? "depth" : "color");
     const u32 w = s.width * s.aa_u, h = s.height * s.aa_v;
     const u32 row = w * s.bpp;
     if (!s.depth) {
@@ -575,13 +652,16 @@ void renderer::download_surface(surface& s)
     if (!slice.ptr) return;
     image* source = s.scale.unit() ? &s.img : native_image(s, s.img);
     if (!source) return;
-    barrier(c, *source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
-    VkBufferImageCopy region{};
-    region.bufferOffset = slice.offset;
-    region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-    region.imageExtent = { w, h, 1 };
-    vkCmdCopyImageToBuffer(c, source->handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, slice.buffer, 1, &region);
-    memory_barrier(c, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
+    {
+        const trace_span span(*this, c, "surface download %ux%u", w, h);
+        barrier(c, *source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+        VkBufferImageCopy region{};
+        region.bufferOffset = slice.offset;
+        region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        region.imageExtent = { w, h, 1 };
+        vkCmdCopyImageToBuffer(c, source->handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, slice.buffer, 1, &region);
+        memory_barrier(c, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
+    }
     stats.downloads++;
     submit(VK_NULL_HANDLE, 0, VK_NULL_HANDLE);
     const uint64_t value = *m_submitted;
@@ -628,6 +708,11 @@ void renderer::end_rendering()
     if (m_occlusion.active()) m_occlusion.end(c);
     vkCmdEndRendering(c);
     m_rendering = false;
+    if (m_trace_open) {
+        const ratio& sc = m_fb.scale;
+        trace_end(c, "pass %ux%u color %u fmt %d depth fmt %d draws %u-%u", sc.edge(m_fb.width * m_fb.aa_u), sc.edge(m_fb.height * m_fb.aa_v),
+                  m_fb.count, (int)m_fb.color_format[0], (int)m_fb.depth_format, m_trace_pass_first, m_trace_draws);
+    }
 }
 
 bool renderer::bind_framebuffer(u32 context)
@@ -818,6 +903,8 @@ void renderer::begin_rendering()
     ri.pColorAttachments = color;
     ri.pDepthAttachment = m_fb.depth ? &depth : nullptr;
     ri.pStencilAttachment = stencil.imageView ? &stencil : nullptr;
+    trace_begin(c);
+    m_trace_pass_first = m_trace_draws;
     vkCmdBeginRendering(c, &ri);
     m_rendering = true;
 }
@@ -1051,6 +1138,7 @@ void renderer::present_source(u32 ea, u32 width, u32 height, u32 pitch, image*& 
         uint32_t* o = reinterpret_cast<uint32_t*>(slice.ptr + (size_t)y * width * 4u);
         for (u32 x = 0; x < width; x++) o[x] = __builtin_bswap32(in[x]);
     }
+    const trace_span span(*this, c, "scanout upload %ux%u", width, height);
     barrier(c, m_display, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
     VkBufferImageCopy region{};
     region.bufferOffset = slice.offset;
@@ -1170,6 +1258,8 @@ bool renderer::blit(const rsx_blit& b)
     }
     VkCommandBuffer c = cmd();
     end_rendering();
+    const trace_span span(*this, c, "blit %ux%u to %ux%u", b.src_x1 > b.src_x0 ? (u32)(b.src_x1 - b.src_x0) : 0u,
+                          b.src_y1 > b.src_y0 ? (u32)(b.src_y1 - b.src_y0) : 0u, b.dst_w, b.dst_h);
     barrier(c, src->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
     barrier(c, dst->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
     const ratio& ds = dst->scale;
@@ -1190,10 +1280,14 @@ bool renderer::blit(const rsx_blit& b)
 
 void renderer::flip_reset()
 {
+    end_rendering();
     if (m_trace) {
         std::fprintf(m_trace, "[trace] frame end, %u draws\n", m_trace_draws);
+        trace_report();
         std::fclose(m_trace);
         m_trace = nullptr;
+        m_trace_spans.clear();
+        m_trace_open = false;
     }
     m_trace_draws = 0;
     if (trace_request.exchange(false, std::memory_order_relaxed)) {
@@ -1201,8 +1295,14 @@ void renderer::flip_reset()
         std::snprintf(name, sizeof name, "trace_%llu.txt", (unsigned long long)m_flips);
         m_trace = std::fopen(name, "w");
         if (m_trace) std::fprintf(stderr, "[vk] F12 trace -> %s\n", name);
+        if (m_trace && !m_trace_pool) {
+            VkQueryPoolCreateInfo qi{ VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
+            qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+            qi.queryCount = k_trace_queries;
+            if (vkCreateQueryPool(m_d->dev, &qi, nullptr, &m_trace_pool) != VK_SUCCESS) m_trace_pool = VK_NULL_HANDLE;
+        }
+        if (m_trace_pool) vkResetQueryPool(m_d->dev, m_trace_pool, 0, k_trace_queries);
     }
-    end_rendering();
     frontend::reset();
     m_fb_valid = false;
     if ((++m_flips & 255u) == 0)

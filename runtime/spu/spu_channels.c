@@ -92,6 +92,8 @@ static uint64_t spu_host_ns(void)
 static SPU_TLS jmp_buf s_spu_halt_env;
 static SPU_TLS int     s_spu_halt_armed = 0;
 
+#define SPUCHECK_ABNORMAL(ctx) ((void)0)
+
 /* Call right after a setjmp returned 0. On 64-bit Windows longjmp unwinds every
  * host frame between it and its setjmp (RtlUnwindEx, a function-table lookup
  * and a virtual unwind per frame), several microseconds per jump; with the
@@ -112,6 +114,7 @@ void spu_jmp_no_unwind(void* env)
  * any architectural registers, local store, or pending guest work. */
 void spu_restart_dispatch(spu_context* ctx)
 {
+    SPUCHECK_ABNORMAL(ctx);
     g_spu_trampoline_fn = 0;
     if (s_spu_halt_armed) SPU_LONGJMP(s_spu_halt_env, 2);
     fprintf(stderr, "[spu] non-local return outside execution driver at 0x%05X\n", ctx->pc);
@@ -132,6 +135,7 @@ void (*g_rsx_window_write)(void) = 0;
 
 void spu_halt(spu_context* ctx)
 {
+    SPUCHECK_ABNORMAL(ctx);
     { static int _n = 0;
       if (_n < 6 && ctx->status == SPU_STATUS_STOPPED_BY_HALT) { _n++;
         fprintf(stderr, "[spu-halt] img=%d pc=0x%05X regs:", ctx->image_id,
@@ -159,6 +163,7 @@ void spu_stop_exit_check(spu_context* ctx)
  * service loop, which continues (i.e. the SPU "resumes" past the stop). */
 void spu_stop(spu_context* ctx)
 {
+    SPUCHECK_ABNORMAL(ctx);
     ctx->status = SPU_STATUS_STOPPED_BY_STOP;
     spu_stop_exit_check(ctx);
 }
@@ -285,6 +290,7 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
     spu_float_mode_leave(fpcr_outer);
     return halted;
 }
+
 
 /* ===========================================================================
  * One private MFC engine per live virtual context. Persistent policy contexts
@@ -1154,8 +1160,7 @@ static spu_lifted_fn spu_lifted_lookup_full(const spu_context* ctx, uint32_t lsa
  *    same address starts with id 0 and takes a fresh one.
  * A verified slot is not re-compared, as without the cache (verify once per
  * load); a store by SPU code into a verified span is not tracked, the same as
- * there. Misses (NULL) are not cached, so a rejected or unlifted target is
- * resolved every time, as before. */
+ * there. */
 typedef struct {
     spu_lifted_fn fn;
     uint32_t id, lsa, rgen, residency;
@@ -1182,7 +1187,7 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
      * a count newer than the registry it saw. */
     const uint32_t rgen = __atomic_load_n(&s_registry_count, __ATOMIC_ACQUIRE);
     spu_dcache_ent* e = &t_dcache[((lsa >> 2) ^ (id * 0x9E3779B1u)) & (SPU_DCACHE_ENTRIES - 1)];
-    if (e->fn && e->id == id && e->lsa == lsa && e->rgen == rgen &&
+    if (e->id == id && e->lsa == lsa && e->rgen == rgen &&
         e->residency == c->dcache_residency && e->image == c->image_id &&
         e->ovl == c->resident_ovl) {
         if (e->reloc) c->reloc_delta = e->reloc_delta;
@@ -1190,14 +1195,10 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
     }
     int reloc = 0;
     const spu_lifted_fn fn = spu_lifted_lookup_full(ctx, lsa, &reloc);
-    if (fn) {
-        /* The resolver may have verified a pending slot; the entry records the
-         * residency it resolved against, read after it. */
-        e->fn = fn; e->id = id; e->lsa = lsa; e->rgen = rgen;
-        e->residency = c->dcache_residency; e->image = c->image_id;
-        e->ovl = c->resident_ovl;
-        e->reloc = reloc; e->reloc_delta = c->reloc_delta;
-    }
+    e->fn = fn; e->id = id; e->lsa = lsa; e->rgen = rgen;
+    e->residency = c->dcache_residency; e->image = c->image_id;
+    e->ovl = c->resident_ovl;
+    e->reloc = reloc; e->reloc_delta = c->reloc_delta;
     return fn;
 }
 
@@ -1389,16 +1390,25 @@ static int spu_overlay_resolve_reloc(spu_context* ctx, uint32_t pc)
 {
     const int nsrc = __atomic_load_n(&s_ovl_src_count, __ATOMIC_ACQUIRE);
     uint32_t max_span = 0;
+    int cand[SPU_OVL_SRC_MAX];
+    uint64_t sig[SPU_OVL_SRC_MAX][2];
+    int ncand = 0;
     for (int i = 0; i < nsrc; i++)
-        if (s_ovl_src[i].canon && s_ovl_src[i].code && s_ovl_src[i].span > max_span)
-            max_span = s_ovl_src[i].span;
+        if (s_ovl_src[i].canon && s_ovl_src[i].code) {
+            if (s_ovl_src[i].span > max_span) max_span = s_ovl_src[i].span;
+            memcpy(sig[ncand], s_ovl_src[i].sig, 16);
+            cand[ncand++] = i;
+        }
     if (!max_span) return 0;
     const uint32_t lowest = pc >= max_span ? pc - max_span + 1 : 0;
     for (uint32_t base = pc & ~15u; ; base -= 16) {
-        for (int i = 0; i < nsrc; i++) {
+        uint64_t at[2];
+        memcpy(at, ctx->ls + base, 16);
+        for (int k = 0; k < ncand; k++) {
+            if (at[0] != sig[k][0] || at[1] != sig[k][1]) continue;
+            const int i = cand[k];
             const spu_ovl_src* o = &s_ovl_src[i];
-            if (!o->canon || !o->code || pc - base >= o->span || base > SPU_LS_SIZE - o->span ||
-                memcmp(ctx->ls + base, o->sig, 16) ||
+            if (pc - base >= o->span || base > SPU_LS_SIZE - o->span ||
                 memcmp(ctx->ls + base, o->code[0].bytes, o->code[0].size))
                 continue;
             int slot = -1;
@@ -1432,10 +1442,7 @@ static int spu_overlay_resolve_reloc(spu_context* ctx, uint32_t pc)
  * writer and are immutable after publication. */
 static struct { uint32_t entry; int image_id; } s_stack_reset[16];
 unsigned g_spu_stack_reset_count;
-/* Nonzero at (entry >> 2) & 1023 of every registered entry, so SPU_DIRECT
- * (spu_context.h) can tell with one load that a transfer needs the drain's
- * stack-reset check. Collisions only cost a trampoline step. */
-uint8_t g_spu_stack_reset_hint[1024];
+uint64_t g_spu_stack_reset_hint[SPU_LS_SIZE / 256];
 void spu_register_stack_reset_entry(uint32_t entry, int image_id)
 {
     /* Registrations have one writer; publish a complete new slot before a
@@ -1446,7 +1453,8 @@ void spu_register_stack_reset_entry(uint32_t entry, int image_id)
     if (n < 16) {
         s_stack_reset[n].entry = entry & SPU_LS_MASK;
         s_stack_reset[n].image_id = image_id;
-        g_spu_stack_reset_hint[((entry & SPU_LS_MASK) >> 2) & 1023u] = 1;
+        __atomic_fetch_or(&g_spu_stack_reset_hint[(entry & SPU_LS_MASK) >> 8],
+                          1ull << (((entry & SPU_LS_MASK) >> 2) & 63u), __ATOMIC_RELAXED);
         __atomic_store_n(&g_spu_stack_reset_count, n + 1, __ATOMIC_RELEASE);
     }
 }

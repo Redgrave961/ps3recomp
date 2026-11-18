@@ -174,7 +174,7 @@ SPU_THREAD_LOCAL uint32_t g_spu_pch[8];
 SPU_THREAD_LOCAL unsigned g_spu_pch_n;
 volatile int g_spu_direct = 1;
 unsigned g_spu_stack_reset_count;
-uint8_t g_spu_stack_reset_hint[1024];
+uint64_t g_spu_stack_reset_hint[SPU_LS_SIZE / 256];
 uint32_t g_spu_depth_guard_limit = 4096;
 uint8_t* vm_base;
 
@@ -242,6 +242,15 @@ int main(void)
     ctx.status = SPU_STATUS_RUNNING;
     ctx.steps = 1;
     spu_recomp_register();
+#ifdef SPU_TEST_ALIAS_HINTS
+    for (int i = 0; i < g_ntab; i++) {
+        const uint32_t alias = (g_tab[i].a + 0x1000u) & SPU_LS_MASK;
+        int taken = 0;
+        for (int j = 0; j < g_ntab; j++) taken |= g_tab[j].a == alias;
+        if (!taken) g_spu_stack_reset_hint[alias >> 8] |= 1ull << ((alias >> 2) & 63u);
+    }
+    g_spu_stack_reset_count = 1;
+#endif
     spu_func_00000000(&ctx);
     while (g_spu_trampoline_fn) { void (*f)(spu_context*) = g_spu_trampoline_fn; g_spu_trampoline_fn = 0; f(&ctx); }
     uint64_t h = 1469598103934665603ull;
@@ -276,13 +285,13 @@ def lift(image, functions, out, promote, merge):
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def run_variant(cc, work, image, functions, harness, promote, merge, tag):
+def run_variant(cc, work, image, functions, harness, promote, merge, tag, defines=()):
     out = os.path.join(work, tag)
     lift(image, functions, out, promote, merge)
     exe = os.path.join(work, tag + (".exe" if os.name == "nt" else ""))
     cmd = [cc, "-std=gnu17", "-O2", "-msse4.1", "-w", "-I", out, "-I", os.path.join(REPO, "include"),
            "-I", os.path.join(REPO, "runtime"), "-I", os.path.join(REPO, "runtime", "spu"),
-           os.path.join(out, "spu_recomp.c"), harness, "-o", exe]
+           *defines, os.path.join(out, "spu_recomp.c"), harness, "-o", exe]
     b = subprocess.run(cmd, capture_output=True, text=True)
     if b.returncode:
         raise RuntimeError(f"{tag}: build failed\n{b.stderr[-3000:]}")
@@ -329,12 +338,17 @@ def main():
             for merge in (False, True):
                 tag = f"{'p' if promote else 'n'}{'m' if merge else 's'}"
                 results[tag] = run_variant(cc, pdir, code, functions, harness, promote, merge, tag)
+        alias = run_variant(cc, pdir, code, functions, harness, args.promote_regs, True, "pa", ("-DSPU_TEST_ALIAS_HINTS",))
         ref = results["ns"]
         if ref[0] != 0:
             print(f"program {p}: reference exited {ref[0]}: {ref[1][:200]}")
             failures += 1
             continue
         promoted += results["ps"][2].count(" sr") > 0
+        dispatches["pa"] = dispatches.get("pa", 0) + alias[3]
+        if alias[:2] != results["pm"][:2] or alias[3] != results["pm"][3]:
+            failures += 1
+            print(f"program {p} seed {args.seed}: aliased stack-reset hints changed the run ({alias[3]} vs {results['pm'][3]} dispatches)")
         for tag, res in results.items():
             dispatches[tag] = dispatches.get(tag, 0) + res[3]
             same = results["n" + tag[1]]
@@ -345,7 +359,7 @@ def main():
                     diff = [f"  {a!r} != {b!r}" for a, b in zip(want.splitlines(), got.splitlines()) if a != b][:6]
                     print(f"program {p} seed {args.seed}: variant {tag} differs\n" + "\n".join(diff))
                     break
-    print(f"{args.programs} programs x 4 variants, {promoted} with promoted registers, {failures} mismatches")
+    print(f"{args.programs} programs x 5 variants, {promoted} with promoted registers, {failures} mismatches")
     print("generic dispatches per variant: " + ", ".join(f"{k}={v}" for k, v in sorted(dispatches.items())))
     if not args.keep:
         shutil.rmtree(work, ignore_errors=True)

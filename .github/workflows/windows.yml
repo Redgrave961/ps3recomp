@@ -140,6 +140,9 @@ jobs:
           t test_spu_float_est -O2 -mavx2 -mfma $spu runtime/spu/tests/test_spu_float_est.c
           t test_spu_float_exact -O2 -msse4.1 -ffp-contract=off -UNDEBUG $spu runtime/spu/tests/test_spu_float_exact.c
           t test_spu_float_vector_scalar -O2 -msse4.1 -ffp-contract=off -UNDEBUG $spu runtime/spu/tests/test_spu_float_vector_scalar.c
+          t test_spu_float_vector_scalar_avx2 -O2 -mavx2 -mfma -ffp-contract=off -UNDEBUG $spu runtime/spu/tests/test_spu_float_vector_scalar.c
+          echo "::group::test_spu_float_vector_scalar_avx2 rz"
+          if "$RUNNER_TEMP/test_spu_float_vector_scalar_avx2.exe" 16 rz; then echo "::endgroup::"; else echo "::endgroup::"; echo "::error::test_spu_float_vector_scalar_avx2 rz failed"; fail=1; fi
           t test_spu_decode -UNDEBUG $spu runtime/spu/tests/test_spu_decode.c runtime/platform/ps3_sync.c runtime/spu/tests/spu_fixture_ppu.c -lsynchronization
           t test_spu_group_lifecycle -I include -I runtime -I runtime/syscalls -I runtime/spu -I libs/video \
             runtime/spu/tests/test_spu_group_lifecycle.c runtime/spu/tests/test_spu_group_lifecycle_win_stubs.c \

@@ -139,6 +139,10 @@ jobs:
           $CC -std=gnu17 -O2 -mavx2 -mfma -I include -I runtime/spu \
             -o /tmp/test_spu_float_est runtime/spu/tests/test_spu_float_est.c -lm
           /tmp/test_spu_float_est
+          $CC -std=gnu17 -O2 -mavx2 -mfma -ffp-contract=off -UNDEBUG -I include -I runtime/spu \
+            -o /tmp/test_spu_float_vector_scalar_avx2 runtime/spu/tests/test_spu_float_vector_scalar.c -lm
+          /tmp/test_spu_float_vector_scalar_avx2 16
+          /tmp/test_spu_float_vector_scalar_avx2 16 rz
           $CC -std=gnu17 -I include -I runtime/spu -c runtime/spu/tests/test_shared_header_data.c -o /tmp/shared_a.o
           $CXX -std=gnu++17 -I include -I runtime/spu -c runtime/spu/tests/test_shared_header_data_b.cpp -o /tmp/shared_b.o
           $CXX /tmp/shared_a.o /tmp/shared_b.o -o /tmp/test_shared_header_data
@@ -155,6 +159,9 @@ jobs:
           /tmp/test_spu_thread_image_id
           $CC $flags runtime/spu/tests/test_spu_user_event_port.c runtime/platform/ps3_sync.c -o /tmp/test_spu_user_event_port
           /tmp/test_spu_user_event_port
+          $CC $flags runtime/spu/tests/test_spu_dma_put.c runtime/spu/tests/spu_fixture_ppu.c runtime/platform/win32_compat.c \
+            runtime/platform/ps3_sync.c -o /tmp/test_spu_dma_put
+          /tmp/test_spu_dma_put
 
       - name: Network and sysutil HLE tests
         if: ${{ !cancelled() }}

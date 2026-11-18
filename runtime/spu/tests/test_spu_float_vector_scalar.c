@@ -11,6 +11,7 @@
 #include "spu_helpers.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 static uint64_t s_rng = 0x9E3779B97F4A7C15ull;
 static inline uint32_t rnd32(void)
@@ -63,6 +64,12 @@ static void check(int op, u128 a, u128 b, u128 c)
 int main(int argc, char** argv)
 {
     const long millions = argc > 1 ? atol(argv[1]) : 16;
+#if defined(SPU_MXCSR_RZ)
+    if (argc > 2 && !strcmp(argv[2], "rz")) {
+        _mm_setcsr(SPU_MXCSR_RZ);
+        g_spu_float_rz = 1;
+    }
+#endif
     /* every pair of edge words in every lane position */
     for (unsigned i = 0; i < NEDGE; i++) for (unsigned j = 0; j < NEDGE; j++) for (unsigned k = 0; k < NEDGE; k++) {
         u128 a, b, c;

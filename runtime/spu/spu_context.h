@@ -646,11 +646,16 @@ void spu_task_launch_check(spu_context* ctx, void* fn); /* SPURS task-launch    
 /* Complete ordered hop; the launch-only ABI above does not tick lockstep. */
 void spu_drain_hop(spu_context* ctx, void (*fn)(spu_context*));
 extern unsigned g_spu_stack_reset_count; /* read-only outside registration */
-extern uint8_t g_spu_stack_reset_hint[1024];
+extern uint64_t g_spu_stack_reset_hint[SPU_LS_SIZE / 256];
+static inline int spu_stack_reset_hint(uint32_t pc)
+{
+    pc &= SPU_LS_MASK;
+    return (int)((g_spu_stack_reset_hint[pc >> 8] >> ((pc >> 2) & 63u)) & 1u);
+}
 static inline int spu_stack_reset_needed(const spu_context* ctx)
 {
     unsigned count = __atomic_load_n(&g_spu_stack_reset_count, __ATOMIC_ACQUIRE);
-    return count && ctx->host_depth && g_spu_stack_reset_hint[(ctx->pc >> 2) & 1023u];
+    return count && ctx->host_depth && spu_stack_reset_hint(ctx->pc);
 }
 
 /* Wake a host thread blocked in a channel wait (channel-stall milestone). */
@@ -726,7 +731,7 @@ void spu_direct_init(void);
         const uint32_t _dpc = (uint32_t)(PC);                                 \
         (ctx)->pc = _dpc;                                                     \
         if (__builtin_expect(g_spu_direct > 0, 1) && (_dpc & SPU_LS_MASK) &&  \
-            (ctx)->steps && !g_spu_stack_reset_hint[(_dpc >> 2) & 1023u] &&    \
+            (ctx)->steps && !spu_stack_reset_hint(_dpc) &&                    \
             !((ctx)->int_enable && ((ctx)->event_status & (ctx)->event_mask))) \
             __attribute__((musttail)) return FN(ctx);                         \
         g_spu_trampoline_fn = FN;                                             \

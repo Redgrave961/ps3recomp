@@ -543,7 +543,7 @@ class SPULifter:
     def _jump(self, expr: str, ret: bool = False) -> str:
         if not self._jt_targets:
             return ""
-        guard = "!ctx->irq_saved && g_spu_direct > 0 && ctx->steps && !g_spu_stack_reset_hint[(_jt >> 2) & 1023u]"
+        guard = "!ctx->irq_saved && g_spu_direct > 0 && ctx->steps && !spu_stack_reset_hint(_jt)"
         if ret:
             guard = f"ctx->host_depth == 0 && _jt != ctx->drain_ret_pc && {guard}"
         cases = " ".join(f"case 0x{a:X}u: goto loc_{a:08X};" for a in self._jt_targets)

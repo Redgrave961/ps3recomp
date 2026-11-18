@@ -18,6 +18,7 @@
 #include "spu_context.h"
 #include "../../include/ps3emu/log_first.h"
 #include "spu_coherency.h"
+#include "spu_coh_bitmap.h"
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
@@ -36,6 +37,30 @@ static inline void spu_rsx_window_check(uint32_t ea, uint32_t size)
 {
     void (*notify)(void) = g_rsx_window_write;
     if (notify && ea < ppu_hle_inject_base + 0x10000u && (uint64_t)ea + size > ppu_hle_inject_base) notify();
+}
+
+static inline const unsigned char* mfc_coh_bits(void)
+{
+    return __atomic_load_n(&g_spu_coh_bits, __ATOMIC_ACQUIRE);
+}
+
+static inline int mfc_line_reserved(const unsigned char* bits, uint32_t addr)
+{
+    const uint32_t line = addr >> SPU_COH_LINE_SHIFT;
+    return bits && ((__atomic_load_n(&bits[line >> 3], __ATOMIC_RELAXED) >> (line & 7u)) & 1u);
+}
+
+static inline int mfc_span_reserved(const unsigned char* bits, uint32_t first, uint32_t last)
+{
+    if (!bits) return 0;
+    const uint32_t l0 = first >> SPU_COH_LINE_SHIFT, l1 = last >> SPU_COH_LINE_SHIFT;
+    const uint32_t b0 = l0 >> 3, b1 = l1 >> 3;
+    const unsigned lo = 0xFFu << (l0 & 7u), hi = 0xFFu >> (7u - (l1 & 7u));
+    if (b0 == b1) return (__atomic_load_n(&bits[b0], __ATOMIC_RELAXED) & lo & hi) != 0;
+    if (__atomic_load_n(&bits[b0], __ATOMIC_RELAXED) & lo) return 1;
+    for (uint32_t b = b0 + 1u; b < b1; b++)
+        if (__atomic_load_n(&bits[b], __ATOMIC_RELAXED)) return 1;
+    return (__atomic_load_n(&bits[b1], __ATOMIC_RELAXED) & hi) != 0;
 }
 
 static inline int mfc_ea_valid(uint64_t ea, uint32_t size)
@@ -221,20 +246,10 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
          * snapshot may be torn, so it gets its event and loses its reservation
          * rather than committing against a line it never saw whole. */
         {
-            extern int  spu_coh_is_reserved(uint32_t);
-            extern void spu_coh_notify_write(uint32_t);
-            extern void spu_coh_notify_write_except(uint32_t, const void*);
-            extern void spu_lockline_lock(uint32_t);
-            extern void spu_lockline_unlock(uint32_t);
-            extern void spu_lockline_lock_range(uint32_t, uint32_t);
-            extern void spu_lockline_unlock_range(uint32_t, uint32_t);
             uint32_t a0 = (uint32_t)ea & ~127u;
             uint32_t a1 = ((uint32_t)ea + size - 1u) & ~127u;
-            int span_reserved = 0;
-            for (uint32_t a = a0; ; a += 128u) {
-                if (spu_coh_is_reserved(a)) { span_reserved = 1; break; }
-                if (a == a1) break;
-            }
+            const unsigned char* bits = mfc_coh_bits();
+            const int span_reserved = mfc_span_reserved(bits, a0, a1);
             /* Lines the unlocked pass left for the locked one: a 16 KiB
              * transfer spans at most 129 lines. */
             uint64_t locked_lines[3] = {0, 0, 0};
@@ -244,10 +259,11 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                 for (uint32_t a = a0; ; a += 128u, i++) {
                     const uint32_t lo = a > ea32 ? a - ea32 : 0u;
                     const uint32_t hi = a + 128u - ea32 < size ? a + 128u - ea32 : size;
-                    if (spu_coh_is_reserved(a)) locked_lines[i >> 6] |= 1ull << (i & 63u);
+                    if (mfc_line_reserved(bits, a)) locked_lines[i >> 6] |= 1ull << (i & 63u);
                     else memcpy(ea_ptr + lo, ls_ptr + lo, hi - lo);
                     if (a == a1) break;
                 }
+                __atomic_signal_fence(__ATOMIC_SEQ_CST);
                 i = 0;
                 for (uint32_t a = a0; ; a += 128u, i++) {
                     const uint32_t lo = a > ea32 ? a - ea32 : 0u;
@@ -257,7 +273,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                         memcpy(ea_ptr + lo, ls_ptr + lo, hi - lo);
                         spu_coh_notify_write_except(a, spu);
                         spu_lockline_unlock(a);
-                    } else if (spu_coh_is_reserved(a)) {
+                    } else if (mfc_line_reserved(bits, a)) {
                         spu_lockline_lock(a);
                         spu_coh_notify_write_except(a, spu);
                         spu_lockline_unlock(a);
@@ -268,19 +284,23 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                 spu_lockline_lock_range((uint32_t)ea, size);
                 memcpy(ea_ptr, ls_ptr, size);
                 for (uint32_t a = a0; ; a += 128u) {
-                    if (spu_coh_is_reserved(a)) spu_coh_notify_write_except(a, spu);
+                    if (mfc_line_reserved(bits, a)) spu_coh_notify_write_except(a, spu);
                     if (a == a1) break;
                 }
                 spu_lockline_unlock_range((uint32_t)ea, size);
             } else {
                 memcpy(ea_ptr, ls_ptr, size);
-                for (uint32_t a = a0; ; a += 128u) {
-                    if (spu_coh_is_reserved(a)) {
-                        spu_lockline_lock(a);
-                        spu_coh_notify_write_except(a, spu);
-                        spu_lockline_unlock(a);
+                __atomic_signal_fence(__ATOMIC_SEQ_CST);
+                bits = mfc_coh_bits();
+                if (mfc_span_reserved(bits, a0, a1)) {
+                    for (uint32_t a = a0; ; a += 128u) {
+                        if (mfc_line_reserved(bits, a)) {
+                            spu_lockline_lock(a);
+                            spu_coh_notify_write_except(a, spu);
+                            spu_lockline_unlock(a);
+                        }
+                        if (a == a1) break;
                     }
-                    if (a == a1) break;
                 }
             }
         }

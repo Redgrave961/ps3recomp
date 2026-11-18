@@ -307,6 +307,7 @@ image* renderer::depth_as_color(surface& s, VkFormat format)
     if (!dv || !sv) return nullptr;
     VkCommandBuffer c = cmd();
     end_rendering();
+    const trace_span span(*this, c, "depth pack %ux%u", w, h);
     barrier(c, s.img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
     m_depth_pack.record(c, dv, sv, m_pack.buffer, 0, bytes, w, h, d16, s.depth_float);
     memory_barrier(c, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT,
@@ -340,6 +341,8 @@ image* renderer::native_image(surface& s, image& source)
             return nullptr;
     }
     VkCommandBuffer c = cmd();
+    end_rendering();
+    const trace_span span(*this, c, "box downscale %ux%u to %ux%u", source.width, source.height, w, h);
     barrier(c, source, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
     barrier(c, m_box, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
     m_downscale.record(c, source.view, m_box.view, w, h, source.width, source.height);
@@ -420,7 +423,6 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
         for (surface* f : m_fb.color) bound |= f == s;
         const VkImageAspectFlags aspect = s->depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
         image* source = &s->img;
-        end_rendering();
         if (bound) {
             image& snap = s->snapshot;
             path = "dummy: snapshot creation failed";
@@ -432,6 +434,8 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
                 s->snapshot_draw = ~0ull;
             }
             if (s->snapshot_draw != m_draw_counter) {
+                end_rendering();
+                const trace_span span(*this, c, "snapshot %ux%u", s->img.width, s->img.height);
                 barrier(c, s->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
                 barrier(c, snap, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
                 VkImageCopy region{};
@@ -449,6 +453,7 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
             source = native_image(*s, *source);
             if (!source) return false;
         }
+        if (!readable(*source)) end_rendering();
         barrier(c, *source, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                 VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
         const VkImageView view = view_for(*source, VK_IMAGE_VIEW_TYPE_2D, s->depth ? s->img.format : d.format, aspect, d.swizzle);
@@ -506,6 +511,8 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
         e->checked = m_epoch;
         rsx::texture_convert(d, vm_base + ea, slice.ptr, m_copies);
         end_rendering();
+        const trace_span span(*this, c, "texture upload %ux%u fmt %d %llu bytes", e->img.width, e->img.height, (int)d.format,
+                              (unsigned long long)bytes);
         barrier(c, e->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
         std::vector<VkBufferImageCopy> regions(m_copies.size());
         for (size_t i = 0; i < m_copies.size(); i++) {
@@ -520,7 +527,7 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
         if (!regions.empty())
             vkCmdCopyBufferToImage(c, slice.buffer, e->img.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, (u32)regions.size(), regions.data());
     }
-    if (e->img.layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+    if (!readable(e->img)) {
         end_rendering();
         barrier(c, e->img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                 VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);

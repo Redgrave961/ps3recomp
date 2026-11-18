@@ -57,7 +57,7 @@ DRIVER = r'''
 #include <stdio.h>
 SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*);
 volatile int g_spu_direct = 0;              /* SPU_DIRECT off: every hop drains */
-uint8_t g_spu_stack_reset_hint[1024];
+uint64_t g_spu_stack_reset_hint[SPU_LS_SIZE / 256];
 static int returned;
 void spu_indirect_branch(spu_context* ctx) { (void)ctx; returned = 1; }
 void spu_register_function(uint32_t addr, void (*fn)(spu_context*)) { (void)addr; (void)fn; }

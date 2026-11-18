@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <atomic>
 #include <memory>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -116,7 +117,12 @@ public:
     std::atomic<bool> trace_request{ false };
     ratio resolution_scale;
 
+    bool tracing() const { return m_trace != nullptr; }
+    void trace_begin(VkCommandBuffer c);
+    void trace_end(VkCommandBuffer c, const char* fmt, ...);
+
     static void barrier(VkCommandBuffer cmd, image& img, VkImageLayout layout, VkPipelineStageFlags2 stage, VkAccessFlags2 access);
+    static bool readable(const image& img);
     static void memory_barrier(VkCommandBuffer cmd, VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access, VkPipelineStageFlags2 dst_stage,
                                VkAccessFlags2 dst_access);
 
@@ -181,6 +187,11 @@ private:
     void trace_draw(u32 id, u32 prim, u32 count, bool indexed) const;
     std::FILE* m_trace = nullptr;
     u32 m_trace_draws = 0;
+    void trace_report();
+    VkQueryPool m_trace_pool = VK_NULL_HANDLE;
+    std::vector<std::string> m_trace_spans;
+    bool m_trace_open = false;
+    u32 m_trace_pass_first = 0;
     bool upload_vertices(const rsx::draw_clause& clause, u32 first, u32 count, u32 vertex_base, VkDescriptorBufferInfo& data,
                          VkDescriptorBufferInfo& layout);
     bool create_dummies();
@@ -312,6 +323,19 @@ public:
         u64 deferred_transfers, deferred_labels;
         u32 stall_ea, stall_size;
     } stats{};
+};
+
+class trace_span {
+public:
+    trace_span(renderer& r, VkCommandBuffer c, const char* fmt, ...);
+    ~trace_span();
+    trace_span(const trace_span&) = delete;
+    trace_span& operator=(const trace_span&) = delete;
+
+private:
+    renderer* m_r = nullptr;
+    VkCommandBuffer m_c = VK_NULL_HANDLE;
+    char m_label[160];
 };
 
 }
