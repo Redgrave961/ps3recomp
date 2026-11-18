@@ -787,11 +787,11 @@ void rsx_mem_store(u32 ea, const void* src, u32 size)
     if (!reserved) {
         memmove(vm_base + ea, src, size);
     } else {
-        spu_lockline_lock();
+        spu_lockline_lock_range(ea, size);
         memmove(vm_base + ea, src, size);
         for (u32 a = l0; a <= l1; a += 128u)
             if (spu_coh_is_reserved(a)) spu_coh_notify_write(a);
-        spu_lockline_unlock();
+        spu_lockline_unlock_range(ea, size);
     }
     if (g_resv_store_active > 0)
         for (u32 a = l0; a <= l1; a += 128u) ppu_resv_break_store(a);

@@ -27,11 +27,11 @@ static void* waiter(void* unused)
     double cpu = seconds(CLOCK_THREAD_CPUTIME_ID);
     double wall = seconds(CLOCK_MONOTONIC);
     atomic_store_explicit(&waiting, 1, memory_order_release);
-    spu_lockline_lock();
+    spu_lockline_lock(0x10000u);
     waiter_cpu = seconds(CLOCK_THREAD_CPUTIME_ID) - cpu;
     waiter_wall = seconds(CLOCK_MONOTONIC) - wall;
     assert(counter == 42 && mirror == ~UINT64_C(42));
-    spu_lockline_unlock();
+    spu_lockline_unlock(0x10000u);
     return NULL;
 }
 
@@ -39,11 +39,11 @@ static void* writer(void* unused)
 {
     (void)unused;
     for (unsigned i = 0; i < 50000; ++i) {
-        spu_lockline_lock();
+        spu_lockline_lock(0x10000u);
         assert(mirror == ~counter);
         ++counter;
         mirror = ~counter;
-        spu_lockline_unlock();
+        spu_lockline_unlock(0x10000u);
     }
     return NULL;
 }
@@ -51,7 +51,7 @@ static void* writer(void* unused)
 int main(void)
 {
     pthread_t thread;
-    spu_lockline_lock();
+    spu_lockline_lock(0x10000u);
     assert(pthread_create(&thread, NULL, waiter, NULL) == 0);
     while (!atomic_load_explicit(&waiting, memory_order_acquire)) {
         struct timespec delay = {0, 1000000};
@@ -61,7 +61,7 @@ int main(void)
     while (nanosleep(&hold, &hold) != 0) {}
     counter = 42;
     mirror = ~counter;
-    spu_lockline_unlock();
+    spu_lockline_unlock(0x10000u);
     assert(pthread_join(thread, NULL) == 0);
     printf("owner hold: waiter wall %.6fs, CPU %.6fs\n", waiter_wall, waiter_cpu);
     fflush(stdout);

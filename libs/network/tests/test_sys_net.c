@@ -20,8 +20,8 @@ int g_resv_store_active = 0;
 uint32_t g_ww_lo = 0, g_ww_hi = 0;
 void ppu_resv_break_store(uint64_t ea) { (void)ea; }
 int  spu_coh_is_reserved(uint32_t addr) { (void)addr; return 0; }
-void spu_lockline_lock(void) {}
-void spu_lockline_unlock(void) {}
+void spu_lockline_lock(uint32_t a) { (void)a; }
+void spu_lockline_unlock(uint32_t a) { (void)a; }
 void spu_coh_notify_write(uint32_t addr) { (void)addr; }
 void ps3_ww_report_inline(uint32_t addr, uint64_t val, int width) { (void)addr; (void)val; (void)width; }
 

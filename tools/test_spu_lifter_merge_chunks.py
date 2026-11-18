@@ -93,15 +93,15 @@ def lift(merge):
 
 
 class MergeChunkInterrupts(unittest.TestCase):
-    CHECK = ('if (ctx->int_enable && (ctx->event_status & ctx->event_mask)) '
-             '{ ctx->pc = 0x4; g_spu_trampoline_fn = spu_func_00000004; return; }')
+    CHECK = (r'loc_00000004:\n    if \(ctx->int_enable && \(ctx->event_status & ctx->event_mask\)\) '
+             r'\{ ctx->pc = 0x4; (ctx->gpr\[\d+\] = sr\d+; )*g_spu_trampoline_fn = spu_func_00000004; return; \}')
 
     def body(self, lifter, addr):
         return '\n'.join(next(f for f in lifter.functions if f.start_addr == addr).body_lines)
 
     def test_merged_entry_checks_for_pending_interrupt(self):
         merged = self.body(lift(True), 0)
-        self.assertIn('loc_00000004:\n    ' + self.CHECK, merged)
+        self.assertRegex(merged, self.CHECK)
         self.assertIn('goto loc_00000004;', merged)
 
     def test_unmerged_output_has_no_entry_check(self):

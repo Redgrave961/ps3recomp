@@ -97,11 +97,11 @@ static spu_context g_spu_b;
 static void spu_getllar(spu_context* ctx, uint32_t ea)
 {
     ea &= ~127u;
-    spu_lockline_lock();
+    spu_lockline_lock(ea);
     spu_coh_reserve(ctx, ea);
     ctx->resv_ea = ea;
     ctx->resv_valid = 1;
-    spu_lockline_unlock();
+    spu_lockline_unlock(ea);
 }
 
 static void spu_reset(spu_context* ctx, uint32_t spu_id)

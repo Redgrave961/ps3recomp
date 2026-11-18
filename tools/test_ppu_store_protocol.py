@@ -35,30 +35,31 @@ void* coh_ctx(void) { return calloc(1, sizeof(spu_context)); }
 void coh_reserve(void* p, uint32_t ea, uint8_t* copy)
 {
     spu_context* c = (spu_context*)p;
-    spu_lockline_lock();
+    spu_lockline_lock(ea);
     spu_coh_reserve(c, ea);
     memcpy(copy, vm_base + (ea & ~127u), 128);
     c->resv_ea = ea & ~127u;
     c->resv_valid = 1;
-    spu_lockline_unlock();
+    spu_lockline_unlock(ea);
 }
 int coh_lost(void* p)
 {
     spu_context* c = (spu_context*)p;
-    spu_lockline_lock();
+    const uint32_t ea = c->resv_ea;
+    spu_lockline_lock(ea);
     const int lost = !c->resv_valid && (c->event_status & SPU_EVENT_LR);
     c->resv_valid = 0;
     SPU_EVENT_CLEAR(c, SPU_EVENT_LR);
-    spu_lockline_unlock();
+    spu_lockline_unlock(ea);
     return lost;
 }
-static void notify(uint32_t a) { spu_lockline_lock(); spu_coh_notify_write(a); spu_lockline_unlock(); }
+static void notify(uint32_t a) { spu_lockline_lock(a); spu_coh_notify_write(a); spu_lockline_unlock(a); }
 void ppu_store_recheck(uint64_t ea) { if (spu_coh_line_reserved((uint32_t)ea)) notify((uint32_t)ea); }
 void vm_write32(uint64_t ea, uint32_t v)
 {
     const uint32_t a = (uint32_t)ea;
     v = __builtin_bswap32(v);
-    if (spu_coh_line_reserved(a)) { spu_lockline_lock(); memcpy(vm_base + a, &v, 4); spu_coh_notify_write(a); spu_lockline_unlock(); return; }
+    if (spu_coh_line_reserved(a)) { spu_lockline_lock(a); memcpy(vm_base + a, &v, 4); spu_coh_notify_write(a); spu_lockline_unlock(a); return; }
     memcpy(vm_base + a, &v, 4);
     __atomic_signal_fence(__ATOMIC_SEQ_CST);
     if (spu_coh_line_reserved(a)) notify(a);

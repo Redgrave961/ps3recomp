@@ -21,6 +21,7 @@ namespace {
 
 constexpr u32 k_page_shift = 12;
 constexpr u32 k_region_shift = 20;
+constexpr u32 k_merge_gap = 1;
 
 u32 texel_bytes(VkFormat f)
 {
@@ -141,9 +142,16 @@ void renderer::watch(u32 ea, u32 size)
     if (m_page_stamp.empty()) {
         m_page_stamp.assign(1u << (32 - k_page_shift), 0u);
         m_region_batch.assign(1u << (32 - k_region_shift), ~0ull);
+        m_region_used.assign(1u << (32 - k_region_shift), ~0ull);
     }
     const u64 batch = rsx_core_batch();
+    if (batch != m_scan_batch) prescan(batch);
     const u32 last = (u32)(((uint64_t)ea + size - 1u) >> k_region_shift);
+    for (u32 r = ea >> k_region_shift; r <= last; r++) {
+        if (m_region_used[r] == batch) continue;
+        m_region_used[r] = batch;
+        m_hot.push_back(r);
+    }
     for (u32 r = ea >> k_region_shift; r <= last; r++) {
         if (m_region_batch[r] == batch) continue;
         u32 end = r;
@@ -156,6 +164,21 @@ void renderer::watch(u32 ea, u32 size)
         for (u32 k = r; k <= end; k++) m_region_batch[k] = batch;
         r = end;
     }
+}
+
+void renderer::prescan(u64 batch)
+{
+    m_scan_batch = batch;
+    std::sort(m_hot.begin(), m_hot.end());
+    for (size_t i = 0; i < m_hot.size();) {
+        const u32 r = m_hot[i];
+        u32 end = r;
+        while (++i < m_hot.size() && m_hot[i] <= end + 1u + k_merge_gap) end = m_hot[i];
+        stats.scans++;
+        if (!scan_writes(r << k_region_shift, (end - r + 1) << k_region_shift, m_page_stamp, m_stamp)) continue;
+        for (u32 k = r; k <= end; k++) m_region_batch[k] = batch;
+    }
+    m_hot.clear();
 }
 
 bool renderer::memory_changed(u32 ea, u32 size, u32 stamp)

@@ -14,8 +14,8 @@ uint32_t ppu_load_elf(const char*);
 /* These subsystems are inactive in a loader-only fixture. */
 int spu_coh_is_reserved(uint32_t) { return 0; }
 void spu_coh_notify_write(uint32_t) { std::abort(); }
-void spu_lockline_lock(void) { std::abort(); }
-void spu_lockline_unlock(void) { std::abort(); }
+void spu_lockline_lock(uint32_t) { std::abort(); }
+void spu_lockline_unlock(uint32_t) { std::abort(); }
 void spu_raw_reg_store(uint32_t, uint32_t, unsigned) { std::abort(); }
 HANDLE CreateThread(void*, SIZE_T, PS3_THREAD_FN, LPVOID, DWORD, DWORD*) { std::abort(); }
 BOOL CloseHandle(HANDLE) { std::abort(); }

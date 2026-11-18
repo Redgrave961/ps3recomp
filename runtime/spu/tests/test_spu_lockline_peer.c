@@ -17,16 +17,6 @@
  * cases that must stay quiet are here for the same reason they are in the PPU
  * test -- an over-eager notify is a livelock, not a safe approximation.
  *
- * The last test is the event acknowledge. An SPU acknowledging the events it
- * has read is a read-modify-write of the same word every one of those raises
- * writes, so an edge landing between the read and the write is dropped and the
- * SPU goes back to sleep holding a reservation it has already lost. The
- * interleaving is built with the lock-line lock rather than raced for: the main
- * thread takes the lock, a second thread starts the acknowledge and is held at
- * that lock, that the acknowledge has NOT completed while the lock is held is
- * asserted, the raise then happens under the lock, and only afterwards is the
- * acknowledge let through.
- *
  * Two more, after the PUTLLUC cases, cover the GETLLAR that skips the lock
  * (spu_coh_reserve_fast): that it really is lock-free for a registered holder
  * on a marked line and still waits otherwise, and -- raced for real this
@@ -289,15 +279,15 @@ static void* llar_thread(void* arg)
 }
 
 /* 1 if a GETLLAR of ea by g_a completed while this thread held the lock. */
-static int llar_completes_under_held_lock(uint32_t ea)
+static int llar_completes_under_held_lock(uint32_t ea, uint32_t held)
 {
     atomic_store(&g_llar_ea_sel, (int)ea);
     atomic_store(&g_llar_entered, 0);
     atomic_store(&g_llar_done, 0);
-    spu_lockline_lock();
+    spu_lockline_lock(held);
     pthread_t t;
     if (pthread_create(&t, NULL, llar_thread, NULL) != 0) {
-        spu_lockline_unlock();
+        spu_lockline_unlock(held);
         return -1;
     }
     while (!atomic_load(&g_llar_entered)) YieldProcessor();
@@ -306,7 +296,7 @@ static int llar_completes_under_held_lock(uint32_t ea)
      * the harness's 30 s timeout killed a passing run. */
     for (int i = 0; i < 200 && !atomic_load(&g_llar_done); i++) Sleep(10);
     int done = atomic_load(&g_llar_done);
-    spu_lockline_unlock();
+    spu_lockline_unlock(held);
     pthread_join(t, NULL);
     return done;
 }
@@ -320,10 +310,10 @@ static void test_registered_getllar_skips_the_lock(void)
     TEST("a registered holder's GETLLAR of a marked line skips the lock when no writer holds it");
     uint32_t seq;
     CHECK(spu_coh_reserve_fast(&g_a, LINE_A, &seq) == 1);
-    CHECK(spu_lockline_unchanged(seq));
+    CHECK(spu_lockline_unchanged(LINE_A, seq));
 
     TEST("...and waits out a writer's open critical section instead of copying through it");
-    CHECK(llar_completes_under_held_lock(LINE_A) == 0);
+    CHECK(llar_completes_under_held_lock(LINE_A, LINE_A) == 0);
     CHECK(g_a.resv_valid == 1);
     CHECK_EQ_U32(g_a.resv_ea, LINE_A);
     CHECK_EQ_U32(g_a.ls[LSA_A + 5], 0x77);
@@ -339,7 +329,7 @@ static void test_registered_getllar_skips_the_lock(void)
     /* LINE_B has never been reserved, so its mark is set by this GETLLAR and
      * must be set under the lock. */
     TEST("a GETLLAR of an unmarked line still takes the lock");
-    CHECK(llar_completes_under_held_lock(LINE_B + 0x80) == 0);
+    CHECK(llar_completes_under_held_lock(LINE_B + 0x80, LINE_B + 0x80) == 0);
     CHECK(g_a.resv_valid == 1);
     CHECK_EQ_U32(g_a.resv_ea, LINE_B + 0x80);
 
@@ -348,8 +338,13 @@ static void test_registered_getllar_skips_the_lock(void)
     TEST("an unregistered context's GETLLAR of a marked line still takes the lock");
     spu_coh_unregister(&g_a);
     CHECK(g_a.coh_listed == 0);
-    CHECK(llar_completes_under_held_lock(LINE_A) == 0);
+    CHECK(llar_completes_under_held_lock(LINE_A, LINE_A) == 0);
     CHECK(g_a.coh_listed == 1);
+
+    TEST("a GETLLAR of an unmarked line does not wait for another line's lock");
+    CHECK(llar_completes_under_held_lock(LINE_B + 0x100, LINE_A) == 1);
+    CHECK(g_a.resv_valid == 1);
+    CHECK_EQ_U32(g_a.resv_ea, LINE_B + 0x100);
 }
 
 /* A write racing a lock-free GETLLAR, for real. Two threads are released
@@ -385,10 +380,10 @@ static void* race_writer(void* arg)
         race_delay((unsigned)(k * 13) & 31u);
         const uint8_t v = (uint8_t)(k % 255 + 1);
         if (k & 1) {
-            spu_lockline_lock();
+            spu_lockline_lock(LINE_A);
             memset(g_guest_mem + LINE_A, v, 128);
             spu_coh_notify_write(LINE_A);
-            spu_lockline_unlock();
+            spu_lockline_unlock(LINE_A);
         } else {
             memset(g_b.ls + LSA_B, v, 128);
             spu_atomic(&g_b, LSA_B, LINE_A, MFC_PUTLLUC_CMD);
@@ -559,22 +554,7 @@ static void test_unaligned_wide_put_around_a_reserved_line(void)
     CHECK(untouched);
 }
 
-/* ===========================================================================
- * The event acknowledge against a concurrent raise
- *
- * Built with the lock rather than raced for. The main thread holds the
- * lock-line lock, so the acknowledge cannot get past it, and that it has not
- * completed is asserted -- which is what makes the interleaving a fact of the
- * run rather than a hope. The raise then happens under the same lock, and the
- * acknowledge is let through afterwards: exactly the order that loses the edge
- * when the acknowledge is a bare read-modify-write.
- *
- * The two waits below decide nothing. An acknowledge that has not started yet
- * lands after the raise and keeps it just the same; what the assertion rules
- * out is the acknowledge COMPLETING while the lock is held, which is the only
- * way the raise can be read, overwritten and lost.
- * ===========================================================================*/
-#define ACK_TAG_EVENT  0x1u    /* MFC tag-status update: what the ack asks for */
+#define ACK_TAG_EVENT  0x1u
 
 static volatile int g_ack_entered;
 static volatile int g_ack_done;
@@ -595,36 +575,148 @@ static void test_ack_keeps_a_concurrent_raise(void)
     g_ack_done = 0;
 
     spu_atomic(&g_a, LSA_A, LINE_A, MFC_GETLLAR_CMD);
-    g_a.event_status = ACK_TAG_EVENT;      /* the event the SPU is acking */
+    g_a.event_status = ACK_TAG_EVENT;
 
-    spu_lockline_lock();
+    spu_lockline_lock(LINE_A);
 
     pthread_t t;
     if (pthread_create(&t, NULL, ack_thread, NULL) != 0) {
-        spu_lockline_unlock();
+        spu_lockline_unlock(LINE_A);
         TEST("the acknowledging thread starts");
         CHECK(0);
         return;
     }
 
-    while (!g_ack_entered) YieldProcessor();
-    Sleep(2);                              /* time to arrive at the lock */
+    for (int i = 0; i < 200 && !g_ack_done; i++) Sleep(10);
 
-    TEST("the acknowledge cannot complete while the lock-line lock is held");
-    CHECK(g_ack_done == 0);
-    CHECK_EQ_U32(g_a.event_status, ACK_TAG_EVENT);
+    TEST("the acknowledge does not wait for a lock-line lock");
+    CHECK(g_ack_done == 1);
+    CHECK_EQ_U32(g_a.event_status, 0);
 
-    /* The raise a peer's commit would make, under the lock that peer holds. */
     spu_coh_notify_write(LINE_A);
-    CHECK_EQ_U32(g_a.event_status, ACK_TAG_EVENT | SPU_EVENT_LR);
-
-    spu_lockline_unlock();
+    spu_lockline_unlock(LINE_A);
     pthread_join(t, NULL);
 
-    TEST("the acknowledge clears what it asked for and keeps the raise");
-    CHECK(g_ack_done == 1);
+    TEST("a raise after the acknowledge is kept");
     CHECK_EQ_U32(g_a.event_status, SPU_EVENT_LR);
     CHECK(g_a.resv_valid == 0);
+
+    TEST("an acknowledge after a raise clears only what it asks for");
+    g_a.event_status = ACK_TAG_EVENT | SPU_EVENT_LR;
+    wrch(&g_a, SPU_WrEventAck, ACK_TAG_EVENT);
+    CHECK_EQ_U32(g_a.event_status, SPU_EVENT_LR);
+}
+
+#define ACK_RACE_ROUNDS 200000
+static atomic_int g_ack_race_go, g_ack_race_acked, g_ack_race_raised;
+
+static void* ack_race_acker(void* arg)
+{
+    (void)arg;
+    for (int k = 1; k <= ACK_RACE_ROUNDS; k++) {
+        while (atomic_load(&g_ack_race_go) != k) sched_yield();
+        wrch(&g_a, SPU_WrEventAck, ACK_TAG_EVENT);
+        atomic_store(&g_ack_race_acked, k);
+    }
+    return NULL;
+}
+
+static void* ack_race_raiser(void* arg)
+{
+    (void)arg;
+    for (int k = 1; k <= ACK_RACE_ROUNDS; k++) {
+        while (atomic_load(&g_ack_race_go) != k) sched_yield();
+        SPU_EVENT_SET(&g_a, SPU_EVENT_LR);
+        atomic_store(&g_ack_race_raised, k);
+    }
+    return NULL;
+}
+
+static void test_ack_races_a_raise(void)
+{
+    reset_pair();
+    atomic_store(&g_ack_race_go, 0);
+    atomic_store(&g_ack_race_acked, 0);
+    atomic_store(&g_ack_race_raised, 0);
+    pthread_t a, r;
+    if (pthread_create(&a, NULL, ack_race_acker, NULL) || pthread_create(&r, NULL, ack_race_raiser, NULL)) {
+        TEST("the racing threads start");
+        CHECK(0);
+        return;
+    }
+    int lost = 0;
+    for (int k = 1; k <= ACK_RACE_ROUNDS; k++) {
+        g_a.event_status = ACK_TAG_EVENT;
+        atomic_store(&g_ack_race_go, k);
+        while (atomic_load(&g_ack_race_acked) != k || atomic_load(&g_ack_race_raised) != k) sched_yield();
+        if (g_a.event_status != SPU_EVENT_LR) lost++;
+    }
+    pthread_join(a, NULL);
+    pthread_join(r, NULL);
+    TEST("an acknowledge racing a raise never loses the raise or keeps the acknowledged bit");
+    CHECK(lost == 0);
+}
+
+
+#define STRIPE_THREADS 4
+#define STRIPE_ROUNDS  20000
+#define STRIPE_SHARED  0x00030000u
+#define STRIPE_OWN     0x00031000u
+static spu_context g_stripe_ctx[STRIPE_THREADS];
+static atomic_int g_stripe_go;
+
+static void stripe_increment(spu_context* ctx, uint32_t ea)
+{
+    for (;;) {
+        spu_atomic(ctx, LSA_A, ea, MFC_GETLLAR_CMD);
+        uint32_t v;
+        memcpy(&v, ctx->ls + LSA_A, 4);
+        v++;
+        memcpy(ctx->ls + LSA_A, &v, 4);
+        spu_atomic(ctx, LSA_A, ea, MFC_PUTLLC_CMD);
+        if (ctx->atomic_stat == 0) return;
+    }
+}
+
+static void* stripe_worker(void* arg)
+{
+    spu_context* ctx = (spu_context*)arg;
+    const uint32_t own = STRIPE_OWN + 0x80u * (uint32_t)(ctx - g_stripe_ctx);
+    while (!atomic_load(&g_stripe_go)) sched_yield();
+    for (int k = 0; k < STRIPE_ROUNDS; k++) {
+        stripe_increment(ctx, STRIPE_SHARED);
+        stripe_increment(ctx, own);
+    }
+    return NULL;
+}
+
+static void test_concurrent_putllc_on_shared_and_own_lines(void)
+{
+    memset(g_guest_mem + STRIPE_SHARED, 0, 128);
+    memset(g_guest_mem + STRIPE_OWN, 0, 0x80u * STRIPE_THREADS);
+    atomic_store(&g_stripe_go, 0);
+    pthread_t t[STRIPE_THREADS];
+    for (int i = 0; i < STRIPE_THREADS; i++) {
+        reset_ctx(&g_stripe_ctx[i], 2u + (uint32_t)i);
+        if (pthread_create(&t[i], NULL, stripe_worker, &g_stripe_ctx[i])) {
+            TEST("the PUTLLC workers start");
+            CHECK(0);
+            return;
+        }
+    }
+    atomic_store(&g_stripe_go, 1);
+    for (int i = 0; i < STRIPE_THREADS; i++) pthread_join(t[i], NULL);
+    uint32_t shared;
+    memcpy(&shared, g_guest_mem + STRIPE_SHARED, 4);
+    TEST("concurrent PUTLLC increments on one line are never lost");
+    CHECK_EQ_U32(shared, (uint32_t)(STRIPE_THREADS * STRIPE_ROUNDS));
+    TEST("concurrent PUTLLC increments on distinct lines are each exact");
+    for (int i = 0; i < STRIPE_THREADS; i++) {
+        uint32_t own;
+        memcpy(&own, g_guest_mem + STRIPE_OWN + 0x80u * (uint32_t)i, 4);
+        CHECK_EQ_U32(own, (uint32_t)STRIPE_ROUNDS);
+    }
+    for (int i = 0; i < STRIPE_THREADS; i++) spu_coh_unregister(&g_stripe_ctx[i]);
 }
 
 
@@ -657,10 +749,10 @@ static void test_producer_keeps_peer_event(unsigned bit)
     g_raise_mode = bit;
     atomic_store(&g_raise_entered, 0);
     atomic_store(&g_raise_done, 0);
-    spu_lockline_lock();
+    spu_lockline_lock(LINE_A);
     pthread_t t;
     if (pthread_create(&t, NULL, raise_thread, NULL)) {
-        spu_lockline_unlock(); CHECK(0); return;
+        spu_lockline_unlock(LINE_A); CHECK(0); return;
     }
     while (!atomic_load(&g_raise_entered)) YieldProcessor();
     Sleep(10);
@@ -668,7 +760,7 @@ static void test_producer_keeps_peer_event(unsigned bit)
      * write is an atomic OR/AND, so it need not, and may already be done. What
      * must hold either way is checked below: neither bit is lost. */
     spu_coh_notify_write(LINE_A);
-    spu_lockline_unlock();
+    spu_lockline_unlock(LINE_A);
     pthread_join(t, NULL);
     TEST("MFC notification retains the concurrent reservation event");
     CHECK_EQ_U32(g_a.event_status, bit | SPU_EVENT_LR);
@@ -694,6 +786,8 @@ int main(void)
     test_wide_put_finds_the_reserved_line();
     test_unaligned_wide_put_around_a_reserved_line();
     test_ack_keeps_a_concurrent_raise();
+    test_ack_races_a_raise();
+    test_concurrent_putllc_on_shared_and_own_lines();
     test_producer_keeps_peer_event(2);
     test_producer_keeps_peer_event(1);
 

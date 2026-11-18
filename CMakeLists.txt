@@ -57,12 +57,7 @@ file(GLOB_RECURSE RUNTIME_SOURCES
 #  - the PPU boot scaffold (runtime/ppu/): compiled by the port against the
 #    lifter-generated ppu_recomp.h, not as part of the runtime library. See
 #    docs/PPU_RECOMP.md.
-#  - spu_dispatch_mt.c: the musttail SPU indirect-branch fast path. It uses
-#    __attribute__((musttail)), which MSVC cannot parse, and it must be compiled
-#    *inside the game build* by clang so the tail call is guaranteed -- a plain
-#    call leaks one resolver frame per guest loop iteration. The port adds it to
-#    its own target.
-list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/tests/|/runtime/ppu/|/spu_dispatch_mt\.c$")
+list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/tests/|/runtime/ppu/")
 
 # ---------------------------------------------------------------------------
 # Static library

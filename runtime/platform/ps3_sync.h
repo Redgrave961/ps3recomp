@@ -18,6 +18,9 @@ int  ps3_futex_wait(volatile uint32_t* addr, uint32_t expected, uint64_t deadlin
 void ps3_futex_wake_one(volatile uint32_t* addr);
 void ps3_futex_wake_all(volatile uint32_t* addr);
 
+int  ps3_brief_wait(volatile uint32_t* addr, uint32_t expected, uint64_t us);
+void ps3_brief_wake(volatile uint32_t* addr);
+
 typedef struct ps3_lock { volatile uint32_t v; } ps3_lock;
 
 void ps3_lock_slow(ps3_lock* l, unsigned spin);

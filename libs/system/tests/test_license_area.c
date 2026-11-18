@@ -13,8 +13,8 @@ void ppu_resv_break_store(uint64_t ea) { (void)ea; }
 void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
 int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
 void spu_coh_notify_write(uint32_t a) { (void)a; }
-void spu_lockline_lock(void) {}
-void spu_lockline_unlock(void) {}
+void spu_lockline_lock(uint32_t a) { (void)a; }
+void spu_lockline_unlock(uint32_t a) { (void)a; }
 void cellMsgDialog_tick(void) {}
 /* cellSysutil.c declares vm_write32 extern (the runtime defines it); the test stores the word big-endian like the runtime. */
 void vm_write32(uint64_t a, uint32_t v) { for (int i = 0; i < 4; i++) vm_base[a + i] = (uint8_t)(v >> (24 - 8 * i)); }

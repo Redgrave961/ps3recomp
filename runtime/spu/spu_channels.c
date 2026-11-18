@@ -475,10 +475,10 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         int llar_fast = spu_coh_reserve_fast(ctx, ea, &llar_seq);
         if (llar_fast) {
             memcpy(ls, mem, MFC_ATOMIC_LINE);
-            llar_fast = spu_lockline_unchanged(llar_seq);
+            llar_fast = spu_lockline_unchanged(ea, llar_seq);
         }
         if (!llar_fast) {
-            spu_lockline_lock();
+            spu_lockline_lock(ea);
             /* Tell the PPU store paths this line is live, so a store into it goes
              * through the lock and raises SPU_EVENT_LR here instead of landing
              * unannounced. Nothing else about this transaction changes. */
@@ -501,11 +501,11 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * GETLLAR until that bit is set, and spun forever on 0. PUTLLUC is 2. */
         if (!llar_fast) { ctx->resv_ea = ea; ctx->resv_valid = 1; }   /* the fast path published it already */
         ctx->atomic_stat = 4;
-        if (!llar_fast) spu_lockline_unlock();
+        if (!llar_fast) spu_lockline_unlock(ea);
         return 1;
 
     case MFC_PUTLLC_CMD:
-        spu_lockline_lock();
+        spu_lockline_lock(ea);
         if (ctx->resv_valid && ctx->resv_ea == ea &&
             memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) == 0) {
             memcpy(mem, ls, MFC_ATOMIC_LINE);          /* commit local store */
@@ -528,7 +528,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
             ctx->atomic_stat = 1;                      /* PUTLLC_FAILURE -> retry */
         }
         ctx->resv_valid = 0;                           /* reservation consumed */
-        spu_lockline_unlock();
+        spu_lockline_unlock(ea);
         if (ctx->atomic_stat == 0) {
             spu_rsx_window_check(ea, MFC_ATOMIC_LINE);
         }
@@ -536,7 +536,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
 
     case MFC_PUTLLUC_CMD:
     case MFC_PUTQLLUC_CMD:
-        spu_lockline_lock();
+        spu_lockline_lock(ea);
         memcpy(mem, ls, MFC_ATOMIC_LINE);              /* unconditional store */
         /* Unconditional, so it invalidates EVERY reservation on the line --
          * this SPU's included, which is why the notify runs before the
@@ -545,7 +545,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * has already overwritten. */
         spu_coh_notify_write(ea);
         ctx->resv_valid = 0; ctx->atomic_stat = 2;   /* PUTLLUC complete */
-        spu_lockline_unlock();
+        spu_lockline_unlock(ea);
         spu_rsx_window_check(ea, MFC_ATOMIC_LINE);
         return 1;
 
@@ -644,15 +644,6 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
                              ctx->dec_base_ns = spu_host_ns();              break;
     case SPU_WrEventMask:    ctx->event_mask = v;                           break; /* WrEventMask */
     case SPU_WrEventAck:
-        /* Under the lock-line lock, because every producer of the LR bit sets
-         * it under that lock: the PPU coherent store, and a peer SPU's PUTLLC,
-         * PUTLLUC or plain PUT. A bare read-modify-write here can read
-         * event_status, have a concurrent |= SPU_EVENT_LR land in between, and
-         * write the stale value back. The edge is then gone, and an SPU that
-         * has just acknowledged the events it read goes back to sleep believing
-         * it still holds a reservation it has already lost, which is the parked
-         * SPURS kernel this whole mechanism exists to wake. */
-        spu_lockline_lock();
         SPU_EVENT_CLEAR(ctx, v);
         /* A stall-and-notify nobody has read yet stays pending. We run a
          * resumed list inline, inside the MFC_WrListStallAck that resumes it,
@@ -662,7 +653,6 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
          * (list_stall_stat set, Sn clear). */
         if ((v & 0x2u) && ctx->list_stall_stat)
             SPU_EVENT_SET(ctx, 0x2u);
-        spu_lockline_unlock();
         break;
     case SPU_WrSRR0:         ctx->srr0 = v & 0x3FFFCu;   /* a word-aligned LS address */ break;
     default:
@@ -1046,7 +1036,7 @@ static void spu_report_cross_image(uint32_t addr, int want, int got)
             "issue #59.\n", addr, want, got);
 }
 
-spu_fn spu_lookup(uint32_t addr, int image_id)   /* exported: clang-built fast-path dispatch (spu_dispatch_mt.c) needs it */
+spu_fn spu_lookup(uint32_t addr, int image_id)
 {
     /* Match the context's active image; image_id 0 (context or entry) matches
      * any, for back-compat with single-image contexts. */

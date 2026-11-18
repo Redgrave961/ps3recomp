@@ -287,6 +287,7 @@ private:
     bool memory_changed(u32 ea, u32 size, u32 stamp);
     u32 refresh(u32 ea, u32 size, u32 stamp, uint8_t* dst);
     void watch(u32 ea, u32 size);
+    void prescan(u64 batch);
     void mark_written(u32 ea, u32 size);
 
     unit_binding m_units[rsx::TEXTURES + rsx::VERTEX_TEXTURES];
@@ -295,6 +296,9 @@ private:
     std::unordered_map<uint64_t, VkSampler> m_samplers;
     std::vector<u32> m_page_stamp;
     std::vector<u64> m_region_batch;
+    std::vector<u64> m_region_used;
+    std::vector<u32> m_hot;
+    u64 m_scan_batch = ~0ull;
     u32 m_stamp = 1;
     u64 m_epoch = 1;
     u64 m_flips = 0;

@@ -36,12 +36,10 @@ extern "C" {
 /* SPU external event: lock-line reservation lost. */
 #define SPU_EVENT_LR  0x400u
 
-/* The lock-line lock. One process-wide spinlock serializing every lock-line
- * transaction, SPU and PPU alike: the SPU's GETLLAR snapshot and PUTLLC
- * compare-and-commit, and a PPU store or stwcx to a line some SPU has
- * reserved. The critical sections are two 128-byte memcpy and a memcmp. */
-void spu_lockline_lock(void);
-void spu_lockline_unlock(void);
+void spu_lockline_lock(uint32_t ea);
+void spu_lockline_unlock(uint32_t ea);
+void spu_lockline_lock_range(uint32_t ea, uint32_t size);
+void spu_lockline_unlock_range(uint32_t ea, uint32_t size);
 
 /* Mark `ea`'s 128-byte line as SPU-reserved and remember `ctx` as a possible
  * reservation holder. Called from the SPU's GETLLAR with the lock held.
@@ -56,7 +54,7 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea);
  * Returns 0 when the caller must take the lock and call spu_coh_reserve
  * instead. On 1 the caller copies the line, also without the lock. */
 int spu_coh_reserve_fast(spu_context* ctx, uint32_t ea, uint32_t* seq);
-int spu_lockline_unchanged(uint32_t seq);
+int spu_lockline_unchanged(uint32_t ea, uint32_t seq);
 
 /* Is `addr`'s line marked? The PPU store fast path -- a range-free O(1) bitmap
  * lookup guarded by a global that is zero until the first GETLLAR. */

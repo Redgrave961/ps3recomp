@@ -164,11 +164,13 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
          * cannot detect that a peer's reservation was lost. Issuer exclusion
          * follows the existing plain-MFC-write model; issuer reservation
          * behavior for storage controls is not separately modeled here. */
-        spu_lockline_lock();
-        memset(vm_base + (uint32_t)ea, 0, size);
-        for (uint32_t offset = 0; offset < size; offset += 128u)
-            spu_coh_notify_write_except((uint32_t)ea + offset, spu);
-        spu_lockline_unlock();
+        for (uint32_t offset = 0; offset < size; offset += 128u) {
+            const uint32_t line = (uint32_t)ea + offset;
+            spu_lockline_lock(line);
+            memset(vm_base + line, 0, 128u);
+            spu_coh_notify_write_except(line, spu);
+            spu_lockline_unlock(line);
+        }
         return 0;
     }
     if (!size) return 0;
@@ -222,8 +224,10 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
             extern int  spu_coh_is_reserved(uint32_t);
             extern void spu_coh_notify_write(uint32_t);
             extern void spu_coh_notify_write_except(uint32_t, const void*);
-            extern void spu_lockline_lock(void);
-            extern void spu_lockline_unlock(void);
+            extern void spu_lockline_lock(uint32_t);
+            extern void spu_lockline_unlock(uint32_t);
+            extern void spu_lockline_lock_range(uint32_t, uint32_t);
+            extern void spu_lockline_unlock_range(uint32_t, uint32_t);
             uint32_t a0 = (uint32_t)ea & ~127u;
             uint32_t a1 = ((uint32_t)ea + size - 1u) & ~127u;
             int span_reserved = 0;
@@ -244,35 +248,37 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                     else memcpy(ea_ptr + lo, ls_ptr + lo, hi - lo);
                     if (a == a1) break;
                 }
-                spu_lockline_lock();
                 i = 0;
                 for (uint32_t a = a0; ; a += 128u, i++) {
                     const uint32_t lo = a > ea32 ? a - ea32 : 0u;
                     const uint32_t hi = a + 128u - ea32 < size ? a + 128u - ea32 : size;
                     if ((locked_lines[i >> 6] >> (i & 63u)) & 1u) {
+                        spu_lockline_lock(a);
                         memcpy(ea_ptr + lo, ls_ptr + lo, hi - lo);
                         spu_coh_notify_write_except(a, spu);
+                        spu_lockline_unlock(a);
                     } else if (spu_coh_is_reserved(a)) {
-                        spu_coh_notify_write_except(a, spu);   /* reserved after its copy */
+                        spu_lockline_lock(a);
+                        spu_coh_notify_write_except(a, spu);
+                        spu_lockline_unlock(a);
                     }
                     if (a == a1) break;
                 }
-                spu_lockline_unlock();
             } else if (span_reserved) {
-                spu_lockline_lock();
+                spu_lockline_lock_range((uint32_t)ea, size);
                 memcpy(ea_ptr, ls_ptr, size);
                 for (uint32_t a = a0; ; a += 128u) {
                     if (spu_coh_is_reserved(a)) spu_coh_notify_write_except(a, spu);
                     if (a == a1) break;
                 }
-                spu_lockline_unlock();
+                spu_lockline_unlock_range((uint32_t)ea, size);
             } else {
                 memcpy(ea_ptr, ls_ptr, size);
                 for (uint32_t a = a0; ; a += 128u) {
                     if (spu_coh_is_reserved(a)) {
-                        spu_lockline_lock();
+                        spu_lockline_lock(a);
                         spu_coh_notify_write_except(a, spu);
-                        spu_lockline_unlock();
+                        spu_lockline_unlock(a);
                     }
                     if (a == a1) break;
                 }

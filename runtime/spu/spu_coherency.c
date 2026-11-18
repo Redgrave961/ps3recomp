@@ -12,6 +12,7 @@
  */
 
 #include <stdlib.h>
+#include <string.h>
 #include "spu_coherency.h"
 #include "spu_coh_bitmap.h"
 #include "../memory/vm_page_map.h"
@@ -27,22 +28,76 @@ extern "C" {
 
 #include "../platform/ps3_sync.h"
 
-static struct { ps3_lock lock; uint32_t seq; } g_lockline;
-void spu_lockline_lock(void)
+#define SPU_LL_STRIPES 256u
+
+typedef struct {
+    ps3_lock lock;
+    uint32_t seq;
+} __attribute__((aligned(64))) spu_ll_stripe;
+
+static spu_ll_stripe g_stripes[SPU_LL_STRIPES];
+
+static inline unsigned spu_ll_index(uint32_t ea) { return (ea >> SPU_COH_LINE_SHIFT) & (SPU_LL_STRIPES - 1u); }
+
+static void spu_ll_acquire(spu_ll_stripe* s)
 {
-    ps3_lock_acquire(&g_lockline.lock);
-    __atomic_store_n(&g_lockline.seq, g_lockline.seq + 1, __ATOMIC_RELAXED);
+    ps3_lock_acquire(&s->lock);
+    __atomic_store_n(&s->seq, s->seq + 1, __ATOMIC_RELAXED);
     __atomic_thread_fence(__ATOMIC_RELEASE);
 }
-void spu_lockline_unlock(void)
+
+static void spu_ll_release(spu_ll_stripe* s)
 {
-    __atomic_store_n(&g_lockline.seq, g_lockline.seq + 1, __ATOMIC_RELEASE);
-    ps3_lock_release(&g_lockline.lock);
+    __atomic_store_n(&s->seq, s->seq + 1, __ATOMIC_RELEASE);
+    ps3_lock_release(&s->lock);
 }
-int spu_lockline_unchanged(uint32_t seq)
+
+void spu_lockline_lock(uint32_t ea) { spu_ll_acquire(&g_stripes[spu_ll_index(ea)]); }
+void spu_lockline_unlock(uint32_t ea) { spu_ll_release(&g_stripes[spu_ll_index(ea)]); }
+
+static void spu_ll_range_set(uint32_t ea, uint32_t size, uint64_t set[SPU_LL_STRIPES / 64u])
+{
+    for (unsigned w = 0; w < SPU_LL_STRIPES / 64u; w++) set[w] = 0;
+    const uint32_t first = ea >> SPU_COH_LINE_SHIFT;
+    const uint32_t lines = size ? ((uint32_t)(ea + (size - 1u)) >> SPU_COH_LINE_SHIFT) - first + 1u : 1u;
+    if (lines >= SPU_LL_STRIPES) {
+        for (unsigned w = 0; w < SPU_LL_STRIPES / 64u; w++) set[w] = ~0ull;
+        return;
+    }
+    for (uint32_t i = 0; i < lines; i++) {
+        const unsigned s = (first + i) & (SPU_LL_STRIPES - 1u);
+        set[s >> 6] |= 1ull << (s & 63u);
+    }
+}
+
+void spu_lockline_lock_range(uint32_t ea, uint32_t size)
+{
+    uint64_t set[SPU_LL_STRIPES / 64u];
+    spu_ll_range_set(ea, size, set);
+    for (unsigned s = 0; s < SPU_LL_STRIPES; s++)
+        if ((set[s >> 6] >> (s & 63u)) & 1u) spu_ll_acquire(&g_stripes[s]);
+}
+
+void spu_lockline_unlock_range(uint32_t ea, uint32_t size)
+{
+    uint64_t set[SPU_LL_STRIPES / 64u];
+    spu_ll_range_set(ea, size, set);
+    for (unsigned s = SPU_LL_STRIPES; s-- > 0;)
+        if ((set[s >> 6] >> (s & 63u)) & 1u) spu_ll_release(&g_stripes[s]);
+}
+
+int spu_lockline_unchanged(uint32_t ea, uint32_t seq)
 {
     __atomic_thread_fence(__ATOMIC_ACQUIRE);
-    return __atomic_load_n(&g_lockline.seq, __ATOMIC_RELAXED) == seq;
+    return __atomic_load_n(&g_stripes[spu_ll_index(ea)].seq, __ATOMIC_RELAXED) == seq;
+}
+
+static void spu_ll_quiesce(void)
+{
+    for (unsigned s = 0; s < SPU_LL_STRIPES; s++) {
+        ps3_lock_acquire(&g_stripes[s].lock);
+        ps3_lock_release(&g_stripes[s].lock);
+    }
 }
 
 /* ===========================================================================
@@ -68,55 +123,67 @@ static unsigned char s_coh_bitmap[SPU_COH_BITMAP_SZ];
  * vm_write* paying one compare against a hot global. */
 
 /* Every live virtual context may retain a reservation between scheduling
- * quanta; physical SPU count is not a bound on this set. All access is under
- * the lock-line lock. Entries are removed before their context's lifetime ends.
+ * quanta; physical SPU count is not a bound on this set. Entries are removed
+ * before their context's lifetime ends.
  *
  * A contiguous array, not a linked list: every notifier walks all of it with
  * the line held, and a list's scattered nodes were a cache miss per holder on
  * top of the one on each holder's resv_valid, which the walk now prefetches a
  * few entries ahead. */
-static spu_context** s_coh_ctxs;
-static unsigned s_coh_n, s_coh_cap;
+#define SPU_COH_BLOCK  256u
+#define SPU_COH_BLOCKS 256u
+static spu_context** s_coh_blocks[SPU_COH_BLOCKS];
+static unsigned s_coh_n;
+static ps3_lock s_coh_reg;
 #define SPU_COH_PREFETCH 4
-static inline void spu_coh_prefetch_holder(unsigned i)
+
+static inline spu_context** spu_coh_slot(unsigned i) { return &s_coh_blocks[i / SPU_COH_BLOCK][i % SPU_COH_BLOCK]; }
+static inline spu_context* spu_coh_holder(unsigned i) { return __atomic_load_n(spu_coh_slot(i), __ATOMIC_ACQUIRE); }
+static inline void spu_coh_prefetch_holder(unsigned i, unsigned n)
 {
-    if (i < s_coh_n) __builtin_prefetch(&s_coh_ctxs[i]->resv_valid);
+    if (i < n) {
+        spu_context* c = spu_coh_holder(i);
+        if (c) __builtin_prefetch(&c->resv_valid);
+    }
 }
 
 unsigned long g_spu_lr_raise = 0;
 
+static void spu_coh_register(spu_context* ctx)
+{
+    ps3_lock_acquire(&s_coh_reg);
+    unsigned i = 0;
+    while (i < s_coh_n && spu_coh_holder(i)) i++;
+    if (i == s_coh_n && (i / SPU_COH_BLOCK >= SPU_COH_BLOCKS || !s_coh_blocks[i / SPU_COH_BLOCK])) {
+        spu_context** block = i / SPU_COH_BLOCK < SPU_COH_BLOCKS
+                                  ? (spu_context**)malloc(SPU_COH_BLOCK * sizeof(*block)) : NULL;
+        if (!block) {
+            fprintf(stderr, "[spu-coh] cannot register reservation holder %p\n", (void*)ctx);
+            fflush(stderr);
+            abort();
+        }
+        memset(block, 0, SPU_COH_BLOCK * sizeof(*block));
+        __atomic_store_n(&s_coh_blocks[i / SPU_COH_BLOCK], block, __ATOMIC_RELEASE);
+    }
+    __atomic_store_n(spu_coh_slot(i), ctx, __ATOMIC_RELEASE);
+    if (i == s_coh_n) __atomic_store_n(&s_coh_n, i + 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&ctx->coh_listed, 1, __ATOMIC_RELAXED);
+    ps3_lock_release(&s_coh_reg);
+}
+
 void spu_coh_reserve(spu_context* ctx, uint32_t ea)
 {
-    /* Read before writing. The kernel reserves the same few lines over and
-     * over, and a store of the same value still takes the cache line away
-     * from every other core: each PPU store then missed on the pointer and on
-     * the bitmap byte. */
     uint32_t line = ea >> SPU_COH_LINE_SHIFT;
     const unsigned char bit = (unsigned char)(1u << (line & 7));
-    if (!(s_coh_bitmap[line >> 3] & bit)) {
+    if (!(__atomic_load_n(&s_coh_bitmap[line >> 3], __ATOMIC_RELAXED) & bit)) {
         ppu_slow_pages(line << SPU_COH_LINE_SHIFT, 1u << SPU_COH_LINE_SHIFT);
-        __atomic_store_n(&s_coh_bitmap[line >> 3], (unsigned char)(s_coh_bitmap[line >> 3] | bit), __ATOMIC_RELEASE);
+        __atomic_fetch_or(&s_coh_bitmap[line >> 3], bit, __ATOMIC_RELEASE);
         __atomic_store_n(&g_spu_coh_bits, (const unsigned char*)s_coh_bitmap, __ATOMIC_RELEASE);
         __atomic_thread_fence(__ATOMIC_SEQ_CST);
         FlushProcessWriteBuffers();
     }
 
-    if (!ctx) return;
-    for (unsigned i = 0; i < s_coh_n; i++)
-        if (s_coh_ctxs[i] == ctx) { __atomic_store_n(&ctx->coh_listed, 1, __ATOMIC_RELAXED); return; }
-    if (s_coh_n == s_coh_cap) {
-        unsigned cap = s_coh_cap ? s_coh_cap * 2u : 64u;
-        spu_context** grown = (spu_context**)realloc(s_coh_ctxs, cap * sizeof(*grown));
-        if (!grown) {
-            fprintf(stderr, "[spu-coh] cannot register reservation holder %p\n", (void*)ctx);
-            fflush(stderr);
-            abort(); /* A missed holder loses invalidation events, including ABA. */
-        }
-        s_coh_ctxs = grown;
-        s_coh_cap = cap;
-    }
-    s_coh_ctxs[s_coh_n++] = ctx;
-    __atomic_store_n(&ctx->coh_listed, 1, __ATOMIC_RELAXED);
+    if (ctx && !__atomic_load_n(&ctx->coh_listed, __ATOMIC_RELAXED)) spu_coh_register(ctx);
 }
 
 /* Drop a context from the reserving set.
@@ -132,19 +199,19 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
 void spu_coh_unregister(spu_context* ctx)
 {
     if (!ctx) return;
-    /* Under the lock-line lock, which every walker of s_coh_ctxs holds: a
-     * notifier that loaded this pointer just before removal would
-     * otherwise go on dereferencing it after the job returned and its stack
-     * (or its whole async thread) was gone. GH3 at -O2 crashed that way in
-     * spu_coh_notify_write, reading a freed thread stack. */
-    spu_lockline_lock();
-    for (unsigned i = 0; i < s_coh_n; i++) {
-        if (s_coh_ctxs[i] != ctx) continue;
-        s_coh_ctxs[i] = s_coh_ctxs[--s_coh_n];   /* order does not matter */
-        break;
+    const unsigned n = __atomic_load_n(&s_coh_n, __ATOMIC_ACQUIRE);
+    unsigned listed = 0;
+    while (listed < n && spu_coh_holder(listed) != ctx) listed++;
+    if (listed == n) {
+        __atomic_store_n(&ctx->coh_listed, 0, __ATOMIC_RELAXED);
+        return;
     }
+    ps3_lock_acquire(&s_coh_reg);
+    for (unsigned i = 0; i < s_coh_n; i++)
+        if (spu_coh_holder(i) == ctx) __atomic_store_n(spu_coh_slot(i), NULL, __ATOMIC_SEQ_CST);
     __atomic_store_n(&ctx->coh_listed, 0, __ATOMIC_RELAXED);
-    spu_lockline_unlock();
+    ps3_lock_release(&s_coh_reg);
+    spu_ll_quiesce();
 }
 
 /* Drop every registered context that lies in [lo, hi) -- a host thread's
@@ -155,20 +222,19 @@ void spu_coh_unregister(spu_context* ctx)
  * spu_coh_unregister if it keeps firing. */
 void spu_coh_forget_range(uintptr_t lo, uintptr_t hi)
 {
-    spu_lockline_lock();
-    for (unsigned i = 0; i < s_coh_n;) {
-        uintptr_t c = (uintptr_t)s_coh_ctxs[i];
-        if (c >= lo && c < hi) {
-            static int _n = 0;
-            if (PS3_LOG_FIRST(_n, 16))
-                fprintf(stderr, "[spu-coh] leaked ctx %p (img=%d) dropped at thread exit\n",
-                        (void*)c, s_coh_ctxs[i]->image_id);
-            s_coh_ctxs[i] = s_coh_ctxs[--s_coh_n];   /* re-check slot i */
-        } else {
-            i++;
-        }
+    int dropped = 0;
+    ps3_lock_acquire(&s_coh_reg);
+    for (unsigned i = 0; i < s_coh_n; i++) {
+        spu_context* c = spu_coh_holder(i);
+        if (!c || (uintptr_t)c < lo || (uintptr_t)c >= hi) continue;
+        static int _n = 0;
+        if (PS3_LOG_FIRST(_n, 16))
+            fprintf(stderr, "[spu-coh] leaked ctx %p (img=%d) dropped at thread exit\n", (void*)c, c->image_id);
+        __atomic_store_n(spu_coh_slot(i), NULL, __ATOMIC_SEQ_CST);
+        dropped = 1;
     }
-    spu_lockline_unlock();
+    ps3_lock_release(&s_coh_reg);
+    if (dropped) spu_ll_quiesce();
 }
 
 int spu_coh_is_reserved(uint32_t addr)
@@ -255,7 +321,7 @@ int spu_coh_reserve_fast(spu_context* ctx, uint32_t ea, uint32_t* seq)
     __atomic_store_n(&ctx->resv_ea, ea, __ATOMIC_RELAXED);
     __atomic_store_n(&ctx->resv_valid, 1, __ATOMIC_RELAXED);
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    *seq = __atomic_load_n(&g_lockline.seq, __ATOMIC_ACQUIRE);
+    *seq = __atomic_load_n(&g_stripes[spu_ll_index(ea)].seq, __ATOMIC_ACQUIRE);
     return !(*seq & 1u);
 }
 
@@ -264,10 +330,11 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
     uint32_t line = ea & ~127u;
     spu_coh_writer_fence();
     ppu_resv_break_line(ea);
-    for (unsigned i = 0; i < SPU_COH_PREFETCH; i++) spu_coh_prefetch_holder(i);
-    for (unsigned i = 0; i < s_coh_n; i++) {
-        spu_coh_prefetch_holder(i + SPU_COH_PREFETCH);
-        spu_context* c = s_coh_ctxs[i];
+    const unsigned n = __atomic_load_n(&s_coh_n, __ATOMIC_ACQUIRE);
+    for (unsigned i = 0; i < SPU_COH_PREFETCH; i++) spu_coh_prefetch_holder(i, n);
+    for (unsigned i = 0; i < n; i++) {
+        spu_coh_prefetch_holder(i + SPU_COH_PREFETCH, n);
+        spu_context* c = spu_coh_holder(i);
         if (!c || (const void*)c == self) continue;
         if (spu_coh_holds(c, line)) {
             SPU_EVENT_SET(c, SPU_EVENT_LR);

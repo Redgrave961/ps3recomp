@@ -759,6 +759,20 @@ void spu_direct_init(void);
  * host-frame return as SPU_RET, publishing the register actually branched. */
 #define SPU_RET_REG(ctx, n) do {                                       (ctx)->pc = (ctx)->gpr[n]._u32[0];                             if ((ctx)->host_depth == 0)                                        g_spu_trampoline_fn = spu_indirect_branch;                 return;                                                    } while (0)
 
+void (*spu_lifted_lookup(const spu_context* ctx, uint32_t lsa))(spu_context*);
+static inline void (*spu_icall_target(spu_context* ctx))(spu_context*)
+{
+    ctx->pc &= SPU_LS_MASK;
+    if (ctx->irq_saved) return 0;
+    void (*fn)(spu_context*) = spu_lifted_lookup(ctx, ctx->pc);
+    return fn && !spu_stack_reset_needed(ctx) ? fn : 0;
+}
+#define SPU_ICALL(ctx) do {                                                   \
+        void (*_icf)(spu_context*) = spu_icall_target(ctx);                   \
+        if (__builtin_expect(_icf != 0, 1)) _icf(ctx);                        \
+        else spu_indirect_branch(ctx);                                        \
+    } while (0)
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

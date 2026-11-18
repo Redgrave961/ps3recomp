@@ -19,9 +19,9 @@ int main(int argc, char** argv)
     fail_allocation = 1;
     if (!strcmp(argv[1], "mfc")) (void)mfc_for(ctx);
     else {
-        spu_lockline_lock();
+        spu_lockline_lock(0x10000u);
         spu_coh_reserve(ctx, 0x10000);
-        spu_lockline_unlock();
+        spu_lockline_unlock(0x10000u);
     }
     return 0; /* surviving allocation failure would fabricate working state */
 }

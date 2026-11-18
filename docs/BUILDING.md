@@ -33,8 +33,7 @@ supported: the runtime uses `__atomic_*`, `__int128` and `__builtin_bswap*`.
 | `PS3RECOMP_PAD_SDL` | `OFF` | Windows: SDL3 controller backend instead of XInput |
 
 `runtime/ppu/` is excluded from the library: it includes the lifter-generated
-`ppu_recomp.h`, so the port compiles it into its own target, together with
-`runtime/spu/spu_dispatch_mt.c` (needs clang's `musttail`).
+`ppu_recomp.h`, so the port compiles it into its own target.
 
 ## Tests
 

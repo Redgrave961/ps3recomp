@@ -128,19 +128,85 @@ void ps3_futex_wake_all(volatile uint32_t* addr)
 #endif
 }
 
+#if defined(_WIN32)
+static HANDLE armed_timer(uint64_t us)
+{
+    static __declspec(thread) HANDLE t_timer;
+    if (!t_timer) t_timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    LARGE_INTEGER due;
+    due.QuadPart = -(LONGLONG)(us * 10ull);
+    return t_timer && SetWaitableTimerEx(t_timer, &due, 0, NULL, NULL, NULL, 0) ? t_timer : NULL;
+}
+#endif
+
+#define PS3_BRIEF_SLOTS 8u
+#define PS3_BRIEF_CLAIMED ((uintptr_t)1)
+
+static struct { volatile uintptr_t addr; void* volatile event; } s_brief[PS3_BRIEF_SLOTS];
+static volatile uint32_t s_brief_waiters;
+
+int ps3_brief_wait(volatile uint32_t* addr, uint32_t expected, uint64_t us)
+{
+    unsigned slot = 0;
+    for (uintptr_t free_slot = 0; slot < PS3_BRIEF_SLOTS; slot++, free_slot = 0)
+        if (__atomic_compare_exchange_n(&s_brief[slot].addr, &free_slot, PS3_BRIEF_CLAIMED, 0, __ATOMIC_ACQUIRE,
+                                        __ATOMIC_RELAXED))
+            break;
+    if (slot == PS3_BRIEF_SLOTS) {
+        ps3_sleep_us(us);
+        return 0;
+    }
+#if defined(_WIN32)
+    static __declspec(thread) HANDLE t_event;
+    if (!t_event) t_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    ResetEvent(t_event);
+    __atomic_store_n(&s_brief[slot].event, (void*)t_event, __ATOMIC_RELAXED);
+#endif
+    __atomic_add_fetch(&s_brief_waiters, 1u, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&s_brief[slot].addr, (uintptr_t)addr, __ATOMIC_SEQ_CST);
+    int woken = 1;
+    if (__atomic_load_n(addr, __ATOMIC_SEQ_CST) == expected) {
+#if defined(_WIN32)
+        HANDLE timer = t_event ? armed_timer(us) : NULL;
+        if (timer) {
+            HANDLE both[2] = { t_event, timer };
+            woken = WaitForMultipleObjects(2, both, FALSE, INFINITE) == WAIT_OBJECT_0;
+        } else {
+            ps3_sleep_us(us);
+            woken = 0;
+        }
+#else
+        woken = ps3_futex_wait(addr, expected, ps3_sync_now_ns() + us * 1000ull);
+#endif
+    }
+    __atomic_store_n(&s_brief[slot].addr, (uintptr_t)0, __ATOMIC_RELEASE);
+    __atomic_sub_fetch(&s_brief_waiters, 1u, __ATOMIC_RELEASE);
+    return woken;
+}
+
+void ps3_brief_wake(volatile uint32_t* addr)
+{
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if (!__atomic_load_n(&s_brief_waiters, __ATOMIC_RELAXED)) return;
+    for (unsigned slot = 0; slot < PS3_BRIEF_SLOTS; slot++) {
+        if (__atomic_load_n(&s_brief[slot].addr, __ATOMIC_ACQUIRE) != (uintptr_t)addr) continue;
+#if defined(_WIN32)
+        SetEvent((HANDLE)__atomic_load_n(&s_brief[slot].event, __ATOMIC_RELAXED));
+#else
+        ps3_futex_wake_all(addr);
+        return;
+#endif
+    }
+}
+
 void ps3_sleep_us(uint64_t us)
 {
     if (!us) return;
 #if defined(_WIN32)
-    static __declspec(thread) HANDLE t_timer;
-    if (!t_timer) t_timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-    if (t_timer) {
-        LARGE_INTEGER due;
-        due.QuadPart = -(LONGLONG)(us * 10ull);
-        if (SetWaitableTimerEx(t_timer, &due, 0, NULL, NULL, NULL, 0)) {
-            WaitForSingleObject(t_timer, INFINITE);
-            return;
-        }
+    HANDLE timer = armed_timer(us);
+    if (timer) {
+        WaitForSingleObject(timer, INFINITE);
+        return;
     }
     Sleep((DWORD)((us + 999) / 1000));
 #elif defined(__linux__)
