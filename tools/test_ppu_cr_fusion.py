@@ -91,7 +91,7 @@ def test_lines_and_liveness():
             fused = L._fuse_cr(plain)
             stores = lambda ls: sum("cr_val" in x for x in ls)
             assert not any(f"ctx->cr >> {31 - 4 * bf - bit})" in x for x in fused), (kind, fused)
-            assert stores(fused) == stores(plain) - dead, (kind, bf, bit, dead, fused)
+            assert stores(fused) == (stores(plain) - dead if bf in (2, 3, 4) else 0), (kind, bf, bit, dead, fused)
     assert all("xer" not in x for x in lift(program("cmpw", 0, 3, True, False), True))
     assert any("ctx->xer >> 31" in x for x in L._fuse_cr(lift(program("cmpw", 0, 3, True, True), False)))
 
@@ -173,7 +173,7 @@ def test_fused_runs_like_unfused():
         "        a.cr = 0x5A5A5A5Au; a.xer = so ? 0x80000000u : 0; a.gpr[3] = 9;",
         "        if (fp) { a.fpr[4] = F[i]; a.fpr[5] = F[j]; } else { a.gpr[4] = I[i]; a.gpr[5] = I[j]; }",
         "        b = a; p(&a); f(&b);",
-        "        if (a.gpr[3] != b.gpr[3] || a.cr != b.cr) { if (fails++ < 20) printf(\"case %d inputs %d,%d: r3 %llu/%llu cr %08X/%08X\\n\", n, i, j,",
+        "        if (a.gpr[3] != b.gpr[3] || ((a.cr ^ b.cr) & 0x00FFF000u)) { if (fails++ < 20) printf(\"case %d inputs %d,%d: r3 %llu/%llu cr %08X/%08X\\n\", n, i, j,",
         "            (unsigned long long)a.gpr[3], (unsigned long long)b.gpr[3], a.cr, b.cr); }",
         "    }",
         "}",
