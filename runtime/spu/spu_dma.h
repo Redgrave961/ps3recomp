@@ -573,7 +573,7 @@ static inline void mfc_channel_write(mfc_engine* mfc, spu_context* spu,
     }
 }
 
-static inline uint32_t mfc_channel_read(mfc_engine* mfc, spu_context* spu,
+static inline uint32_t mfc_channel_read(spu_context* spu,
                                          uint32_t channel)
 {
     switch (channel) {

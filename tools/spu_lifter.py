@@ -620,8 +620,6 @@ class SPULifter:
                 func.body_lines.append(f"    @O{last_k}@")
         if any("(_ls, " in t for t in texts):
             func.body_lines.insert(0, "    uint8_t* const _ls = ctx->ls;")
-        if any(", _rz);" in t for t in texts):
-            func.body_lines.insert(0, "    const int _rz = SPU_RZ_NOW();")
 
         # Infinite no-op self-loop (the SPU `br .` halt idiom): a function whose
         # whole body is nops + an unconditional branch back into itself does
@@ -960,7 +958,7 @@ class SPULifter:
             "cwx": "spu_cwx", "cdx": "spu_cdx",
         }
         if mn in ("fa", "fs", "fm"):
-            return f"{g(rt())} = spu_{mn}_r({g(ra())}, {g(rb())}, _rz);"
+            return f"{g(rt())} = spu_{mn}({g(ra())}, {g(rb())});"
         if mn in rr_bin:
             return f"{g(rt())} = {rr_bin[mn]}({g(ra())}, {g(rb())});"
 
@@ -1040,7 +1038,7 @@ class SPULifter:
             return f"{g(rt())} = spu_shufb({g(ra())}, {g(rb())}, {g(rc)});"
         if mn in ("fma", "fms", "fnms"):
             rc = _reg(ops[3])
-            return f"{g(rt())} = spu_{mn}_r({g(ra())}, {g(rb())}, {g(rc)}, _rz);"
+            return f"{g(rt())} = spu_{mn}({g(ra())}, {g(rb())}, {g(rc)});"
         if mn == "mpya":
             rc = _reg(ops[3])
             return f"{g(rt())} = spu_mpya({g(ra())}, {g(rb())}, {g(rc)});"

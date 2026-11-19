@@ -375,7 +375,8 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
         spu_context* c = spu_coh_holder(i);
         if (!c || (const void*)c == self) continue;
         uint32_t r = line | 1u;
-        if (__atomic_compare_exchange_n(&c->resv, &r, line, 0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED)) {
+        if (__atomic_load_n(&c->resv, __ATOMIC_RELAXED) == r &&
+            __atomic_compare_exchange_n(&c->resv, &r, line, 0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED)) {
             SPU_EVENT_SET(c, SPU_EVENT_LR);
             g_spu_lr_raise++;
             spu_ll_defer_wake(c);

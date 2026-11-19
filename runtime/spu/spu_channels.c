@@ -169,12 +169,12 @@ void spu_stop(spu_context* ctx)
 }
 
 /* SPU_FLOAT_RZ=1: SPU code runs with FPCR at round toward zero with flush-to-zero, so the
- * single-precision helpers take their native form (spu_helpers.h, spu__nv_rz). The mode is set
+ * single-precision helpers truncate and flush like the SPU (spu_helpers.h). The mode is set
  * on entry to spu_run_with_halt and the caller's FPCR is put back on the way out: a run can
  * happen synchronously on a PPU thread (a workload dispatched from the PPU caller), whose
  * lifted floating point must keep round to nearest with denormals. Double precision restores
- * the default around itself inside a run. x86-64 with AVX2 always runs SPU code in the MXCSR
- * equivalent (SPU_MXCSR_RZ); other hosts run the exact forms.
+ * the default around itself inside a run. x86-64 always runs SPU code in the MXCSR
+ * equivalent (SPU_MXCSR_RZ).
  * Returns the FPCR/MXCSR to restore, or ~0 when nothing was changed. */
 static uint64_t spu_float_mode_enter(void)
 {
@@ -193,10 +193,9 @@ static uint64_t spu_float_mode_enter(void)
     __asm__ volatile("msr fpcr, %0" :: "r"((uint64_t)SPU_FPCR_RZFZ));
     return v;
 #elif defined(SPU_MXCSR_RZ)
-    if (g_spu_float_rz) return ~0ull;
     const uint32_t v = _mm_getcsr();
+    if ((v & ~0x3Fu) == SPU_MXCSR_RZ) return ~0ull;   /* nested run: the outer one restores */
     _mm_setcsr(SPU_MXCSR_RZ);
-    g_spu_float_rz = 1;
     return v;
 #else
     return ~0ull;
@@ -207,7 +206,7 @@ static void spu_float_mode_leave(uint64_t outer)
 #if defined(__aarch64__) && defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
     if (outer != ~0ull) __asm__ volatile("msr fpcr, %0" :: "r"(outer));
 #elif defined(SPU_MXCSR_RZ)
-    if (outer != ~0ull) { g_spu_float_rz = 0; _mm_setcsr((uint32_t)outer); }
+    if (outer != ~0ull) _mm_setcsr((uint32_t)outer);
 #else
     (void)outer;
 #endif
@@ -332,7 +331,7 @@ static DWORD WINAPI spu_pcsample_thread(LPVOID p)
     }
 }
 
-static mfc_engine* mfc_claim(spu_context* ctx)
+static __attribute__((noinline, cold)) mfc_engine* mfc_claim(spu_context* ctx)
 {
     /* Looked up once. mfc_claim runs on a context's first MFC access, and with
      * SPU_PCSAMPLE unset `started` never became 1, so every access paid a
@@ -797,7 +796,7 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
     uint32_t v = 0;
 
     if (channel_is_mfc(channel)) {
-        v = mfc_channel_read(mfc_for(ctx), ctx, channel);
+        v = mfc_channel_read(ctx, channel);
         return spu_make_preferred_u32(v);
     }
 
@@ -1549,6 +1548,13 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
     for (uint64_t bits = cover[w]; bits; bits &= bits - 1) {
         const int i = (int)(w * 64u + (unsigned)__builtin_ctzll(bits));
         if (i >= nat) break;
+        const uint32_t rlo = s_ovl_at[i].lsa;
+        __builtin_prefetch(vm_base + s_ovl_at[i].ea + ((lsa > rlo ? lsa : rlo) - rlo));
+    }
+    for (unsigned w = 0; w < SPU_OVL_AT_WORDS; w++)
+    for (uint64_t bits = cover[w]; bits; bits &= bits - 1) {
+        const int i = (int)(w * 64u + (unsigned)__builtin_ctzll(bits));
+        if (i >= nat) break;
         const uint32_t rlo = s_ovl_at[i].lsa, rhi = rlo + s_ovl_at[i].span;
         const uint32_t lo = lsa > rlo ? lsa : rlo;
         const uint32_t hi = (lsa + size) < rhi ? (lsa + size) : rhi;
@@ -2112,3 +2118,4 @@ void spu_trace_rt(spu_context* ctx, uint32_t rt)
 #ifdef __cplusplus
 }
 #endif
+
