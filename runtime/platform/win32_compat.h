@@ -788,13 +788,10 @@ BOOL   ResetEvent(HANDLE h);
 BOOL   PulseEvent(HANDLE h);
 
 HANDLE CreateSemaphoreA(void* sa, LONG initial, LONG maximum, LPCSTR name);
-HANDLE CreateSemaphoreW(void* sa, LONG initial, LONG maximum, LPCWSTR name);
-HANDLE CreateSemaphoreExA(void* sa, LONG initial, LONG maximum, LPCSTR name, DWORD flags, DWORD access);
 #define CreateSemaphore CreateSemaphoreA
 BOOL   ReleaseSemaphore(HANDLE h, LONG count, LONG* previous);
 
 HANDLE CreateWaitableTimerA(void* sa, BOOL manual_reset, LPCSTR name);
-HANDLE CreateWaitableTimerW(void* sa, BOOL manual_reset, LPCWSTR name);
 #define CreateWaitableTimer CreateWaitableTimerA
 /* due: negative = relative, in 100 ns units (the only form used in-tree);
  * positive = absolute FILETIME. period in ms, 0 = one-shot. */
@@ -822,15 +819,12 @@ DWORD  SuspendThread(HANDLE h);
 #define FILE_ATTRIBUTE_NORMAL    0x00000080u
 DWORD  GetFileAttributesA(const char* path);
 BOOL   SetThreadPriority(HANDLE h, int priority);
-int    GetThreadPriority(HANDLE h);
 DWORD_PTR SetThreadAffinityMask(HANDLE h, DWORD_PTR mask);
-DWORD  SetThreadIdealProcessor(HANDLE h, DWORD ideal);
 LONG   SetThreadDescription(HANDLE h, PCWSTR description);   /* HRESULT */
 BOOL   SetPriorityClass(HANDLE process, DWORD cls);
 DWORD  GetPriorityClass(HANDLE process);
 
 DWORD  WaitForSingleObject(HANDLE h, DWORD ms);
-DWORD  WaitForSingleObjectEx(HANDLE h, DWORD ms, BOOL alertable);
 DWORD  WaitForMultipleObjects(DWORD count, const HANDLE* handles, BOOL wait_all, DWORD ms);
 BOOL   CloseHandle(HANDLE h);
 

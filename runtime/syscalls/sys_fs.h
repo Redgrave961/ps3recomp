@@ -11,6 +11,7 @@
 #include "../ppu/ppu_context.h"
 #include "../../include/ps3emu/ps3types.h"
 #include "../../include/ps3emu/error_codes.h"
+#include "../../libs/filesystem/ps3_vfs.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -19,7 +20,6 @@
   #define WIN32_LEAN_AND_MEAN
   #include <windows.h>
 #else
-  #include <dirent.h>
   #include <sys/stat.h>
 #endif
 
@@ -87,7 +87,7 @@ extern "C" {
 /* File descriptor entry */
 typedef struct sys_fs_fd_info {
     int    active;
-    FILE*  fp;
+    ps3_vfile* fp;
     char   path[512];  /* host path */
     int    flags;
 } sys_fs_fd_info;
@@ -95,16 +95,7 @@ typedef struct sys_fs_fd_info {
 /* Directory descriptor entry */
 typedef struct sys_fs_dir_info {
     int    active;
-    char   path[512];
-
-#ifdef _WIN32
-    HANDLE           find_handle;
-    WIN32_FIND_DATAA find_data;
-    int              first_read;
-#else
-    DIR*   dp;
-#endif
-
+    ps3_vdir* dir;
 } sys_fs_dir_info;
 
 extern sys_fs_fd_info  g_sys_fs_fds[SYS_FS_FD_MAX];

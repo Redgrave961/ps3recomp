@@ -442,8 +442,8 @@ static inline void spu_ls_write32(spu_context* ctx, uint32_t lsa, uint32_t val)
  *
  * LS bytes are big-endian (the SPU's native order); registers in our
  * model are stored in native (little-endian on x86) order so that
- * `_u32[i]` directly gives lane i's value and `spu_preferred_u32(r)`
- * == `r._u32[0]`. The byte-swap below converts between the two on
+ * `_u32[i]` directly gives lane i's value and the preferred slot is
+ * `r._u32[0]`. The byte-swap below converts between the two on
  * every quadword load/store, mirroring what `spu_ls_read32` already
  * does explicitly. Doing the swap here (rather than in every channel
  * extractor) keeps the per-word `_u32[i]` semantics that the lifter
@@ -529,20 +529,6 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
 #endif
 }
 
-/* ---------------------------------------------------------------------------
- * Preferred slot extraction
- *
- * SPU instructions operate on the "preferred slot" of a 128-bit register,
- * which is the leftmost (highest-address in big-endian) element.
- * For word operations, preferred slot = element 0 of the _u32 array
- * (since our u128 stores big-endian element order).
- * -----------------------------------------------------------------------*/
-static inline uint32_t spu_preferred_u32(const u128* reg)
-{
-    return reg->_u32[0];
-}
-
-/* Create a register with a value splatted to the preferred word slot */
 static inline u128 spu_make_preferred_u32(uint32_t val)
 {
     u128 r;
@@ -684,13 +670,14 @@ void (*spu_take_interrupt(spu_context* ctx,
 extern volatile int g_spu_direct;
 /* Drain a translated call up to its explicit architectural return PC. */
 void spu_drain_call(spu_context* ctx, uint32_t return_pc);
-static inline void spu_call_return(spu_context* ctx, uint32_t return_pc)
+static inline int spu_call_return(spu_context* ctx, uint32_t return_pc)
 {
     if (__builtin_expect(!g_spu_trampoline_fn && !((ctx->pc ^ return_pc) & SPU_LS_MASK) && g_spu_direct >= 0, 1)) {
         spu_depth_guard_check(ctx);
-        return;
+        return 1;
     }
     spu_drain_call(ctx, return_pc);
+    return 0;
 }
 /* Drain the pending trampoline chain: run each queued transfer target until
  * none remain. The one central hook site for the faithful execution model. */

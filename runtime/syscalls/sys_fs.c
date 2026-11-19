@@ -20,7 +20,6 @@
   #define S_ISREG(m) (((m) & _S_IFREG) != 0)
 #else
   #include <unistd.h>
-  #include <dirent.h>
   #include <time.h>     /* nanosleep: the delay in the open-retry loop */
 #endif
 
@@ -102,8 +101,8 @@ extern __attribute__((weak)) const char* cellGame_get_hdd_title_id(void);
 
 static void ps3_vfs_ps3game_fallback(char* path, size_t cap)
 {
-    struct stat st;
-    if (!path || !*path || stat(path, &st) == 0)
+    ps3_vstat st;
+    if (!path || !*path || ps3_vfs_stat(path, &st) == 0)
         return;
     /* An HDD game (a PSN title, CATEGORY "HG") boots from /dev_hdd0/game/<id>/,
      * so that directory is the booted game tree: <root>/game/<id>/X is
@@ -123,7 +122,7 @@ static void ps3_vfs_ps3game_fallback(char* path, size_t cap)
                 memcpy(alt, path, head);
                 snprintf(alt + head, sizeof alt - head, "/PS3_GAME/%s", g + strlen(key));
                 fs_normalize_sep(alt);
-                if (stat(alt, &st) == 0) { snprintf(path, cap, "%s", alt); return; }
+                if (ps3_vfs_stat(alt, &st) == 0) { snprintf(path, cap, "%s", alt); return; }
             }
         }
     }
@@ -139,7 +138,7 @@ static void ps3_vfs_ps3game_fallback(char* path, size_t cap)
         memcpy(alt, path, head);
         snprintf(alt + head, sizeof alt - head, "/PS3_GAME%s", u);
         fs_normalize_sep(alt);
-        if (stat(alt, &st) == 0) snprintf(path, cap, "%s", alt);
+        if (ps3_vfs_stat(alt, &st) == 0) snprintf(path, cap, "%s", alt);
         return;
     }
     char alt[1024];
@@ -148,7 +147,7 @@ static void ps3_vfs_ps3game_fallback(char* path, size_t cap)
         return;
     memcpy(alt, path, head);
     snprintf(alt + head, sizeof alt - head, "/%s", p + 10);
-    if (stat(alt, &st) != 0)
+    if (ps3_vfs_stat(alt, &st) != 0)
         return;
     snprintf(path, cap, "%s", alt);
 }
@@ -285,7 +284,7 @@ int64_t sys_fs_open(ppu_context* ctx)
             return (int64_t)(int32_t)CELL_EEXIST;
     }
 
-    FILE* fp = fopen(host_path, mode);
+    ps3_vfile* fp = ps3_vfile_open(host_path, mode);
     const int open_errno = errno;
 
     /* Transient open failures: on Windows an existing, correctly-pathed file can
@@ -313,7 +312,7 @@ int64_t sys_fs_open(ppu_context* ctx)
              * and the recovery this exists for never happens. */
             { struct timespec _d = { 0, 1000 * 1000 }; nanosleep(&_d, NULL); }
 #endif
-            fp = fopen(host_path, mode);
+            fp = ps3_vfile_open(host_path, mode);
         }
         if (fp) fprintf(stderr, "[sys_fs] open recovered after retry: %s\n", host_path);
     }
@@ -323,23 +322,23 @@ int64_t sys_fs_open(ppu_context* ctx)
      * "r+b" for another reason (a share lock, no write permission) must not be
      * emptied by the fallback. */
     if (!fp && (flags & CELL_FS_O_CREAT) && open_errno == ENOENT) {
-        fp = fopen(host_path, "w+b");
+        fp = ps3_vfile_open(host_path, "w+b");
     }
 
     /* A DIRECTORY open is not a failure. fopen() cannot open one on Windows,
      * but real cellFsOpen answers CELL_EISDIR and titles branch on it. */
     if (!fp) {
-        struct stat _sd;
-        if (stat(host_path, &_sd) == 0 && (_sd.st_mode & S_IFMT) == S_IFDIR) {
+        ps3_vstat _sd;
+        if (ps3_vfs_stat(host_path, &_sd) == 0 && _sd.is_dir) {
             fprintf(stderr, "[sys_fs] open -> EISDIR (directory): %s\n", host_path);
             return (int64_t)(int32_t)CELL_EISDIR;
         }
     }
 
     if (!fp) {
-        { struct stat _s2; int _ex = (stat(host_path,&_s2)==0);
+        { ps3_vstat _s2; int _ex = (ps3_vfs_stat(host_path, &_s2) == 0);
           fprintf(stderr, "[sys_fs] open FAILED: %s (errno=%d %s, exists=%d, size=%lld)\n",
-                  host_path, errno, strerror(errno), _ex, _ex?(long long)_s2.st_size:-1LL); }
+                  host_path, errno, strerror(errno), _ex, _ex ? (long long)_s2.size : -1LL); }
         return (int64_t)(int32_t)CELL_ENOENT;
     }
 
@@ -351,7 +350,7 @@ int64_t sys_fs_open(ppu_context* ctx)
     }
     if (slot < 0) {
         fs_slot_unlock();
-        fclose(fp);
+        ps3_vfile_close(fp);
         return (int64_t)(int32_t)CELL_EMFILE;
     }
     sys_fs_fd_info* f = &g_sys_fs_fds[slot];
@@ -394,14 +393,7 @@ int64_t sys_fs_read(ppu_context* ctx)
     if (!f->active || !f->fp)
         return (int64_t)(int32_t)CELL_EBADF;
 
-    void* buf = vm_to_host(buf_addr);
-    /* The VM commits pages on first user-mode touch; a read the CRT hands to
-     * the kernel (anything past its 4 KB buffer) into a still-reserved page
-     * fails instead, and fread comes back short. GH3's Bink reader saw that
-     * as a read error on every movie and never decoded a frame -- solid green
-     * video. ppu_fs.cpp fs_prefault is the same fix for cellFs. */
-    if (size) vm_commit(buf_addr, (uint32_t)size);
-    size_t nread = fread(buf, 1, (size_t)size, f->fp);
+    size_t nread = ps3_vfile_read(vm_to_host(buf_addr), (size_t)size, f->fp);
 
     if (nread_addr != 0) {
         write_be64(nread_addr, (uint64_t)nread);
@@ -441,8 +433,8 @@ int64_t sys_fs_write(ppu_context* ctx)
     }
 
     const void* buf = vm_to_host(buf_addr);
-    size_t nwritten = fwrite(buf, 1, (size_t)size, f->fp);
-    fflush(f->fp);
+    size_t nwritten = ps3_vfile_write(buf, (size_t)size, f->fp);
+    if (ps3_vfile_host(f->fp)) fflush(ps3_vfile_host(f->fp));
 
     if (nwritten_addr != 0) {
         write_be64(nwritten_addr, (uint64_t)nwritten);
@@ -469,7 +461,7 @@ int64_t sys_fs_close(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_EBADF;
 
     if (f->fp)
-        fclose(f->fp);
+        ps3_vfile_close(f->fp);
     fs_slot_lock();     /* hand the slot back once the stream is closed */
     f->fp = NULL;
     f->active = 0;
@@ -521,21 +513,12 @@ int64_t sys_fs_lseek(ppu_context* ctx)
      * the offset unchanged. The MSVC CRT drops its read buffer on a failed
      * call and the stream then reports the OS position, which is past the
      * buffered data, so the old position is put back explicitly. */
-#ifdef _WIN32
-    const int64_t before = _ftelli64(f->fp);
-    if (_fseeki64(f->fp, offset, origin) != 0) {
-        if (before >= 0) _fseeki64(f->fp, before, SEEK_SET);
+    const int64_t before = ps3_vfile_tell(f->fp);
+    if (ps3_vfile_seek(f->fp, offset, origin) != 0) {
+        if (before >= 0) ps3_vfile_seek(f->fp, before, SEEK_SET);
         return (int64_t)(int32_t)CELL_EINVAL;
     }
-    int64_t pos = _ftelli64(f->fp);
-#else
-    const off_t before = ftello(f->fp);
-    if (fseeko(f->fp, (off_t)offset, origin) != 0) {
-        if (before >= 0) fseeko(f->fp, before, SEEK_SET);
-        return (int64_t)(int32_t)CELL_EINVAL;
-    }
-    int64_t pos = (int64_t)ftello(f->fp);
-#endif
+    int64_t pos = ps3_vfile_tell(f->fp);
 
     if (pos_addr != 0) {
         write_be64(pos_addr, (uint64_t)pos);
@@ -547,20 +530,10 @@ int64_t sys_fs_lseek(ppu_context* ctx)
 /* ---------------------------------------------------------------------------
  * Helper: fill CellFsStat from host stat
  * -----------------------------------------------------------------------*/
-static void fill_cell_stat(uint32_t stat_addr, struct stat* st)
+static void fill_cell_stat(uint32_t stat_addr, const ps3_vstat* st)
 {
-    uint32_t mode = CELL_FS_S_IRUSR | CELL_FS_S_IRGRP | CELL_FS_S_IROTH;
-    if (S_ISDIR(st->st_mode)) {
-        mode |= CELL_FS_S_IFDIR | CELL_FS_S_IXUSR;
-    } else {
-        mode |= CELL_FS_S_IFREG;
-    }
-#ifndef _WIN32
-    if (st->st_mode & S_IWUSR) mode |= CELL_FS_S_IWUSR;
-    if (st->st_mode & S_IXUSR) mode |= CELL_FS_S_IXUSR;
-#else
-    mode |= CELL_FS_S_IWUSR; /* assume writable on Windows */
-#endif
+    uint32_t mode = CELL_FS_S_IRUSR | CELL_FS_S_IRGRP | CELL_FS_S_IROTH | CELL_FS_S_IWUSR;
+    mode |= st->is_dir ? CELL_FS_S_IFDIR | CELL_FS_S_IXUSR : CELL_FS_S_IFREG;
 
     /* CellFsStat is 0x34 (52) bytes, 4-byte aligned: the s64/u64 members are
      * be_t<...,4> so there is NO pad after gid (RPCS3: CHECK_SIZE_ALIGN(...,52,4)).
@@ -570,10 +543,10 @@ static void fill_cell_stat(uint32_t stat_addr, struct stat* st)
     write_be32(stat_addr + 0x00, mode);
     write_be32(stat_addr + 0x04, 0);  /* uid */
     write_be32(stat_addr + 0x08, 0);  /* gid */
-    write_be64(stat_addr + 0x0C, (uint64_t)st->st_atime);
-    write_be64(stat_addr + 0x14, (uint64_t)st->st_mtime);
-    write_be64(stat_addr + 0x1C, (uint64_t)st->st_ctime);
-    write_be64(stat_addr + 0x24, (uint64_t)st->st_size);
+    write_be64(stat_addr + 0x0C, (uint64_t)st->atime);
+    write_be64(stat_addr + 0x14, (uint64_t)st->mtime);
+    write_be64(stat_addr + 0x1C, (uint64_t)st->ctime);
+    write_be64(stat_addr + 0x24, st->size);
     write_be64(stat_addr + 0x2C, 4096ULL);  /* blksize */
 }
 
@@ -595,15 +568,9 @@ int64_t sys_fs_stat(ppu_context* ctx)
     char host_path[1024];
     sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
 
-    struct stat st;
-#ifdef _WIN32
-    if (_stat64(host_path, (struct _stat64*)&st) != 0)
-#else
-    if (stat(host_path, &st) != 0)
-#endif
-    {
+    ps3_vstat st;
+    if (ps3_vfs_stat(host_path, &st) != 0)
         return (int64_t)(int32_t)CELL_ENOENT;
-    }
 
     fill_cell_stat(stat_addr, &st);
     return CELL_OK;
@@ -628,18 +595,8 @@ int64_t sys_fs_fstat(ppu_context* ctx)
     if (!f->active || !f->fp)
         return (int64_t)(int32_t)CELL_EBADF;
 
-    struct stat st;
-#ifdef _WIN32
-    int fno = _fileno(f->fp);
-    if (_fstat64(fno, (struct _stat64*)&st) != 0)
-#else
-    int fno = fileno(f->fp);
-    if (fstat(fno, &st) != 0)
-#endif
-    {
-        return (int64_t)(int32_t)CELL_EBADF;
-    }
-
+    ps3_vstat st;
+    ps3_vfile_fstat(f->fp, &st);
     fill_cell_stat(stat_addr, &st);
     return CELL_OK;
 }
@@ -665,18 +622,9 @@ int64_t sys_fs_opendir(ppu_context* ctx)
     /* Open the host directory first, then claim a slot (see fs_slot_lock): the
      * old order filled in a slot it had not yet marked active, so a concurrent
      * opendir could pick the same one. A full table is EMFILE. */
-#ifdef _WIN32
-    char search_path[1024];
-    WIN32_FIND_DATAA find_data;
-    snprintf(search_path, sizeof(search_path), "%s\\*", host_path);
-    HANDLE find_handle = FindFirstFileA(search_path, &find_data);
-    if (find_handle == INVALID_HANDLE_VALUE)
+    ps3_vdir* dir = ps3_vdir_open(host_path);
+    if (!dir)
         return (int64_t)(int32_t)CELL_ENOENT;
-#else
-    DIR* dp = opendir(host_path);
-    if (!dp)
-        return (int64_t)(int32_t)CELL_ENOENT;
-#endif
 
     fs_slot_lock();
     int slot = -1;
@@ -685,24 +633,13 @@ int64_t sys_fs_opendir(ppu_context* ctx)
     }
     if (slot < 0) {
         fs_slot_unlock();
-#ifdef _WIN32
-        FindClose(find_handle);
-#else
-        closedir(dp);
-#endif
+        ps3_vdir_close(dir);
         return (int64_t)(int32_t)CELL_EMFILE;
     }
 
     sys_fs_dir_info* d = &g_sys_fs_dirs[slot];
     memset(d, 0, sizeof(*d));
-#ifdef _WIN32
-    d->find_handle = find_handle;
-    d->find_data   = find_data;
-    d->first_read  = 1;
-#else
-    d->dp = dp;
-#endif
-    strncpy(d->path, host_path, sizeof(d->path) - 1);
+    d->dir = dir;
     d->active = 1;     /* published last */
     fs_slot_unlock();
 
@@ -733,32 +670,12 @@ int64_t sys_fs_readdir(ppu_context* ctx)
     if (!d->active)
         return (int64_t)(int32_t)CELL_EBADF;
 
-    const char* name = NULL;
     int is_dir = 0;
-
-#ifdef _WIN32
-    if (d->first_read) {
-        d->first_read = 0;
-        name = d->find_data.cFileName;
-        is_dir = (d->find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? 1 : 0;
-    } else {
-        if (!FindNextFileA(d->find_handle, &d->find_data)) {
-            /* End of directory */
-            if (nread_addr != 0) write_be64(nread_addr, 0);
-            return CELL_OK;
-        }
-        name = d->find_data.cFileName;
-        is_dir = (d->find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? 1 : 0;
-    }
-#else
-    struct dirent* entry = readdir(d->dp);
-    if (!entry) {
+    const char* name = ps3_vdir_next(d->dir, &is_dir);
+    if (!name) {
         if (nread_addr != 0) write_be64(nread_addr, 0);
         return CELL_OK;
     }
-    name = entry->d_name;
-    is_dir = (entry->d_type == DT_DIR) ? 1 : 0;
-#endif
 
     if (dirent_addr != 0 && name != NULL) {
         uint8_t* out = (uint8_t*)vm_to_host(dirent_addr);
@@ -796,12 +713,7 @@ int64_t sys_fs_closedir(ppu_context* ctx)
     if (!d->active)
         return (int64_t)(int32_t)CELL_EBADF;
 
-#ifdef _WIN32
-    if (d->find_handle != INVALID_HANDLE_VALUE)
-        FindClose(d->find_handle);
-#else
-    if (d->dp) closedir(d->dp);
-#endif
+    ps3_vdir_close(d->dir);
 
     fs_slot_lock();     /* hand the slot back once the handle is closed */
     d->active = 0;
@@ -971,14 +883,17 @@ int64_t sys_fs_ftruncate(ppu_context* ctx)
     if (!f->active || !f->fp)
         return (int64_t)(int32_t)CELL_EBADF;
 
-    fflush(f->fp);
+    FILE* host = ps3_vfile_host(f->fp);
+    if (!host)
+        return (int64_t)(int32_t)CELL_EINVAL;
+    fflush(host);
 
 #ifdef _WIN32
-    int fno = _fileno(f->fp);
+    int fno = _fileno(host);
     if (_chsize_s(fno, (long long)size) != 0)
         return (int64_t)(int32_t)CELL_EINVAL;
 #else
-    int fno = fileno(f->fp);
+    int fno = fileno(host);
     if (ftruncate(fno, (off_t)size) != 0)
         return (int64_t)(int32_t)CELL_EINVAL;
 #endif

@@ -1653,7 +1653,7 @@ static int64_t sys_spu_image_open_handler(ppu_context* ctx)
     char host_path[1024];
     sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
 
-    FILE* f = fopen(host_path, "rb");
+    ps3_vfile* f = ps3_vfile_open(host_path, "rb");
     if (!f) {
         fprintf(stderr, "[SPU] image_open img=0x%08X path='%s' (host: %s) — open failed\n",
                 img_ea, ps3_path, host_path);
@@ -1686,9 +1686,11 @@ static int64_t sys_spu_image_open_handler(ppu_context* ctx)
      * bytes and call sys_spu_image_import_handler rather than re-deriving any of
      * it here -- re-deriving is how the two paths drifted apart to begin with.
      */
-    long fsz = (fseek(f, 0, SEEK_END) == 0) ? ftell(f) : -1;
-    if (fsz <= 0 || fsz > (long)SPU_IMAGE_STAGE_MAX || fseek(f, 0, SEEK_SET) != 0) {
-        fclose(f);
+    ps3_vstat fst;
+    ps3_vfile_fstat(f, &fst);
+    long fsz = (long)fst.size;
+    if (fsz <= 0 || fsz > (long)SPU_IMAGE_STAGE_MAX) {
+        ps3_vfile_close(f);
         fprintf(stderr, "[SPU] image_open img=0x%08X path='%s' — implausible size %ld\n",
                 img_ea, ps3_path, fsz);
         fflush(stderr);
@@ -1709,8 +1711,8 @@ static int64_t sys_spu_image_open_handler(ppu_context* ctx)
      * guest map: a short read then cannot leave half an image staged for the
      * import path to parse as a whole one. */
     uint8_t* buf = (uint8_t*)malloc((size_t)fsz);
-    size_t got = buf ? fread(buf, 1, (size_t)fsz, f) : 0;
-    fclose(f);
+    size_t got = buf ? ps3_vfile_read(buf, (size_t)fsz, f) : 0;
+    ps3_vfile_close(f);
     if (got != (size_t)fsz) {
         fprintf(stderr, "[SPU] image_open img=0x%08X path='%s' — short read "
                         "(%zu of %ld)\n", img_ea, ps3_path, got, fsz);

@@ -35,6 +35,7 @@ struct image {
     VkImageView view = VK_NULL_HANDLE;
     VkFormat format = VK_FORMAT_UNDEFINED;
     VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+    VkImageUsageFlags usage = 0;
     u32 width = 0;
     u32 height = 0;
     std::vector<std::pair<uint64_t, VkImageView>> views;
@@ -114,7 +115,7 @@ public:
     void rescale(ratio scale);
     bool report(u32 type, u32 ea);
     bool defer(const rsx_write& w);
-    std::atomic<bool> trace_request{ false };
+    std::atomic<u32> trace_frames{ 0 };
     ratio resolution_scale;
 
     bool tracing() const { return m_trace != nullptr; }
@@ -158,7 +159,7 @@ private:
     vk_ring m_ring;
     VkSemaphore m_timeline = VK_NULL_HANDLE;
     uint64_t* m_submitted = nullptr;
-    std::array<submission, 16> m_submissions;
+    std::array<submission, 64> m_submissions;
     u32 m_submission = 0;
     bool m_recording = false;
     bool m_rendering = false;
@@ -173,28 +174,28 @@ private:
         VkDeviceSize size = 0;
     };
     bool create_scratch(scratch& s, VkDeviceSize size, VkBufferUsageFlags usage);
-    scratch m_pack;
     std::vector<std::pair<uint64_t, scratch>> m_scratch_garbage;
     image m_display;
     occlusion m_occlusion;
     depth_pack m_depth_pack;
     downscale m_downscale;
     image m_box;
-    image* depth_as_color(surface& s, VkFormat format);
+    image* depth_as_color(surface& s);
 
     bool draw_setup();
     void draw_execute(const rsx::draw_clause& clause, u32 id);
     void trace_draw(u32 id, u32 prim, u32 count, bool indexed) const;
     std::FILE* m_trace = nullptr;
+    bool m_trace_timed = false;
     u32 m_trace_draws = 0;
     void trace_report();
     VkQueryPool m_trace_pool = VK_NULL_HANDLE;
     std::vector<std::string> m_trace_spans;
     bool m_trace_open = false;
     u32 m_trace_pass_first = 0;
-    bool upload_vertices(const rsx::draw_clause& clause, u32 first, u32 count, u32 vertex_base, VkDescriptorBufferInfo& data,
-                         VkDescriptorBufferInfo& layout);
+    bool upload_vertices(const rsx::draw_clause& clause, u32 first, u32 count, u32 vertex_base, VkDescriptorBufferInfo& layout);
     bool create_dummies();
+    bool create_buffer_set();
 
     pipelines m_pipelines;
     shader_cache m_shaders;
@@ -214,12 +215,19 @@ private:
     struct fp_seen_hash {
         size_t operator()(const fp_seen_key& k) const { return std::hash<std::string_view>()(std::string_view(reinterpret_cast<const char*>(&k), sizeof k)); }
     };
-    struct fp_lookup {
+    struct fp_candidate {
         const fragment_program* fp = nullptr;
+        u32 count = 0;
         std::vector<u32> words;
-        std::vector<uint8_t> constant;
+        std::vector<u32> mask;
+    };
+    struct fp_lookup {
+        std::array<fp_candidate, 4> slots;
+        u32 next = 0;
     };
     std::unordered_map<fp_seen_key, fp_lookup, fp_seen_hash> m_fp_seen;
+    fp_seen_key m_fp_last_key{};
+    fp_lookup* m_fp_last = nullptr;
     u32 m_fp_ea = 0;
     VkDeviceSize m_ubo_align = 256;
     std::vector<uint8_t> m_index_scratch;
@@ -247,9 +255,9 @@ private:
         u32 max = 0;
         uint64_t submission = 0;
         u64 used = 0;
+        bool seen = false;
     };
-    bool cached_clean(cached& e, u32 ea, u32 size);
-    uint8_t* cache_slot(cached& e, u32 size);
+    bool cache_place(cached& e, u32 ea, u32 size, u32 bytes, u32& offset, uint8_t*& out);
     void evict(u64 age);
     void release_held();
     std::unordered_map<uint64_t, cached> m_vertex_cache;
@@ -258,8 +266,10 @@ private:
     uint64_t m_reached = 0;
     u64 m_progress = 0;
     dynamic_cache m_dynamic;
+    VkDescriptorPool m_buffer_pool = VK_NULL_HANDLE;
+    VkDescriptorSet m_buffer_set = VK_NULL_HANDLE;
     struct bound_descriptors {
-        VkDescriptorBufferInfo buffers[5];
+        u32 offsets[4];
         VkDescriptorImageInfo images[rsx::TEXTURES + rsx::VERTEX_TEXTURES];
         VkPipeline pipeline = VK_NULL_HANDLE;
         bool valid = false;
@@ -284,14 +294,27 @@ private:
         u32 stamp = 0;
         u64 checked = 0;
         u64 used = 0;
+        bool patched = false;
+        u32 variant = 0;
+    };
+    struct unit_resolved {
+        bool valid = false;
+        rsx::texture_regs regs{};
+        u32 ea = 0;
+        u64 epoch = 0;
+        u64 generation = 0;
+        VkDescriptorImageInfo info{};
+        rsx_spv_texture_state state{};
     };
     struct unit_binding {
+        bool described = false;
         bool valid = false;
         rsx::texture_regs regs{};
         rsx::texture_desc desc{};
     };
 
-    void describe_units();
+    void describe_units(u32 first, u32 last);
+    rsx::texture_regs unit_regs(u32 u) const;
     bool resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out, rsx_spv_texture_state& state);
     VkImageView view_for(image& img, VkImageViewType type, VkFormat format, VkImageAspectFlags aspect, const VkComponentMapping& swizzle);
     VkSampler sampler_for(const VkSamplerCreateInfo& info, const VkSamplerCustomBorderColorCreateInfoEXT* border);
@@ -299,16 +322,23 @@ private:
     u32 refresh(u32 ea, u32 size, u32 stamp, uint8_t* dst);
     void watch(u32 ea, u32 size);
     void prescan(u64 batch);
+#ifndef _WIN32
+    bool scan(u32 base, u32 bytes);
+#endif
     void mark_written(u32 ea, u32 size);
 
     unit_binding m_units[rsx::TEXTURES + rsx::VERTEX_TEXTURES];
+    unit_resolved m_resolved[rsx::TEXTURES + rsx::VERTEX_TEXTURES];
+    u64 m_binding_gen = 1;
     const char* m_texture_path[rsx::TEXTURES + rsx::VERTEX_TEXTURES]{};
     std::unordered_map<uint64_t, std::unique_ptr<texture_entry>> m_textures;
     std::unordered_map<uint64_t, VkSampler> m_samplers;
     std::vector<u32> m_page_stamp;
+#ifndef _WIN32
     std::vector<u64> m_region_batch;
     std::vector<u64> m_region_used;
     std::vector<u32> m_hot;
+#endif
     u64 m_scan_batch = ~0ull;
     u32 m_stamp = 1;
     u64 m_epoch = 1;
@@ -321,6 +351,7 @@ public:
         u64 draws, clears, uploads, blits, downloads, surface_loads;
         u64 epochs, watch_calls, watch_bytes, copy_bytes, reuse_bytes, scans, write_stalls, surface_stalls, stall_ns, stall_bytes;
         u64 deferred_transfers, deferred_labels;
+        u64 scan_ns, changed_pages;
         u32 stall_ea, stall_size;
     } stats{};
 };

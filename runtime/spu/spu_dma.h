@@ -19,6 +19,7 @@
 #include "../../include/ps3emu/log_first.h"
 #include "spu_coherency.h"
 #include "spu_coh_bitmap.h"
+#include "../memory/vm_page_map.h"
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
@@ -36,7 +37,7 @@ extern void (*g_rsx_window_write)(void);
 static inline void spu_rsx_window_check(uint32_t ea, uint32_t size)
 {
     void (*notify)(void) = g_rsx_window_write;
-    if (notify && ea < ppu_hle_inject_base + 0x10000u && (uint64_t)ea + size > ppu_hle_inject_base) notify();
+    if (notify && ((ea < ppu_hle_inject_base + 0x10000u && (uint64_t)ea + size > ppu_hle_inject_base) || vm_watched(ea, size))) notify();
 }
 
 static inline const unsigned char* mfc_coh_bits(void)

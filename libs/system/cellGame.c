@@ -7,6 +7,7 @@
 #include "cellGame.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_write32 (guest mem) */
 #include "ps3emu/guest_call.h"              /* g_ps3_guest_caller (funcStat dispatch) */
+#include "../filesystem/ps3_vfs.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -220,14 +221,16 @@ const char* cellGame_get_title(void)
 static int sfo_read_string(const char* sfo_path, const char* key,
                            char* out, int out_size)
 {
-    FILE* fp = fopen(sfo_path, "rb");
+    ps3_vfile* fp = ps3_vfile_open(sfo_path, "rb");
     if (!fp) return -1;
-    fseek(fp, 0, SEEK_END); long sz = ftell(fp); fseek(fp, 0, SEEK_SET);
-    if (sz < 0x14 || sz > (1 << 20)) { fclose(fp); return -1; }
+    ps3_vstat st;
+    ps3_vfile_fstat(fp, &st);
+    const long sz = (long)st.size;
+    if (sz < 0x14 || sz > (1 << 20)) { ps3_vfile_close(fp); return -1; }
     unsigned char* d = (unsigned char*)malloc((size_t)sz);
-    if (!d) { fclose(fp); return -1; }
-    int ok = (fread(d, 1, (size_t)sz, fp) == (size_t)sz);
-    fclose(fp);
+    if (!d) { ps3_vfile_close(fp); return -1; }
+    int ok = (ps3_vfile_read(d, (size_t)sz, fp) == (size_t)sz);
+    ps3_vfile_close(fp);
     if (!ok) { free(d); return -1; }
 
     int ret = -1;

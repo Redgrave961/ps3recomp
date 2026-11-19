@@ -15,7 +15,13 @@ typedef struct rsx_vk_mode {
     float refresh;
 } rsx_vk_mode;
 
+typedef struct rsx_vk_texture_patch {
+    u32 (*variant)(void);
+    int (*apply)(u32 variant, u32 gcm_format, u32 width, u32 height, uint8_t* data, uint64_t size);
+} rsx_vk_texture_patch;
+
 const rsx_renderer* rsx_vk_renderer(const char* title);
+void rsx_vk_set_texture_patch(const rsx_vk_texture_patch* patch);
 void rsx_vk_set_resolution_scale(u32 num, u32 den);
 void rsx_vk_set_display(enum rsx_vk_display display);
 void rsx_vk_on_display_toggle(void (*listener)(enum rsx_vk_display display));

@@ -121,6 +121,7 @@ if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
         $<IF:$<STREQUAL:${CMAKE_C_COMPILER_FRONTEND_VARIANT},MSVC>,/W4,-Wall$<SEMICOLON>-Wextra>
         -Wno-unused-parameter
         -fno-strict-aliasing
+        $<$<STREQUAL:${CMAKE_C_COMPILER_FRONTEND_VARIANT},MSVC>:/Zc:tlsGuards->
         # No spontaneous fused multiply-add. MSVC never contracts, and x86-64
         # without -mfma has nothing to contract into, so every validated
         # result came from separate multiplies and adds; arm64 has FMA in

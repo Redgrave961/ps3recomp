@@ -125,14 +125,6 @@ int rsx_tiling_active(void);
  * starts lowest, copied to *out. 0 when none does. */
 int rsx_tiling_find(u32 location, u32 offset, u32 len, rsx_tile* out);
 
-/* The guest bytes [*lo, *lo + *span) the RSX's view of [offset, offset +
- * len) is made of: the range itself, widened over each tile it touches to
- * whole 64-row bands rounded out to the 64 KB bank groups the band's tiles
- * are interleaved over. A change detector that hashes those bytes sees every
- * write that changes what the RSX reads. Returns 0 (and the range itself)
- * when no tile is touched. */
-int rsx_tiling_footprint(u32 location, u32 offset, u32 len, u32* lo, u32* span);
-
 /* How a client reaches guest memory. `ptr` returns the host bytes of
  * [offset, offset + len) at `location`, or NULL; the range copies below ask
  * for no more than one 1 MB IO page at a time, so a caller whose IO pages

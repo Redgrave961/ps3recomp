@@ -50,6 +50,7 @@
 #include "sysNet.h"
 #include "../../runtime/ppu/ppu_context.h"
 #include "../../runtime/ppu/ppu_memory.h"
+#include "../../runtime/memory/vm_track.h"
 #include "../../include/ps3emu/nid.h"
 
 #include <stdio.h>
@@ -513,7 +514,10 @@ int32_t sys_net_bnet_recv(int32_t s, void* buf, uint32_t len, int32_t flags)
 {
     if (!valid_socket(s)) return fail(SYS_NET_EBADF);
     if (would_block(s, flags, POLLIN)) return fail(SYS_NET_EWOULDBLOCK);
-    int n = recv(s_sockets[s].host_fd, GUEST_PTR(EA(buf), char*), (int)len, host_recv_flags(flags));
+    char* dst = GUEST_PTR(EA(buf), char*);
+    vm_io_begin(dst, len);
+    int n = recv(s_sockets[s].host_fd, dst, (int)len, host_recv_flags(flags));
+    vm_io_end(dst, len);
     if (net_trace() && n != HOST_SOCKET_ERROR) trace("recv", s, n, NULL);
     return n == HOST_SOCKET_ERROR ? host_fail() : n;
 }
@@ -528,8 +532,10 @@ int32_t sys_net_bnet_recvfrom(int32_t s, void* buf, uint32_t len, int32_t flags,
     if (would_block(s, flags, POLLIN)) return fail(SYS_NET_EWOULDBLOCK);
     memset(&a, 0, sizeof(a));
     alen = sizeof(a);
-    n = recvfrom(s_sockets[s].host_fd, GUEST_PTR(EA(buf), char*), (int)len,
-                 host_recv_flags(flags), (struct sockaddr*)&a, &alen);
+    char* dst = GUEST_PTR(EA(buf), char*);
+    vm_io_begin(dst, len);
+    n = recvfrom(s_sockets[s].host_fd, dst, (int)len, host_recv_flags(flags), (struct sockaddr*)&a, &alen);
+    vm_io_end(dst, len);
     if (n == HOST_SOCKET_ERROR) return host_fail();
     if (net_trace()) trace("recvfrom", s, n, &a);
     write_sockaddr(EA(from), EA(fromlen), &a);

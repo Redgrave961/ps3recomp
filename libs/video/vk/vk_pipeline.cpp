@@ -53,8 +53,8 @@ bool pipelines::create(vk_device& d, const std::string& cache_path)
     m_d = &d;
     m_cache_path = cache_path;
 
-    std::vector<VkDescriptorSetLayoutBinding> b;
-    auto add = [&](uint32_t binding, VkDescriptorType type, VkShaderStageFlags stages) {
+    std::vector<VkDescriptorSetLayoutBinding> buffers, textures;
+    auto add = [](std::vector<VkDescriptorSetLayoutBinding>& b, uint32_t binding, VkDescriptorType type, VkShaderStageFlags stages) {
         VkDescriptorSetLayoutBinding x{};
         x.binding = binding;
         x.descriptorType = type;
@@ -62,23 +62,26 @@ bool pipelines::create(vk_device& d, const std::string& cache_path)
         x.stageFlags = stages;
         b.push_back(x);
     };
-    add(RSX_SPV_BIND_VP_CONSTANTS, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_VERTEX_BIT);
-    add(RSX_SPV_BIND_VERTEX_LAYOUT, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_VERTEX_BIT);
-    add(RSX_SPV_BIND_VERTEX_DATA, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT);
-    add(RSX_SPV_BIND_FP_CONSTANTS, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT);
-    add(RSX_SPV_BIND_FP_STATE, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT);
+    add(buffers, RSX_SPV_BIND_VP_CONSTANTS, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, VK_SHADER_STAGE_VERTEX_BIT);
+    add(buffers, RSX_SPV_BIND_VERTEX_LAYOUT, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, VK_SHADER_STAGE_VERTEX_BIT);
+    add(buffers, RSX_SPV_BIND_VERTEX_DATA, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT);
+    add(buffers, RSX_SPV_BIND_FP_CONSTANTS, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, VK_SHADER_STAGE_FRAGMENT_BIT);
+    add(buffers, RSX_SPV_BIND_FP_STATE, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, VK_SHADER_STAGE_FRAGMENT_BIT);
     for (uint32_t i = 0; i < RSX_SPV_TEXTURE_UNITS; i++)
-        add(RSX_SPV_BIND_TEXTURE0 + i, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT);
+        add(textures, RSX_SPV_BIND_TEXTURE0 + i, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT);
     for (uint32_t i = 0; i < RSX_SPV_VERTEX_TEXTURE_UNITS; i++)
-        add(RSX_SPV_BIND_VERTEX_TEXTURE0 + i, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_VERTEX_BIT);
+        add(textures, RSX_SPV_BIND_VERTEX_TEXTURE0 + i, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_VERTEX_BIT);
     VkDescriptorSetLayoutCreateInfo si{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+    si.bindingCount = (uint32_t)buffers.size();
+    si.pBindings = buffers.data();
+    VK_TRY(vkCreateDescriptorSetLayout(d.dev, &si, nullptr, &m_sets[RSX_SPV_SET_BUFFERS]));
     si.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
-    si.bindingCount = (uint32_t)b.size();
-    si.pBindings = b.data();
-    VK_TRY(vkCreateDescriptorSetLayout(d.dev, &si, nullptr, &m_set));
+    si.bindingCount = (uint32_t)textures.size();
+    si.pBindings = textures.data();
+    VK_TRY(vkCreateDescriptorSetLayout(d.dev, &si, nullptr, &m_sets[RSX_SPV_SET_TEXTURES]));
     VkPipelineLayoutCreateInfo li{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-    li.setLayoutCount = 1;
-    li.pSetLayouts = &m_set;
+    li.setLayoutCount = 2;
+    li.pSetLayouts = m_sets;
     VK_TRY(vkCreatePipelineLayout(d.dev, &li, nullptr, &m_layout));
 
     std::vector<uint8_t> blob;
@@ -212,7 +215,7 @@ void pipelines::destroy()
     if (m_db) std::fclose(std::exchange(m_db, nullptr));
     vkDestroyPipelineCache(m_d->dev, m_cache, nullptr);
     vkDestroyPipelineLayout(m_d->dev, m_layout, nullptr);
-    vkDestroyDescriptorSetLayout(m_d->dev, m_set, nullptr);
+    for (VkDescriptorSetLayout s : m_sets) vkDestroyDescriptorSetLayout(m_d->dev, s, nullptr);
     m_d = nullptr;
 }
 

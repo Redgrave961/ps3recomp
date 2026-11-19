@@ -129,6 +129,9 @@ void ps3_futex_wake_all(volatile uint32_t* addr)
 }
 
 #if defined(_WIN32)
+#define PS3_TIMER_SLACK_NS 1000000ull
+#define PS3_TIMER_MARGIN_NS 100000ull
+
 static HANDLE armed_timer(uint64_t us)
 {
     static __declspec(thread) HANDLE t_timer;
@@ -203,12 +206,20 @@ void ps3_sleep_us(uint64_t us)
 {
     if (!us) return;
 #if defined(_WIN32)
-    HANDLE timer = armed_timer(us);
-    if (timer) {
-        WaitForSingleObject(timer, INFINITE);
-        return;
+    static __declspec(thread) uint64_t t_slack_ns = PS3_TIMER_SLACK_NS;
+    const uint64_t start = ps3_sync_now_ns(), deadline = start + us * 1000ull;
+    if (us * 1000ull > t_slack_ns) {
+        const uint64_t ask = (us * 1000ull - t_slack_ns) / 1000ull;
+        HANDLE timer = armed_timer(ask);
+        if (timer) WaitForSingleObject(timer, INFINITE);
+        else Sleep((DWORD)(ask / 1000u));
+        const uint64_t woke = ps3_sync_now_ns() - start, over = woke > ask * 1000ull ? woke - ask * 1000ull : 0;
+        const uint64_t want = over + PS3_TIMER_MARGIN_NS < PS3_TIMER_SLACK_NS ? over + PS3_TIMER_MARGIN_NS : PS3_TIMER_SLACK_NS;
+        t_slack_ns = want > t_slack_ns ? want : t_slack_ns - (t_slack_ns - want) / 16u;
     }
-    Sleep((DWORD)((us + 999) / 1000));
+    for (uint64_t now = ps3_sync_now_ns(); now < deadline; now = ps3_sync_now_ns())
+        if (deadline - now > 50000ull) SwitchToThread();
+        else PS3_SYNC_PAUSE();
 #elif defined(__linux__)
     const uint64_t deadline = ps3_sync_now_ns() + us * 1000ull;
     struct timespec ts;

@@ -97,7 +97,7 @@ typedef struct ppu_context {
     /* Reserve address for lwarx/stwcx (load-linked / store-conditional) */
     uint64_t reserve_addr;
     uint64_t reserve_value;
-    int      reserve_valid;
+    uint64_t reserve_time;
 
     /* VRSAVE (SPR 256): software-managed; kept so mfspr returns what mtspr wrote */
     uint32_t vrsave;
@@ -115,22 +115,6 @@ static inline void ppu_context_init(ppu_context* ctx)
      * r2 (TOC) gets set from the ELF entry descriptor.
      * r13 (SDA base) gets set from the module loader. */
 }
-
-/* ---------------------------------------------------------------------------
- * Condition Register helpers
- * -----------------------------------------------------------------------*/
-
-/* Set a 4-bit CR field (0-7). */
-static inline void ppu_cr_set(ppu_context* ctx, int field, uint8_t value)
-{
-    uint32_t shift = (uint32_t)(28 - field * 4);
-    ctx->cr = (ctx->cr & ~(0xFu << shift)) | ((uint32_t)(value & 0xF) << shift);
-}
-
-/* ---------------------------------------------------------------------------
- * XER helpers
- * -----------------------------------------------------------------------*/
-static inline int ppu_xer_get_so(const ppu_context* ctx) { return (ctx->xer & PPU_XER_SO) != 0; }
 
 /* ---------------------------------------------------------------------------
  * Stack pointer management

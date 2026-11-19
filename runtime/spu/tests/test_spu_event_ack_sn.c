@@ -45,10 +45,9 @@ int main(void)
     printf("%s: WrEventAck keeps Sn pending while a list is parked\n", fails ? "FAIL" : "PASS");
     return fails ? 1 : 0;
 }
-void ppu_resv_break_store(uint64_t ea){(void)ea;abort();}
 void ps3_ww_report_inline(uint32_t a,uint64_t v,int w){(void)a;(void)v;(void)w;abort();}
 unsigned long long ps3_ms_now(void){abort();}
-uint32_t g_ww_lo=0xFFFFFFFFu,g_ww_hi;int g_resv_store_active;
+uint32_t g_ww_lo=0xFFFFFFFFu,g_ww_hi;
 void spurs_ef_set_from_spu(uint32_t ea, uint16_t bits) { (void)ea; (void)bits; abort(); }
 uint32_t g_spu_image_src_ea, g_spu_image_ls_start, g_spu_image_span;
 void spu_thread_publish_ctx(uint32_t tid, void* c) { (void)tid; (void)c; abort(); }

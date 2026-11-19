@@ -2,7 +2,8 @@
 #define PS3RECOMP_NPDRM_H
 
 #include <stdint.h>
-#include <stdio.h>
+
+#include "ps3_vfs.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -16,8 +17,8 @@ extern "C" {
 
 typedef struct npdrm_file npdrm_file;
 
-int         npdrm_is_npd(FILE* f);
-npdrm_file* npdrm_open(FILE* f, const char* file_name);
+int         npdrm_is_npd(ps3_vfile* f);
+npdrm_file* npdrm_open(ps3_vfile* f);
 int64_t     npdrm_read(npdrm_file* d, uint64_t offset, void* dst, uint64_t size);
 uint64_t    npdrm_size(const npdrm_file* d);
 void        npdrm_close(npdrm_file* d);

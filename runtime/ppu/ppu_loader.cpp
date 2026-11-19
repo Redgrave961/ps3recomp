@@ -372,289 +372,57 @@ static inline void vm_coh_notify(uint32_t a)
     spu_lockline_unlock(a);
 }
 
-/* ---------------------------------------------------------------------------
- * lwarx/stwcx. cross-thread reservation invalidation.
- *
- * The recompiled lwarx sets ctx->reserve_addr = ea; stwcx checks
- * (reserve_addr == ea) && ppu_stwcx32(ea, reserved_value, new). ppu_stwcx32 is a
- * value-CAS, which is ABA-VULNERABLE: for a lock-free free-list pop
- * (`lwarx head; next=*head; stwcx next,head`), a concurrent pop+push that
- * restores head to its old value lets a stale stwcx succeed -> the popped `next`
- * points at a reused block -> heap corruption. Real PPC loses the reservation on
- * ANY store to the granule, so that stale stwcx would FAIL.
- *
- * We emulate that: on a SUCCESSFUL stwcx (a real store landed), break every
- * OTHER thread's reservation on the same address by clobbering its reserve_addr
- * to an impossible value (bit 32 set -> never equals a (uint32_t) guest ea), so
- * that thread's own `reserve_addr == ea` guard fails and it retries. This is the
- * exact mechanism the guest's lock-free allocator/free-lists rely on, and it
- * fixes the LBP loader's nondeterministic heap corruption (OOM aborts + hangs).
- * Only stwcx-mediated updates are covered (the common lock-free-stack case);
- * that's where the game's atomics live, and it keeps the hot vm_write path free.
- *
- * The break alone (v1) still had a residual window: a break could land between a
- * thread's inline `reserve_addr==ea` guard and its CAS. So we ALSO serialize
- * recheck+CAS+break under one lock and RE-VALIDATE the caller's own reservation
- * (via thread-local g_active_ctx) inside that critical section -- exact PPC
- * reservation semantics. stwcx is a sync point (rare vs vm_write), so a single
- * lock is cheap enough; shard by address later if it shows up in a profile.
- * -----------------------------------------------------------------------*/
-extern "C" PPU_THREAD_LOCAL ppu_context* g_active_ctx;   /* fwd (defined below) */
-#define PPU_RESV_MAX 128
-#define PPU_RESV_INVALID 0x100000000ull   /* out of (uint32_t) ea range */
-static ppu_context* g_resv_ctxs[PPU_RESV_MAX];
-static volatile LONG g_resv_ctx_n = 0;
-/* Sharded by address: a single global lock convoyed all stwcx (workers spinning
- * on a descheduled holder -> loader too slow to finish jobs). Shard by the
- * 16-byte-block of ea so unrelated structures never serialize; same-structure
- * contention (which is inherent) still serializes on one slot. */
-#define PPU_RESV_LOCKS 1024
-static volatile LONG g_resv_locks[PPU_RESV_LOCKS];
-/* PPU_RESV_STORE=1 -> also invalidate reservations on PLAIN stores (vm_write32/64)
- * to a reserved word, matching real PPC (any store to the reservation granule
- * kills it). stwcx-break alone covers stwcx-vs-stwcx ABA, but a value that returns
- * to its old bits via NON-stwcx writes slips past it; this closes that window.
- * vm_write* reads g_resv_store_active directly (a hot global) so the default-off
- * path costs one predictable branch. */
-extern "C" int g_resv_store_active = -1;   /* -1 uninit, 0 off, 1 on */
-extern "C" void ppu_resv_register(ppu_context* c)
-{
-    if (g_resv_store_active < 0) g_resv_store_active = getenv("PPU_RESV_STORE") ? 1 : 0;
-    long i = _InterlockedExchangeAdd(&g_resv_ctx_n, 1);
-    if (i < PPU_RESV_MAX) g_resv_ctxs[i] = c;
-}
-/* Where every guest thread is, as a GUEST address.
- *
- * This is the probe the tree was missing. A thread stuck in lifted code is
- * invisible to everything else: PS3_SCBLOCK_PROF only times lv2 syscalls, the
- * usleep histogram only sees threads that sleep, g_hle_inflight only sees HLE
- * handlers, and the sampler resolves a host RIP -- which the lifted TU has no
- * .pdata for, and which identical code folding makes ambiguous anyway (a hot
- * `{ return; }` stub is the tell). Guitar Hero III's main thread went dark to
- * all four at once.
- *
- * ctx->lr needs none of that machinery: the lifter writes it before every call,
- * it is already a guest address, and sys_ppu_thread_create registers every
- * thread's context here for the reservation set. So the answer was sitting in
- * an array nobody read. Best-effort and unlocked -- a torn read of one word
- * costs a wrong digit in a diagnostic, and the alternative is taking a lock on
- * the reservation path to print a log line.
- *
- * CAVEAT: an unchanged lr does NOT mean the thread has made no calls. A
- * lifted INDIRECT call (ps3_indirect_call, bctrl through a vtable) does not
- * write lr, so a thread looping on one sits at the same lr indefinitely
- * while calling out every pass. Reading a pinned lr as "no calls since
- * entry" narrowed a search to the wrong loop once already. lr names the
- * last DIRECT call site and nothing more. */
-extern "C" void ppu_report_guest_lrs(void)
-{
-    long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
-    for (long i = 0; i < n; i++) {
-        ppu_context* c = g_resv_ctxs[i];
-        if (!c) continue;
-        fprintf(stderr, "[WATCHDOG]   guest-tid %-3u lr=0x%08X  r3=0x%08X sp=0x%08X\n",
-                (unsigned)c->thread_id, (uint32_t)c->lr,
-                (uint32_t)c->gpr[3], (uint32_t)c->gpr[1]);
-    }
-    fflush(stderr);
-}
+extern "C" PPU_THREAD_LOCAL ppu_context* g_active_ctx;
+extern "C" alignas(64) uint64_t g_ppu_resv[PPU_RESV_MASK + 1] = {};
 
-/* Break every reservation on ea's word (real-PPC granule semantics on a store).
- * Best-effort/unlocked: the break is a single word write; a concurrent stwcx
- * recheck reads reserve_addr under its slot lock and the value-CAS backstops the
- * narrow race. Skips already-invalid slots. */
-extern "C" void ppu_resv_break_store(uint64_t ea)
-{
-    uint32_t a = (uint32_t)ea & ~3u;
-    long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
-    for (long i = 0; i < n; i++) {
-        ppu_context* c = g_resv_ctxs[i];
-        if (c && c->reserve_addr < PPU_RESV_INVALID && ((uint32_t)c->reserve_addr & ~3u) == a)
-            c->reserve_addr = PPU_RESV_INVALID;
-    }
-}
-/* Break every PPU reservation in ea's 128-byte line, except the calling
- * thread's own. The Cell reservation granule is the LINE, not the word: an SPU
- * PUTLLC that rewrites other words of a line must fail a PPU lwarx/stwcx. on
- * it, and the per-word value-CAS cannot see that. Havok keeps its job queue in
- * lines both sides update; letting the PPU commit over an SPU update corrupted
- * the queue into a cycle that an SPU task then walked forever.
- * Called (via spu_coh_notify_write) for every write to an SPU-reserved line. */
+static inline uint64_t* resv_line(uint32_t ea) { return &g_ppu_resv[(ea >> 7) & PPU_RESV_MASK]; }
+
 extern "C" void ppu_resv_break_line(uint32_t ea)
 {
-    const uint32_t line = ea & ~127u;
+    const uint64_t old = __atomic_fetch_add(resv_line(ea), 2, __ATOMIC_ACQ_REL);
     ppu_context* self = g_active_ctx;
-    long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
-    for (long i = 0; i < n; i++) {
-        ppu_context* c = g_resv_ctxs[i];
-        if (c && c != self && c->reserve_addr < PPU_RESV_INVALID &&
-            ((uint32_t)c->reserve_addr & ~127u) == line)
-            c->reserve_addr = PPU_RESV_INVALID;
-    }
-}
-static inline volatile LONG* resv_slot(uint64_t ea) { return &g_resv_locks[((uint32_t)ea >> 4) & (PPU_RESV_LOCKS - 1)]; }
-static inline void resv_lock(volatile LONG* L)   { while (_InterlockedExchange(L, 1)) { while (*L) YieldProcessor(); } }
-static inline void resv_unlock(volatile LONG* L) { _InterlockedExchange(L, 0); }
-static inline void ppu_resv_break(uint64_t addr)   /* MUST hold g_resv_lock */
-{
-    uint64_t a = (uint32_t)addr;   /* match the inline guard: reserve_addr holds (uint32_t)ea */
-    long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
-    for (long i = 0; i < n; i++) {
-        ppu_context* c = g_resv_ctxs[i];
-        if (c && c->reserve_addr == a) c->reserve_addr = PPU_RESV_INVALID;
-    }
-}
-/* RESV_DIAG: detect a stwcx whose ctx isn't in the registry -- if that fires,
- * that thread's reservations are never broken by others (ABA slips through), and
- * the fix is to register it (not plain-store invalidation). One line per ctx. */
-static inline int resv_diag() { static int v = -1; if (v < 0) v = getenv("RESV_DIAG") ? 1 : 0; return v; }
-static void resv_check_reg(ppu_context* self)
-{
-    long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
-    for (long i = 0; i < n; i++) if (g_resv_ctxs[i] == self) return;
-    static ppu_context* seen[64]; static long sn = 0;
-    for (long i = 0; i < sn; i++) if (seen[i] == self) return;
-    if (sn < 64) seen[sn++] = self;
-    fprintf(stderr, "[RESV-UNREG] stwcx/stdcx by UNREGISTERED ctx=%p tid=%llu (n_reg=%ld)\n",
-            (void*)self, (unsigned long long)self->thread_id, g_resv_ctx_n);
-    fflush(stderr);
+    if (self && (((uint32_t)self->reserve_addr ^ ea) & ~127u) == 0 && self->reserve_time == old)
+        self->reserve_time = old + 2;
 }
 
-/* stwcx./stdcx. store-conditional (see ppu_recomp.h). Under the reservation lock:
- * re-validate the caller's reservation (broken by any concurrent committer),
- * CAS iff the big-endian word still equals `expected`, and on success break every
- * other thread's reservation on that word so their stwcx retries. */
-/* A successful stwcx./stdcx. is a STORE, and the write watch could not see
- * one: PPU_WWATCH hooks vm_write*, and a lifted stwcx. goes straight to a
- * host compare-exchange on guest memory. So any field maintained with
- * atomics -- every refcount and every job counter -- read as "nothing ever
- * writes this", which is the most confident kind of wrong answer a probe
- * can give. Report the commit through the same path as an ordinary store. */
-extern "C" void ppu_ww_note_atomic(uint32_t ea, uint32_t val, int width, void* ra);
-extern "C" uint32_t g_ww_lo, g_ww_hi;
+template <class T>
+static inline int ppu_store_conditional(ppu_context* self, uint32_t a, T expected, T val)
+{
+    uint64_t* line = resv_line(a);
+    uint64_t t = self->reserve_time;
+    if ((t & 1) || !__atomic_compare_exchange_n(line, &t, t + 1, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return 0;
+    const int coh = spu_coh_is_reserved(a);
+    if (coh) {
+        spu_lockline_lock(a);
+        if (__atomic_load_n(line, __ATOMIC_ACQUIRE) != t + 1) {
+            spu_lockline_unlock(a);
+            __atomic_fetch_sub(line, 1, __ATOMIC_RELEASE);
+            return 0;
+        }
+    }
+    T raw, swapped;
+    if constexpr (sizeof(T) == 4) raw = __builtin_bswap32(expected), swapped = __builtin_bswap32(val);
+    else raw = __builtin_bswap64(expected), swapped = __builtin_bswap64(val);
+    const int ok = __atomic_compare_exchange_n((T*)(vm_base + a), &raw, swapped, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    if (coh) {
+        if (ok) spu_coh_notify_write(a);
+        spu_lockline_unlock(a);
+    } else if (ok && spu_coh_is_reserved(a)) {
+        vm_coh_notify(a);
+    }
+    __atomic_fetch_add(line, ok ? 1 : ~0ull, __ATOMIC_RELEASE);
+    return ok;
+}
 
 extern "C" int ppu_stwcx32(ppu_context* self, uint64_t ea, uint32_t expected, uint32_t val)
 {
-    uint32_t exp_raw = __builtin_bswap32(expected);
-    uint32_t new_raw = __builtin_bswap32(val);
-    if (resv_diag() && self) resv_check_reg(self);
-    volatile LONG* L = resv_slot(ea);
-    resv_lock(L);
-    if (self && self->reserve_addr != (uint32_t)ea) { resv_unlock(L); return 0; }   /* reservation lost */
-    /* On a line an SPU has reserved, take the lock-line lock around the CAS and
-     * notify: the same serialization the coherent stores use, so a PPU commit
-     * cannot land inside an SPU PUTLLC's compare/commit window (nor the
-     * reverse), and the reserving SPU gets its lost-reservation event. */
-    int coh = spu_coh_is_reserved((uint32_t)ea);
-    /* SPU_PUTLLC_WHY=1: count PPU commits that land on a line an SPU has
-     * reserved. If an SPU's PUTLLC never succeeds for "no reservation", the
-     * PPU hammering the same 128-byte line is one of only two agents that can
-     * be taking it. */
-    if (coh) { static int s_w = -1;
-        if (s_w < 0) s_w = getenv("SPU_PUTLLC_WHY") ? 1 : 0;
-        if (s_w) { static unsigned long long n;
-            if ((++n % 100000) == 1)
-                fprintf(stderr, "[ppu-steals-resv] %llu: PPU CAS on reserved line 0x%08X\n",
-                        n, (uint32_t)ea & ~127u); } }
-    if (coh) spu_lockline_lock((uint32_t)ea);
-    /* Re-check under the lock-line lock: an SPU commit to this line between
-     * the check above and here has broken the reservation (SPU commits call
-     * ppu_resv_break_line with this lock held). */
-    if (coh && self && self->reserve_addr != (uint32_t)ea) {
-        spu_lockline_unlock((uint32_t)ea); resv_unlock(L); return 0;
-    }
-    int ok = __atomic_compare_exchange_n((uint32_t*)(vm_base + ea), &exp_raw, new_raw,
-                                         0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
-    if (coh) {
-        if (ok) spu_coh_notify_write((uint32_t)ea);
-        spu_lockline_unlock((uint32_t)ea);
-    } else if (ok && spu_coh_is_reserved((uint32_t)ea)) {
-        vm_coh_notify((uint32_t)ea);
-    }
-    if (ok) ppu_resv_break(ea);
-    resv_unlock(L);
-    /* PPU_CASWATCH=<hex ea>: log successful stwcx. on that 128-byte line.
-     * PPU_WWATCH hooks plain stores only; an atomic counter (a semaphore an SPU
-     * spins on) is written exclusively through here and looked untouched. */
-    { static int64_t s_cw = -2;
-      if (s_cw == -2) { const char* e = getenv("PPU_CASWATCH"); s_cw = e ? (int64_t)(strtoul(e, 0, 16) & ~127u) : -1; }
-      if (ok && s_cw >= 0 && ((uint32_t)ea & ~127u) == (uint32_t)s_cw) {
-          static int n; if (PS3_LOG_FIRST(n, 200))
-              fprintf(stderr, "[caswatch] 0x%08X %08X -> %08X lr=0x%08X tid=%u\n", (uint32_t)ea, expected, val,
-                      self ? (uint32_t)self->lr : 0u, self ? (unsigned)self->thread_id : 0u); } }
-    /* PPU_CAS_FAIL=1: histogram the EAs whose store-conditional keeps FAILING.
-     *
-     * A lwarx/stwcx. retry loop that never succeeds is a livelock, and it is
-     * invisible to every other probe: the thread issues no syscall, sleeps
-     * nowhere, enters no HLE, and its lr stays pinned at whatever call brought
-     * it in. "Which address" is the whole question, and nothing could answer
-     * it -- so count failures per address and name the top ones. */
-    { static int s_cf = -1;
-      if (s_cf < 0) s_cf = getenv("PPU_CAS_FAIL") ? 1 : 0;
-      if (s_cf && !ok) {
-          enum { CF_N = 64 };
-          static uint32_t cf_ea[CF_N]; static uint32_t cf_n[CF_N];
-          static int cf_used = 0; static long cf_total = 0;
-          uint32_t a32 = (uint32_t)ea;
-          int i = 0;
-          for (; i < cf_used; i++) if (cf_ea[i] == a32) break;
-          if (i == cf_used && cf_used < CF_N) { cf_ea[cf_used] = a32; cf_used++; }
-          if (i < CF_N) cf_n[i]++;
-          if ((++cf_total % 200000) == 0) {
-              fprintf(stderr, "[cas-fail] %ld failed store-conditionals; top EAs:\n",
-                      cf_total);
-              for (int k = 0; k < 5; k++) {
-                  int best = -1;
-                  for (int j = 0; j < cf_used; j++)
-                      if (cf_n[j] && (best < 0 || cf_n[j] > cf_n[best])) best = j;
-                  if (best < 0) break;
-                  fprintf(stderr, "[cas-fail]   0x%08X  x%u\n", cf_ea[best], cf_n[best]);
-                  cf_n[best] = 0;
-              }
-              fflush(stderr);
-              for (int j = 0; j < cf_used; j++) cf_n[j] = 0;
-          }
-      } }
-    /* Gate on the armed window before the call: this sits on EVERY successful
-     * stwcx., which locks use, so the disabled cost has to be two compares and
-     * no call at all. */
-    if (ok && g_ww_lo && (uint32_t)ea >= g_ww_lo && (uint32_t)ea < g_ww_hi)
-        ppu_ww_note_atomic((uint32_t)ea, val, 4, __builtin_return_address(0));
-    return ok;
-}
-extern "C" int ppu_stdcx64(ppu_context* self, uint64_t ea, uint64_t expected, uint64_t val)
-{
-    uint64_t exp_raw = __builtin_bswap64(expected);
-    uint64_t new_raw = __builtin_bswap64(val);
-    if (resv_diag() && self) resv_check_reg(self);
-    volatile LONG* L = resv_slot(ea);   /* ea and ea+4 share a 16-byte-block slot */
-    resv_lock(L);
-    if (self && self->reserve_addr != (uint32_t)ea) { resv_unlock(L); return 0; }
-    int coh = spu_coh_is_reserved((uint32_t)ea);
-    if (coh) spu_lockline_lock((uint32_t)ea);
-    if (coh && self && self->reserve_addr != (uint32_t)ea) {   /* as in ppu_stwcx32 */
-        spu_lockline_unlock((uint32_t)ea); resv_unlock(L); return 0;
-    }
-    int ok = __atomic_compare_exchange_n((uint64_t*)(vm_base + ea), &exp_raw, new_raw, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
-    if (coh) {
-        if (ok) spu_coh_notify_write((uint32_t)ea);
-        spu_lockline_unlock((uint32_t)ea);
-    } else if (ok && spu_coh_is_reserved((uint32_t)ea)) {
-        vm_coh_notify((uint32_t)ea);
-    }
-    if (ok) { ppu_resv_break(ea); ppu_resv_break(ea + 4); }  /* 8-byte store spans two words */
-    resv_unlock(L);
-    if (ok && g_ww_lo && (uint32_t)ea + 4u >= g_ww_lo && (uint32_t)ea < g_ww_hi) {
-        /* Report as two words: the watch window is word-granular, and a
-         * doubleword CAS on a counter pair is exactly the case worth seeing. */
-        ppu_ww_note_atomic((uint32_t)ea,     (uint32_t)(val >> 32), 4,
-                           __builtin_return_address(0));
-        ppu_ww_note_atomic((uint32_t)ea + 4, (uint32_t)val, 4,
-                           __builtin_return_address(0));
-    }
-    return ok;
+    return ppu_store_conditional<uint32_t>(self, (uint32_t)ea, expected, val);
 }
 
+extern "C" int ppu_stdcx64(ppu_context* self, uint64_t ea, uint64_t expected, uint64_t val)
+{
+    return ppu_store_conditional<uint64_t>(self, (uint32_t)ea, expected, val);
+}
 /* ---- page-guard watchpoint (find raw memcpy/vector stores that vm_write* can't
  * see, e.g. the lifter bug clobbering the GCM handler OPDs to the TOC base). When
  * armed via ppu_guard_page(guest_ea), the 4 KB host page is set read-only and a
@@ -782,14 +550,8 @@ extern "C" void ppu_guard_page(uint32_t guest_ea)
     if (!vm_base || s_guard_page) return;
     s_guard_ea   = guest_ea;
     s_guard_page = ((uintptr_t)vm_base + guest_ea) & ~(uintptr_t)0xFFF;
-    AddVectoredExceptionHandler(1, ppu_guard_veh);   /* runs before vm_commit_veh */
-    /* Commit first: VirtualProtect fails silently on a reserved page, and a
-     * page nothing has touched yet (VRAM, early in boot) is exactly that --
-     * the guard then reported "no writer" for a buffer that was written. */
-    /* The whole 64 KB demand-commit block: vm_commit_veh commits a block at a
-     * time on first touch, and doing so later re-commits this page read-write,
-     * silently disarming the guard. */
-    VirtualAlloc((void*)(s_guard_page & ~(uintptr_t)0xFFFF), 0x10000, MEM_COMMIT, PAGE_READWRITE);
+    AddVectoredExceptionHandler(1, ppu_guard_veh);
+    vm_commit_host((const void*)s_guard_page, 0x1000);
     DWORD old;
     VirtualProtect((void*)s_guard_page, 0x1000, PAGE_READONLY, &old);
     fprintf(stderr, "[GUARD] armed on guest 0x%08X (host page %p)\n", guest_ea, (void*)s_guard_page);
@@ -1195,17 +957,11 @@ static __attribute__((noinline)) void barrier_watch_hit_slow(uint32_t a, uint32_
       } }
 }
 
-/* See the note on the forward declaration above ppu_stwcx32. */
-extern "C" void ppu_ww_note_atomic(uint32_t ea, uint32_t val, int width, void* ra)
-{
-    barrier_watch_hit(ea, val, width, ra);
-}
-
 extern "C" void (*g_rsx_window_write)(void);
-static inline void ppu_window_note(uint32_t a)
+static inline void ppu_window_note(uint32_t a, uint32_t n)
 {
     void (*notify)(void) = g_rsx_window_write;
-    if (notify && a - ppu_hle_inject_base < 0x10000u) notify();
+    if (notify && (a - ppu_hle_inject_base < 0x10000u || vm_watched(a, n))) notify();
 }
 
 extern "C" void ppu_store_block(uint64_t ea, const void* src, uint32_t n)
@@ -1213,21 +969,21 @@ extern "C" void ppu_store_block(uint64_t ea, const void* src, uint32_t n)
     const uint32_t a = (uint32_t)ea;
     if (vm_oob(a, n) || vm_null_store(a, 0, n, __builtin_return_address(0))) return;
     vm_write_coh(a, src, n);
-    ppu_window_note(a);
+    ppu_window_note(a, n);
 }
 extern "C" void ppu_store_recheck(uint64_t ea)
 {
     const uint32_t a = (uint32_t)ea;
     if (spu_coh_line_reserved(a)) vm_coh_notify(a);
-    ppu_window_note(a);
+    ppu_window_note(a, 16);
 }
 void vm_write8 (uint64_t a, uint8_t  v) { barrier_watch_hit((uint32_t)a, v, 1, __builtin_return_address(0)); if (vm_oob((uint32_t)a,1) || vm_null_store((uint32_t)a, v, 1, __builtin_return_address(0))) return;
-    vm_write_coh((uint32_t)a, &v, 1); ppu_window_note((uint32_t)a); }
+    vm_write_coh((uint32_t)a, &v, 1); ppu_window_note((uint32_t)a, 1); }
 void vm_write16(uint64_t a, uint16_t v) { barrier_watch_hit((uint32_t)a, v, 2, __builtin_return_address(0)); if (vm_oob((uint32_t)a,2) || vm_null_store((uint32_t)a, v, 2, __builtin_return_address(0))) return;
-    v = __builtin_bswap16(v); vm_write_coh((uint32_t)a, &v, 2); ppu_window_note((uint32_t)a); }
+    v = __builtin_bswap16(v); vm_write_coh((uint32_t)a, &v, 2); ppu_window_note((uint32_t)a, 2); }
 void vm_write32(uint64_t a, uint32_t v) { barrier_watch_hit((uint32_t)a, v, 4, __builtin_return_address(0)); if (vm_oob((uint32_t)a,4) || vm_null_store((uint32_t)a, v, 4, __builtin_return_address(0))) return;
     { uint32_t _v = v;
-      v = __builtin_bswap32(v); vm_write_coh((uint32_t)a, &v, 4); ppu_window_note((uint32_t)a);
+      v = __builtin_bswap32(v); vm_write_coh((uint32_t)a, &v, 4); ppu_window_note((uint32_t)a, 4);
       /* Raw SPU problem state: run control, mailboxes and signal notification
        * have side effects. The plain store above still happens -- the registers
        * are guest memory and the PPU reads most of them straight back. */
@@ -1241,7 +997,7 @@ void vm_write64(uint64_t a, uint64_t v) {
     barrier_watch_hit((uint32_t)a,     (uint32_t)(v >> 32), 4, __builtin_return_address(0));
     barrier_watch_hit((uint32_t)a + 4, (uint32_t)v,         4, __builtin_return_address(0));
     if (vm_oob((uint32_t)a,8) || vm_null_store((uint32_t)a, (uint32_t)(v >> 32), 8, __builtin_return_address(0))) return;
-    v = __builtin_bswap64(v); vm_write_coh((uint32_t)a, &v, 8); ppu_window_note((uint32_t)a); }
+    v = __builtin_bswap64(v); vm_write_coh((uint32_t)a, &v, 8); ppu_window_note((uint32_t)a, 8); }
 }
 
 /* Cross-fragment trampoline pointer (matches the lifted header's TLS decl). */
@@ -1832,22 +1588,12 @@ static uint64_t ppu_image_overlap_end(uint64_t addr, uint64_t end)
 /* Default used by the PS3 executable entry path when PROC_PARAM is absent. */
 static int32_t g_ppu_primary_priority = 1001;
 
-extern "C" uint32_t ppu_load_elf(const char* path)
+extern "C" uint32_t ppu_load_elf_image(const uint8_t* file, uint64_t fsz)
 {
     g_ppu_primary_priority = 1001;
-    FILE* f = fopen(path, "rb");
-    if (!f) { fprintf(stderr, "[ppu] cannot open %s\n", path); return 0; }
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    uint8_t* file = (uint8_t*)malloc(sz);
-    if (!file || fread(file, 1, sz, f) != (size_t)sz) { fclose(f); free(file); return 0; }
-    fclose(f);
-
-    if (sz < 64 || memcmp(file, "\x7F""ELF", 4) != 0 || file[4] != 2 /*ELFCLASS64*/ || file[5] != 2 /*MSB*/) {
-        fprintf(stderr, "[ppu] not a 64-bit big-endian ELF\n"); free(file); return 0;
+    if (fsz < 64 || memcmp(file, "\x7F""ELF", 4) != 0 || file[4] != 2 /*ELFCLASS64*/ || file[5] != 2 /*MSB*/) {
+        fprintf(stderr, "[ppu] not a 64-bit big-endian ELF\n"); return 0;
     }
-    uint64_t fsz = (uint64_t)sz;
     uint32_t entry = (uint32_t)be64(file + 24);
     uint64_t phoff = be64(file + 32);
     uint16_t phentsize = be16(file + 54);
@@ -1917,7 +1663,6 @@ extern "C" uint32_t ppu_load_elf(const char* path)
         g_ppu_image_ranges.push_back({p_vaddr, p_vaddr + (p_memsz > p_filesz ? p_memsz : p_filesz)});
         loaded++;
     }
-    free(file);
     fprintf(stderr, "[ppu] loaded %d PT_LOAD segments, entry OPD 0x%08X\n", loaded, entry);
 
     /* Arm PPU_GUARD_EA here as well as in lv2_syscall. The syscall path only
@@ -2019,6 +1764,21 @@ extern "C" uint32_t ppu_load_elf(const char* path)
               }
           }
       } }
+    return entry;
+}
+
+extern "C" uint32_t ppu_load_elf(const char* path)
+{
+    FILE* f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "[ppu] cannot open %s\n", path); return 0; }
+    fseek(f, 0, SEEK_END);
+    const long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    uint8_t* file = sz > 0 ? (uint8_t*)malloc((size_t)sz) : nullptr;
+    const bool ok = file && fread(file, 1, (size_t)sz, f) == (size_t)sz;
+    fclose(f);
+    const uint32_t entry = ok ? ppu_load_elf_image(file, (uint64_t)sz) : 0;
+    free(file);
     return entry;
 }
 
@@ -2471,7 +2231,6 @@ extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
     }
     fprintf(stderr, "[ppu] run: code 0x%08X, toc 0x%08X, sp 0x%08X\n", code, toc, (uint32_t)ctx.gpr[1]);
     g_active_ctx = &ctx;
-    ppu_resv_register(&ctx);   /* main/entry thread: join the reservation set too */
     fn(&ctx);
     while (g_trampoline_fn) { void (*tf)(void*) = g_trampoline_fn; g_trampoline_fn = 0; tf(&ctx); }
     return 0;

@@ -6,6 +6,7 @@
  */
 
 #include "cellPngDec.h"
+#include "../filesystem/ps3_vfs.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -101,15 +102,16 @@ static int pngdec_load_source(PngDecSubState* sub)
         char host_path[1024];
         sys_fs_translate_path(sub->src.fileName, host_path, (int)sizeof(host_path));
 
-        FILE* f = fopen(host_path, "rb");
+        ps3_vfile* f = ps3_vfile_open(host_path, "rb");
         if (!f) {
             printf("[cellPngDec] Cannot open file: %s (host: %s)\n",
                    sub->src.fileName, host_path);
             return -1;
         }
 
-        fseek(f, 0, SEEK_END);
-        long total_size = ftell(f);
+        ps3_vstat st;
+        ps3_vfile_fstat(f, &st);
+        long total_size = (long)st.size;
 
         long read_offset = (long)sub->src.fileOffset;
         long read_size;
@@ -120,22 +122,22 @@ static int pngdec_load_source(PngDecSubState* sub)
             read_size = total_size - read_offset;
 
         if (read_size <= 0) {
-            fclose(f);
+            ps3_vfile_close(f);
             printf("[cellPngDec] File is empty or offset past end: %s\n", host_path);
             return -1;
         }
 
-        fseek(f, read_offset, SEEK_SET);
+        ps3_vfile_seek(f, read_offset, SEEK_SET);
 
         sub->src_data = (u8*)malloc((size_t)read_size);
         if (!sub->src_data) {
-            fclose(f);
+            ps3_vfile_close(f);
             return -1;
         }
 
-        sub->src_size = (u32)fread(sub->src_data, 1, (size_t)read_size, f);
+        sub->src_size = (u32)ps3_vfile_read(sub->src_data, (size_t)read_size, f);
         sub->src_allocated = 1;
-        fclose(f);
+        ps3_vfile_close(f);
 
         printf("[cellPngDec] Loaded %u bytes from '%s'\n", sub->src_size, host_path);
         return 0;

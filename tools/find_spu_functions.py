@@ -605,6 +605,52 @@ def find_end(start, insns_by_addr, sorted_starts, code_end):
     return min(next_start, code_end)
 
 
+def resolve_functions(seed_starts, sized_by_start, insns_by_addr, code_end):
+    sorted_starts = sorted(seed_starts)
+    funcs = []
+    for start in sorted_starts:
+        end = sized_by_start[start] if start in sized_by_start else find_end(start, insns_by_addr, sorted_starts, code_end)
+        if end > start:
+            funcs.append((start, end))
+    funcs.sort()
+    cleaned = []
+    for s, e in funcs:
+        if cleaned and s < cleaned[-1][1]:
+            ps, pe = cleaned[-1]
+            cleaned[-1] = (ps, max(pe, e))
+        else:
+            cleaned.append((s, e))
+    return cleaned
+
+
+def is_padding(ins):
+    return ins.raw == 0 or ins.mnemonic in ("nop", "lnop")
+
+
+def collect_gap_entries(funcs, insns_by_addr):
+    """Entries of code no seed reached: whole functions called only through a
+    pointer the other passes cannot resolve (runtime-computed task/job entry
+    points). A gap between two lifted functions that decodes as an unbroken
+    instruction stream is code; data embedded in .text breaks the decode with
+    an undecodable word. Each function in the gap starts at the first
+    non-padding instruction after the previous one's terminator."""
+    entries = set()
+    for (_, a), (b, _) in zip(funcs, funcs[1:]):
+        if b - a < 8:
+            continue
+        span = [insns_by_addr.get(x) for x in range(a, b, 4)]
+        if any(i is None or i.mnemonic == ".word" for i in span):
+            continue
+        start = True
+        for ins in span:
+            if start and not is_padding(ins):
+                entries.add(ins.addr)
+                start = False
+            if not start and (is_return(ins) or (ins.mnemonic in _TERMINATORS_NO_FALLTHROUGH and not is_resuming_stop(ins))):
+                start = True
+    return entries
+
+
 def detect_functions(buf, base_override=None, verbose=True, raw=False):
     if raw:
         # A raw local-store image: a SPURS job binary, which the title loads
@@ -670,30 +716,15 @@ def detect_functions(buf, base_override=None, verbose=True, raw=False):
     if not seed_starts:
         seed_starts.add(code_start)
 
-    sorted_starts = sorted(seed_starts)
     sized_by_start = {s: e for (s, e) in sized_funcs}
-
-    # ---- end discovery ----
-    funcs = []
-    for start in sorted_starts:
-        if start in sized_by_start:
-            end = sized_by_start[start]
-        else:
-            end = find_end(start, insns_by_addr, sorted_starts, code_end)
-        if end > start:
-            funcs.append((start, end))
-
-    # Coalesce / dedupe adjacent ranges produced by overlapping seeds:
-    # If two seeds resolved to overlapping ranges keep the earlier one.
-    funcs.sort()
-    cleaned = []
-    for s, e in funcs:
-        if cleaned and s < cleaned[-1][1]:
-            # Overlap: take the earlier start, extend end if needed.
-            ps, pe = cleaned[-1]
-            cleaned[-1] = (ps, max(pe, e))
-        else:
-            cleaned.append((s, e))
+    cleaned = resolve_functions(seed_starts, sized_by_start, insns_by_addr, code_end)
+    for _ in range(16):
+        gap = collect_gap_entries(cleaned, insns_by_addr) - seed_starts
+        if not gap:
+            break
+        seed_starts |= gap
+        cleaned = resolve_functions(seed_starts, sized_by_start, insns_by_addr, code_end)
+    sorted_starts = sorted(seed_starts)
 
     if verbose:
         print(f"Text segment: va=0x{code_start:X} .. 0x{code_end:X}"

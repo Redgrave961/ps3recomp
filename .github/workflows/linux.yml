@@ -152,12 +152,12 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           flags="-std=gnu17 -I include -I runtime -I runtime/syscalls -I runtime/spu -I libs/video -ffunction-sections -fdata-sections -fuse-ld=lld -Wl,--gc-sections -pthread"
-          $CC $flags runtime/spu/tests/test_spu_group_lifecycle.c runtime/spu/tests/test_spu_group_lifecycle_win_stubs.c \
+          $CC $flags runtime/spu/tests/test_spu_group_lifecycle.c runtime/spu/tests/test_spu_group_lifecycle_win_stubs.c libs/filesystem/ps3_vfs.c \
             runtime/spu/spu_lifted_thread.c runtime/platform/ps3_sync.c runtime/spu/tests/spu_fixture_ppu.c -o /tmp/test_spu_group_lifecycle
           /tmp/test_spu_group_lifecycle
-          $CC $flags runtime/spu/tests/test_spu_thread_image_id.c runtime/spu/spu_lifted_thread.c -o /tmp/test_spu_thread_image_id
+          $CC $flags runtime/spu/tests/test_spu_thread_image_id.c runtime/spu/spu_lifted_thread.c libs/filesystem/ps3_vfs.c -o /tmp/test_spu_thread_image_id
           /tmp/test_spu_thread_image_id
-          $CC $flags runtime/spu/tests/test_spu_user_event_port.c runtime/platform/ps3_sync.c -o /tmp/test_spu_user_event_port
+          $CC $flags runtime/spu/tests/test_spu_user_event_port.c runtime/platform/ps3_sync.c libs/filesystem/ps3_vfs.c -o /tmp/test_spu_user_event_port
           /tmp/test_spu_user_event_port
           $CC $flags runtime/spu/tests/test_spu_dma_put.c runtime/spu/tests/spu_fixture_ppu.c runtime/platform/win32_compat.c \
             runtime/platform/ps3_sync.c -o /tmp/test_spu_dma_put

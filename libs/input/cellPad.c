@@ -101,6 +101,12 @@ static u32           s_port_setting[CELL_PAD_MAX_PORT_NUM];
 static PadHostState  s_host_state[PAD_MAX_HOST_PORTS];
 /* Per-port "a report has arrived since your last read" flag; see cellPadGetData. */
 static int s_data_fresh[PAD_MAX_HOST_PORTS];
+static int s_xbox_layout;
+
+int cellPad_xbox_layout(void)
+{
+    return __atomic_load_n(&s_xbox_layout, __ATOMIC_RELAXED);
+}
 
 #if PAD_BACKEND_SDL
 /* PS3 port i's gamepad, by SDL instance id (0 = none); the port keeps the
@@ -180,8 +186,7 @@ static u32 pad_status_take(u32 port)
 
 typedef struct {
     u16 lo, hi;                 /* what the host motors were last asked for */
-    unsigned long long sent_ms; /* when (pad_now_ms), 0 = nothing to renew */
-} PadRumble;
+    unsigned long long sent_ms; /* when (pad_now_ms), 0 = nothing to renew */} PadRumble;
 static PadRumble s_rumble[PAD_MAX_HOST_PORTS];
 
 static unsigned long long pad_now_ms(void);
@@ -585,6 +590,13 @@ static void pad_sdl_close(int p, int gone)
     pad_host_release(&s_host_state[p]);
 }
 
+static void pad_sdl_use_layout(SDL_Gamepad* gp)
+{
+    const SDL_GamepadType t = SDL_GetGamepadType(gp);
+    const int xbox = t != SDL_GAMEPAD_TYPE_PS3 && t != SDL_GAMEPAD_TYPE_PS4 && t != SDL_GAMEPAD_TYPE_PS5;
+    __atomic_store_n(&s_xbox_layout, xbox, __ATOMIC_RELAXED);
+}
+
 /* Open every gamepad SDL lists that no port has yet. */
 static void pad_sdl_scan(void)
 {
@@ -612,6 +624,8 @@ static void pad_sdl_scan(void)
         s_sdl_had[port] = 1;
         memset(&s_rumble[port], 0, sizeof s_rumble[port]);   /* nothing left over from before */
         SDL_RumbleGamepad(gp, 0, 0, 0);
+        SDL_SetGamepadLED(gp, 0xFF, 0x33, 0x00);
+        pad_sdl_use_layout(gp);
         SDL_SetGamepadSensorEnabled(gp, SDL_SENSOR_ACCEL, true);
         SDL_SetGamepadSensorEnabled(gp, SDL_SENSOR_GYRO, true);
         const char* name = SDL_GetGamepadName(gp);
@@ -697,6 +711,7 @@ static void pad_poll_sdl(void)
         if (lt > 3000) btns |= CELL_PAD_CTRL_L2;
         if (rt > 3000) btns |= CELL_PAD_CTRL_R2;
 
+        if (btns & ~s_host_state[i].buttons) pad_sdl_use_layout(gp);
         s_host_state[i].buttons = btns;
 
         /* Analog sticks */

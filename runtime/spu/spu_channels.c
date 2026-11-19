@@ -1331,6 +1331,9 @@ int spu_overlay_register_verified_region(uint32_t content_ea, uint32_t load_lsa,
 #define SPU_OVL_AT_MAX 256
 static struct { uint32_t ea, lsa, span; int image_id; } s_ovl_at[SPU_OVL_AT_MAX];
 static int s_ovl_at_count;
+#define SPU_OVL_AT_BLOCK_SHIFT 11
+#define SPU_OVL_AT_WORDS (SPU_OVL_AT_MAX / 64)
+static uint64_t s_ovl_at_blocks[SPU_LS_SIZE >> SPU_OVL_AT_BLOCK_SHIFT][SPU_OVL_AT_WORDS];
 void spu_overlay_register_region_at(uint32_t content_ea, uint32_t lsa, uint32_t span, int image_id)
 {
     if (!span || image_id <= 0 || lsa >= SPU_LS_SIZE || span > SPU_LS_SIZE - lsa) return;
@@ -1341,6 +1344,8 @@ void spu_overlay_register_region_at(uint32_t content_ea, uint32_t lsa, uint32_t 
     }
     s_ovl_at[n].ea = content_ea; s_ovl_at[n].lsa = lsa;
     s_ovl_at[n].span = span; s_ovl_at[n].image_id = image_id;
+    for (uint32_t b = lsa >> SPU_OVL_AT_BLOCK_SHIFT; b <= (lsa + span - 1u) >> SPU_OVL_AT_BLOCK_SHIFT; b++)
+        __atomic_fetch_or(&s_ovl_at_blocks[b][n >> 6], 1ull << (n & 63), __ATOMIC_RELAXED);
     __atomic_store_n(&s_ovl_at_count, n + 1, __ATOMIC_RELEASE);
 }
 
@@ -1533,15 +1538,27 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
         }
     }
     const int nat = __atomic_load_n(&s_ovl_at_count, __ATOMIC_ACQUIRE);
-    for (int i = 0; i < nat; i++) {
+    uint64_t cover[SPU_OVL_AT_WORDS] = { 0 };
+    if (nat && size) {
+        const uint32_t last = (uint32_t)(SPU_LS_SIZE >> SPU_OVL_AT_BLOCK_SHIFT) - 1u;
+        const uint32_t b1 = (lsa + size - 1u) >> SPU_OVL_AT_BLOCK_SHIFT;
+        for (uint32_t b = lsa >> SPU_OVL_AT_BLOCK_SHIFT; b <= (b1 < last ? b1 : last); b++)
+            for (unsigned w = 0; w < SPU_OVL_AT_WORDS; w++) cover[w] |= __atomic_load_n(&s_ovl_at_blocks[b][w], __ATOMIC_RELAXED);
+    }
+    for (unsigned w = 0; w < SPU_OVL_AT_WORDS; w++)
+    for (uint64_t bits = cover[w]; bits; bits &= bits - 1) {
+        const int i = (int)(w * 64u + (unsigned)__builtin_ctzll(bits));
+        if (i >= nat) break;
         const uint32_t rlo = s_ovl_at[i].lsa, rhi = rlo + s_ovl_at[i].span;
         const uint32_t lo = lsa > rlo ? lsa : rlo;
         const uint32_t hi = (lsa + size) < rhi ? (lsa + size) : rhi;
         if (lo >= hi || (hi - lo < 128 && hi - lo != size)) continue;
         const uint8_t* q = ls + (lo - lsa);
+        const uint32_t src = s_ovl_at[i].ea + (lo - rlo);
+        if (ea + (lo - lsa) != src && memcmp(q, vm_base + src, hi - lo)) continue;
         uint32_t k = 0;
         while (k < hi - lo && !q[k]) k++;
-        if (k == hi - lo || memcmp(q, vm_base + s_ovl_at[i].ea + (lo - rlo), hi - lo)) continue;
+        if (k == hi - lo) continue;
         int have = 0, free_slot = -1;
         for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot) {
             if (ctx->resident_code[slot].image_id == s_ovl_at[i].image_id &&

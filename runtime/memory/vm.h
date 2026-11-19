@@ -16,6 +16,7 @@
 
 #include "../../include/ps3emu/ps3types.h"
 #include "../../include/ps3emu/error_codes.h"
+#include "vm_track.h"
 
 #include <stdint.h>
 #include <stddef.h>
@@ -304,7 +305,7 @@ static inline int32_t vm_commit(uint32_t addr, uint32_t size)
     size = VM_ALIGN_UP(size, VM_PAGE_SIZE);
 
 #ifdef _WIN32
-    if (!VirtualAlloc(vm_base + addr, size, MEM_COMMIT, PAGE_READWRITE))
+    if (!vm_commit_host(vm_base + addr, size))
         return CELL_ENOMEM;
 #else
     if (vm__mprotect_pages(addr, size, PROT_READ | PROT_WRITE) != 0)

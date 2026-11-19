@@ -106,7 +106,7 @@ typedef struct ppu_context {
     uint64_t thread_id;     /* PPU thread ID              */
     uint64_t reserve_addr;  /* lwarx/stwcx. reservation address */
     uint64_t reserve_value; /* lwarx/stwcx. reservation value   */
-    int      reserve_valid; /* lwarx/stwcx. reservation flag    */
+    uint64_t reserve_time;
     uint32_t vrsave;        /* VRSAVE (SPR 256): plain state      */
 } ppu_context;
 
@@ -129,6 +129,8 @@ void     vm_write64(uint64_t addr, uint64_t val);
  * threads -- a plain conditional write races and corrupts under real concurrency. */
 int      ppu_stwcx32(ppu_context* ctx, uint64_t addr, uint32_t expected, uint32_t val);
 int      ppu_stdcx64(ppu_context* ctx, uint64_t addr, uint64_t expected, uint64_t val);
+#define PPU_RESV_MASK 0x1FFFFFu
+extern uint64_t g_ppu_resv[PPU_RESV_MASK + 1];
 #ifdef __cplusplus
 }
 #endif
@@ -153,42 +155,22 @@ void ppu_store_recheck(uint64_t ea);
 typedef uint16_t __attribute__((aligned(1), may_alias)) vm_u16;
 typedef uint32_t __attribute__((aligned(1), may_alias)) vm_u32;
 typedef uint64_t __attribute__((aligned(1), may_alias)) vm_u64;
-#if defined(__x86_64__) || defined(_M_X64)
-#define VM_LD(insn, T, p, max) ({ uint64_t _v; __asm__ volatile(insn : "=r"(_v) : "m"(*(const T*)(p))); \\
-    if (max) __builtin_assume(_v <= (max)); _v; })
-static inline uint8_t  vm_ld8  (const uint8_t* p) { return (uint8_t)VM_LD("movz{bl %1, %k0|x %k0, %1}", uint8_t, p, 0xFFu); }
-static inline uint16_t vm_ldr16(const uint8_t* p) { return (uint16_t)VM_LD("movz{wl %1, %k0|x %k0, %1}", vm_u16, p, 0xFFFFu); }
-static inline uint32_t vm_ldr32(const uint8_t* p) { return (uint32_t)VM_LD("mov{l %1, %k0| %k0, %1}", vm_u32, p, 0xFFFFFFFFu); }
-static inline uint64_t vm_ldr64(const uint8_t* p) { return VM_LD("mov{q %1, %0| %0, %1}", vm_u64, p, 0); }
-static inline uint16_t vm_ld16 (const uint8_t* p)
-{ return (uint16_t)VM_LD("movz{wl %1, %k0|x %k0, %1}\\n\\trol{w $8, %w0| %w0, 8}", vm_u16, p, 0xFFFFu); }
-#ifdef __MOVBE__
-static inline uint32_t vm_ld32(const uint8_t* p) { return (uint32_t)VM_LD("movbe{l %1, %k0| %k0, %1}", vm_u32, p, 0xFFFFFFFFu); }
-static inline uint64_t vm_ld64(const uint8_t* p) { return VM_LD("movbe{q %1, %0| %0, %1}", vm_u64, p, 0); }
-#endif
-#else
 static inline uint8_t  vm_ld8  (const uint8_t* p) { return *(const volatile uint8_t*)p; }
 static inline uint16_t vm_ldr16(const uint8_t* p) { return *(const volatile vm_u16*)p; }
 static inline uint32_t vm_ldr32(const uint8_t* p) { return *(const volatile vm_u32*)p; }
 static inline uint64_t vm_ldr64(const uint8_t* p) { return *(const volatile vm_u64*)p; }
 static inline uint16_t vm_ld16 (const uint8_t* p) { return __builtin_bswap16(vm_ldr16(p)); }
-#endif
-#if !defined(__MOVBE__) || !(defined(__x86_64__) || defined(_M_X64))
 static inline uint32_t vm_ld32(const uint8_t* p) { return __builtin_bswap32(vm_ldr32(p)); }
 static inline uint64_t vm_ld64(const uint8_t* p) { return __builtin_bswap64(vm_ldr64(p)); }
-#endif
 static inline uint64_t vm_ldr_n(const uint8_t* p, unsigned n)
 {
     return n == 1 ? vm_ld8(p) : n == 2 ? vm_ldr16(p) : n == 4 ? vm_ldr32(p) : vm_ldr64(p);
 }
 #define VM_RAW_LD(T, ea) ((T)vm_ldr_n(vm_base + (uint32_t)(ea), sizeof(T)))
-static inline void vm_raw_ld16_at(const uint8_t* p, void* dst)
-{
-    const uint64_t lo = vm_ldr64(p), hi = vm_ldr64(p + 8);
-    memcpy(dst, &lo, 8);
-    memcpy((uint8_t*)dst + 8, &hi, 8);
-}
-#define vm_raw_ld16(dst, ea) vm_raw_ld16_at(vm_base + (uint32_t)(ea), dst)
+#include <immintrin.h>
+static inline __m128i vm_ldr128_at(const uint8_t* p) { return *(const volatile __m128i_u*)p; }
+
+#define vm_raw_ld128(ea) vm_ldr128_at(vm_base + (uint32_t)(ea))
 typedef struct ppu_mm { uint8_t* vb; int64_t ld_span, st_span; uint32_t gcm; } ppu_mm;
 static inline ppu_mm ppu_mm_take(void)
 {
@@ -220,37 +202,34 @@ static inline int vm_mm_st_ok(const ppu_mm* m, uint32_t ea, uint32_t n)
 }
 #define VM_INL static inline __attribute__((always_inline))
 VM_INL int vm_st_slow(uint32_t ea) { return ppu_slow_page[ea >> 12]; }
+VM_INL int vm_st_slow_after(uint32_t ea) { return *(const volatile unsigned char*)&ppu_slow_page[ea >> 12]; }
 VM_INL void vm_st8(uint8_t* vb, uint64_t a, uint8_t v)
 {
     const uint32_t ea = (uint32_t)a;
     if (__builtin_expect(vm_st_slow(ea), 0)) { vm_write8(a, v); return; }
     *(volatile uint8_t*)(vb + ea) = v;
-    __atomic_signal_fence(__ATOMIC_SEQ_CST);
-    if (__builtin_expect(vm_st_slow(ea), 0)) ppu_store_recheck(a);
+    if (__builtin_expect(vm_st_slow_after(ea), 0)) ppu_store_recheck(a);
 }
 VM_INL void vm_st16(uint8_t* vb, uint64_t a, uint16_t v)
 {
     const uint32_t ea = (uint32_t)a;
     if (__builtin_expect(vm_st_slow(ea), 0)) { vm_write16(a, v); return; }
     *(volatile vm_u16*)(vb + ea) = __builtin_bswap16(v);
-    __atomic_signal_fence(__ATOMIC_SEQ_CST);
-    if (__builtin_expect(vm_st_slow(ea), 0)) ppu_store_recheck(a);
+    if (__builtin_expect(vm_st_slow_after(ea), 0)) ppu_store_recheck(a);
 }
 VM_INL void vm_st32(uint8_t* vb, uint64_t a, uint32_t v)
 {
     const uint32_t ea = (uint32_t)a;
     if (__builtin_expect(vm_st_slow(ea), 0)) { vm_write32(a, v); return; }
     *(volatile vm_u32*)(vb + ea) = __builtin_bswap32(v);
-    __atomic_signal_fence(__ATOMIC_SEQ_CST);
-    if (__builtin_expect(vm_st_slow(ea), 0)) ppu_store_recheck(a);
+    if (__builtin_expect(vm_st_slow_after(ea), 0)) ppu_store_recheck(a);
 }
 VM_INL void vm_st64(uint8_t* vb, uint64_t a, uint64_t v)
 {
     const uint32_t ea = (uint32_t)a;
     if (__builtin_expect(vm_st_slow(ea), 0)) { vm_write64(a, v); return; }
     *(volatile vm_u64*)(vb + ea) = __builtin_bswap64(v);
-    __atomic_signal_fence(__ATOMIC_SEQ_CST);
-    if (__builtin_expect(vm_st_slow(ea), 0)) ppu_store_recheck(a);
+    if (__builtin_expect(vm_st_slow_after(ea), 0)) ppu_store_recheck(a);
 }
 VM_INL void vm_st_raw(uint8_t* vb, uint64_t a, const void* src, uint32_t n)
 {
@@ -260,17 +239,13 @@ VM_INL void vm_st_raw(uint8_t* vb, uint64_t a, const void* src, uint32_t n)
     __atomic_signal_fence(__ATOMIC_SEQ_CST);
     if (__builtin_expect(vm_st_slow(ea), 0)) ppu_store_recheck(a);
 }
-VM_INL void vm_st128(uint8_t* vb, uint64_t a, const void* src)
+VM_INL void vm_st128(uint8_t* vb, uint64_t a, __m128i v)
 {
     const uint32_t ea = (uint32_t)a;
-    if (__builtin_expect(vm_st_slow(ea), 0)) { ppu_store_block(a, src, 16); return; }
-    uint64_t lo, hi;
-    memcpy(&lo, src, 8);
-    memcpy(&hi, (const uint8_t*)src + 8, 8);
-    *(volatile vm_u64*)(vb + ea) = lo;
-    *(volatile vm_u64*)(vb + ea + 8) = hi;
-    __atomic_signal_fence(__ATOMIC_SEQ_CST);
-    if (__builtin_expect(vm_st_slow(ea), 0)) ppu_store_recheck(a);
+    if (__builtin_expect(vm_st_slow(ea), 0)) { uint8_t t[16]; _mm_storeu_si128((__m128i*)t, v); ppu_store_block(a, t, 16); return; }
+    *(volatile __m128i_u*)(vb + ea) = v;
+    if (__builtin_expect(vm_st_slow_after(ea), 0)) ppu_store_recheck(a);
+
 }
 static inline uint8_t  vm_read8_mm (const ppu_mm* m, uint64_t a) { return vm_ld8(m->vb + (uint32_t)a); }
 static inline uint16_t vm_read16_mm(const ppu_mm* m, uint64_t a) { return vm_ld16(m->vb + (uint32_t)a); }
@@ -593,7 +568,8 @@ extern "C" PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*);
 #define vm_read32(a) vm_ld32(_vb + (uint32_t)(a))
 #define vm_read64(a) vm_ld64(_vb + (uint32_t)(a))
 #define VM_RAW_LD(T, ea) ((T)vm_ldr_n(_vb + (uint32_t)(ea), sizeof(T)))
-#define vm_raw_ld16(dst, ea) vm_raw_ld16_at(_vb + (uint32_t)(ea), dst)
+#undef vm_raw_ld128
+#define vm_raw_ld128(ea) vm_ldr128_at(_vb + (uint32_t)(ea))
 #endif
 #if !defined(PPU_NO_INLINE_LOADS) && !defined(PPU_NO_INLINE_STORES)
 #undef vm_write8
@@ -605,7 +581,7 @@ extern "C" PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*);
 #define vm_write32(a, v) vm_st32(_vb, a, v)
 #define vm_write64(a, v) vm_st64(_vb, a, v)
 #define vm_write_raw(a, s, n) vm_st_raw(_vb, a, s, n)
-#define vm_write128(a, s) vm_st128(_vb, a, s)
+#define vm_write128(a, v) vm_st128(_vb, a, v)
 #endif
 
 """
@@ -2224,17 +2200,16 @@ class PPULifter:
             return f"ctx->{spr_field} = ctx->gpr[{g}];"
 
         # VSCR lives in the low-order word of the vector (VRB bits 96:127):
-        # NJ = 0x00010000, SAT = 0x00000001. Vectors are held big-endian.
+        # NJ = 0x00010000, SAT = 0x00000001. Vectors are held byte-reversed, so
+        # that word is the native 32-bit lane at host offset 0.
         if mn == "mtvscr":
             vb = int(ops[0][1:])
-            return (f"{{ const uint8_t* _b = (const uint8_t*)&ctx->vr[{vb}]; "
-                    f"ctx->vscr = ((uint32_t)_b[12] << 24 | (uint32_t)_b[13] << 16 | "
-                    f"(uint32_t)_b[14] << 8 | _b[15]) & 0x00010001u; }}")
+            return (f"{{ uint32_t _w; memcpy(&_w, &ctx->vr[{vb}], 4); "
+                    f"ctx->vscr = _w & 0x00010001u; }}")
         if mn == "mfvscr":
             vd = int(ops[0][1:])
-            return (f"{{ uint8_t* _d = (uint8_t*)&ctx->vr[{vd}]; memset(_d, 0, 12); "
-                    f"_d[12] = 0; _d[13] = (uint8_t)(ctx->vscr >> 16); _d[14] = 0; "
-                    f"_d[15] = (uint8_t)ctx->vscr; }}")
+            return (f"{{ uint32_t _w = ((ctx->vscr >> 16) & 0xFFu) << 16 | (ctx->vscr & 0xFFu); "
+                    f"memset(&ctx->vr[{vd}], 0, 16); memcpy(&ctx->vr[{vd}], &_w, 4); }}")
 
         if mn == "mtcr":
             return f"ctx->cr = (uint32_t)ctx->gpr[{_reg_idx(ops[-1])}];"
@@ -2629,8 +2604,8 @@ class PPULifter:
         if mn == "lwarx":
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             ea = f"ctx->gpr[{ra}] + ctx->gpr[{rb}]" if ra != "0" else f"ctx->gpr[{rb}]"
-            return (f"{{ uint64_t ea = {ea}; "
-                    f"__atomic_store_n(&ctx->reserve_addr, (uint64_t)(uint32_t)ea, __ATOMIC_SEQ_CST); "
+            return (f"{{ uint64_t ea = {ea}; ctx->reserve_addr = (uint32_t)ea; "
+                    f"ctx->reserve_time = __atomic_load_n(&g_ppu_resv[((uint32_t)ea >> 7) & PPU_RESV_MASK], __ATOMIC_ACQUIRE); "
                     f"ctx->gpr[{rd}] = vm_read32(ea); ctx->reserve_value = ctx->gpr[{rd}]; }}")
 
         if mn == "stwcx" or mn == "stwcx.":
@@ -2649,8 +2624,8 @@ class PPULifter:
         if mn == "ldarx":
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             ea = f"ctx->gpr[{ra}] + ctx->gpr[{rb}]" if ra != "0" else f"ctx->gpr[{rb}]"
-            return (f"{{ uint64_t ea = {ea}; "
-                    f"__atomic_store_n(&ctx->reserve_addr, (uint64_t)(uint32_t)ea, __ATOMIC_SEQ_CST); "
+            return (f"{{ uint64_t ea = {ea}; ctx->reserve_addr = (uint32_t)ea; "
+                    f"ctx->reserve_time = __atomic_load_n(&g_ppu_resv[((uint32_t)ea >> 7) & PPU_RESV_MASK], __ATOMIC_ACQUIRE); "
                     f"ctx->gpr[{rd}] = vm_read64(ea); ctx->reserve_value = ctx->gpr[{rd}]; }}")
 
         if mn == "stdcx" or mn == "stdcx.":
@@ -2678,7 +2653,7 @@ class PPULifter:
                 store = "if (sh) vm_write_raw(q, s + (16u - sh), sh);"
             return (f"{{ uint64_t ea = {_xea(ra, rb)}; uint32_t sh = (uint32_t)(ea & 0xF); "
                     f"uint64_t q = ea & ~0xFULL; "
-                    f"const uint8_t* s = (const uint8_t*)&ctx->vr[{vs}]; {store} }}")
+                    f"uint8_t s[16]; vmx_rev(s, &ctx->vr[{vs}]); {store} }}")
 
         if mn == "lwaux":
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
@@ -2874,14 +2849,14 @@ class PPULifter:
             ra = _reg_idx(ops[1])
             rb = _reg_idx(ops[2])
             return (f"{{ uint64_t ea = ({_xea(ra,rb)}) & ~0xFULL; "
-                    f"vm_raw_ld16(&ctx->vr[{vd}], ea); }}")
+                    f"vmx_st(&ctx->vr[{vd}], vmx_revv(vm_raw_ld128(ea))); }}")
 
         if mn in ("stvx", "stvxl"):
             vs = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
             ra = _reg_idx(ops[1])
             rb = _reg_idx(ops[2])
             return (f"{{ uint64_t ea = ({_xea(ra,rb)}) & ~0xFULL; "
-                    f"vm_write128(ea, &ctx->vr[{vs}]); }}")
+                    f"vm_write128(ea, vmx_revv(vmx_ld(&ctx->vr[{vs}]))); }}")
 
         # Cell unaligned vector loads (CBEA / AltiVec): lvlx loads bytes
         # [EA&15 .. 15] of the aligned quadword left-justified into vD and
@@ -2904,10 +2879,9 @@ class PPULifter:
             # destination elements are undefined; keep our zero-fill policy.
             size = {"lvebx": 1, "lvehx": 2, "lvewx": 4}[mn]
             return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
-                    f"ea &= ~{size - 1}ULL; "
-                    f"memset(&ctx->vr[{vd}], 0, 16); "
+                    f"ea &= ~{size - 1}ULL; uint8_t _t[16] = {{0}}; "
                     f"{{ uint{size*8}_t _e = VM_RAW_LD(uint{size*8}_t, ea); "
-                    f"memcpy((uint8_t*)&ctx->vr[{vd}] + (ea & 15), &_e, {size}); }} }}")
+                    f"memcpy(_t + (ea & 15), &_e, {size}); }} vmx_rev(&ctx->vr[{vd}], _t); }}")
 
         if mn == "stvebx" or mn == "stvehx" or mn == "stvewx":
             vs = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
@@ -2916,7 +2890,7 @@ class PPULifter:
             size = {"stvebx": 1, "stvehx": 2, "stvewx": 4}[mn]
             return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
                     f"ea &= ~{size - 1}ULL; "
-                    f"{{ uint{size*8}_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[{vs}] + (ea & 15), {size}); "
+                    f"{{ uint8_t _t[16]; vmx_rev(_t, &ctx->vr[{vs}]); uint{size*8}_t _e; memcpy(&_e, _t + (ea & 15), {size}); "
                     f"vm_write_raw(ea, &_e, {size}); }} }}")
 
         if mn == "lvsl" or mn == "lvsr":
@@ -2928,10 +2902,10 @@ class PPULifter:
             # lvsr: generates {16-b, 17-b, ..., 31-b}
             if mn == "lvsl":
                 return (f"{{ uint8_t b = (uint8_t)(({_xea(ra,rb)}) & 0xF); "
-                        f"for (int i = 0; i < 16; i++) ((uint8_t*)&ctx->vr[{vd}])[i] = b + i; }}")
+                        f"for (int i = 0; i < 16; i++) ((uint8_t*)&ctx->vr[{vd}])[i] = (uint8_t)(b + 15 - i); }}")
             else:
                 return (f"{{ uint8_t b = (uint8_t)(16 - (({_xea(ra,rb)}) & 0xF)); "
-                        f"for (int i = 0; i < 16; i++) ((uint8_t*)&ctx->vr[{vd}])[i] = b + i; }}")
+                        f"for (int i = 0; i < 16; i++) ((uint8_t*)&ctx->vr[{vd}])[i] = (uint8_t)(b + 15 - i); }}")
 
         # VMX splat (vspltw, vsplth, vspltb) — duplicate one element across vector
         if mn == "vspltw":
@@ -2939,7 +2913,7 @@ class PPULifter:
             vb = int(ops[1][1:])
             uimm = int(ops[2]) & 3
             return (f"{{ uint32_t* d = (uint32_t*)&ctx->vr[{vd}]; "
-                    f"uint32_t val = ((uint32_t*)&ctx->vr[{vb}])[{uimm}]; "
+                    f"uint32_t val = ((uint32_t*)&ctx->vr[{vb}])[{3 - uimm}]; "
                     f"d[0] = d[1] = d[2] = d[3] = val; }}")
 
         if mn == "vxor":
@@ -2974,7 +2948,7 @@ class PPULifter:
             ctype, n = ({"b":("uint8_t",16), "h":("uint16_t",8), "w":("uint32_t",4)})[esz]
             half = n // 2
             start = 0 if mn[4] == 'h' else half
-            asg = " ".join(f"t[{2*i}]=a[{start+i}]; t[{2*i+1}]=b[{start+i}];"
+            asg = " ".join(f"t[{n-1-2*i}]=a[{n-1-start-i}]; t[{n-2-2*i}]=b[{n-1-start-i}];"
                            for i in range(half))
             return (f"{{ {ctype}* d=({ctype}*)&ctx->vr[{vd}]; "
                     f"{ctype}* a=({ctype}*)&ctx->vr[{va}]; {ctype}* b=({ctype}*)&ctx->vr[{vb}]; "
@@ -2997,10 +2971,10 @@ class PPULifter:
             vd = int(ops[0][1:])
             va = int(ops[1][1:])
             vb = int(ops[2][1:])
-            sh = int(ops[3])  # numeric shift count (disasm emits plain number)
+            sh = int(ops[3]) & 15
             return (f"{{ uint8_t tmp[32]; "
-                    f"memcpy(tmp, &ctx->vr[{va}], 16); memcpy(tmp+16, &ctx->vr[{vb}], 16); "
-                    f"memcpy(&ctx->vr[{vd}], tmp + {sh}, 16); }}")
+                    f"memcpy(tmp, &ctx->vr[{vb}], 16); memcpy(tmp+16, &ctx->vr[{va}], 16); "
+                    f"memcpy(&ctx->vr[{vd}], tmp + {16 - sh}, 16); }}")
 
         if mn == "vand":
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
@@ -3032,11 +3006,9 @@ class PPULifter:
             if mn == "vspltisb":
                 return (f"{{ memset(&ctx->vr[{vd}], (uint8_t){simm}, 16); }}")
             elif mn == "vspltish":
-                # store BE: swap bytes within each halfword lane
-                return (f"{{ uint8_t* p=(uint8_t*)&ctx->vr[{vd}]; uint16_t hv=(uint16_t)((int16_t){simm}); "
-                        f"for(int i=0;i<8;i++){{ p[i*2]=(uint8_t)(hv>>8); p[i*2+1]=(uint8_t)hv; }} }}")
+                return f"vmx_st(&ctx->vr[{vd}], _mm_set1_epi16((short){simm}));"
             else:
-                return f"vmx_stw(&ctx->vr[{vd}], _mm_set1_epi32({simm}));"
+                return f"vmx_st(&ctx->vr[{vd}], _mm_set1_epi32({simm}));"
 
         # Splat byte (vspltb vD, vB, UIMM — UIMM encoded in vA field)
         # Splat byte/halfword (operand form "vD, vB, UIMM" — UIMM is a bare int,
@@ -3044,12 +3016,12 @@ class PPULifter:
         if mn == "vspltb":
             vd = int(ops[0][1:]); vb = int(ops[1][1:]); uimm = int(ops[2]) & 15
             return (f"{{ uint8_t* d=(uint8_t*)&ctx->vr[{vd}]; uint8_t* b=(uint8_t*)&ctx->vr[{vb}]; "
-                    f"uint8_t v=b[{uimm}]; for(int i=0;i<16;i++) d[i]=v; }}")
+                    f"uint8_t v=b[{15 - uimm}]; for(int i=0;i<16;i++) d[i]=v; }}")
 
         if mn == "vsplth":
             vd = int(ops[0][1:]); vb = int(ops[1][1:]); uimm = int(ops[2]) & 7
             return (f"{{ uint16_t* d=(uint16_t*)&ctx->vr[{vd}]; uint16_t* b=(uint16_t*)&ctx->vr[{vb}]; "
-                    f"uint16_t v=b[{uimm}]; for(int i=0;i<8;i++) d[i]=v; }}")
+                    f"uint16_t v=b[{7 - uimm}]; for(int i=0;i<8;i++) d[i]=v; }}")
 
         return f"/* TODO: {mn} {insn.operands} */;"
 
@@ -3414,7 +3386,7 @@ class PPULifter:
             lines += ["#ifdef __cplusplus", f'extern "C" int {g};', "#else",
                       f"extern int {g};", "#endif"]
         name = f"{func.name}_lifted" if func.start_addr in self.wrap else func.name
-        lines.append(f"void {name}(ppu_context* ctx) {{")
+        lines.append(f"void {name}(ppu_context* __restrict ctx) {{")
         lines.append("    PPU_MM_SNAP")
         clean = lambda m: m.group(1) if int(m.group(2), 16) in func_by_addr and int(m.group(2), 16) not in self.wrap \
             else m.group(0)

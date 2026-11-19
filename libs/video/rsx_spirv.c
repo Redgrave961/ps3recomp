@@ -509,13 +509,13 @@ static void demote_if(spv* s, u32 cond)
     sel_end(s, m);
 }
 
-static u32 sampler_var(spv* s, u32 dim, int depth, u32 binding)
+static u32 sampler_var(spv* s, u32 dim, int depth, u32 set, u32 binding)
 {
     static const u32 dims[4] = { 0, 1, 3, 2 };
     u32 img = intern(s, OpTypeImage, 0, (const u32[]){ tf(s), dims[dim & 3u], depth ? 1u : 0u, 0, 0, 1, 0 }, 7, 0);
     u32 si = intern(s, OpTypeSampledImage, 0, &img, 1, 0);
     u32 v = gvar(s, si, SC_UniformConstant, 0);
-    deco1(s, v, DEC_DescriptorSet, 0);
+    deco1(s, v, DEC_DescriptorSet, set);
     deco1(s, v, DEC_Binding, binding);
     return v;
 }
@@ -787,7 +787,7 @@ static u32 vp_layout(vpc* c)
     for (u32 m = 0; m < 10; m++) mdeco(s, st_, m, DEC_Offset, offs[m]);
     deco(s, st_, DEC_Block);
     c->ubo_l = gvar(s, st_, SC_Uniform, 0);
-    deco1(s, c->ubo_l, DEC_DescriptorSet, 0);
+    deco1(s, c->ubo_l, DEC_DescriptorSet, RSX_SPV_SET_BUFFERS);
     deco1(s, c->ubo_l, DEC_Binding, RSX_SPV_BIND_VERTEX_LAYOUT);
     return c->ubo_l;
 }
@@ -809,7 +809,7 @@ static u32 vp_consts(vpc* c)
     mdeco(s, st_, 0, DEC_Offset, 0);
     deco(s, st_, DEC_Block);
     c->ubo_c = gvar(s, st_, SC_Uniform, 0);
-    deco1(s, c->ubo_c, DEC_DescriptorSet, 0);
+    deco1(s, c->ubo_c, DEC_DescriptorSet, RSX_SPV_SET_BUFFERS);
     deco1(s, c->ubo_c, DEC_Binding, RSX_SPV_BIND_VP_CONSTANTS);
     return c->ubo_c;
 }
@@ -825,7 +825,7 @@ static u32 vp_data(vpc* c)
     sb_ins(s, &s->deco, OpMemberDecorate, (const u32[]){ st_, 0, DEC_NonWritable }, 3);
     deco(s, st_, DEC_Block);
     c->ssbo = gvar(s, st_, SC_StorageBuffer, 0);
-    deco1(s, c->ssbo, DEC_DescriptorSet, 0);
+    deco1(s, c->ssbo, DEC_DescriptorSet, RSX_SPV_SET_BUFFERS);
     deco1(s, c->ssbo, DEC_Binding, RSX_SPV_BIND_VERTEX_DATA);
     return c->ssbo;
 }
@@ -1092,7 +1092,7 @@ static u32 vp_txl(vpc* c, const vpi* i, u32 s0)
     spv* s = c->s;
     u32 unit = bf(i->d2, 8, 2);
     u32 dim = (c->key->texture_dims >> (unit * 2u)) & 3u;
-    if (!c->vtex[unit]) c->vtex[unit] = sampler_var(s, dim, 0, RSX_SPV_BIND_VERTEX_TEXTURE0 + unit);
+    if (!c->vtex[unit]) c->vtex[unit] = sampler_var(s, dim, 0, RSX_SPV_SET_TEXTURES, RSX_SPV_BIND_VERTEX_TEXTURE0 + unit);
     u32 img = ld(s, sampler_type(s, dim, 0), c->vtex[unit]);
     u32 coord = coord_for_dim(s, s0, dim == 2 ? 2u : dim);
     return I(s, OpImageSampleExplicitLod, tv4(s), img, coord, IMG_Lod, exf(s, s0, 3));
@@ -1693,7 +1693,7 @@ static u32 fp_state(fpc* c)
     for (u32 m = 0; m < 10; m++) mdeco(s, st_, m, DEC_Offset, offs[m]);
     deco(s, st_, DEC_Block);
     c->ubo_s = gvar(s, st_, SC_Uniform, 0);
-    deco1(s, c->ubo_s, DEC_DescriptorSet, 0);
+    deco1(s, c->ubo_s, DEC_DescriptorSet, RSX_SPV_SET_BUFFERS);
     deco1(s, c->ubo_s, DEC_Binding, RSX_SPV_BIND_FP_STATE);
     return c->ubo_s;
 }
@@ -2036,7 +2036,7 @@ static u32 fp_consts(fpc* c)
     mdeco(s, st_, 0, DEC_Offset, 0);
     deco(s, st_, DEC_Block);
     c->ubo_c = gvar(s, st_, SC_Uniform, 0);
-    deco1(s, c->ubo_c, DEC_DescriptorSet, 0);
+    deco1(s, c->ubo_c, DEC_DescriptorSet, RSX_SPV_SET_BUFFERS);
     deco1(s, c->ubo_c, DEC_Binding, RSX_SPV_BIND_FP_CONSTANTS);
     return c->ubo_c;
 }
@@ -2166,7 +2166,7 @@ static u32 fp_tex(fpc* c, const fpi* i, u32 op, u32 s0, u32 s1, u32 s2)
     }
     int proj = op == FP_TXP;
     if (shadow && (dim == 0 || dim == 3 || (dim == 2 && proj))) return cvs(s, 0.0f);
-    if (!c->tex[unit]) c->tex[unit] = sampler_var(s, dim, shadow, RSX_SPV_BIND_TEXTURE0 + unit);
+    if (!c->tex[unit]) c->tex[unit] = sampler_var(s, dim, shadow, RSX_SPV_SET_TEXTURES, RSX_SPV_BIND_TEXTURE0 + unit);
     u32 img = ld(s, sampler_type(s, dim, shadow), c->tex[unit]);
     u32 ts = fp_texstate(c, unit);
     u32 ctl = ex(s, tu(s), ts, 0);
@@ -2658,7 +2658,7 @@ int rsx_spv_depth_pack(int d16, rsx_spv_blob* out)
     spv* s = spv_begin();
     if (!s) return -1;
     u32 mainid = newl(s);
-    u32 dvar = sampler_var(s, 1, 0, 0);
+    u32 dvar = sampler_var(s, 1, 0, 0, 0);
     const u32 fimg = intern(s, OpTypeImage, 0, (const u32[]){ tf(s), 1, 0, 0, 0, 1, 0 }, 7, 0);
     const u32 uimg = intern(s, OpTypeImage, 0, (const u32[]){ tu(s), 1, 0, 0, 0, 1, 0 }, 7, 0);
     const u32 usi = intern(s, OpTypeSampledImage, 0, &uimg, 1, 0);
@@ -2668,14 +2668,10 @@ int rsx_spv_depth_pack(int d16, rsx_spv_blob* out)
         deco1(s, svar, DEC_DescriptorSet, 0);
         deco1(s, svar, DEC_Binding, 1);
     }
-    u32 ra = intern(s, OpTypeRuntimeArray, 0, (const u32[]){ tu(s) }, 1, 1);
-    deco1(s, ra, DEC_ArrayStride, 4);
-    u32 sst = intern(s, OpTypeStruct, 0, &ra, 1, 1);
-    mdeco(s, sst, 0, DEC_Offset, 0);
-    deco(s, sst, DEC_Block);
-    u32 buf = gvar(s, sst, SC_StorageBuffer, 0);
-    deco1(s, buf, DEC_DescriptorSet, 0);
-    deco1(s, buf, DEC_Binding, 2);
+    const u32 oimg = intern(s, OpTypeImage, 0, (const u32[]){ tu(s), 1, 0, 0, 0, 2, d16 ? 38u : 33u }, 7, 0);
+    u32 dst = gvar(s, oimg, SC_UniformConstant, 0);
+    deco1(s, dst, DEC_DescriptorSet, 0);
+    deco1(s, dst, DEC_Binding, 2);
     u32 pst = intern(s, OpTypeStruct, 0, (const u32[]){ tu(s), tu(s), tu(s) }, 3, 1);
     for (u32 m = 0; m < 3; m++) mdeco(s, pst, m, DEC_Offset, m * 4u);
     deco(s, pst, DEC_Block);
@@ -2691,36 +2687,28 @@ int rsx_spv_depth_pack(int d16, rsx_spv_blob* out)
     u32 w = ld(s, tu(s), I(s, OpAccessChain, pp, push, ci(s, 0)));
     u32 h = ld(s, tu(s), I(s, OpAccessChain, pp, push, ci(s, 1)));
     u32 mode = ld(s, tu(s), I(s, OpAccessChain, pp, push, ci(s, 2)));
-    u32 cols = d16 ? ushr(s, tu(s), I(s, OpIAdd, tu(s), w, cu(s, 1)), cu(s, 1)) : w;
-    u32 inside = band(s, I(s, OpULessThan, tbool(s), x, cols), I(s, OpULessThan, tbool(s), y, h));
+    u32 inside = band(s, I(s, OpULessThan, tbool(s), x, w), I(s, OpULessThan, tbool(s), y, h));
     u32 merge, then_l;
     sel_if(s, inside, &merge, &then_l);
     u32 dimg = I(s, OpImage, fimg, ld(s, sampler_type(s, 1, 0), dvar));
+    u32 coord = I(s, OpCompositeConstruct, tvec(s, ti(s), 2), bc(s, ti(s), x), bc(s, ti(s), y));
     u32 word;
     if (d16) {
-        u32 x0 = ushl(s, tu(s), x, cu(s, 1));
-        u32 x1 = X(s, tu(s), GL_UMin, I(s, OpIAdd, tu(s), x0, cu(s, 1)), I(s, OpISub, tu(s), w, cu(s, 1)));
-        u32 is_float = I(s, OpIEqual, tbool(s), mode, cu(s, 1));
-        u32 p0 = depth16(s, depth_fetch(s, dimg, x0, y), is_float);
-        u32 p1 = depth16(s, depth_fetch(s, dimg, x1, y), is_float);
-        p1 = sel(s, tu(s), I(s, OpULessThan, tbool(s), I(s, OpIAdd, tu(s), x0, cu(s, 1)), w), p1, cu(s, 0));
-        word = uor(s, tu(s), p0, ushl(s, tu(s), p1, cu(s, 16)));
+        word = depth16(s, depth_fetch(s, dimg, x, y), I(s, OpIEqual, tbool(s), mode, cu(s, 1)));
     } else {
         u32 z = depth_fetch(s, dimg, x, y);
         u32 f24 = uand(s, tu(s), ushr(s, tu(s), bc(s, tu(s), z), cu(s, 7)), cu(s, 0xFFFFFFu));
         u32 d24 = sel(s, tu(s), I(s, OpIEqual, tbool(s), mode, cu(s, 1)), f24, depth_unorm(s, z, 16777215.f));
         u32 simg = I(s, OpImage, uimg, ld(s, usi, svar));
-        u32 coord = I(s, OpCompositeConstruct, tvec(s, ti(s), 2), bc(s, ti(s), x), bc(s, ti(s), y));
         u32 st8 = uand(s, tu(s), ex(s, tu(s), I(s, OpImageFetch, tu4(s), simg, coord, IMG_Lod, ci(s, 0)), 0), cu(s, 0xFFu));
         word = uor(s, tu(s), ushl(s, tu(s), d24, cu(s, 8)), st8);
     }
-    u32 idx = I(s, OpIAdd, tu(s), I(s, OpIMul, tu(s), y, cols), x);
-    st(s, I(s, OpAccessChain, tptr(s, SC_StorageBuffer, tu(s)), buf, ci(s, 0), idx), word);
+    V(s, OpImageWrite, ld(s, oimg, dst), coord, I(s, OpCompositeConstruct, tu4(s), word, cu(s, 0), cu(s, 0), cu(s, 0)));
     sel_end(s, merge);
     sb_ins(s, BODY(s), OpReturn, k_none, 0);
     fn_end(s);
-    const u32 caps[1] = { 1 };
-    return spv_finish(s, 5, caps, 1, mainid, NULL, 0, out);
+    const u32 caps[2] = { 1, 49 };
+    return spv_finish(s, 5, caps, d16 ? 2u : 1u, mainid, NULL, 0, out);
 }
 
 static u32 box_first(spv* s, u32 a, u32 cell) { return I(s, OpUDiv, tu(s), a, cell); }
@@ -2738,7 +2726,7 @@ int rsx_spv_box_down(rsx_spv_blob* out)
     spv* s = spv_begin();
     if (!s) return -1;
     u32 mainid = newl(s);
-    u32 src = sampler_var(s, 1, 0, 0);
+    u32 src = sampler_var(s, 1, 0, 0, 0);
     const u32 fimg = intern(s, OpTypeImage, 0, (const u32[]){ tf(s), 1, 0, 0, 0, 1, 0 }, 7, 0);
     const u32 oimg = intern(s, OpTypeImage, 0, (const u32[]){ tf(s), 1, 0, 0, 0, 2, 1 }, 7, 0);
     u32 dst = gvar(s, oimg, SC_UniformConstant, 0);

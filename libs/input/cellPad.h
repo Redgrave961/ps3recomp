@@ -185,6 +185,8 @@ s32 cellPadSetPortSetting(u32 port_no, u32 port_setting);
 /* NID: 0xBE5C3E81 */
 s32 cellPadSetActDirect(u32 port_no, CellPadActParam* param);
 
+int cellPad_xbox_layout(void);
+
 #ifdef __cplusplus
 }
 #endif

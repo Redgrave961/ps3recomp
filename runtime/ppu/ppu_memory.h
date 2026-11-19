@@ -4,8 +4,6 @@
  * All PS3 memory is big-endian.  These functions translate a 32-bit PS3
  * virtual address to a host pointer via vm_base, then perform a load or
  * store with the appropriate byte swap.
- *
- * Atomic operations (lwarx/stwcx) are emulated with C11 atomics.
  */
 
 #ifndef PPU_MEMORY_H
@@ -17,7 +15,6 @@
 
 #include <stdint.h>
 #include <string.h>
-#include <stdatomic.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -58,8 +55,6 @@ static inline void* vm_translate(uint32_t addr)
 }
 
 static inline uint8_t* vm_ptr8(uint32_t addr)  { return (uint8_t*)vm_translate(addr); }
-static inline uint32_t* vm_ptr32(uint32_t addr) { return (uint32_t*)vm_translate(addr); }
-static inline uint64_t* vm_ptr64(uint32_t addr) { return (uint64_t*)vm_translate(addr); }
 
 /* ---------------------------------------------------------------------------
  * Loads -- read from big-endian guest memory, return host-endian value.
@@ -93,15 +88,9 @@ static inline uint64_t vm_read64(uint32_t addr)
 /* ---------------------------------------------------------------------------
  * Stores -- write host-endian value into big-endian guest memory.
  * -----------------------------------------------------------------------*/
-/* PPU reservation: a plain store to a reserved word must break other threads'
- * reservations (real-PPC granule semantics). g_resv_store_active gates it so the
- * default path is one predictable branch. Defined in ppu_loader.cpp. */
 #ifdef __cplusplus
 extern "C" {
 #endif
-extern int  g_resv_store_active;
-void        ppu_resv_break_store(uint64_t ea);
-
 /* PPU <-> SPU lock-line coherence (runtime/spu/spu_coherency.c). A PPU store to
  * a 128-byte line an SPU has reserved with GETLLAR has to serialize through the
  * SPU lock-line lock -- otherwise it can land inside a PUTLLC's compare and be
@@ -175,7 +164,6 @@ static inline void vm_write32(uint32_t addr, uint32_t val)
     PS3_WW_CHECK(addr, val, 4);
     uint32_t raw = ps3_bswap32(val);
     VM_WRITE_COH(addr, &raw, sizeof(raw));
-    if (g_resv_store_active > 0) ppu_resv_break_store(addr);
 }
 
 static inline void vm_write64(uint32_t addr, uint64_t val)
@@ -183,173 +171,6 @@ static inline void vm_write64(uint32_t addr, uint64_t val)
     PS3_WW_CHECK(addr, val, 8);
     uint64_t raw = ps3_bswap64(val);
     VM_WRITE_COH(addr, &raw, sizeof(raw));
-    if (g_resv_store_active > 0) ppu_resv_break_store(addr);
-}
-
-/* A block store is a store to every 128-byte line it touches, so it breaks
- * an SPU reservation on any of them the same way vm_write32 does on one:
- * under the lock-line lock, with the lost-reservation event raised per line.
- * Only the lines that are reserved are notified, and a block that touches
- * none takes the plain path. */
-static inline int vm_block_reserved(uint32_t guest_dst, size_t len)
-{
-    if (len == 0) return 0;
-    uint32_t first = guest_dst & ~127u;
-    uint32_t last  = (uint32_t)(guest_dst + (len - 1)) & ~127u;
-    for (uint32_t line = first; ; line += 128u) {
-        if (spu_coh_line_reserved(line)) return 1;
-        if (line == last) break;
-    }
-    return 0;
-}
-
-static inline void vm_block_notify(uint32_t guest_dst, size_t len)
-{
-    uint32_t first = guest_dst & ~127u;
-    uint32_t last  = (uint32_t)(guest_dst + (len - 1)) & ~127u;
-    for (uint32_t line = first; ; line += 128u) {
-        if (spu_coh_is_reserved(line)) spu_coh_notify_write(line);
-        if (line == last) break;
-    }
-}
-
-static inline void vm_memcpy_to(uint32_t guest_dst, const void* host_src, size_t len)
-{
-    if (vm_block_reserved(guest_dst, len)) {
-        spu_lockline_lock_range(guest_dst, (uint32_t)len);
-        memcpy(vm_ptr8(guest_dst), host_src, len);
-        vm_block_notify(guest_dst, len);
-        spu_lockline_unlock_range(guest_dst, (uint32_t)len);
-    } else {
-        memcpy(vm_ptr8(guest_dst), host_src, len);
-    }
-}
-
-static inline void vm_memset(uint32_t guest_dst, int val, size_t len)
-{
-    if (vm_block_reserved(guest_dst, len)) {
-        spu_lockline_lock_range(guest_dst, (uint32_t)len);
-        memset(vm_ptr8(guest_dst), val, len);
-        vm_block_notify(guest_dst, len);
-        spu_lockline_unlock_range(guest_dst, (uint32_t)len);
-    } else {
-        memset(vm_ptr8(guest_dst), val, len);
-    }
-}
-
-/* ---------------------------------------------------------------------------
- * Atomic operations -- lwarx / stwcx emulation
- *
- * PowerPC reservation-based atomics:
- *   lwarx  rD, rA, rB   -- Load word and reserve (sets reservation)
- *   stwcx. rS, rA, rB   -- Store word conditional (clears reservation)
- *                           Sets CR0 EQ bit on success.
- *
- * We emulate this using C11 compare-and-swap on the host.
- * -----------------------------------------------------------------------*/
-
-static inline uint32_t ppu_lwarx(ppu_context* ctx, uint32_t addr)
-{
-    /* Read the current value from memory (big-endian, so swap). */
-    uint32_t raw;
-    _Atomic(uint32_t)* atom = (_Atomic(uint32_t)*)vm_ptr32(addr);
-    raw = atomic_load_explicit(atom, memory_order_acquire);
-
-    ctx->reserve_addr  = addr;
-    ctx->reserve_value = raw;
-    ctx->reserve_valid = 1;
-
-    return ps3_bswap32(raw);
-}
-
-static inline int ppu_stwcx(ppu_context* ctx, uint32_t addr, uint32_t val)
-{
-    if (!ctx->reserve_valid || ctx->reserve_addr != addr) {
-        /* No reservation or address mismatch -- fail */
-        ppu_cr_set(ctx, 0, PPU_CR_SO * ppu_xer_get_so(ctx));
-        ctx->reserve_valid = 0;
-        return 0;
-    }
-
-    uint32_t expected = (uint32_t)ctx->reserve_value;
-    uint32_t desired  = ps3_bswap32(val);
-    _Atomic(uint32_t)* atom = (_Atomic(uint32_t)*)vm_ptr32(addr);
-
-    /* On a line an SPU has reserved, commit under the lock-line lock and notify
-     * -- the same serialization the coherent stores above use, so a PPU commit
-     * can never land inside an SPU PUTLLC's compare/commit window (nor the
-     * reverse), and the reserving SPU gets its lost-reservation event. */
-    int ok;
-    if (spu_coh_is_reserved(addr)) {
-        spu_lockline_lock(addr);
-        ok = atomic_compare_exchange_strong_explicit(
-            atom, &expected, desired,
-            memory_order_acq_rel, memory_order_acquire);
-        if (ok) spu_coh_notify_write(addr);
-        spu_lockline_unlock(addr);
-    } else {
-        ok = atomic_compare_exchange_strong_explicit(
-            atom, &expected, desired,
-            memory_order_acq_rel, memory_order_acquire);
-    }
-
-    ctx->reserve_valid = 0;
-
-    if (ok)
-        ppu_cr_set(ctx, 0, PPU_CR_EQ | (PPU_CR_SO * ppu_xer_get_so(ctx)));
-    else
-        ppu_cr_set(ctx, 0, PPU_CR_SO * ppu_xer_get_so(ctx));
-
-    return ok;
-}
-
-/* 64-bit variants: ldarx / stdcx. */
-static inline uint64_t ppu_ldarx(ppu_context* ctx, uint32_t addr)
-{
-    _Atomic(uint64_t)* atom = (_Atomic(uint64_t)*)vm_ptr64(addr);
-    uint64_t raw = atomic_load_explicit(atom, memory_order_acquire);
-
-    ctx->reserve_addr  = addr;
-    ctx->reserve_value = raw;
-    ctx->reserve_valid = 1;
-
-    return ps3_bswap64(raw);
-}
-
-static inline int ppu_stdcx(ppu_context* ctx, uint32_t addr, uint64_t val)
-{
-    if (!ctx->reserve_valid || ctx->reserve_addr != addr) {
-        ppu_cr_set(ctx, 0, PPU_CR_SO * ppu_xer_get_so(ctx));
-        ctx->reserve_valid = 0;
-        return 0;
-    }
-
-    uint64_t expected = ctx->reserve_value;
-    uint64_t desired  = ps3_bswap64(val);
-    _Atomic(uint64_t)* atom = (_Atomic(uint64_t)*)vm_ptr64(addr);
-
-    int ok;
-    if (spu_coh_is_reserved(addr)) {
-        spu_lockline_lock(addr);
-        ok = atomic_compare_exchange_strong_explicit(
-            atom, &expected, desired,
-            memory_order_acq_rel, memory_order_acquire);
-        if (ok) spu_coh_notify_write(addr);
-        spu_lockline_unlock(addr);
-    } else {
-        ok = atomic_compare_exchange_strong_explicit(
-            atom, &expected, desired,
-            memory_order_acq_rel, memory_order_acquire);
-    }
-
-    ctx->reserve_valid = 0;
-
-    if (ok)
-        ppu_cr_set(ctx, 0, PPU_CR_EQ | (PPU_CR_SO * ppu_xer_get_so(ctx)));
-    else
-        ppu_cr_set(ctx, 0, PPU_CR_SO * ppu_xer_get_so(ctx));
-
-    return ok;
 }
 
 #ifdef __cplusplus

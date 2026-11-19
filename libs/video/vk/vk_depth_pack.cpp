@@ -12,7 +12,7 @@ bool depth_pack::create(vk_device& d)
     VkDescriptorSetLayoutBinding b[3]{};
     for (uint32_t i = 0; i < 3; i++) {
         b[i].binding = i;
-        b[i].descriptorType = i < 2 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        b[i].descriptorType = i < 2 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         b[i].descriptorCount = 1;
         b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     }
@@ -60,14 +60,14 @@ void depth_pack::destroy()
     m_d = nullptr;
 }
 
-void depth_pack::record(VkCommandBuffer cmd, VkImageView depth, VkImageView stencil, VkBuffer out, VkDeviceSize offset, VkDeviceSize size,
-                        uint32_t width, uint32_t height, bool d16, bool is_float) const
+void depth_pack::record(VkCommandBuffer cmd, VkImageView depth, VkImageView stencil, VkImageView out, uint32_t width, uint32_t height,
+                        bool d16, bool is_float) const
 {
     const VkDescriptorImageInfo images[2] = {
         { m_sampler, depth, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
         { m_sampler, stencil, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
     };
-    const VkDescriptorBufferInfo buffer{ out, offset, size };
+    const VkDescriptorImageInfo target{ VK_NULL_HANDLE, out, VK_IMAGE_LAYOUT_GENERAL };
     VkWriteDescriptorSet w[3]{};
     uint32_t n = 0;
     for (uint32_t i = 0; i < (d16 ? 1u : 2u); i++) {
@@ -81,15 +81,14 @@ void depth_pack::record(VkCommandBuffer cmd, VkImageView depth, VkImageView sten
     w[n].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     w[n].dstBinding = 2;
     w[n].descriptorCount = 1;
-    w[n].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    w[n].pBufferInfo = &buffer;
+    w[n].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    w[n].pImageInfo = &target;
     n++;
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipe[d16 ? 1 : 0]);
     vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_layout, 0, n, w);
     const uint32_t pc[3] = { width, height, is_float ? 1u : 0u };
     vkCmdPushConstants(cmd, m_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
-    const uint32_t cols = d16 ? (width + 1u) / 2u : width;
-    vkCmdDispatch(cmd, (cols + 7u) / 8u, (height + 7u) / 8u, 1);
+    vkCmdDispatch(cmd, (width + 7u) / 8u, (height + 7u) / 8u, 1);
 }
 
 }

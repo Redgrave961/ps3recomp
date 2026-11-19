@@ -122,7 +122,7 @@ bool renderer::open(vk_device& d, VkSemaphore timeline, uint64_t* submitted, con
     }
     m_ubo_align = std::max<VkDeviceSize>(16, d.props.limits.minUniformBufferOffsetAlignment);
     m_shaders.init(d, m_pipelines);
-    if (!m_ring.create(d, 256ull << 20, 256ull << 20, timeline) || !m_pipelines.create(d, cache_path) || !create_dummies() ||
+    if (!m_ring.create(d, 256ull << 20, 256ull << 20, timeline) || !m_pipelines.create(d, cache_path) || !create_buffer_set() || !create_dummies() ||
         !m_occlusion.create(d, timeline) || !m_depth_pack.create(d) || !m_downscale.create(d))
         return false;
     m_pipelines.precompile(m_shaders);
@@ -143,8 +143,6 @@ void renderer::close()
     m_downscale.destroy();
     for (auto& g : m_scratch_garbage) vmaDestroyBuffer(m_d->vma, g.second.buffer, g.second.mem);
     m_scratch_garbage.clear();
-    if (m_pack.buffer) vmaDestroyBuffer(m_d->vma, m_pack.buffer, m_pack.mem);
-    m_pack = scratch{};
     destroy_image(m_box);
     for (auto& s : m_surfaces) {
         destroy_image(s->img);
@@ -161,6 +159,7 @@ void renderer::close()
     for (auto& [k, s] : m_samplers) vkDestroySampler(m_d->dev, s, nullptr);
     m_samplers.clear();
     if (m_dummy_sampler) vkDestroySampler(m_d->dev, m_dummy_sampler, nullptr);
+    if (m_buffer_pool) vkDestroyDescriptorPool(m_d->dev, std::exchange(m_buffer_pool, VK_NULL_HANDLE), nullptr);
     m_pipelines.destroy();
     m_shaders.destroy();
     m_ring.destroy();
@@ -181,7 +180,7 @@ bool renderer::readable(const image& img)
 
 void renderer::trace_begin(VkCommandBuffer c)
 {
-    if (!m_trace || m_trace_open || !m_trace_pool || (m_trace_spans.size() + 1u) * 2u > k_trace_queries) return;
+    if (!m_trace_timed || m_trace_open || !m_trace_pool || (m_trace_spans.size() + 1u) * 2u > k_trace_queries) return;
     vkCmdWriteTimestamp2(c, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, m_trace_pool, (u32)m_trace_spans.size() * 2u);
     m_trace_open = true;
 }
@@ -289,11 +288,15 @@ VkCommandBuffer renderer::cmd()
 {
     submission& s = m_submissions[m_submission];
     if (m_recording) return s.cmd;
-    VkSemaphoreWaitInfo wi{ VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
-    wi.semaphoreCount = 1;
-    wi.pSemaphores = &m_timeline;
-    wi.pValues = &s.done;
-    vkWaitSemaphores(m_d->dev, &wi, UINT64_MAX);
+    if (s.done > m_reached) vkGetSemaphoreCounterValue(m_d->dev, m_timeline, &m_reached);
+    if (s.done > m_reached) {
+        VkSemaphoreWaitInfo wi{ VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
+        wi.semaphoreCount = 1;
+        wi.pSemaphores = &m_timeline;
+        wi.pValues = &s.done;
+        vkWaitSemaphores(m_d->dev, &wi, UINT64_MAX);
+        m_reached = s.done;
+    }
     vkResetCommandPool(m_d->dev, s.pool, 0);
     VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -387,6 +390,7 @@ bool renderer::create_image(image& img, VkFormat format, u32 width, u32 height, 
     }
     img.format = format;
     img.aspect = aspect;
+    img.usage = usage;
     img.width = width;
     img.height = height;
     img.layout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -429,6 +433,7 @@ void renderer::retire(surface* s)
     discard(s->native);
     auto it = std::find_if(m_surfaces.begin(), m_surfaces.end(), [s](const std::unique_ptr<surface>& p) { return p.get() == s; });
     if (it != m_surfaces.end()) m_surfaces.erase(it);
+    m_binding_gen++;
 }
 
 ratio renderer::scale_for(u32 width, u32 height) const
@@ -504,6 +509,7 @@ surface* renderer::surface_for(u32 ea, u32 pitch, u32 width, u32 height, u32 for
         i++;
     }
     m_surfaces.push_back(std::move(made));
+    m_binding_gen++;
     return s;
 }
 
@@ -1283,18 +1289,29 @@ void renderer::flip_reset()
     end_rendering();
     if (m_trace) {
         std::fprintf(m_trace, "[trace] frame end, %u draws\n", m_trace_draws);
-        trace_report();
-        std::fclose(m_trace);
-        m_trace = nullptr;
+        if (m_trace_timed) trace_report();
+        m_trace_timed = false;
         m_trace_spans.clear();
         m_trace_open = false;
+        if (trace_frames.fetch_sub(1, std::memory_order_relaxed) <= 1) {
+            trace_frames.store(0, std::memory_order_relaxed);
+            std::fclose(m_trace);
+            m_trace = nullptr;
+        } else {
+            std::fprintf(m_trace, "[trace] frame %llu\n", (unsigned long long)m_flips);
+        }
     }
     m_trace_draws = 0;
-    if (trace_request.exchange(false, std::memory_order_relaxed)) {
+    if (!m_trace && trace_frames.load(std::memory_order_relaxed)) {
         char name[48];
         std::snprintf(name, sizeof name, "trace_%llu.txt", (unsigned long long)m_flips);
         m_trace = std::fopen(name, "w");
-        if (m_trace) std::fprintf(stderr, "[vk] F12 trace -> %s\n", name);
+        if (m_trace) {
+            std::setvbuf(m_trace, nullptr, _IOFBF, 1u << 28);
+            std::fprintf(m_trace, "[trace] frame %llu\n", (unsigned long long)m_flips);
+            std::fprintf(stderr, "[vk] F12 trace -> %s\n", name);
+            m_trace_timed = true;
+        }
         if (m_trace && !m_trace_pool) {
             VkQueryPoolCreateInfo qi{ VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
             qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
@@ -1313,12 +1330,15 @@ void renderer::flip_reset()
             }
             discard(it->second->img);
             it = m_textures.erase(it);
+            m_binding_gen++;
         }
+    if ((m_flips & 63u) == 0) evict(64);
 }
 
 void renderer::rescale(ratio scale)
 {
     resolution_scale = scale;
+    m_binding_gen++;
     VkCommandBuffer c = cmd();
     end_rendering();
     for (auto& p : m_surfaces) {

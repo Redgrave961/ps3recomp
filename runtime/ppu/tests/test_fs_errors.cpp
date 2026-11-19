@@ -18,6 +18,7 @@
  */
 /* ps3_dev_flash_path (runtime/platform), which host_path calls for /dev_flash. */
 #include "../../platform/ps3_dev_flash.c"
+#include "../../../libs/filesystem/ps3_vfs.c"
 #include "ppu_fs.cpp"
 #ifdef _WIN32
 #  include <windows.h>
@@ -39,8 +40,8 @@ void sys_fs_translate_path(const char* g, char* h, int n)
 void ps3_hle_register_ctx(uint32_t, const char*, void (*)(ppu_context*)) {}
 }
 #include "../../../libs/filesystem/npdrm.h"
-int npdrm_is_npd(FILE* f) { (void)f; return 0; }
-npdrm_file* npdrm_open(FILE* f, const char* n) { (void)f; (void)n; return 0; }
+int npdrm_is_npd(ps3_vfile* f) { (void)f; return 0; }
+npdrm_file* npdrm_open(ps3_vfile* f) { (void)f; return 0; }
 int64_t npdrm_read(npdrm_file* d, uint64_t o, void* p, uint64_t n) { (void)d; (void)o; (void)p; (void)n; return -1; }
 uint64_t npdrm_size(const npdrm_file* d) { (void)d; return 0; }
 void npdrm_close(npdrm_file* d) { (void)d; }
@@ -151,11 +152,11 @@ int main(int argc, char** argv)
     strcpy((char*)mem + PATH, "/dev_hdd1/ps3recomp_fs_errors.bin");
     { ppu_context ctx = mk(PATH, STATB); cellFsStat(&ctx);
       const uint64_t at = rd64(STATB + 0x0C), mt = rd64(STATB + 0x14), ct = rd64(STATB + 0x1C);
-      fs_stat64_t st;
-      const bool have = FS_STAT64(host, &st) == 0;
+      ps3_vstat st;
+      const bool have = ps3_vfs_stat(host, &st) == 0;
       CHECK(call_rc(ctx) == 0 && have, "cellFsStat on the file");
-      CHECK(mt != 0 && mt == (uint64_t)st.st_mtime, "cellFsStat mtime %llu is the host file's (%lld)",
-            (unsigned long long)mt, (long long)st.st_mtime);
+      CHECK(mt != 0 && mt == (uint64_t)st.mtime, "cellFsStat mtime %llu is the host file's (%lld)",
+            (unsigned long long)mt, (long long)st.mtime);
       CHECK(at != 0 && ct != 0, "cellFsStat atime %llu / ctime %llu are set", (unsigned long long)at, (unsigned long long)ct); }
     { uint32_t fd2 = 0;
       CHECK(open_guest("/dev_hdd1/ps3recomp_fs_errors.bin", 0, &fd2) == 0, "reopen read-only");

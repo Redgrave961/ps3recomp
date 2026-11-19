@@ -328,10 +328,6 @@ HANDLE CreateSemaphoreA(void* sa, LONG initial, LONG maximum, LPCSTR name)
     o->maximum = maximum;
     return (HANDLE)o;
 }
-HANDLE CreateSemaphoreW(void* sa, LONG initial, LONG maximum, LPCWSTR name)
-{ (void)name; return CreateSemaphoreA(sa, initial, maximum, NULL); }
-HANDLE CreateSemaphoreExA(void* sa, LONG initial, LONG maximum, LPCSTR name, DWORD flags, DWORD access)
-{ (void)flags; (void)access; return CreateSemaphoreA(sa, initial, maximum, name); }
 BOOL ReleaseSemaphore(HANDLE h, LONG count, LONG* previous)
 {
     ps3_obj* o = obj_of(h);
@@ -358,8 +354,6 @@ HANDLE CreateWaitableTimerA(void* sa, BOOL manual_reset, LPCSTR name)
     o->manual = manual_reset ? 1 : 0;
     return (HANDLE)o;
 }
-HANDLE CreateWaitableTimerW(void* sa, BOOL manual_reset, LPCWSTR name)
-{ (void)name; return CreateWaitableTimerA(sa, manual_reset, NULL); }
 BOOL SetWaitableTimer(HANDLE h, const LARGE_INTEGER* due, LONG period_ms,
                       void* completion, void* arg, BOOL resume)
 {
@@ -958,17 +952,6 @@ BOOL SetThreadPriority(HANDLE h, int priority)
     return TRUE;
 }
 
-int GetThreadPriority(HANDLE h)
-{
-    pthread_t pt; DWORD tid; int self; ps3_obj* t;
-    if (!resolve_thread(h, &pt, &tid, &self, &t)) { SetLastError(ERROR_INVALID_HANDLE); return THREAD_PRIORITY_ERROR_RETURN; }
-    if (!t) return THREAD_PRIORITY_NORMAL;
-    pthread_mutex_lock(&s_lock);
-    int p = t->priority;
-    pthread_mutex_unlock(&s_lock);
-    return p;
-}
-
 DWORD_PTR SetThreadAffinityMask(HANDLE h, DWORD_PTR mask)
 {
     pthread_t pt; DWORD tid; int self; ps3_obj* t;
@@ -983,14 +966,6 @@ DWORD_PTR SetThreadAffinityMask(HANDLE h, DWORD_PTR mask)
     }
     if (started) apply_affinity(pt, mask);
     return prev;
-}
-
-DWORD SetThreadIdealProcessor(HANDLE h, DWORD ideal)
-{
-    pthread_t pt; DWORD tid; int self; ps3_obj* t;
-    if (!resolve_thread(h, &pt, &tid, &self, &t)) { SetLastError(ERROR_INVALID_HANDLE); return (DWORD)-1; }
-    (void)ideal;
-    return 0;   /* advisory on Windows too; the previous "ideal" is unknowable here */
 }
 
 LONG SetThreadDescription(HANDLE h, PCWSTR description)
@@ -1285,9 +1260,6 @@ DWORD WaitForSingleObject(HANDLE h, DWORD ms)
     if (result == WAIT_TIMEOUT) SetLastError(ERROR_TIMEOUT);
     return result;
 }
-
-DWORD WaitForSingleObjectEx(HANDLE h, DWORD ms, BOOL alertable)
-{ (void)alertable; return WaitForSingleObject(h, ms); }
 
 DWORD WaitForMultipleObjects(DWORD count, const HANDLE* handles, BOOL wait_all, DWORD ms)
 {

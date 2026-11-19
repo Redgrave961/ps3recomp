@@ -145,7 +145,7 @@ jobs:
           if "$RUNNER_TEMP/test_spu_float_vector_scalar_avx2.exe" 16 rz; then echo "::endgroup::"; else echo "::endgroup::"; echo "::error::test_spu_float_vector_scalar_avx2 rz failed"; fail=1; fi
           t test_spu_decode -UNDEBUG $spu runtime/spu/tests/test_spu_decode.c runtime/platform/ps3_sync.c runtime/spu/tests/spu_fixture_ppu.c -lsynchronization
           t test_spu_group_lifecycle -I include -I runtime -I runtime/syscalls -I runtime/spu -I libs/video \
-            runtime/spu/tests/test_spu_group_lifecycle.c runtime/spu/tests/test_spu_group_lifecycle_win_stubs.c \
+            runtime/spu/tests/test_spu_group_lifecycle.c runtime/spu/tests/test_spu_group_lifecycle_win_stubs.c libs/filesystem/ps3_vfs.c \
             runtime/spu/spu_lifted_thread.c runtime/platform/ps3_sync.c runtime/spu/tests/spu_fixture_ppu.c -lsynchronization
           t test_sys_net -I include libs/network/tests/test_sys_net.c -lws2_32
           t test_np_commerce2 -I include libs/network/tests/test_np_commerce2.c -lws2_32

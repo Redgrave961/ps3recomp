@@ -28,9 +28,24 @@ const vertex_method k_vertex_methods[] = {
     { M_VERTEX_DATA1F, 1u, 1u, VT_F, 4u },
 };
 
+enum method_kind : u8 {
+    K_STORE,
+    K_PROGRAM,
+    K_CONSTANT,
+    K_BEGIN_END,
+    K_DRAW_ARRAYS,
+    K_DRAW_INDEX,
+    K_INLINE,
+    K_ELEMENT16,
+    K_ELEMENT32,
+    K_CLEAR,
+    K_REPORT,
+    K_VERTEX,
+};
+
 struct groups {
     u16 bits[REG_COUNT] = {};
-    u8 vertex[REG_COUNT] = {};
+    u8 kind[REG_COUNT] = {};
 
     void mark(u32 first, u32 last, u32 bit)
     {
@@ -104,17 +119,26 @@ struct groups {
         mark(M_VTEX_OFFSET, M_VTEX_OFFSET + 0x7Cu, D_VERTEX_TEXTURES);
         for (u32 v = 0; v < std::size(k_vertex_methods); v++)
             for (u32 m = k_vertex_methods[v].base; m < k_vertex_methods[v].base + ATTRIBS * k_vertex_methods[v].regs_per_attribute * 4u; m += 4u)
-                vertex[m >> 2] = (u8)(v + 1u);
+                kind[m >> 2] = (u8)(K_VERTEX + v);
+        for (u32 m = 0; m < 0x80u; m += 4u) {
+            kind[(M_TRANSFORM_PROGRAM + m) >> 2] = K_PROGRAM;
+            kind[(M_TRANSFORM_CONSTANT + m) >> 2] = K_CONSTANT;
+        }
+        kind[M_BEGIN_END >> 2] = K_BEGIN_END;
+        kind[M_DRAW_ARRAYS >> 2] = K_DRAW_ARRAYS;
+        kind[M_DRAW_INDEX_ARRAY >> 2] = K_DRAW_INDEX;
+        kind[M_INLINE_ARRAY >> 2] = K_INLINE;
+        kind[M_ARRAY_ELEMENT16 >> 2] = K_ELEMENT16;
+        kind[M_ARRAY_ELEMENT32 >> 2] = K_ELEMENT32;
+        kind[M_CLEAR_SURFACE >> 2] = K_CLEAR;
+        kind[M_CLEAR_REPORT_VALUE >> 2] = K_REPORT;
+        kind[M_ZPASS_PIXEL_COUNT_ENABLE >> 2] = K_REPORT;
+        kind[M_ZCULL_STATS_ENABLE >> 2] = K_REPORT;
+        kind[M_RENDER_ENABLE >> 2] = K_REPORT;
     }
 };
 
 const groups k_groups;
-
-const vertex_method* find_vertex_method(u32 m)
-{
-    const u8 v = k_groups.vertex[m >> 2];
-    return v ? &k_vertex_methods[v - 1u] : nullptr;
-}
 
 u32 swap(u32 v) { return __builtin_bswap32(v); }
 
@@ -188,15 +212,15 @@ void frontend::push_vertex(u32 index, u32 sub, u32 size, u32 type, u32 value)
 
 void frontend::vertex_data(u32 method, u32 be)
 {
-    const vertex_method* v = find_vertex_method(method);
-    const u32 word = (method - v->base) >> 2;
-    const u32 index = word / v->regs_per_attribute;
-    const u32 sub = word % v->regs_per_attribute;
-    const u32 value = v->bytes == 2u ? (be << 16) | (be >> 16) : v->bytes == 1u ? swap(be) : be;
-    if (in_begin_end) push_vertex(index, sub, v->size, v->type, value);
+    const vertex_method& v = k_vertex_methods[k_groups.kind[method >> 2] - K_VERTEX];
+    const u32 word = (method - v.base) >> 2;
+    const u32 index = word / v.regs_per_attribute;
+    const u32 sub = word % v.regs_per_attribute;
+    const u32 value = v.bytes == 2u ? (be << 16) | (be >> 16) : v.bytes == 1u ? swap(be) : be;
+    if (in_begin_end) push_vertex(index, sub, v.size, v.type, value);
     register_attribute& a = attribute[index];
-    a.type = v->type;
-    a.size = v->size;
+    a.type = v.type;
+    a.size = v.size;
     a.data[sub] = value;
     dirty |= D_VERTEX_LAYOUT;
 }
@@ -283,57 +307,59 @@ void frontend::methods(u32 method, u32 inc, const u32* be, u32 count)
 {
     while (count) {
         u32 used = 1;
-        if (method >= M_TRANSFORM_PROGRAM && method < M_TRANSFORM_PROGRAM + 0x80u) {
+        switch (k_groups.kind[method >> 2]) {
+        case K_STORE:
+            store(method, swap(*be));
+            break;
+        case K_PROGRAM: {
             const u32 index = (method - M_TRANSFORM_PROGRAM) >> 2;
             used = program_methods(index, be, inc ? std::min(count, 32u - index) : count);
-        } else if (method >= M_TRANSFORM_CONSTANT && method < M_TRANSFORM_CONSTANT + 0x80u) {
+            break;
+        }
+        case K_CONSTANT: {
             const u32 index = (method - M_TRANSFORM_CONSTANT) >> 2;
             used = constant_methods(index, inc, be, inc ? std::min(count, 32u - index) : count);
-        } else {
+            break;
+        }
+        case K_BEGIN_END:
+            begin_end(swap(*be));
+            break;
+        case K_DRAW_ARRAYS:
+        case K_DRAW_INDEX: {
             const u32 value = swap(*be);
-            switch (method) {
-            case M_BEGIN_END:
-                begin_end(value);
-                break;
-            case M_DRAW_ARRAYS:
-            case M_DRAW_INDEX_ARRAY: {
-                draw.kind = method == M_DRAW_ARRAYS ? draw_kind::array : draw_kind::indexed;
-                const draw_range range{ value & 0xFFFFFFu, (value >> 24) + 1u };
-                if (!draw.ranges.empty() && draw.ranges.back().first + draw.ranges.back().count == range.first)
-                    draw.ranges.back().count += range.count;
-                else
-                    draw.ranges.push_back(range);
-                break;
+            draw.kind = method == M_DRAW_ARRAYS ? draw_kind::array : draw_kind::indexed;
+            const draw_range range{ value & 0xFFFFFFu, (value >> 24) + 1u };
+            if (!draw.ranges.empty() && draw.ranges.back().first + draw.ranges.back().count == range.first)
+                draw.ranges.back().count += range.count;
+            else
+                draw.ranges.push_back(range);
+            break;
+        }
+        case K_INLINE:
+            draw.kind = draw_kind::inlined;
+            draw.inline_words.push_back(*be);
+            break;
+        case K_ELEMENT16:
+            if (in_begin_end) {
+                const u32 value = swap(*be);
+                draw.elements.push_back(value & 0xFFFFu);
+                draw.elements.push_back(value >> 16);
             }
-            case M_INLINE_ARRAY:
-                draw.kind = draw_kind::inlined;
-                draw.inline_words.push_back(*be);
-                break;
-            case M_ARRAY_ELEMENT16:
-                if (in_begin_end) {
-                    draw.elements.push_back(value & 0xFFFFu);
-                    draw.elements.push_back(value >> 16);
-                }
-                break;
-            case M_ARRAY_ELEMENT32:
-                if (in_begin_end) draw.elements.push_back(value);
-                break;
-            case M_CLEAR_SURFACE:
-                reg[method >> 2] = value;
-                on_clear(value);
-                break;
-            case M_CLEAR_REPORT_VALUE:
-            case M_ZPASS_PIXEL_COUNT_ENABLE:
-            case M_ZCULL_STATS_ENABLE:
-            case M_RENDER_ENABLE:
-                reg[method >> 2] = value;
-                on_report(method, value);
-                break;
-            default:
-                if (find_vertex_method(method)) vertex_data(method, *be);
-                else store(method, value);
-                break;
-            }
+            break;
+        case K_ELEMENT32:
+            if (in_begin_end) draw.elements.push_back(swap(*be));
+            break;
+        case K_CLEAR:
+            reg[method >> 2] = swap(*be);
+            on_clear(reg[method >> 2]);
+            break;
+        case K_REPORT:
+            reg[method >> 2] = swap(*be);
+            on_report(method, reg[method >> 2]);
+            break;
+        default:
+            vertex_data(method, *be);
+            break;
         }
         if (used >= count) return;
         count -= used;
@@ -341,5 +367,4 @@ void frontend::methods(u32 method, u32 inc, const u32* be, u32 count)
         method += inc * used;
     }
 }
-
 }

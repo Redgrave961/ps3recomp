@@ -29,6 +29,7 @@ extern "C" {
 #include "../platform/ps3_sync.h"
 
 #define SPU_LL_STRIPES 256u
+#define SPU_LL_SPIN 256u
 
 typedef struct {
     ps3_lock lock;
@@ -41,7 +42,7 @@ static inline unsigned spu_ll_index(uint32_t ea) { return (ea >> SPU_COH_LINE_SH
 
 static void spu_ll_acquire(spu_ll_stripe* s)
 {
-    ps3_lock_acquire(&s->lock);
+    ps3_lock_acquire_spin(&s->lock, SPU_LL_SPIN);
     __atomic_store_n(&s->seq, s->seq + 1, __ATOMIC_RELAXED);
     __atomic_thread_fence(__ATOMIC_RELEASE);
 }
@@ -52,8 +53,48 @@ static void spu_ll_release(spu_ll_stripe* s)
     ps3_lock_release(&s->lock);
 }
 
+static SPU_THREAD_LOCAL spu_context** t_wake;
+static SPU_THREAD_LOCAL unsigned t_wake_n, t_wake_cap;
+static volatile uint32_t s_waking;
+
+static void spu_ll_defer_wake(spu_context* c)
+{
+    if (t_wake_n == t_wake_cap) {
+        const unsigned cap = t_wake_cap ? t_wake_cap * 2u : 16u;
+        spu_context** grown = (spu_context**)realloc(t_wake, cap * sizeof(*grown));
+        if (!grown) {
+            fprintf(stderr, "[spu-coh] cannot queue reservation wake\n");
+            fflush(stderr);
+            abort();
+        }
+        t_wake = grown;
+        t_wake_cap = cap;
+    }
+    t_wake[t_wake_n++] = c;
+}
+
+static int spu_ll_wake_begin(void)
+{
+    if (!t_wake_n) return 0;
+    __atomic_add_fetch(&s_waking, 1u, __ATOMIC_RELAXED);
+    return 1;
+}
+
+static void spu_ll_wake_end(int pending)
+{
+    if (!pending) return;
+    for (unsigned i = 0; i < t_wake_n; i++) spu_ch_wake(t_wake[i]);
+    t_wake_n = 0;
+    __atomic_sub_fetch(&s_waking, 1u, __ATOMIC_RELEASE);
+}
+
 void spu_lockline_lock(uint32_t ea) { spu_ll_acquire(&g_stripes[spu_ll_index(ea)]); }
-void spu_lockline_unlock(uint32_t ea) { spu_ll_release(&g_stripes[spu_ll_index(ea)]); }
+void spu_lockline_unlock(uint32_t ea)
+{
+    const int pending = spu_ll_wake_begin();
+    spu_ll_release(&g_stripes[spu_ll_index(ea)]);
+    spu_ll_wake_end(pending);
+}
 
 static void spu_ll_range_set(uint32_t ea, uint32_t size, uint64_t set[SPU_LL_STRIPES / 64u])
 {
@@ -82,8 +123,10 @@ void spu_lockline_unlock_range(uint32_t ea, uint32_t size)
 {
     uint64_t set[SPU_LL_STRIPES / 64u];
     spu_ll_range_set(ea, size, set);
+    const int pending = spu_ll_wake_begin();
     for (unsigned s = SPU_LL_STRIPES; s-- > 0;)
         if ((set[s >> 6] >> (s & 63u)) & 1u) spu_ll_release(&g_stripes[s]);
+    spu_ll_wake_end(pending);
 }
 
 int spu_lockline_unchanged(uint32_t ea, uint32_t seq)
@@ -98,6 +141,7 @@ static void spu_ll_quiesce(void)
         ps3_lock_acquire(&g_stripes[s].lock);
         ps3_lock_release(&g_stripes[s].lock);
     }
+    while (__atomic_load_n(&s_waking, __ATOMIC_ACQUIRE)) SwitchToThread();
 }
 
 /* ===========================================================================
@@ -340,7 +384,7 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
             SPU_EVENT_SET(c, SPU_EVENT_LR);
             __atomic_store_n(&c->resv_valid, 0, __ATOMIC_RELAXED);
             g_spu_lr_raise++;
-            spu_ch_wake(c);
+            spu_ll_defer_wake(c);
         }
     }
 }

@@ -412,11 +412,10 @@ VkPresentModeKHR pick_mode()
     std::vector<VkPresentModeKHR> list(n);
     vkGetPhysicalDeviceSurfacePresentModesKHR(g.d.gpu, g.surface, &n, list.data());
     auto has = [&](VkPresentModeKHR m) { return std::find(list.begin(), list.end(), m) != list.end(); };
-    if (rsx_core_free_flips())
-        return g.vsync ? VK_PRESENT_MODE_FIFO_KHR : has(VK_PRESENT_MODE_MAILBOX_KHR) ? VK_PRESENT_MODE_MAILBOX_KHR : VK_PRESENT_MODE_IMMEDIATE_KHR;
-    if (g.mode == pacing::vrr || g.mode == pacing::measuring) return VK_PRESENT_MODE_FIFO_KHR;
-    if (g.d.caps.fifo_latest_ready && has(VK_PRESENT_MODE_FIFO_LATEST_READY_KHR)) return VK_PRESENT_MODE_FIFO_LATEST_READY_KHR;
-    return VK_PRESENT_MODE_FIFO_KHR;
+    const bool latest = g.d.caps.fifo_latest_ready && has(VK_PRESENT_MODE_FIFO_LATEST_READY_KHR);
+    if (rsx_core_free_flips() && !g.vsync) return has(VK_PRESENT_MODE_MAILBOX_KHR) ? VK_PRESENT_MODE_MAILBOX_KHR : VK_PRESENT_MODE_IMMEDIATE_KHR;
+    if (!rsx_core_free_flips() && (g.mode == pacing::vrr || g.mode == pacing::measuring)) return VK_PRESENT_MODE_FIFO_KHR;
+    return latest ? VK_PRESENT_MODE_FIFO_LATEST_READY_KHR : VK_PRESENT_MODE_FIFO_KHR;
 }
 
 bool swapchain_build()
@@ -831,6 +830,12 @@ bool vulkan_open()
     return true;
 }
 
+void update_hidden()
+{
+    const bool hidden = (SDL_GetWindowFlags(g.window) & (SDL_WINDOW_MINIMIZED | SDL_WINDOW_HIDDEN | SDL_WINDOW_OCCLUDED)) != 0;
+    rsx_core_set_hidden_refresh(hidden ? std::max(1u, (u32)std::lround(g.refresh.load())) : 0u);
+}
+
 void window_main()
 {
     int ok = -1;
@@ -889,13 +894,18 @@ void window_main()
             g.resized = true;
             g.queue_cv.notify_one();
             break;
+        case SDL_EVENT_WINDOW_SHOWN:
+        case SDL_EVENT_WINDOW_HIDDEN:
+        case SDL_EVENT_WINDOW_OCCLUDED:
+        case SDL_EVENT_WINDOW_EXPOSED:
+            update_hidden();
+            break;
         case SDL_EVENT_WINDOW_MINIMIZED:
         case SDL_EVENT_WINDOW_RESTORED:
-            rsx_core_set_hidden_refresh(e.type == SDL_EVENT_WINDOW_MINIMIZED ? std::max(1u, (u32)std::lround(g.refresh.load())) : 0u);
-            [[fallthrough]];
         case SDL_EVENT_WINDOW_FOCUS_GAINED:
         case SDL_EVENT_WINDOW_ENTER_FULLSCREEN:
         case SDL_EVENT_WINDOW_LEAVE_FULLSCREEN:
+            update_hidden();
             g.display_changed = true;
             g.resized = true;
             g.queue_cv.notify_one();
@@ -909,7 +919,7 @@ void window_main()
                 if (const auto listener = g.display_listener.load()) listener(next);
             }
             else if (e.key.key == SDLK_F12)
-                g.r.trace_request.store(true, std::memory_order_relaxed);
+                g.r.trace_frames.store(90, std::memory_order_relaxed);
             break;
         default:
             break;
@@ -1013,7 +1023,7 @@ void write_bmp(const char* path, const uint8_t* bgra, uint32_t w, uint32_t h)
     std::fclose(f);
 }
 
-void vk_present(void*, u32, const rsx_display_buffer* db)
+int vk_present(void*, u32, const rsx_display_buffer* db)
 {
     const uint32_t w = db->width, h = db->height, pitch = db->pitch;
     static uint32_t last_w, last_h, last_p;
@@ -1029,7 +1039,7 @@ void vk_present(void*, u32, const rsx_display_buffer* db)
     const uint64_t fit = g.fit.load(std::memory_order_acquire);
     if (!ea || (content && content == shown && fit == shown_fit)) {
         g.r.flush();
-        return;
+        return 0;
     }
 
     uint32_t i = 0;
@@ -1048,20 +1058,26 @@ void vk_present(void*, u32, const rsx_display_buffer* db)
     const uint32_t sw = std::min(scale.edge(w), src ? src->width : 0u), sh = std::min(scale.edge(h), src ? src->height : 0u);
     if (!src) {
         g.r.flush();
-        return;
+        return 0;
     }
     static const char* capture = std::getenv("PS3_VK_CAPTURE");
     static uint64_t flips;
+    ++flips;
     const char* capture_path = nullptr;
-    if (capture && ++flips == std::strtoull(capture, const_cast<char**>(&capture_path), 10) && *capture_path == ':') capture_path++;
+    char shot[48];
+    if (capture && flips == std::strtoull(capture, const_cast<char**>(&capture_path), 10) && *capture_path == ':') capture_path++;
     else capture_path = nullptr;
+    if (!capture_path && g.r.tracing() && g.r.trace_frames.load(std::memory_order_relaxed) % 15u == 0) {
+        std::snprintf(shot, sizeof shot, "trace_shot_%llu.bmp", (unsigned long long)flips);
+        capture_path = shot;
+    }
     const VkExtent2D out{ (uint32_t)(fit >> 40), (uint32_t)(fit >> 20) & 0xFFFFFu };
     const VkFormat out_format = (VkFormat)(fit & 0xFFFFFu);
     const bool fitted = fit && !capture_path && src->width == sw && src->height == sh &&
                         (src->format == VK_FORMAT_B8G8R8A8_UNORM || src->format == VK_FORMAT_R8G8B8A8_UNORM);
     if (!(fitted ? slot_reserve(s, out.width, out.height, out_format) : slot_reserve(s, sw, sh, VK_FORMAT_B8G8R8A8_UNORM))) {
         g.r.flush();
-        return;
+        return 0;
     }
     s.fitted = fitted;
     std::optional<vk::trace_span> span;
@@ -1139,7 +1155,7 @@ void vk_present(void*, u32, const rsx_display_buffer* db)
     }
     g.queue_cv.notify_one();
 
-    struct counters_snapshot { u64 epochs, watch_calls, watch_bytes, copy_bytes, reuse_bytes, scans, write_stalls, surface_stalls, stall_ns, stall_bytes, deferred_transfers, deferred_labels; };
+    struct counters_snapshot { u64 epochs, watch_calls, watch_bytes, copy_bytes, reuse_bytes, scans, write_stalls, surface_stalls, stall_ns, stall_bytes, deferred_transfers, deferred_labels, scan_ns, changed_pages; };
     static uint64_t presents;
     if (stats_on() && ++presents % 600u == 0) {
         static int64_t last_rsx_cpu;
@@ -1150,7 +1166,7 @@ void vk_present(void*, u32, const rsx_display_buffer* db)
                      (unsigned long long)st.blits, (unsigned long long)st.downloads, (unsigned long long)st.surface_loads,
                      (double)(rsx_cpu - last_rsx_cpu) / 600.0 / 1e6, pacing_name(g.mode));
         static counters_snapshot last;
-        std::fprintf(stderr, "[vk] per frame: %.1f epochs, %.1f memory checks over %.2f MB, %.1f write-watch calls, %.2f MB vertex copies, %.2f MB vertex reused\n",
+        std::fprintf(stderr, "[vk] per frame: %.1f epochs, %.1f memory checks over %.2f MB, %.1f write scans, %.2f MB vertex copies, %.2f MB vertex reused\n",
                      (st.epochs - last.epochs) / 600.0, (st.watch_calls - last.watch_calls) / 600.0,
                      (st.watch_bytes - last.watch_bytes) / 600.0 / 1048576.0, (st.scans - last.scans) / 600.0, (st.copy_bytes - last.copy_bytes) / 600.0 / 1048576.0,
                      (st.reuse_bytes - last.reuse_bytes) / 600.0 / 1048576.0);
@@ -1158,10 +1174,15 @@ void vk_present(void*, u32, const rsx_display_buffer* db)
                      (st.deferred_transfers - last.deferred_transfers) / 600.0, (st.deferred_labels - last.deferred_labels) / 600.0,
                      (st.write_stalls - last.write_stalls) / 600.0, (st.surface_stalls - last.surface_stalls) / 600.0,
                      (st.stall_bytes - last.stall_bytes) / 600.0 / 1048576.0, (st.stall_ns - last.stall_ns) / 600.0 / 1e6, st.stall_ea, st.stall_size);
+        std::fprintf(stderr, "[vk] per frame: %.3f ms scanning writes (%.1f us per scan), %.1f pages changed\n",
+                     (st.scan_ns - last.scan_ns) / 600.0 / 1e6,
+                     st.scans > last.scans ? (st.scan_ns - last.scan_ns) / 1e3 / (double)(st.scans - last.scans) : 0.0,
+                     (st.changed_pages - last.changed_pages) / 600.0);
         last = { st.epochs, st.watch_calls, st.watch_bytes, st.copy_bytes, st.reuse_bytes, st.scans, st.write_stalls, st.surface_stalls, st.stall_ns, st.stall_bytes,
-                 st.deferred_transfers, st.deferred_labels };
+                 st.deferred_transfers, st.deferred_labels, st.scan_ns, st.changed_pages };
         last_rsx_cpu = rsx_cpu;
     }
+    return 1;
 }
 
 void vk_close(void*)

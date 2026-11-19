@@ -143,6 +143,14 @@ def program(rng):
         leaf_pcs.append(start)
         for _ in range(rng.randint(1, 8)):
             emit(compute(rng, len(code) * 4))
+        if rng.random() < 0.25:
+            emit(rr(0x00D, 0, 29, rng.choice(POOL)))
+        if j and rng.random() < 0.6:
+            emit(ri10(0x04, 0, 0, 72 + j))
+            patches.append(("call", emit(0), rng.randrange(j)))
+            emit(ri10(0x04, 0, 72 + j, 0))
+            for _ in range(rng.randint(0, 4)):
+                emit(compute(rng, len(code) * 4))
         if rng.random() < 0.6:
             emit(rr(rng.choice((0x128, 0x129, 0x12A, 0x12B)), 0, 0, rng.choice(POOL)))
             for _ in range(rng.randint(1, 6)):
@@ -276,9 +284,7 @@ def find_cc(explicit):
 def lift(image, functions, out, promote, merge):
     cmd = [sys.executable, os.path.join(HERE, "spu_lifter.py"), image, "--base", "0",
            "--functions", functions, "--return-entries", "-o", out]
-    if promote:
-        cmd += ["--promote-regs", str(promote)]
-    else:
+    if not promote:
         cmd.append("--no-promote")
     if merge:
         cmd.append("--merge-chunks")
@@ -308,7 +314,6 @@ def main():
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--cc")
     ap.add_argument("--keep")
-    ap.add_argument("--promote-regs", type=int, default=16)
     args = ap.parse_args()
     cc = find_cc(args.cc)
     if not cc:
@@ -322,6 +327,7 @@ def main():
         f.write(HARNESS)
     failures = 0
     promoted = 0
+    narrowed = 0
     dispatches = {}
     for p in range(args.programs):
         image, bounds = program(rng)
@@ -334,17 +340,18 @@ def main():
         with open(functions, "w") as f:
             json.dump([{"start": s, "end": e} for s, e in bounds], f)
         results = {}
-        for promote in (0, args.promote_regs):
+        for promote in (False, True):
             for merge in (False, True):
                 tag = f"{'p' if promote else 'n'}{'m' if merge else 's'}"
                 results[tag] = run_variant(cc, pdir, code, functions, harness, promote, merge, tag)
-        alias = run_variant(cc, pdir, code, functions, harness, args.promote_regs, True, "pa", ("-DSPU_TEST_ALIAS_HINTS",))
+        alias = run_variant(cc, pdir, code, functions, harness, True, True, "pa", ("-DSPU_TEST_ALIAS_HINTS",))
         ref = results["ns"]
         if ref[0] != 0:
             print(f"program {p}: reference exited {ref[0]}: {ref[1][:200]}")
             failures += 1
             continue
         promoted += results["ps"][2].count(" sr") > 0
+        narrowed += results["ps"][2].count("if (_fast)")
         dispatches["pa"] = dispatches.get("pa", 0) + alias[3]
         if alias[:2] != results["pm"][:2] or alias[3] != results["pm"][3]:
             failures += 1
@@ -359,7 +366,8 @@ def main():
                     diff = [f"  {a!r} != {b!r}" for a, b in zip(want.splitlines(), got.splitlines()) if a != b][:6]
                     print(f"program {p} seed {args.seed}: variant {tag} differs\n" + "\n".join(diff))
                     break
-    print(f"{args.programs} programs x 5 variants, {promoted} with promoted registers, {failures} mismatches")
+    print(f"{args.programs} programs x 5 variants, {promoted} with promoted registers, "
+          f"{narrowed} narrowed call reloads, {failures} mismatches")
     print("generic dispatches per variant: " + ", ".join(f"{k}={v}" for k, v in sorted(dispatches.items())))
     if not args.keep:
         shutil.rmtree(work, ignore_errors=True)

@@ -2,15 +2,8 @@
 
 #include <stdlib.h>
 #include <string.h>
-#include <wmmintrin.h>
+#include "ps3_aes.h"
 
-#ifdef _WIN32
-#define np_seek _fseeki64
-#define np_tell _ftelli64
-#else
-#define np_seek fseeko
-#define np_tell ftello
-#endif
 
 #define FLAG_COMPRESSED    0x00000001u
 #define FLAG_PLAIN         0x00000002u
@@ -35,65 +28,18 @@ static const uint8_t KLIC_BUILTIN[4][16] = {
     { 0x2A,0x6A,0xFB,0xCF,0x43,0xD1,0x57,0x9F,0x7D,0x73,0x87,0x41,0xA1,0x3B,0xD4,0x2E },
     { 0x0D,0xB8,0x57,0x32,0x36,0x6C,0xD7,0x34,0xFC,0x87,0x9E,0x74,0x33,0x43,0xBB,0x4F } };
 
-#define AES_TARGET __attribute__((target("aes,sse4.1")))
-
-typedef struct { __m128i e[11], d[11]; } aes_key;
-
-#define AES_STEP(i, rc) do { __m128i t = _mm_shuffle_epi32(_mm_aeskeygenassist_si128(k->e[i - 1], rc), 0xFF); \
-    __m128i p = k->e[i - 1]; p = _mm_xor_si128(p, _mm_slli_si128(p, 4)); p = _mm_xor_si128(p, _mm_slli_si128(p, 4)); \
-    k->e[i] = _mm_xor_si128(_mm_xor_si128(p, _mm_slli_si128(p, 4)), t); } while (0)
-
-AES_TARGET static void aes_init(aes_key* k, const uint8_t key[16])
+PS3_AES_TARGET static void aes_ecb(const uint8_t key[16], const uint8_t in[16], uint8_t out[16])
 {
-    k->e[0] = _mm_loadu_si128((const __m128i*)key);
-    AES_STEP(1, 0x01); AES_STEP(2, 0x02); AES_STEP(3, 0x04); AES_STEP(4, 0x08); AES_STEP(5, 0x10);
-    AES_STEP(6, 0x20); AES_STEP(7, 0x40); AES_STEP(8, 0x80); AES_STEP(9, 0x1B); AES_STEP(10, 0x36);
-    k->d[0] = k->e[10];
-    for (int i = 1; i < 10; i++) k->d[i] = _mm_aesimc_si128(k->e[10 - i]);
-    k->d[10] = k->e[0];
+    ps3_aes_key k;
+    ps3_aes128_init(&k, key);
+    ps3_aes_ecb_enc(&k, in, out);
 }
 
-AES_TARGET static __m128i aes_enc(const aes_key* k, __m128i x)
+PS3_AES_TARGET static void aes_cbc_dec(const uint8_t key[16], const uint8_t iv[16], const uint8_t* in, uint8_t* out, size_t n)
 {
-    x = _mm_xor_si128(x, k->e[0]);
-    for (int i = 1; i < 10; i++) x = _mm_aesenc_si128(x, k->e[i]);
-    return _mm_aesenclast_si128(x, k->e[10]);
-}
-
-AES_TARGET static void aes_ecb(const uint8_t key[16], const uint8_t in[16], uint8_t out[16])
-{
-    aes_key k;
-    aes_init(&k, key);
-    _mm_storeu_si128((__m128i*)out, aes_enc(&k, _mm_loadu_si128((const __m128i*)in)));
-}
-
-AES_TARGET static void aes_cbc_dec(const uint8_t key[16], const uint8_t iv[16], const uint8_t* in, uint8_t* out, size_t n)
-{
-    aes_key k;
-    aes_init(&k, key);
-    __m128i prev = _mm_loadu_si128((const __m128i*)iv);
-    size_t i = 0;
-    for (; i + 64 <= n; i += 64) {
-        __m128i c0 = _mm_loadu_si128((const __m128i*)(in + i)), c1 = _mm_loadu_si128((const __m128i*)(in + i + 16));
-        __m128i c2 = _mm_loadu_si128((const __m128i*)(in + i + 32)), c3 = _mm_loadu_si128((const __m128i*)(in + i + 48));
-        __m128i x0 = _mm_xor_si128(c0, k.d[0]), x1 = _mm_xor_si128(c1, k.d[0]);
-        __m128i x2 = _mm_xor_si128(c2, k.d[0]), x3 = _mm_xor_si128(c3, k.d[0]);
-        for (int r = 1; r < 10; r++) {
-            x0 = _mm_aesdec_si128(x0, k.d[r]); x1 = _mm_aesdec_si128(x1, k.d[r]);
-            x2 = _mm_aesdec_si128(x2, k.d[r]); x3 = _mm_aesdec_si128(x3, k.d[r]);
-        }
-        _mm_storeu_si128((__m128i*)(out + i), _mm_xor_si128(_mm_aesdeclast_si128(x0, k.d[10]), prev));
-        _mm_storeu_si128((__m128i*)(out + i + 16), _mm_xor_si128(_mm_aesdeclast_si128(x1, k.d[10]), c0));
-        _mm_storeu_si128((__m128i*)(out + i + 32), _mm_xor_si128(_mm_aesdeclast_si128(x2, k.d[10]), c1));
-        _mm_storeu_si128((__m128i*)(out + i + 48), _mm_xor_si128(_mm_aesdeclast_si128(x3, k.d[10]), c2));
-        prev = c3;
-    }
-    for (; i + 16 <= n; i += 16) {
-        __m128i c = _mm_loadu_si128((const __m128i*)(in + i)), x = _mm_xor_si128(c, k.d[0]);
-        for (int r = 1; r < 10; r++) x = _mm_aesdec_si128(x, k.d[r]);
-        _mm_storeu_si128((__m128i*)(out + i), _mm_xor_si128(_mm_aesdeclast_si128(x, k.d[10]), prev));
-        prev = c;
-    }
+    ps3_aes_key k;
+    ps3_aes128_init(&k, key);
+    ps3_aes_cbc_dec(&k, iv, in, out, n);
 }
 
 static void dbl(uint8_t b[16])
@@ -103,23 +49,23 @@ static void dbl(uint8_t b[16])
     b[15] = (uint8_t)(b[15] << 1) ^ (carry ? 0x87 : 0);
 }
 
-AES_TARGET static void aes_cmac(const uint8_t key[16], const uint8_t* m, size_t n, uint8_t mac[16])
+PS3_AES_TARGET static void aes_cmac(const uint8_t key[16], const uint8_t* m, size_t n, uint8_t mac[16])
 {
-    aes_key k;
-    aes_init(&k, key);
+    ps3_aes_key k;
+    ps3_aes128_init(&k, key);
     uint8_t sub[16] = { 0 }, last[16] = { 0 };
-    _mm_storeu_si128((__m128i*)sub, aes_enc(&k, _mm_setzero_si128()));
+    _mm_storeu_si128((__m128i*)sub, ps3_aes_enc(&k, _mm_setzero_si128()));
     dbl(sub);
     const size_t blocks = n ? (n + 15) / 16 : 1;
     const int full = n && n % 16 == 0;
     if (!full) dbl(sub);
     __m128i x = _mm_setzero_si128();
-    for (size_t i = 0; i + 1 < blocks; i++) x = aes_enc(&k, _mm_xor_si128(x, _mm_loadu_si128((const __m128i*)(m + i * 16))));
+    for (size_t i = 0; i + 1 < blocks; i++) x = ps3_aes_enc(&k, _mm_xor_si128(x, _mm_loadu_si128((const __m128i*)(m + i * 16))));
     const size_t rem = n - (blocks - 1) * 16;
     memcpy(last, m + (blocks - 1) * 16, rem);
     if (!full) last[rem] = 0x80;
     for (int i = 0; i < 16; i++) last[i] ^= sub[i];
-    _mm_storeu_si128((__m128i*)mac, aes_enc(&k, _mm_xor_si128(x, _mm_loadu_si128((const __m128i*)last))));
+    _mm_storeu_si128((__m128i*)mac, ps3_aes_enc(&k, _mm_xor_si128(x, _mm_loadu_si128((const __m128i*)last))));
 }
 
 typedef struct { uint32_t h[5]; uint64_t len; uint8_t buf[64]; size_t n; } sha1_ctx;
@@ -224,7 +170,7 @@ void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_
 
 static int rap_key(const uint8_t* content_id, uint8_t key[16])
 {
-    char cid[49], guest[96], path[1024];
+    char cid[49], guest[96], path[1100];
     memcpy(cid, content_id, 48);
     cid[48] = 0;
     snprintf(guest, sizeof guest, "/dev_hdd0/home/00000001/exdata/%s.rap", cid);
@@ -247,7 +193,7 @@ static int klic_matches(const uint8_t* hdr, const uint8_t k[16])
 }
 
 struct npdrm_file {
-    FILE* f;
+    ps3_vfile* f;
     uint8_t hdr[0x100];
     uint8_t key[16];
     uint32_t flags, block_size, blocks, version;
@@ -269,10 +215,10 @@ static int64_t load_block(npdrm_file* d, uint32_t b)
     if (b + 1 == d->blocks && d->size % d->block_size) len = (uint32_t)(d->size % d->block_size);
     const uint32_t padded = (len + 15u) & ~15u;
     uint8_t m[0x20], expect[20];
-    if (np_seek(d->f, (int64_t)meta_off, SEEK_SET) || fread(m, 1, meta, d->f) != meta) return -1;
+    if (ps3_vfile_seek(d->f, (int64_t)meta_off, SEEK_SET) || ps3_vfile_read(m, meta, d->f) != meta) return -1;
     if (lead) { for (int i = 0; i < 16; i++) expect[i] = m[i] ^ m[i + 16]; memcpy(expect + 16, m + 16, 4); }
     else memcpy(expect, m, 16);
-    if (np_seek(d->f, (int64_t)data_off, SEEK_SET) || fread(d->enc, 1, padded, d->f) != padded) return -1;
+    if (ps3_vfile_seek(d->f, (int64_t)data_off, SEEK_SET) || ps3_vfile_read(d->enc, padded, d->f) != padded) return -1;
     if (d->flags & FLAG_DEBUG) {
         memcpy(d->plain, d->enc, len);
     } else {
@@ -300,23 +246,22 @@ static int64_t load_block(npdrm_file* d, uint32_t b)
     return len;
 }
 
-int npdrm_is_npd(FILE* f)
+int npdrm_is_npd(ps3_vfile* f)
 {
     uint8_t m[4];
-    const int64_t pos = np_tell(f);
-    const int npd = np_seek(f, 0, SEEK_SET) == 0 && fread(m, 1, 4, f) == 4 && !memcmp(m, "NPD", 4);
-    np_seek(f, pos, SEEK_SET);
+    const int64_t pos = ps3_vfile_tell(f);
+    const int npd = ps3_vfile_seek(f, 0, SEEK_SET) == 0 && ps3_vfile_read(m, 4, f) == 4 && !memcmp(m, "NPD", 4);
+    ps3_vfile_seek(f, pos, SEEK_SET);
     return npd;
 }
 
-npdrm_file* npdrm_open(FILE* f, const char* file_name)
+npdrm_file* npdrm_open(ps3_vfile* f)
 {
-    (void)file_name;
     npdrm_file* d = (npdrm_file*)calloc(1, sizeof *d);
     if (!d) return NULL;
     d->f = f;
     d->cached = -1;
-    if (np_seek(f, 0, SEEK_SET) || fread(d->hdr, 1, 0x100, f) != 0x100 || memcmp(d->hdr, "NPD", 4)) goto fail;
+    if (ps3_vfile_seek(f, 0, SEEK_SET) || ps3_vfile_read(d->hdr, 0x100, f) != 0x100 || memcmp(d->hdr, "NPD", 4)) goto fail;
     d->version = be32(d->hdr + 4);
     const uint32_t license = be32(d->hdr + 8);
     d->flags = be32(d->hdr + 0x80);
@@ -369,7 +314,7 @@ uint64_t npdrm_size(const npdrm_file* d) { return d->size; }
 void npdrm_close(npdrm_file* d)
 {
     if (!d) return;
-    fclose(d->f);
+    ps3_vfile_close(d->f);
     free(d->plain);
     free(d->enc);
     free(d);
@@ -379,14 +324,14 @@ int npdrm_license_available(const char* host_path, const uint8_t* klicensee)
 {
     if (!host_path) return (int)NPDRM_ERROR_INVALID_PARAM;
     if (klicensee) npdrm_add_klicensee(klicensee);
-    FILE* f = fopen(host_path, "rb");
+    ps3_vfile* f = ps3_vfile_open(host_path, "rb");
     if (!f) return (int)NPDRM_ERROR_IO;
-    if (!npdrm_is_npd(f)) { fclose(f); return 0; }
-    npdrm_file* d = npdrm_open(f, host_path);
+    if (!npdrm_is_npd(f)) { ps3_vfile_close(f); return 0; }
+    npdrm_file* d = npdrm_open(f);
     if (!d) {
         uint8_t hdr[0x10];
-        const int license2 = np_seek(f, 0, SEEK_SET) == 0 && fread(hdr, 1, 0x10, f) == 0x10 && (be32(hdr + 8) & 3) != 3;
-        fclose(f);
+        const int license2 = ps3_vfile_seek(f, 0, SEEK_SET) == 0 && ps3_vfile_read(hdr, 0x10, f) == 0x10 && (be32(hdr + 8) & 3) != 3;
+        ps3_vfile_close(f);
         return (int)(license2 ? NPDRM_ERROR_LICENSE_NOT_FOUND : NPDRM_ERROR_NO_ENTITLEMENT);
     }
     npdrm_close(d);

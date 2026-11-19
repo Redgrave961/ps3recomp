@@ -87,7 +87,8 @@ static struct {
     u32 irq_vblank_queued;
 } s;
 
-static u8 s_core_regs[0x2000 >> 2];
+#define RSX_3D_REGS (0x2000u >> 2)
+static u16 s_next_core[RSX_3D_REGS + 1u];
 
 static inline u32 rsx_load(u32 ea)
 {
@@ -102,8 +103,8 @@ static inline void rsx_store_control(u32 ea, u32 value)
 static void rsx_publish_get(void)
 {
     rsx_store_control(RSX_GET_EA, s.get);
-    __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    if (__atomic_load_n(&s.get_waiters, __ATOMIC_ACQUIRE)) {
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&s.get_waiters, __ATOMIC_RELAXED)) {
         __atomic_add_fetch(&s.get_epoch, 1u, __ATOMIC_RELEASE);
         WakeByAddressAll((PVOID)&s.get_epoch);
     }
@@ -112,6 +113,7 @@ static void rsx_publish_get(void)
 void rsx_core_wait_get_outside(u32 lo, u32 hi)
 {
     __atomic_add_fetch(&s.get_waiters, 1u, __ATOMIC_ACQ_REL);
+    FlushProcessWriteBuffers();
     for (;;) {
         u32 seen = __atomic_load_n(&s.get_epoch, __ATOMIC_ACQUIRE);
         const u32 get = rsx_load(RSX_GET_EA);
@@ -249,15 +251,19 @@ static u64 rsx_tick_freq(void)
 
 static void rsx_sleep_until(HANDLE timer, u64 target)
 {
-    const u64 now = rsx_ticks();
+    const u64 freq = rsx_tick_freq(), slack = freq / 1000u, spin = freq / 20000u;
+    u64 now = rsx_ticks();
     if (now >= target) return;
-    const u64 freq = rsx_tick_freq();
-    const u64 left = target - now;
-    LARGE_INTEGER due;
-    due.QuadPart = -(LONGLONG)((left / freq) * 10000000ull + (left % freq) * 10000000ull / freq);
-    if (due.QuadPart == 0) return;
-    if (SetWaitableTimerEx(timer, &due, 0, NULL, NULL, NULL, 0))
-        WaitForSingleObject(timer, INFINITE);
+    if (target - now > slack) {
+        const u64 left = target - now - slack;
+        LARGE_INTEGER due;
+        due.QuadPart = -(LONGLONG)((left / freq) * 10000000ull + (left % freq) * 10000000ull / freq);
+        if (due.QuadPart && SetWaitableTimerEx(timer, &due, 0, NULL, NULL, NULL, 0)) WaitForSingleObject(timer, INFINITE);
+    }
+    while ((now = rsx_ticks()) < target) {
+        if (target - now > spin) SwitchToThread();
+        else YieldProcessor();
+    }
 }
 
 static HANDLE rsx_timer_create(void)
@@ -362,9 +368,8 @@ static void rsx_frame_limit(void)
 
 static void rsx_scanout(u32 buffer)
 {
-    rsx_frame_limit();
-    if (s.renderer && s.renderer->present)
-        s.renderer->present(s.renderer->user, buffer, &s.display[buffer]);
+    if (s.renderer && s.renderer->present && s.renderer->present(s.renderer->user, buffer, &s.display[buffer]))
+        rsx_frame_limit();
 }
 
 static void rsx_flip_done(u32 buffer)
@@ -410,6 +415,12 @@ void rsx_core_flip_immediate(u32 buffer)
     rsx_core_doorbell();
 }
 
+static void rsx_watch(u32 ea)
+{
+    vm_watch(ea);
+    FlushProcessWriteBuffers();
+}
+
 static void rsx_semaphore_acquire(u32 value)
 {
     s.batch++;
@@ -421,12 +432,14 @@ static void rsx_semaphore_acquire(u32 value)
     if (rsx_load(ea) == value) return;
     rsx_publish_get();
     rsx_flush();
+    rsx_watch(ea);
     for (;;) {
         const u32 seen = __atomic_load_n(&s.bell, __ATOMIC_ACQUIRE);
         rsx_service_immediate();
-        if (rsx_load(ea) == value) return;
-        rsx_wait_bell(seen);
+        if (rsx_load(ea) == value) break;
+        WaitOnAddress((volatile VOID*)&s.bell, &seen, sizeof seen, 1);
     }
+    vm_unwatch(ea);
 }
 
 static void rsx_label_retire(const void* arg)
@@ -534,25 +547,25 @@ static void rsx_driver_method(u32 reg, u32 value)
     rsx_fault("unknown driver method", s.get, reg);
 }
 
-static void rsx_3d_methods(u32 reg, u32 inc, const u32* be, u32 n)
+static void rsx_3d_methods(u32 reg, const u32* be, u32 n)
 {
     const rsx_renderer* r = s.renderer;
+    const int render = r && r->methods;
+    const u32 first = reg >> 2;
     u32 start = 0;
-    for (u32 i = 0; i < n; i++) {
-        const u32 m = reg + inc * i;
-        if (!s_core_regs[m >> 2]) continue;
-        if (r && r->methods && i > start) r->methods(r->user, reg + inc * start, inc, be + start, i - start);
-        rsx_core_method(m, __builtin_bswap32(be[i]));
-        start = i + 1;
+    for (u32 j = s_next_core[first] - first; j < n; j = s_next_core[first + j + 1u] - first) {
+        if (render && j > start) r->methods(r->user, reg + 4u * start, 4u, be + start, j - start);
+        rsx_core_method(reg + 4u * j, __builtin_bswap32(be[j]));
+        start = j + 1u;
     }
-    if (r && r->methods && n > start) r->methods(r->user, reg + inc * start, inc, be + start, n - start);
+    if (render && n > start) r->methods(r->user, reg + 4u * start, 4u, be + start, n - start);
 }
 
 static u32 rsx_dispatch(u32 reg, u32 inc, const u32* be, u32 n)
 {
     if (reg < 0x2000u) {
         if (inc == 0) {
-            if (s_core_regs[reg >> 2]) {
+            if (s_next_core[reg >> 2] == reg >> 2) {
                 for (u32 i = 0; i < n; i++) rsx_core_method(reg, __builtin_bswap32(be[i]));
             } else if (s.renderer && s.renderer->methods) {
                 s.renderer->methods(s.renderer->user, reg, 0, be, n);
@@ -561,7 +574,7 @@ static u32 rsx_dispatch(u32 reg, u32 inc, const u32* be, u32 n)
         }
         const u32 room = (0x2000u - reg) >> 2;
         const u32 k = n < room ? n : room;
-        rsx_3d_methods(reg, 4, be, k);
+        rsx_3d_methods(reg, be, k);
         return k;
     }
     if (reg >= 0xE000u) {
@@ -596,18 +609,19 @@ static void rsx_run_args(u32 put)
     rsx_publish_get();
 }
 
-static void rsx_park(u32 seen)
+static void rsx_park(u32 jump, u32 seen)
 {
     s.batch++;
     const u32 ea = rsx_io_to_ea(s.get);
-    const u32 word = rsx_load(ea);
     rsx_publish_get();
     rsx_flush();
+    rsx_watch(ea);
     for (;;) {
         rsx_service_immediate();
-        if (rsx_load(ea) != word || __atomic_load_n(&s.bell, __ATOMIC_ACQUIRE) != seen) return;
+        if (rsx_load(ea) != jump || __atomic_load_n(&s.bell, __ATOMIC_ACQUIRE) != seen) break;
         WaitOnAddress((volatile VOID*)&s.bell, &seen, sizeof seen, 1);
     }
+    vm_unwatch(ea);
 }
 
 static void rsx_control(u32 cmd, u32 seen)
@@ -641,7 +655,7 @@ static void rsx_control(u32 cmd, u32 seen)
         return;
     }
     if (target == s.get) {
-        rsx_park(seen);
+        rsx_park(cmd, seen);
         return;
     }
     s.get = target;
@@ -735,7 +749,10 @@ void rsx_core_init(u32 local_size, u32 main_size)
     InitializeConditionVariable(&s.irq_cv);
     static const u16 core_regs[] = { 0x0050, 0x0060, 0x0064, 0x0068, 0x006C, 0x0104, 0x0110,
                                      0x0180, 0x01A4, 0x01A8, 0x1D6C, 0x1D70, 0x1D74, 0x1800 };
-    for (u32 i = 0; i < sizeof core_regs / sizeof core_regs[0]; i++) s_core_regs[core_regs[i] >> 2] = 1;
+    for (u32 i = 0; i <= RSX_3D_REGS; i++) s_next_core[i] = RSX_3D_REGS;
+    for (u32 i = 0; i < sizeof core_regs / sizeof core_regs[0]; i++) s_next_core[core_regs[i] >> 2] = (u16)(core_regs[i] >> 2);
+    for (u32 i = RSX_3D_REGS; i-- > 0;)
+        if (s_next_core[i] != i) s_next_core[i] = s_next_core[i + 1u];
     rsx_window_clear();
     rsx_transfer_reset();
     ppu_slow_pages(VM_HLE_INJECT_BASE, 0x10000u);
@@ -793,8 +810,6 @@ void rsx_mem_store(u32 ea, const void* src, u32 size)
             if (spu_coh_is_reserved(a)) spu_coh_notify_write(a);
         spu_lockline_unlock_range(ea, size);
     }
-    if (g_resv_store_active > 0)
-        for (u32 a = l0; a <= l1; a += 128u) ppu_resv_break_store(a);
 }
 
 int rsx_core_defer(const rsx_write* w)

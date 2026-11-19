@@ -54,35 +54,6 @@ int rsx_tiling_find(u32 location, u32 offset, u32 len, rsx_tile* out)
     return found;
 }
 
-int rsx_tiling_footprint(u32 location, u32 offset, u32 len, u32* lo, u32* span)
-{
-    const u64 end = (u64)offset + len;
-    u64 l = offset, h = end, pos = offset;
-    int any = 0;
-    rsx_tile t;
-    while (pos < end && rsx_tiling_find(location, (u32)pos, (u32)(end - pos), &t)) {
-        const u64 t_end = (u64)t.offset + t.size;
-        const u64 band = 64ull * t.pitch;
-        const u64 a = pos > t.offset ? pos : t.offset;
-        const u64 b = end < t_end ? end : t_end;
-        /* a 64-row band of tiles is stored over the 16 KB tiles' own span,
-         * each tile in one of the four banks of its 64 KB group */
-        u64 fl = t.offset + (a - t.offset) / band * band;
-        u64 fh = t.offset + (b - t.offset + band - 1u) / band * band;
-        fl &= ~0xFFFFull;
-        fh = (fh + 0xFFFFu) & ~0xFFFFull;
-        if (fl < t.offset) fl = t.offset;
-        if (fh > t_end) fh = t_end;
-        if (fl < l) l = fl;
-        if (fh > h) h = fh;
-        any = 1;
-        pos = t_end;
-    }
-    *lo = (u32)l;
-    *span = h - l > 0xFFFFFFFFull ? 0xFFFFFFFFu : (u32)(h - l);
-    return any;
-}
-
 static void rsx_tiling_put(const rsx_tiled_mem* mem, u8* dst, const u8* src, u32 n)
 {
     if (mem->store) mem->store(mem->user, dst, src, n);

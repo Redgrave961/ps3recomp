@@ -131,39 +131,6 @@ static void ranges(rsx_tile tile4)
     free(g_mem);
 }
 
-/* Every 32-byte block of a range is stored inside its footprint. */
-static void footprint_case(const rsx_tile* t, u32 offset, u32 len)
-{
-    u32 lo, span, outside = 0;
-    const int any = rsx_tiling_footprint(RSX_LOCATION_MAIN, offset, len, &lo, &span);
-    for (u32 p = offset & ~31u; p < offset + len; p += 32u) {
-        u32 a = p;
-        if (p - t->offset < t->size) a = rsx_tile_address(t, p);
-        if (a < lo || a - lo >= span || (a + 31u) - lo >= span) outside++;
-    }
-    CHECK(any && !outside && lo <= offset && lo + span >= offset + len,
-          "pitch %u: the footprint of 0x%X+0x%X (0x%X+0x%X) holds all of its bytes (%u blocks outside)",
-          t->pitch, offset, len, lo, span, outside);
-}
-
-static void footprints(rsx_tile tile4)
-{
-    rsx_tiling_set(4, RSX_LOCATION_MAIN, tile4.offset, tile4.size, tile4.pitch, tile4.bank);
-    footprint_case(&tile4, tile4.offset, 8192u * 351u + 1920u);          /* a retail title's 480x352 texture */
-    footprint_case(&tile4, tile4.offset + 8192u * 100u + 64u, 8192u * 7u);
-    footprint_case(&tile4, tile4.offset - 4096u, 8192u * 70u);           /* from before the tile */
-    footprint_case(&tile4, tile4.offset + tile4.size - 8192u * 3u, 8192u * 5u);  /* past its end */
-    rsx_tiling_set(4, 0, 0, 0, 0, 0);
-    const rsx_tile p5120 = { 0x100000u, 0x280000u, 5120u, 1u };
-    rsx_tiling_set(3, RSX_LOCATION_MAIN, p5120.offset, p5120.size, p5120.pitch, p5120.bank);
-    footprint_case(&p5120, p5120.offset + 5120u * 64u * 3u + 640u, 5120u * 90u);
-    footprint_case(&p5120, p5120.offset + 0x12345u, 0x777u);
-    u32 lo, span;
-    CHECK(!rsx_tiling_footprint(RSX_LOCATION_MAIN, 0x10000u, 0x1000u, &lo, &span) && lo == 0x10000u && span == 0x1000u,
-          "a range off every tile is its own footprint");
-    rsx_tiling_set(3, 0, 0, 0, 0, 0);
-}
-
 int main(void)
 {
     static const u32 title_tile4[][2] = {
@@ -201,7 +168,6 @@ int main(void)
     CHECK(rsx_tile_address(&tile4, tile4.offset - 1u) == RSX_TILE_NO_ADDRESS, "a byte before the tile has no tiled address");
 
     ranges(tile4);
-    footprints(tile4);
     printf("[rsx_tiling] %s (%d failed)\n", fails ? "FAIL" : "PASS", fails);
     return fails ? 1 : 0;
 }

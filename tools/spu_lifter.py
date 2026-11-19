@@ -20,7 +20,7 @@ SPU register model
   * Most arithmetic is SIMD across the natural lane width (word = 4x32,
     halfword = 8x16, byte = 16x8).
   * Scalar / addressing instructions use the *preferred slot* = word lane 0
-    (``reg._u32[0]``), matching spu_preferred_u32() in spu_context.h.
+    (``reg._u32[0]``).
 
 Scope (Phase 1)
 ---------------
@@ -529,6 +529,8 @@ class SPULifter:
         self.link_return: set = set()
         self.promote = True
         self.promote_regs = 16
+        self.defer = False
+        self._pending: list = []
         self._prom = False
         self._regs: set = set()
         self._jt_targets: list = []
@@ -589,7 +591,7 @@ class SPULifter:
                     f"{{ ctx->pc = {self._pc(insn.addr)}; @I{k}@ g_spu_trampoline_fn = "
                     f"{self.prefix}spu_func_{insn.addr:08X}; return; }}")
             c = self._translate(insn, func) or ""
-            c = c.replace("@SPILL@", f"@S{k}@").replace("@RELOAD@", "@R@")
+            c = c.replace("@SPILL@", f"@S{k}@").replace("@RELOAD@", f"@R{k}@")
             texts.append(c)
             if c:
                 if self.trace:
@@ -616,7 +618,8 @@ class SPULifter:
                     f"    {{ @O{last_k}@ SPU_DIRECT(ctx, {self._pc(end)}, {self.prefix}spu_func_{end:08X}); }}")
             else:
                 func.body_lines.append(f"    @O{last_k}@")
-        self._finish_promotion(func, fins, texts, start, end)
+        if any(", _rz);" in t for t in texts):
+            func.body_lines.insert(0, "    const int _rz = SPU_RZ_NOW();")
 
         # Infinite no-op self-loop (the SPU `br .` halt idiom): a function whose
         # whole body is nops + an unconditional branch back into itself does
@@ -626,25 +629,75 @@ class SPULifter:
         # (spu_halt longjmps back to the dispatcher) so the host thread returns.
         body_insns = [i for i in insns if start <= i.addr < end]
         if body_insns and all(i.mnemonic in ("nop", "lnop", "br", "bra")
-                              for i in body_insns):
-            last = body_insns[-1]
-            ltgt = self._branch_target(last)
-            if (last.mnemonic in ("br", "bra") and ltgt is not None
-                    and start <= ltgt < end):
-                func.body_lines = [
-                    "    /* infinite no-op self-loop (SPU halt idiom) -> abort */",
-                    "    spu_halt(ctx); return;",
-                ]
+                              for i in body_insns) \
+                and body_insns[-1].mnemonic in ("br", "bra") \
+                and self._branch_target(body_insns[-1]) is not None \
+                and start <= self._branch_target(body_insns[-1]) < end:
+            func.body_lines = [
+                "    /* infinite no-op self-loop (SPU halt idiom) -> abort */",
+                "    spu_halt(ctx); return;",
+            ]
+        elif self.defer:
+            self._pending.append((func, fins, texts, start, end, self._regs, self._prom))
+        else:
+            self._finish_promotion(func, fins, texts, start, end, self._regs, self._prom, {})
 
         self.functions.append(func)
         return func
 
-    def _finish_promotion(self, func: LiftedFunction, fins, texts, start: int, end: int) -> None:
-        tok = re.compile(r"@([SIO])(\d+)@|@R@")
-        if not self._prom or not self._regs:
+    _CALL_SAFE = {"spu_ls_read128", "spu_ls_write128", "spu_call_return", "SPU_RET", "SPU_RET_REG", "SPU_DIRECT"}
+    _CALL_ANY = ("spu_unsupported", "spu_halt", "SPU_ICALL")
+
+    def finalize(self) -> None:
+        """Complete every deferred function. A direct call reloads, on its normal return,
+        only the registers the callee may write (W, a fixpoint over direct calls and
+        SPU_DIRECT tail calls); a runtime call that receives ctx, an indirect call or an
+        unlifted target makes W every register."""
+        pend, self._pending = self._pending, []
+        every = (1 << 128) - 1
+        fname = re.compile(re.escape(self.prefix) + r"spu_func_([0-9A-F]{8})\b")
+        ref = re.compile(r"\bsr(\d+)\b|ctx->gpr\[(\d+)\]")
+        ctxcall = re.compile(r"\b(\w+)\s*\(\s*ctx\b")
+        own: dict = {}
+        for func, fins, texts, start, end, regs, prom in pend:
+            mask, deps, wild = 0, set(), False
+            for b in func.body_lines:
+                for m in ref.finditer(b):
+                    mask |= 1 << int(m.group(1) or m.group(2))
+                deps.update(int(a, 16) for a in fname.findall(b))
+                if any(t in b for t in self._CALL_ANY):
+                    wild = True
+                for name in ctxcall.findall(b):
+                    if name not in self._CALL_SAFE and not fname.fullmatch(name):
+                        wild = True
+            for ins in fins:
+                if ins.mnemonic not in _NO_RT_WRITE:
+                    mask |= 1 << _dest_reg(ins)
+            own[start] = (every if wild else mask, deps)
+        w = {s: m for s, (m, _) in own.items()}
+        changed = True
+        while changed:
+            changed = False
+            for s, (m, deps) in own.items():
+                v = w[s]
+                if v == every:
+                    continue
+                for d in deps:
+                    v |= w.get(d, every)
+                    if v == every:
+                        break
+                if v != w[s]:
+                    w[s] = v
+                    changed = True
+        for func, fins, texts, start, end, regs, prom in pend:
+            self._finish_promotion(func, fins, texts, start, end, regs, prom, w)
+
+    def _finish_promotion(self, func: LiftedFunction, fins, texts, start: int, end: int,
+                          regs: set, prom: bool, wsum: dict) -> None:
+        tok = re.compile(r"@([SIOR])(\d+)@")
+        if not prom or not regs:
             func.body_lines = [tok.sub("", b) for b in func.body_lines]
             return
-        regs = self._regs
         if len(regs) > self.promote_regs:
             ref = re.compile(r"\bsr(\d+)\b")
             counts: dict = {}
@@ -658,7 +711,6 @@ class SPULifter:
 
             texts = [demote(t) for t in texts]
             func.body_lines = [demote(b) for b in func.body_lines]
-            self._regs = regs
         n = len(fins)
         idx_of = {ins.addr: k for k, ins in enumerate(fins)}
         assign = re.compile(r"\bsr(\d+) = (?!=)")
@@ -690,7 +742,7 @@ class SPULifter:
 
         def transfer(k, d):
             t = texts[k]
-            if "@R@" in t:
+            if f"@R{k}@" in t:
                 return 0
             mn = fins[k].mnemonic
             if mn in ("rdch", "rchcnt") or (mn == "wrch" and f"@S{k}@" in t):
@@ -717,13 +769,23 @@ class SPULifter:
         def bits(v):
             return [r for r in range(128) if v >> r & 1]
 
-        reload = " ".join(f"sr{r} = ctx->gpr[{r}];" for r in sorted(regs))
+        full = sum(1 << r for r in regs)
+
+        def reload(v):
+            return " ".join(f"sr{r} = ctx->gpr[{r}];" for r in sorted(regs) if v >> r & 1)
+
+        reload_all = reload(full)
 
         def sub(m):
-            if m.group(0) == "@R@":
-                return reload
             k = int(m.group(2))
             kind = m.group(1)
+            if kind == "R":
+                if "_fast" not in texts[k]:
+                    return reload_all
+                wv = wsum.get(self._branch_target(fins[k]), full) & full
+                if wv == full:
+                    return f"(void)_fast; {reload_all}"
+                return f"if (_fast) {{ {reload(wv)} }} else {{ {reload_all} }}"
             if kind == "S" and fins[k].mnemonic in ("rdch", "rchcnt"):
                 kind = "I"
             v = d_in[k] | mask[k] if kind == "S" else d_in[k] if kind == "I" else (d_out[k] or 0)
@@ -867,7 +929,6 @@ class SPULifter:
             "clgt": "spu_clgt", "clgth": "spu_clgth", "clgtb": "spu_clgtb",
             "mpy": "spu_mpy", "mpyu": "spu_mpyu",
             "mpyh": "spu_mpyh", "mpyhh": "spu_mpyhh", "mpys": "spu_mpys",
-            "fa": "spu_fa", "fs": "spu_fs", "fm": "spu_fm",
             "fi": "spu_fi",   # floating interpolate (reciprocal refine)
             "fceq": "spu_fceq", "fcgt": "spu_fcgt",
             "fcmeq": "spu_fcmeq", "fcmgt": "spu_fcmgt",
@@ -896,6 +957,8 @@ class SPULifter:
             "cbx": "spu_cbx", "chx": "spu_chx",
             "cwx": "spu_cwx", "cdx": "spu_cdx",
         }
+        if mn in ("fa", "fs", "fm"):
+            return f"{g(rt())} = spu_{mn}_r({g(ra())}, {g(rb())}, _rz);"
         if mn in rr_bin:
             return f"{g(rt())} = {rr_bin[mn]}({g(ra())}, {g(rb())});"
 
@@ -973,9 +1036,12 @@ class SPULifter:
         if mn == "shufb":
             rc = _reg(ops[3])
             return f"{g(rt())} = spu_shufb({g(ra())}, {g(rb())}, {g(rc)});"
-        if mn in ("fma", "fms", "fnms", "mpya"):
+        if mn in ("fma", "fms", "fnms"):
             rc = _reg(ops[3])
-            return f"{g(rt())} = spu_{mn}({g(ra())}, {g(rb())}, {g(rc)});"
+            return f"{g(rt())} = spu_{mn}_r({g(ra())}, {g(rb())}, {g(rc)}, _rz);"
+        if mn == "mpya":
+            rc = _reg(ops[3])
+            return f"{g(rt())} = spu_mpya({g(ra())}, {g(rb())}, {g(rc)});"
         # sfx: extended subtract — RT is also a source (carry-in = low bit of old RT).
         if mn == "sfx":
             return f"{g(rt())} = spu_sfx({g(ra())}, {g(rb())}, {g(rt())});"
@@ -1072,7 +1138,7 @@ class SPULifter:
                 rs, rr = ("const int32_t _rd = ctx->reloc_delta; ", " ctx->reloc_delta = _rd;") if self.reloc else ("", "")
                 return (f"{link} {{ int32_t _si = (int32_t)ctx->image_id; {rs}"
                         f"@SPILL@ ctx->host_depth++; {self.prefix}spu_func_{tgt:08X}(ctx); "
-                        f"spu_call_return(ctx, {self._pc(addr + 4)}); ctx->host_depth--; ctx->image_id = _si;{rr} @RELOAD@ }}")
+                        f"const int _fast = spu_call_return(ctx, {self._pc(addr + 4)}); ctx->host_depth--; ctx->image_id = _si;{rr} @RELOAD@ }}")
             return f"{link} /* TODO spu: brsl unresolved target */;"
         if mn in _COND_BR:
             tgt = self._branch_target(insn)
@@ -1477,6 +1543,7 @@ def main() -> None:
     lifter.reloc = args.reloc
     lifter.promote = not args.no_promote
     lifter.promote_regs = args.promote_regs
+    lifter.defer = True
     lifter.bi_r0_jump = compute_bi_r0_jumps(insns, bounds)
     if lifter.bi_r0_jump:
         print(f"  {len(lifter.bi_r0_jump)} `bi $r0` computed-jump site(s) "
@@ -1509,6 +1576,7 @@ def main() -> None:
               f"(--merge-chunks, max {args.max_group_insns} insns)")
     for s, e in bounds:
         lifter.lift_function(insns, s, groups.get(s, e))
+    lifter.finalize()
 
     os.makedirs(args.output, exist_ok=True)
     hp = os.path.join(args.output, args.header_name)

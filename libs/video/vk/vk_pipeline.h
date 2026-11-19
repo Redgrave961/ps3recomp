@@ -65,6 +65,7 @@ public:
     void save_cache();
     void precompile(shader_cache& shaders);
     VkPipelineLayout layout() const { return m_layout; }
+    VkDescriptorSetLayout buffer_set_layout() const { return m_sets[RSX_SPV_SET_BUFFERS]; }
     VkPipeline get(const pipeline_key& key, const shader& vs, const shader& fs);
     bool dynamic_blend() const { return m_dynamic_blend; }
     bool dynamic_polygon_mode() const { return m_dynamic_polygon; }
@@ -97,7 +98,7 @@ private:
                      VkPipelineRasterizationProvokingVertexStateCreateInfoEXT& prov) const;
 
     vk_device* m_d = nullptr;
-    VkDescriptorSetLayout m_set = VK_NULL_HANDLE;
+    VkDescriptorSetLayout m_sets[2] = {};
     VkPipelineLayout m_layout = VK_NULL_HANDLE;
     VkPipelineCache m_cache = VK_NULL_HANDLE;
     std::string m_cache_path;

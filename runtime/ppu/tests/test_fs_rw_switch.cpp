@@ -16,6 +16,7 @@
  *   test_fs_rw_switch [DIR]      (DIR: where the test file goes; default the
  *                                 system temp directory)
  */
+#include "../../../libs/filesystem/ps3_vfs.c"
 #include "ppu_fs.cpp"
 #ifdef _WIN32
 #  include <windows.h>
@@ -39,8 +40,8 @@ void ps3_hle_register_ctx(uint32_t, const char*, void (*)(ppu_context*)) {}
 /* ps3_dev_flash_path (runtime/platform), which host_path calls for /dev_flash: the real one, it needs nothing. */
 #include "../../platform/ps3_dev_flash.c"
 #include "../../../libs/filesystem/npdrm.h"
-int npdrm_is_npd(FILE* f) { (void)f; return 0; }
-npdrm_file* npdrm_open(FILE* f, const char* n) { (void)f; (void)n; return 0; }
+int npdrm_is_npd(ps3_vfile* f) { (void)f; return 0; }
+npdrm_file* npdrm_open(ps3_vfile* f) { (void)f; return 0; }
 int64_t npdrm_read(npdrm_file* d, uint64_t o, void* p, uint64_t n) { (void)d; (void)o; (void)p; (void)n; return -1; }
 uint64_t npdrm_size(const npdrm_file* d) { (void)d; return 0; }
 void npdrm_close(npdrm_file* d) { (void)d; }

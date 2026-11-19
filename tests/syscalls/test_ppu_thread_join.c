@@ -18,7 +18,6 @@ uint32_t vm_read32(uint64_t a)         /* guest words are big-endian (sys_ppu_th
     const uint8_t* p = vm_base + (uint32_t)a;
     return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
 }
-void ppu_resv_register(ppu_context* c) { (void)c; }
 int ps3_intr_is_handler(unsigned long long tid) { (void)tid; return 0; }
 int ps3_intr_wait(unsigned long long tid) { (void)tid; return 0; }
 PPU_THREAD_LOCAL ppu_context* g_active_ctx;

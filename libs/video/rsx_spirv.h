@@ -15,6 +15,11 @@ extern "C" {
 #define RSX_SPV_FP_MAX_CONSTANTS    512u
 #define RSX_SPV_FP_MAX_INSTRUCTIONS 4096u
 
+enum rsx_spv_set {
+    RSX_SPV_SET_BUFFERS  = 0,
+    RSX_SPV_SET_TEXTURES = 1
+};
+
 enum rsx_spv_binding {
     RSX_SPV_BIND_VP_CONSTANTS   = 0,
     RSX_SPV_BIND_VERTEX_LAYOUT  = 1,

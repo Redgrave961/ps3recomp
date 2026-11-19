@@ -6,7 +6,7 @@
  * SPU_EVENT_LR and loses its reservation. Any one of them silently missing
  * leaves the SPU parked forever, and nothing else in the tree fails, so this
  * asserts all three -- through the REAL PPU store path (ppu_memory.h's
- * vm_write* and ppu_stwcx), not a copy of it, since the whole bug class here is
+ * vm_write*), not a copy of it, since the whole bug class here is
  * a hook that is not where the stores actually go.
  *
  * The two paths that must NOT fire are tested as carefully as the one that
@@ -26,7 +26,7 @@
  * dependency on the rest of the runtime is spu_ch_wake, stubbed below. */
 #include "../spu_coherency.c"
 
-/* The real PPU store and store-conditional path the hook lives in. */
+/* The real PPU store path the hook lives in. */
 #include "../../ppu/ppu_memory.h"
 
 #include <stdio.h>
@@ -38,11 +38,8 @@
 static uint8_t g_guest_mem[1u << 20];
 uint8_t* vm_base = g_guest_mem;
 
-/* ppu_memory.h's inline stores reference these. Nothing here watches writes,
- * and PPU-vs-PPU reservation breaking is a different mechanism. */
+/* ppu_memory.h's inline stores reference these. Nothing here watches writes. */
 uint32_t g_ww_lo = 0xFFFFFFFFu, g_ww_hi = 0;
-int      g_resv_store_active = 0;
-void ppu_resv_break_store(uint64_t ea) { (void)ea; }
 void ps3_ww_report_inline(uint32_t addr, uint64_t val, int width)
 {
     (void)addr; (void)val; (void)width;
@@ -233,115 +230,6 @@ static void test_all_store_widths(void)
     }
 }
 
-static void test_store_conditional(void)
-{
-    ppu_context ppu;
-    ppu_context_init(&ppu);
-
-    /* A successful stwcx on a reserved line notifies. */
-    spu_reset(&g_spu_a, 0);
-    spu_getllar(&g_spu_a, LINE_A);
-    vm_write32(LINE_A + 32, 0x1000u);          /* seed, drops the reservation */
-    spu_getllar(&g_spu_a, LINE_A);             /* reserve again */
-    g_wakes = 0;
-
-    TEST("a successful stwcx into a reserved line raises SPU_EVENT_LR");
-    CHECK_EQ_U32(ppu_lwarx(&ppu, LINE_A + 32), 0x1000u);
-    CHECK(ppu_stwcx(&ppu, LINE_A + 32, 0x1001u) == 1);
-    CHECK_EQ_U32(vm_read32(LINE_A + 32), 0x1001u);
-    CHECK_EQ_U32(g_spu_a.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
-    CHECK(g_spu_a.resv_valid == 0);
-    CHECK(g_wakes == 1);
-
-    /* A stwcx that FAILS its compare stored nothing, so there is nothing to
-     * report: the SPU's line is untouched and its reservation still good. */
-    spu_reset(&g_spu_a, 0);
-    spu_getllar(&g_spu_a, LINE_A);
-    g_wakes = 0;
-
-    TEST("a failed stwcx raises nothing");
-    ppu_lwarx(&ppu, LINE_A + 32);
-    vm_write32(LINE_A + 64, 0x9999u);          /* elsewhere in the line */
-    g_spu_a.event_status = 0;                  /* ignore that one */
-    g_spu_a.resv_valid = 1;
-    g_wakes = 0;
-    ppu.reserve_value = 0xFFFFFFFFu;           /* now the compare cannot match */
-    CHECK(ppu_stwcx(&ppu, LINE_A + 32, 0x2002u) == 0);
-    CHECK_EQ_U32(g_spu_a.event_status, 0);
-    CHECK(g_spu_a.resv_valid == 1);
-    CHECK(g_wakes == 0);
-
-    /* stdcx., the 8-byte commit. */
-    spu_reset(&g_spu_a, 0);
-    spu_getllar(&g_spu_a, LINE_A);
-    vm_write64(LINE_A + 40, 0x0102030405060708ull);
-    spu_getllar(&g_spu_a, LINE_A);
-    g_wakes = 0;
-
-    TEST("a successful stdcx into a reserved line raises SPU_EVENT_LR");
-    CHECK(ppu_ldarx(&ppu, LINE_A + 40) == 0x0102030405060708ull);
-    CHECK(ppu_stdcx(&ppu, LINE_A + 40, 0x1112131415161718ull) == 1);
-    CHECK(vm_read64(LINE_A + 40) == 0x1112131415161718ull);
-    CHECK_EQ_U32(g_spu_a.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
-    CHECK(g_wakes == 1);
-}
-
-/* ===========================================================================
- * Block stores: a memset or memcpy is a store to every line it touches
- * ===========================================================================*/
-static void test_block_stores(void)
-{
-    const uint32_t LINE_D = 0x00040400u;       /* never reserved by anyone */
-    uint8_t buf[512];
-    memset(buf, 0x5A, sizeof(buf));
-
-    /* One block from inside LINE_A to inside LINE_B, with a different SPU
-     * holding each: both reservations go, both SPUs wake, once each. */
-    spu_reset(&g_spu_a, 0);
-    spu_reset(&g_spu_b, 1);
-    spu_getllar(&g_spu_a, LINE_A);
-    spu_getllar(&g_spu_b, LINE_B);
-    g_wakes = 0;
-
-    TEST("a memset spanning two reserved lines breaks both reservations");
-    vm_memset(LINE_A + 100, 0x77, (LINE_B + 10) - (LINE_A + 100));
-    CHECK(vm_read8(LINE_A + 100) == 0x77u);
-    CHECK(vm_read8(LINE_B + 9) == 0x77u);
-    CHECK_EQ_U32(g_spu_a.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
-    CHECK_EQ_U32(g_spu_b.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
-    CHECK(g_spu_a.resv_valid == 0);
-    CHECK(g_spu_b.resv_valid == 0);
-    CHECK(g_wakes == 2);
-
-    TEST("a memcpy into a reserved line breaks it");
-    spu_reset(&g_spu_a, 0);
-    spu_getllar(&g_spu_a, LINE_C);
-    g_wakes = 0;
-    vm_memcpy_to(LINE_C + 120, buf, 16);       /* straddles into the next line */
-    CHECK(vm_read8(LINE_C + 120) == 0x5Au);
-    CHECK(vm_read8(LINE_C + 135) == 0x5Au);
-    CHECK_EQ_U32(g_spu_a.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
-    CHECK(g_spu_a.resv_valid == 0);
-    CHECK(g_wakes == 1);
-
-    TEST("a block that touches no reserved line raises nothing");
-    spu_reset(&g_spu_a, 0);
-    spu_getllar(&g_spu_a, LINE_C);
-    g_wakes = 0;
-    vm_memcpy_to(LINE_D, buf, sizeof(buf));
-    vm_memset(LINE_D, 0, 300);
-    CHECK_EQ_U32(g_spu_a.event_status, 0);
-    CHECK(g_spu_a.resv_valid == 1);
-    CHECK(g_wakes == 0);
-
-    TEST("an empty block is not a store");
-    vm_memset(LINE_C, 0, 0);
-    vm_memcpy_to(LINE_C, buf, 0);
-    CHECK_EQ_U32(g_spu_a.event_status, 0);
-    CHECK(g_spu_a.resv_valid == 1);
-    CHECK(g_wakes == 0);
-}
-
 /* More live virtual contexts than physical SPUs, including persistent
  * policy contexts which are idle while another workload runs. */
 static void test_many_contexts(void)
@@ -428,8 +316,6 @@ int main(void)
     test_ppu_store_raises_lr();
     test_no_false_raise();
     test_all_store_widths();
-    test_store_conditional();
-    test_block_stores();
     spu_coh_unregister(&g_spu_a);
     spu_coh_unregister(&g_spu_b);
     test_many_contexts();

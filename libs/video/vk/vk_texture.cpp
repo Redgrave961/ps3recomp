@@ -1,12 +1,12 @@
 #include "vk_renderer.h"
-
+#include "rsx_vk.h"
+#include "../../../runtime/memory/vm_track.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 
-#ifdef _WIN32
-#include <windows.h>
-#else
+#ifndef _WIN32
 #include <fcntl.h>
 #include <linux/fs.h>
 #include <linux/userfaultfd.h>
@@ -19,9 +19,13 @@ namespace vk {
 
 namespace {
 
+std::atomic<const rsx_vk_texture_patch*> g_patch{ nullptr };
+
 constexpr u32 k_page_shift = 12;
+#ifndef _WIN32
 constexpr u32 k_region_shift = 20;
 constexpr u32 k_merge_gap = 1;
+#endif
 
 u32 texel_bytes(VkFormat f)
 {
@@ -40,19 +44,17 @@ u32 texel_bytes(VkFormat f)
 }
 
 #ifdef _WIN32
-bool scan_writes(u32 base, u32 bytes, std::vector<u32>& stamps, u32& clock)
+struct page_stamper {
+    std::vector<u32>& stamps;
+    u32& clock;
+    u32 stamp;
+};
+
+void stamp_page(void* user, uint32_t page)
 {
-    thread_local std::vector<PVOID> pages(1u << 16);
-    for (;;) {
-        ULONG_PTR count = pages.size();
-        DWORD granularity = 0;
-        if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, vm_base + base, bytes, pages.data(), &count, &granularity) != 0) return false;
-        if (count) {
-            const u32 s = ++clock;
-            for (ULONG_PTR i = 0; i < count; i++) stamps[(u32)(static_cast<uint8_t*>(pages[i]) - vm_base) >> k_page_shift] = s;
-        }
-        if (count < pages.size()) return true;
-    }
+    page_stamper& s = *static_cast<page_stamper*>(user);
+    if (!s.stamp) s.stamp = ++s.clock;
+    s.stamps[page] = s.stamp;
 }
 #else
 struct write_tracker {
@@ -74,7 +76,7 @@ struct write_tracker {
     }
 };
 
-bool scan_writes(u32 base, u32 bytes, std::vector<u32>& stamps, u32& clock)
+bool scan_writes(u32 base, u32 bytes, std::vector<u32>& stamps, u32& clock, u64& changed)
 {
     static const write_tracker tracker;
     if (!tracker.ok) return false;
@@ -94,7 +96,7 @@ bool scan_writes(u32 base, u32 bytes, std::vector<u32>& stamps, u32& clock)
         if (n) {
             const u32 s = ++clock;
             for (long i = 0; i < n; i++)
-                for (uint64_t a = regions[i].start; a < regions[i].end; a += 1u << k_page_shift)
+                for (uint64_t a = regions[i].start; a < regions[i].end; a += 1u << k_page_shift, changed++)
                     stamps[(u32)(a - (uintptr_t)vm_base) >> k_page_shift] = s;
         }
         if (arg.walk_end >= arg.end) return true;
@@ -141,11 +143,17 @@ void renderer::watch(u32 ea, u32 size)
     stats.watch_bytes += size;
     if (m_page_stamp.empty()) {
         m_page_stamp.assign(1u << (32 - k_page_shift), 0u);
+#ifndef _WIN32
         m_region_batch.assign(1u << (32 - k_region_shift), ~0ull);
         m_region_used.assign(1u << (32 - k_region_shift), ~0ull);
+#endif
     }
     const u64 batch = rsx_core_batch();
     if (batch != m_scan_batch) prescan(batch);
+#ifdef _WIN32
+    page_stamper s{ m_page_stamp, m_stamp, 0 };
+    vm_track(ea, size, stamp_page, &s);
+#else
     const u32 last = (u32)(((uint64_t)ea + size - 1u) >> k_region_shift);
     for (u32 r = ea >> k_region_shift; r <= last; r++) {
         if (m_region_used[r] == batch) continue;
@@ -156,29 +164,47 @@ void renderer::watch(u32 ea, u32 size)
         if (m_region_batch[r] == batch) continue;
         u32 end = r;
         while (end + 1 <= last && m_region_batch[end + 1] != batch) end++;
-        stats.scans++;
-        if (!scan_writes(r << k_region_shift, (end - r + 1) << k_region_shift, m_page_stamp, m_stamp)) {
+        if (!scan(r << k_region_shift, (end - r + 1) << k_region_shift)) {
             mark_written(ea, size);
             return;
         }
         for (u32 k = r; k <= end; k++) m_region_batch[k] = batch;
         r = end;
     }
+#endif
 }
+
+#ifndef _WIN32
+bool renderer::scan(u32 base, u32 bytes)
+{
+    const auto start = std::chrono::steady_clock::now();
+    const bool ok = scan_writes(base, bytes, m_page_stamp, m_stamp, stats.changed_pages);
+    stats.scans++;
+    stats.scan_ns += (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
+    return ok;
+}
+#endif
 
 void renderer::prescan(u64 batch)
 {
     m_scan_batch = batch;
+#ifdef _WIN32
+    const auto start = std::chrono::steady_clock::now();
+    page_stamper s{ m_page_stamp, m_stamp, 0 };
+    stats.changed_pages += vm_track_drain(stamp_page, &s);
+    stats.scans++;
+    stats.scan_ns += (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
+#else
     std::sort(m_hot.begin(), m_hot.end());
     for (size_t i = 0; i < m_hot.size();) {
         const u32 r = m_hot[i];
         u32 end = r;
         while (++i < m_hot.size() && m_hot[i] <= end + 1u + k_merge_gap) end = m_hot[i];
-        stats.scans++;
-        if (!scan_writes(r << k_region_shift, (end - r + 1) << k_region_shift, m_page_stamp, m_stamp)) continue;
+        if (!scan(r << k_region_shift, (end - r + 1) << k_region_shift)) continue;
         for (u32 k = r; k <= end; k++) m_region_batch[k] = batch;
     }
     m_hot.clear();
+#endif
 }
 
 bool renderer::memory_changed(u32 ea, u32 size, u32 stamp)
@@ -220,6 +246,8 @@ VkImageView renderer::view_for(image& img, VkImageViewType type, VkFormat format
     vi.format = format;
     vi.components = swizzle;
     vi.subresourceRange = { aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS };
+    const VkImageViewUsageCreateInfo usage{ VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, nullptr, img.usage & ~VK_IMAGE_USAGE_STORAGE_BIT };
+    if (img.usage & VK_IMAGE_USAGE_STORAGE_BIT) vi.pNext = &usage;
     VkImageView view = VK_NULL_HANDLE;
     if (vkCreateImageView(m_d->dev, &vi, nullptr, &view) != VK_SUCCESS) return VK_NULL_HANDLE;
     img.views.emplace_back(key, view);
@@ -255,52 +283,54 @@ VkSampler renderer::sampler_for(const VkSamplerCreateInfo& info, const VkSampler
     return s;
 }
 
-void renderer::describe_units()
+void renderer::describe_units(u32 first, u32 last)
 {
-    for (u32 u = 0; u < rsx::TEXTURES + rsx::VERTEX_TEXTURES; u++) {
+    for (u32 u = first; u < last; u++) {
         unit_binding& b = m_units[u];
-        const bool vertex = u >= rsx::TEXTURES;
-        const u32 base = vertex ? rsx::M_VTEX_OFFSET + (u - rsx::TEXTURES) * 0x20u : rsx::M_TEXTURE_OFFSET + u * 0x20u;
-        rsx::texture_regs& g = b.regs;
-        g.offset = r(base);
-        g.format = r(base + 0x04u);
-        g.address = r(base + 0x08u);
-        g.control0 = r(base + 0x0Cu);
-        g.filter = r(base + 0x14u);
-        g.image_rect = r(base + 0x18u);
-        g.border = r(base + 0x1Cu);
-        if (vertex) {
-            g.control1 = 0;
-            g.control2 = 0;
-            g.control3 = r(base + 0x10u);
-        } else {
-            g.control1 = r(base + 0x10u);
-            g.control2 = r(rsx::M_TEXTURE_CONTROL2 + u * 4u);
-            g.control3 = r(rsx::M_TEXTURE_CONTROL3 + u * 4u);
-        }
-        b.valid = rsx::texture_describe(g, vertex, b.desc);
+        const rsx::texture_regs g = unit_regs(u);
+        if (b.described && !std::memcmp(&g, &b.regs, sizeof g)) continue;
+        b.regs = g;
+        b.described = true;
+        b.valid = rsx::texture_describe(g, u >= rsx::TEXTURES, b.desc);
     }
 }
 
-image* renderer::depth_as_color(surface& s, VkFormat format)
+rsx::texture_regs renderer::unit_regs(u32 u) const
+{
+    const bool vertex = u >= rsx::TEXTURES;
+    const u32 base = vertex ? rsx::M_VTEX_OFFSET + (u - rsx::TEXTURES) * 0x20u : rsx::M_TEXTURE_OFFSET + u * 0x20u;
+    rsx::texture_regs g{};
+    g.offset = r(base);
+    g.format = r(base + 0x04u);
+    g.address = r(base + 0x08u);
+    g.control0 = r(base + 0x0Cu);
+    g.filter = r(base + 0x14u);
+    g.image_rect = r(base + 0x18u);
+    g.border = r(base + 0x1Cu);
+    if (vertex) {
+        g.control3 = r(base + 0x10u);
+    } else {
+        g.control1 = r(base + 0x10u);
+        g.control2 = r(rsx::M_TEXTURE_CONTROL2 + u * 4u);
+        g.control3 = r(rsx::M_TEXTURE_CONTROL3 + u * 4u);
+    }
+    return g;
+}
+
+image* renderer::depth_as_color(surface& s)
 {
     image& dst = s.as_color;
-    if (dst.width != s.img.width || dst.height != s.img.height || dst.format != format) {
+    const bool d16 = s.bpp == 2;
+    const VkFormat packed = d16 ? VK_FORMAT_R16_UINT : VK_FORMAT_R32_UINT;
+    if (dst.width != s.img.width || dst.height != s.img.height || dst.format != packed) {
         discard(dst);
-        if (!create_image(dst, format, s.img.width, s.img.height, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        if (!create_image(dst, packed, s.img.width, s.img.height, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
                           VK_IMAGE_ASPECT_COLOR_BIT))
             return nullptr;
         s.as_color_version = ~0ull;
     }
     if (s.as_color_version == s.version) return &dst;
-    const bool d16 = s.bpp == 2;
-    const u32 w = s.img.width, h = s.img.height, row = d16 ? (w + 1u) & ~1u : w;
-    const VkDeviceSize bytes = (VkDeviceSize)row * h * s.bpp;
-    if (m_pack.size < bytes) {
-        if (m_pack.buffer) m_scratch_garbage.emplace_back(*m_submitted + 1u, m_pack);
-        m_pack = scratch{};
-        if (!create_scratch(m_pack, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) return nullptr;
-    }
+    const u32 w = s.img.width, h = s.img.height;
     const VkComponentMapping identity{};
     const VkImageView dv = view_for(s.img, VK_IMAGE_VIEW_TYPE_2D, s.img.format, VK_IMAGE_ASPECT_DEPTH_BIT, identity);
     const VkImageView sv = d16 ? dv : view_for(s.img, VK_IMAGE_VIEW_TYPE_2D, s.img.format, VK_IMAGE_ASPECT_STENCIL_BIT, identity);
@@ -309,15 +339,8 @@ image* renderer::depth_as_color(surface& s, VkFormat format)
     end_rendering();
     const trace_span span(*this, c, "depth pack %ux%u", w, h);
     barrier(c, s.img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
-    m_depth_pack.record(c, dv, sv, m_pack.buffer, 0, bytes, w, h, d16, s.depth_float);
-    memory_barrier(c, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT,
-                   VK_ACCESS_2_TRANSFER_READ_BIT);
-    barrier(c, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
-    VkBufferImageCopy region{};
-    region.bufferRowLength = row;
-    region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-    region.imageExtent = { w, h, 1 };
-    vkCmdCopyBufferToImage(c, m_pack.buffer, dst.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    barrier(c, dst, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+    m_depth_pack.record(c, dv, sv, dst.view, w, h, d16, s.depth_float);
     s.as_color_version = s.version;
     return &dst;
 }
@@ -370,6 +393,16 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
     path = "dummy: address out of range";
     if (!ea) return false;
 
+    unit_resolved& cached = m_resolved[slot];
+    if (!m_trace && cached.valid && cached.ea == ea && cached.epoch == m_epoch && cached.generation == m_binding_gen &&
+        !std::memcmp(&cached.regs, &b.regs, sizeof b.regs)) {
+        path = "memory";
+        out = cached.info;
+        state = cached.state;
+        return true;
+    }
+    cached.valid = false;
+
     VkSamplerCustomBorderColorCreateInfoEXT border{ VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT };
     VkSamplerCreateInfo si{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
     rsx::texture_sampler(b.regs, vertex, d, 16.0f, si, border);
@@ -403,7 +436,7 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
                 skipped = "memory: depth surface sampled as color of another size";
                 continue;
             }
-            image* packed = depth_as_color(*s, d.format);
+            image* packed = depth_as_color(*s);
             path = "dummy: depth pack failed";
             if (!packed) return false;
             barrier(c, *packed, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
@@ -498,7 +531,7 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
         upload = true;
     } else if (e->checked != m_epoch) {
         e->checked = m_epoch;
-        upload = memory_changed(ea, d.guest_size, e->stamp);
+        upload = memory_changed(ea, d.guest_size, e->stamp) || (e->patched && e->variant != g_patch.load(std::memory_order_acquire)->variant());
     }
 
     if (upload) {
@@ -510,6 +543,11 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
         e->stamp = m_stamp;
         e->checked = m_epoch;
         rsx::texture_convert(d, vm_base + ea, slice.ptr, m_copies);
+        e->patched = false;
+        if (const rsx_vk_texture_patch* patch = g_patch.load(std::memory_order_acquire)) {
+            e->variant = patch->variant();
+            e->patched = patch->apply(e->variant, d.gcm_format, d.width, d.height, slice.ptr, bytes) != 0;
+        }
         end_rendering();
         const trace_span span(*this, c, "texture upload %ux%u fmt %d %llu bytes", e->img.width, e->img.height, (int)d.format,
                               (unsigned long long)bytes);
@@ -536,7 +574,13 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
     if (!view) return false;
     path = skipped ? skipped : "memory";
     out = { sampler, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+    if (!skipped) cached = { true, b.regs, ea, m_epoch, m_binding_gen, out, state };
     return true;
 }
 
+}
+
+extern "C" void rsx_vk_set_texture_patch(const rsx_vk_texture_patch* patch)
+{
+    vk::g_patch.store(patch, std::memory_order_release);
 }

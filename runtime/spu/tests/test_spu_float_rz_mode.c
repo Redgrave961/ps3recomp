@@ -71,10 +71,8 @@ int main(void) { puts("SKIP: SPU_FLOAT_RZ is arm64 only"); return 0; }
 
 /* Link-only boundaries outside this CPU-only fixture. Fail if any is reached. */
 void spu_thread_publish_ctx(uint32_t tid, void* c) { (void)tid; (void)c; abort(); }
-void ppu_resv_break_store(uint64_t ea) { (void)ea; abort(); }
 void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; abort(); }
 unsigned long long ps3_ms_now(void) { abort(); }
 uint32_t g_ww_lo = 0xFFFFFFFFu, g_ww_hi;
-int g_resv_store_active;
 void spurs_ef_set_from_spu(uint32_t ea, uint16_t bits) { (void)ea; (void)bits; abort(); }
 uint32_t g_spu_image_src_ea, g_spu_image_ls_start, g_spu_image_span;

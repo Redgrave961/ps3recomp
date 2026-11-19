@@ -4,6 +4,7 @@
  * comes from an emulator's code.
  */
 #include "trophy_files.h"
+#include "../filesystem/ps3_vfs.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,16 +22,16 @@ static uint64_t rd64(const uint8_t* p) { return (uint64_t)rd32(p) << 32 | rd32(p
 int trp_open(const char* path, trp_index* out)
 {
     memset(out, 0, sizeof *out);
-    FILE* f = fopen(path, "rb");
+    ps3_vfile* f = ps3_vfile_open(path, "rb");
     if (!f) return 0;
     uint8_t h[0x40];
-    int ok = fread(h, 1, sizeof h, f) == sizeof h && rd32(h) == TRP_MAGIC;
+    int ok = ps3_vfile_read(h, sizeof h, f) == sizeof h && rd32(h) == TRP_MAGIC;
     const uint64_t fsize = ok ? rd64(h + 8) : 0;
     const uint32_t count = ok ? rd32(h + 16) : 0, esz = ok ? rd32(h + 20) : 0;
     if (ok && (esz < 48 || count > TROPHY_TRP_MAX_FILES)) ok = 0;
     for (uint32_t i = 0; ok && i < count; i++) {
         uint8_t e[48];
-        if (fseek(f, (long)(0x40 + (uint64_t)i * esz), SEEK_SET) || fread(e, 1, 48, f) != 48) { ok = 0; break; }
+        if (ps3_vfile_seek(f, (int64_t)(0x40 + (uint64_t)i * esz), SEEK_SET) || ps3_vfile_read(e, 48, f) != 48) { ok = 0; break; }
         trp_entry* d = &out->e[out->n];
         memcpy(d->name, e, 32);
         d->name[32] = 0;
@@ -39,7 +40,7 @@ int trp_open(const char* path, trp_index* out)
         if (!d->name[0] || d->offset + d->size > fsize || d->size > (64u << 20)) continue;   /* skip a bad one */
         out->n++;
     }
-    fclose(f);
+    ps3_vfile_close(f);
     if (!ok) { out->n = 0; return 0; }
     snprintf(out->path, sizeof out->path, "%s", path);
     out->file_size = fsize;
@@ -59,11 +60,11 @@ char* trp_read_entry_data(const trp_index* t, const char* name, size_t* size)
 {
     const trp_entry* e = trp_find_entry(t, name);
     if (!e) return NULL;
-    FILE* f = fopen(t->path, "rb");
+    ps3_vfile* f = ps3_vfile_open(t->path, "rb");
     if (!f) return NULL;
     char* d = (char*)malloc((size_t)e->size + 1);
-    if (d && (fseek(f, (long)e->offset, SEEK_SET) || fread(d, 1, (size_t)e->size, f) != (size_t)e->size)) { free(d); d = NULL; }
-    fclose(f);
+    if (d && (ps3_vfile_seek(f, (int64_t)e->offset, SEEK_SET) || ps3_vfile_read(d, (size_t)e->size, f) != (size_t)e->size)) { free(d); d = NULL; }
+    ps3_vfile_close(f);
     if (!d) return NULL;
     d[e->size] = 0;
     if (size) *size = (size_t)e->size;

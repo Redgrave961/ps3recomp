@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Regression test: ten VMX integer ops use big-endian lane order.
 
-ctx->vr holds raw big-endian guest bytes, so an op that reads halfword or word
-VALUES must assemble each lane from its bytes in big-endian order. vmulouh,
+ctx->vr holds each register byte-reversed (host byte j = guest byte 15 - j), so
+an op that reads halfword or word VALUES must take each lane in mirrored order. vmulouh,
 vmsumshm, vadduws, vadduhs and vpkuwum read lanes through int16_t*/uint32_t*
 casts (byte-reversed lanes on a little-endian host); vmsumuhm, vsubuws,
 vpkswss, vsrb and vsrab had no lowering and were emitted as "/* TODO */".
@@ -135,10 +135,10 @@ def check_op(cc, mn, rng):
         ",".join("{" + ",".join(_carr(v) for v in t) + "}" for t in vecs) + "};",
         "int main(void) { static ctx_t c; ctx_t* ctx = &c;",
         f"  for (int n = 0; n < {len(vecs)}; n++) {{",
-        "    memcpy(ctx->vr[1], IN[n][0], 16); memcpy(ctx->vr[2], IN[n][1], 16);",
-        "    memcpy(ctx->vr[3], IN[n][2], 16); memset(ctx->vr[4], 0xCD, 16);",
+        "    for (int i = 0; i < 16; i++) { ctx->vr[1][i] = IN[n][0][15 - i]; ctx->vr[2][i] = IN[n][1][15 - i]; }",
+        "    for (int i = 0; i < 16; i++) ctx->vr[3][i] = IN[n][2][15 - i]; memset(ctx->vr[4], 0xCD, 16);",
         "    " + body,
-        "    for (int i = 0; i < 16; i++) printf(\"%02x\", ctx->vr[4][i]); printf(\"\\n\"); }",
+        "    for (int i = 0; i < 16; i++) printf(\"%02x\", ctx->vr[4][15 - i]); printf(\"\\n\"); }",
         "  return 0; }",
     ])
     with tempfile.TemporaryDirectory() as td:

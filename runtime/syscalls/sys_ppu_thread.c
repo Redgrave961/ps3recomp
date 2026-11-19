@@ -121,6 +121,17 @@ int ppu_thread_exists(uint64_t tid)
     return state != PPU_THREAD_STATE_FREE && state != PPU_THREAD_STATE_FINISHED;
 }
 
+void ppu_report_guest_lrs(void)
+{
+    for (uint64_t tid = 1; tid <= PPU_THREAD_MAX; tid++) {
+        if (!ppu_thread_exists(tid)) continue;
+        const ppu_context* c = &g_ppu_threads[tid - 1].ctx;
+        fprintf(stderr, "  guest tid %-3u %-32s lr=0x%08X r3=0x%08X sp=0x%08X\n", (unsigned)tid, g_ppu_threads[tid - 1].name,
+                (uint32_t)c->lr, (uint32_t)c->gpr[3], (uint32_t)c->gpr[1]);
+    }
+    fflush(stderr);
+}
+
 /* ---------------------------------------------------------------------------
  * Priority at thread start (PS3_PRIO_START=1, off by default)
  *
@@ -201,10 +212,6 @@ static void* ppu_host_thread_proc(void* param)
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
 #endif
 
-    /* Register this thread's context for lwarx/stwcx cross-thread reservation
-     * invalidation (ppu_loader.cpp) -- so a concurrent stwcx breaks this thread's
-     * reservation and prevents ABA corruption of the guest's lock-free lists. */
-    { extern void ppu_resv_register(ppu_context*); ppu_resv_register(&info->ctx); }
     ps3_tprof_thread('P', (uint32_t)info->ctx.thread_id);
 
     fprintf(stderr, "[THREAD %llu] host thread started, entry=0x%08llX hosttid=%lu\n",
@@ -357,7 +364,6 @@ ppu_context* ppu_thread_adopt(const char* name, uint32_t stack_size, int32_t pri
     ps3_ft_name((uint32_t)slot + 1u, t->name);
     ps3_thread_name("ppu %s", t->name);
     ps3_tprof_thread('P', (uint32_t)slot + 1u);
-    { extern void ppu_resv_register(ppu_context*); ppu_resv_register(&t->ctx); }
     { extern PPU_THREAD_LOCAL ppu_context* g_active_ctx; g_active_ctx = &t->ctx; }
     return &t->ctx;
 }
