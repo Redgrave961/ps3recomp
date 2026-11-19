@@ -7,8 +7,6 @@
 #    define WIN32_LEAN_AND_MEAN
 #  endif
 #  include <windows.h>
-#  include <intrin.h>
-#  define PS3_SYNC_PAUSE() _mm_pause()
 #  ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
 #    define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #  endif
@@ -21,16 +19,6 @@
 #else
 #  include "win32_compat.h"
 #  include <time.h>
-#endif
-
-#if !defined(PS3_SYNC_PAUSE)
-#  if defined(__x86_64__) || defined(__i386__)
-#    define PS3_SYNC_PAUSE() __builtin_ia32_pause()
-#  elif defined(__aarch64__)
-#    define PS3_SYNC_PAUSE() __asm__ __volatile__("yield" ::: "memory")
-#  else
-#    define PS3_SYNC_PAUSE() ((void)0)
-#  endif
 #endif
 
 extern int32_t ppu_thread_priority(uint64_t tid);
@@ -129,9 +117,6 @@ void ps3_futex_wake_all(volatile uint32_t* addr)
 }
 
 #if defined(_WIN32)
-#define PS3_TIMER_SLACK_NS 1000000ull
-#define PS3_TIMER_MARGIN_NS 100000ull
-
 static HANDLE armed_timer(uint64_t us)
 {
     static __declspec(thread) HANDLE t_timer;
@@ -206,20 +191,9 @@ void ps3_sleep_us(uint64_t us)
 {
     if (!us) return;
 #if defined(_WIN32)
-    static __declspec(thread) uint64_t t_slack_ns = PS3_TIMER_SLACK_NS;
-    const uint64_t start = ps3_sync_now_ns(), deadline = start + us * 1000ull;
-    if (us * 1000ull > t_slack_ns) {
-        const uint64_t ask = (us * 1000ull - t_slack_ns) / 1000ull;
-        HANDLE timer = armed_timer(ask);
-        if (timer) WaitForSingleObject(timer, INFINITE);
-        else Sleep((DWORD)(ask / 1000u));
-        const uint64_t woke = ps3_sync_now_ns() - start, over = woke > ask * 1000ull ? woke - ask * 1000ull : 0;
-        const uint64_t want = over + PS3_TIMER_MARGIN_NS < PS3_TIMER_SLACK_NS ? over + PS3_TIMER_MARGIN_NS : PS3_TIMER_SLACK_NS;
-        t_slack_ns = want > t_slack_ns ? want : t_slack_ns - (t_slack_ns - want) / 16u;
-    }
-    for (uint64_t now = ps3_sync_now_ns(); now < deadline; now = ps3_sync_now_ns())
-        if (deadline - now > 50000ull) SwitchToThread();
-        else PS3_SYNC_PAUSE();
+    HANDLE timer = armed_timer(us);
+    if (timer) WaitForSingleObject(timer, INFINITE);
+    else Sleep((DWORD)((us + 999) / 1000));
 #elif defined(__linux__)
     const uint64_t deadline = ps3_sync_now_ns() + us * 1000ull;
     struct timespec ts;
@@ -235,7 +209,7 @@ void ps3_sleep_us(uint64_t us)
 void ps3_lock_slow(ps3_lock* l, unsigned spin)
 {
     for (unsigned i = 0; i < spin; i++) {
-        PS3_SYNC_PAUSE();
+        ps3_pause();
         if (__atomic_load_n(&l->v, __ATOMIC_RELAXED) == 0) {
             uint32_t z = 0;
             if (__atomic_compare_exchange_n(&l->v, &z, 1u, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
@@ -308,20 +282,32 @@ int ps3_waitq_has(const ps3_waitq* q, uintptr_t key)
     return 0;
 }
 
+#define PS3_WAITER_PARKED 2u
+
 void ps3_waiter_wake(ps3_waiter* w, int64_t result)
 {
     w->result = result;
-    __atomic_store_n(&w->done, 1u, __ATOMIC_RELEASE);
-    ps3_futex_wake_one(&w->done);
+    if (__atomic_exchange_n(&w->done, 1u, __ATOMIC_ACQ_REL) == PS3_WAITER_PARKED) ps3_futex_wake_one(&w->done);
+}
+
+static int waiter_done(void* w)
+{
+    return __atomic_load_n(&((ps3_waiter*)w)->done, __ATOMIC_ACQUIRE) == 1u;
 }
 
 int ps3_waiter_sleep(ps3_waiter* w, uint64_t deadline_ns)
 {
-    while (!__atomic_load_n(&w->done, __ATOMIC_ACQUIRE)) {
-        if (!ps3_futex_wait(&w->done, 0u, deadline_ns))
-            return __atomic_load_n(&w->done, __ATOMIC_ACQUIRE) != 0;
+    if (waiter_done(w)) return 1;
+    uint32_t state = 0;
+    __atomic_compare_exchange_n(&w->done, &state, PS3_WAITER_PARKED, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+    int woken = 1;
+    while (!waiter_done(w)) {
+        if (!ps3_futex_wait(&w->done, PS3_WAITER_PARKED, deadline_ns)) {
+            woken = waiter_done(w);
+            break;
+        }
     }
-    return 1;
+    return woken;
 }
 
 #define PS3_PARK_BUCKETS 256u

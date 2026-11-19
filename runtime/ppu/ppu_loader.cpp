@@ -964,41 +964,77 @@ static inline void ppu_window_note(uint32_t a, uint32_t n)
     if (notify && (a - ppu_hle_inject_base < 0x10000u || vm_watched(a, n))) notify();
 }
 
-extern "C" void ppu_store_block(uint64_t ea, const void* src, uint32_t n)
+static void store_block_at(uint32_t a, const void* src, uint32_t n, void* ra)
 {
-    const uint32_t a = (uint32_t)ea;
-    if (vm_oob(a, n) || vm_null_store(a, 0, n, __builtin_return_address(0))) return;
+    if (vm_oob(a, n) || vm_null_store(a, 0, n, ra)) return;
     vm_write_coh(a, src, n);
     ppu_window_note(a, n);
 }
+static void store8_at(uint32_t a, uint8_t v, void* ra)
+{
+    barrier_watch_hit(a, v, 1, ra);
+    if (vm_oob(a, 1) || vm_null_store(a, v, 1, ra)) return;
+    vm_write_coh(a, &v, 1); ppu_window_note(a, 1);
+}
+static void store16_at(uint32_t a, uint16_t v, void* ra)
+{
+    barrier_watch_hit(a, v, 2, ra);
+    if (vm_oob(a, 2) || vm_null_store(a, v, 2, ra)) return;
+    v = __builtin_bswap16(v); vm_write_coh(a, &v, 2); ppu_window_note(a, 2);
+}
+static void store32_at(uint32_t a, uint32_t v, void* ra)
+{
+    barrier_watch_hit(a, v, 4, ra);
+    if (vm_oob(a, 4) || vm_null_store(a, v, 4, ra)) return;
+    { uint32_t _v = v;
+      v = __builtin_bswap32(v); vm_write_coh(a, &v, 4); ppu_window_note(a, 4);
+      /* Raw SPU problem state: run control, mailboxes and signal notification
+       * have side effects. The plain store above still happens -- the registers
+       * are guest memory and the PPU reads most of them straight back. */
+      if (spu_raw_is_reg(a)) spu_raw_reg_store(a, _v, 4); }
+}
+static void store64_at(uint32_t a, uint64_t v, void* ra)
+{
+    /* PPU_WWATCH covers the 64-bit store too. It did not, which made the watch
+     * blind to exactly the code that matters most for it: every bignum and
+     * every 64-bit struct field is written with std, so a watch on one would
+     * report nothing and read as "nobody writes this". Two halves so an
+     * 8-byte store still shows up when only its low or high word is watched. */
+    barrier_watch_hit(a,     (uint32_t)(v >> 32), 4, ra);
+    barrier_watch_hit(a + 4, (uint32_t)v,         4, ra);
+    if (vm_oob(a, 8) || vm_null_store(a, (uint32_t)(v >> 32), 8, ra)) return;
+    v = __builtin_bswap64(v); vm_write_coh(a, &v, 8); ppu_window_note(a, 8);
+}
+extern "C" void ppu_store_block(uint64_t ea, const void* src, uint32_t n) { store_block_at((uint32_t)ea, src, n, __builtin_return_address(0)); }
 extern "C" void ppu_store_recheck(uint64_t ea)
 {
     const uint32_t a = (uint32_t)ea;
     if (spu_coh_line_reserved(a)) vm_coh_notify(a);
     ppu_window_note(a, 16);
 }
-void vm_write8 (uint64_t a, uint8_t  v) { barrier_watch_hit((uint32_t)a, v, 1, __builtin_return_address(0)); if (vm_oob((uint32_t)a,1) || vm_null_store((uint32_t)a, v, 1, __builtin_return_address(0))) return;
-    vm_write_coh((uint32_t)a, &v, 1); ppu_window_note((uint32_t)a, 1); }
-void vm_write16(uint64_t a, uint16_t v) { barrier_watch_hit((uint32_t)a, v, 2, __builtin_return_address(0)); if (vm_oob((uint32_t)a,2) || vm_null_store((uint32_t)a, v, 2, __builtin_return_address(0))) return;
-    v = __builtin_bswap16(v); vm_write_coh((uint32_t)a, &v, 2); ppu_window_note((uint32_t)a, 2); }
-void vm_write32(uint64_t a, uint32_t v) { barrier_watch_hit((uint32_t)a, v, 4, __builtin_return_address(0)); if (vm_oob((uint32_t)a,4) || vm_null_store((uint32_t)a, v, 4, __builtin_return_address(0))) return;
-    { uint32_t _v = v;
-      v = __builtin_bswap32(v); vm_write_coh((uint32_t)a, &v, 4); ppu_window_note((uint32_t)a, 4);
-      /* Raw SPU problem state: run control, mailboxes and signal notification
-       * have side effects. The plain store above still happens -- the registers
-       * are guest memory and the PPU reads most of them straight back. */
-      if (spu_raw_is_reg((uint32_t)a)) spu_raw_reg_store((uint32_t)a, _v, 4); } }
-void vm_write64(uint64_t a, uint64_t v) {
-    /* PPU_WWATCH covers the 64-bit store too. It did not, which made the watch
-     * blind to exactly the code that matters most for it: every bignum and
-     * every 64-bit struct field is written with std, so a watch on one would
-     * report nothing and read as "nobody writes this". Two halves so an
-     * 8-byte store still shows up when only its low or high word is watched. */
-    barrier_watch_hit((uint32_t)a,     (uint32_t)(v >> 32), 4, __builtin_return_address(0));
-    barrier_watch_hit((uint32_t)a + 4, (uint32_t)v,         4, __builtin_return_address(0));
-    if (vm_oob((uint32_t)a,8) || vm_null_store((uint32_t)a, (uint32_t)(v >> 32), 8, __builtin_return_address(0))) return;
-    v = __builtin_bswap64(v); vm_write_coh((uint32_t)a, &v, 8); ppu_window_note((uint32_t)a, 8); }
+void vm_write8 (uint64_t a, uint8_t  v) { store8_at((uint32_t)a, v, __builtin_return_address(0)); }
+void vm_write16(uint64_t a, uint16_t v) { store16_at((uint32_t)a, v, __builtin_return_address(0)); }
+void vm_write32(uint64_t a, uint32_t v) { store32_at((uint32_t)a, v, __builtin_return_address(0)); }
+void vm_write64(uint64_t a, uint64_t v) { store64_at((uint32_t)a, v, __builtin_return_address(0)); }
+__attribute__((used)) void ppu_store_slow(uint64_t w, uint64_t lo, uint64_t hi, void* ra)
+{
+    const uint32_t a = (uint32_t)w;
+    switch ((uint32_t)(w >> 32)) {
+    case 0: ppu_store_recheck(a); return;
+    case 0x41: store8_at(a, (uint8_t)lo, ra); return;
+    case 0x42: store16_at(a, __builtin_bswap16((uint16_t)lo), ra); return;
+    case 0x44: store32_at(a, __builtin_bswap32((uint32_t)lo), ra); return;
+    case 0x48: store64_at(a, __builtin_bswap64(lo), ra); return;
+    default: {
+        const uint32_t n = (uint32_t)(w >> 32);
+        const uint64_t d[2] = {lo, hi};
+        store_block_at(a, n > 16 ? (const void*)(uintptr_t)lo : d, n, ra);
+    }
+    }
 }
+}
+
+#include "ppu_store_thunk.h"
 
 /* Cross-fragment trampoline pointer (matches the lifted header's TLS decl). */
 extern "C" PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*) = nullptr;

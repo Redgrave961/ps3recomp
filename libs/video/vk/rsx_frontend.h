@@ -147,6 +147,7 @@ public:
     push_attribute push[ATTRIBS];
     draw_clause draw;
     u32 dirty = D_ALL;
+    u32 pushed = 0;
     bool in_begin_end = false;
 
     frontend();

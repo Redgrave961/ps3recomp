@@ -28,6 +28,8 @@ extern "C" {
 
 #include "../platform/ps3_sync.h"
 
+extern uint8_t* vm_base;
+
 #define SPU_LL_STRIPES 256u
 #define SPU_LL_SPIN 256u
 
@@ -374,9 +376,10 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
         spu_coh_prefetch_holder(i + SPU_COH_PREFETCH, n);
         spu_context* c = spu_coh_holder(i);
         if (!c || (const void*)c == self) continue;
-        uint32_t r = line | 1u;
-        if (__atomic_load_n(&c->resv, __ATOMIC_RELAXED) == r &&
-            __atomic_compare_exchange_n(&c->resv, &r, line, 0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED)) {
+        uint32_t r = __atomic_load_n(&c->resv, __ATOMIC_RELAXED);
+        if ((r & ~SPU_RESV_BY_CONTENT) != (line | 1u)) continue;
+        if ((r & SPU_RESV_BY_CONTENT) && !memcmp(vm_base + line, c->resv_line, MFC_ATOMIC_LINE)) continue;
+        if (__atomic_compare_exchange_n(&c->resv, &r, line, 0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED)) {
             SPU_EVENT_SET(c, SPU_EVENT_LR);
             g_spu_lr_raise++;
             spu_ll_defer_wake(c);

@@ -265,6 +265,49 @@ if(PS3RECOMP_BUILD_TESTS)
         set_tests_properties(spurs_${mode} PROPERTIES TIMEOUT 60)
     endforeach()
 
+    add_executable(test_spu_wake_stress
+        runtime/spu/tests/test_spu_wake_stress.c
+        runtime/spu/spu_channels.c
+        runtime/spu/spu_drain.c
+        runtime/spu/spu_lockstep.c
+        runtime/spu/spu_coherency.c
+        runtime/spu/spu_workload.c
+        runtime/spu/spu_interp.c
+        runtime/platform/win32_compat.c
+        runtime/platform/ps3_sync.c
+        runtime/spu/tests/spu_fixture_ppu.c)
+    target_include_directories(test_spu_wake_stress PRIVATE include runtime/spu runtime/platform)
+    target_compile_options(test_spu_wake_stress PRIVATE -UNDEBUG)
+    if(WIN32)
+        target_compile_definitions(test_spu_wake_stress PRIVATE _CRT_SECURE_NO_WARNINGS)
+        target_link_libraries(test_spu_wake_stress PRIVATE synchronization)
+    else()
+        target_link_libraries(test_spu_wake_stress PRIVATE Threads::Threads m)
+    endif()
+    add_test(NAME spu_wake_stress COMMAND test_spu_wake_stress)
+    set_tests_properties(spu_wake_stress PROPERTIES TIMEOUT 180)
+
+    add_executable(test_spu_channel_semantics
+        runtime/spu/tests/test_spu_channel_semantics.c
+        runtime/spu/spu_drain.c
+        runtime/spu/spu_lockstep.c
+        runtime/spu/spu_coherency.c
+        runtime/spu/spu_workload.c
+        runtime/spu/spu_interp.c
+        runtime/platform/win32_compat.c
+        runtime/platform/ps3_sync.c
+        runtime/spu/tests/spu_fixture_ppu.c)
+    target_include_directories(test_spu_channel_semantics PRIVATE include runtime/spu runtime/platform)
+    target_compile_options(test_spu_channel_semantics PRIVATE -UNDEBUG)
+    if(WIN32)
+        target_compile_definitions(test_spu_channel_semantics PRIVATE _CRT_SECURE_NO_WARNINGS)
+        target_link_libraries(test_spu_channel_semantics PRIVATE synchronization)
+    else()
+        target_link_libraries(test_spu_channel_semantics PRIVATE Threads::Threads m)
+    endif()
+    add_test(NAME spu_channel_semantics COMMAND test_spu_channel_semantics)
+    set_tests_properties(spu_channel_semantics PROPERTIES TIMEOUT 60)
+
     # vmaddfp / vnmsubfp against fmaf, lane by lane.
     add_executable(test_vmx_fmaf tests/test_vmx_fmaf.c)
     target_compile_options(test_vmx_fmaf PRIVATE -UNDEBUG)

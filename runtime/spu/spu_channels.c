@@ -510,8 +510,13 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         return 1;
 
     case MFC_PUTLLC_CMD:
+        if ((__atomic_load_n(&ctx->resv, __ATOMIC_RELAXED) & ~SPU_RESV_BY_CONTENT) != ((ea & ~127u) | 1u)) {
+            __atomic_store_n(&ctx->resv, 0u, __ATOMIC_RELAXED);
+            ctx->atomic_stat = 1;
+            return 1;
+        }
         spu_lockline_lock(ea);
-        if (__atomic_load_n(&ctx->resv, __ATOMIC_RELAXED) == ((ea & ~127u) | 1u) &&
+        if ((__atomic_load_n(&ctx->resv, __ATOMIC_RELAXED) & ~SPU_RESV_BY_CONTENT) == ((ea & ~127u) | 1u) &&
             memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) == 0) {
             memcpy(mem, ls, MFC_ATOMIC_LINE);          /* commit local store */
             /* A committing PUTLLC is a line write like any other, so every
@@ -573,6 +578,24 @@ static int channel_is_mfc(uint32_t ch)
     }
 }
 
+static void spu_ch_park(spu_context* ctx, int (*ready)(void*), void* arg)
+{
+    for (;;) {
+        const uint32_t seq = __atomic_load_n(&ctx->ch_wake_seq, __ATOMIC_ACQUIRE);
+        __atomic_store_n(&ctx->ch_sleeping, 1, __ATOMIC_SEQ_CST);
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        if (ready(arg)) break;
+        ps3_futex_wait(&ctx->ch_wake_seq, seq, 0);
+    }
+    __atomic_store_n(&ctx->ch_sleeping, 0, __ATOMIC_RELAXED);
+}
+
+static int spu_out_mbox_free(void* p)
+{
+    const spu_context* ctx = (const spu_context*)p;
+    return ctx->ch_out_mbox.count < SPU_MBOX_DEPTH || ctx->stop_request;
+}
+
 /* ===========================================================================
  * Channel write
  * ===========================================================================*/
@@ -628,14 +651,7 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
         if (ctx->ls != ctx->ls_store)
             while (ctx->ch_out_mbox.count >= SPU_MBOX_DEPTH && ctx->status != SPU_STATUS_STOPPED) {
                 spu_honour_stop_request(ctx);
-                AcquireSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
-                __atomic_store_n(&ctx->ch_sleeping, 1, __ATOMIC_SEQ_CST);
-                __atomic_thread_fence(__ATOMIC_SEQ_CST);
-                if (ctx->ch_out_mbox.count >= SPU_MBOX_DEPTH && !ctx->stop_request)
-                    SleepConditionVariableSRW((CONDITION_VARIABLE*)&ctx->ch_wait_cv,
-                                              (SRWLOCK*)&ctx->ch_wait_lock, INFINITE, 0);
-                __atomic_store_n(&ctx->ch_sleeping, 0, __ATOMIC_RELAXED);
-                ReleaseSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
+                spu_ch_park(ctx, spu_out_mbox_free, ctx);
             }
         spu_channel_write(&ctx->ch_out_mbox, v);
         /* Plain mailbox data is consumed by the following interrupt request. */
@@ -669,8 +685,8 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
 /* ===========================================================================
  * Channel-stall contract (faithful-adopt, from canersaka's fork).
  *
- * A blocking spu_rdch on an empty read channel parks the SPU host thread on a
- * per-SPU CV until a producer (mailbox/signal write, event raise) calls
+ * A blocking spu_rdch on an empty read channel parks the SPU host thread
+ * until a producer (mailbox/signal write, event raise) calls
  * spu_ch_wake -- never fabricating a value. Under SPU_LOCKSTEP the wait
  * releases the run token first (block_begin) so a peer SPU that must post the
  * awaited data is never blocked on this ctx. The producers (mailbox/signal writes, the MFC
@@ -702,25 +718,21 @@ static int spu_ch_ready(spu_context* ctx, uint32_t channel)
     }
 }
 
-/* Signal the per-SPU wait CV so a blocked spu_rdch re-checks its predicate.
- * MUST be called by every producer AFTER it makes a read predicate true. */
+typedef struct { spu_context* ctx; uint32_t channel; } spu_ch_wait_arg;
+
+static int spu_ch_wait_ready(void* p)
+{
+    const spu_ch_wait_arg* a = (const spu_ch_wait_arg*)p;
+    return spu_ch_ready(a->ctx, a->channel) || a->ctx->stop_request;
+}
+
 void spu_ch_wake(spu_context* ctx)
 {
     if (!ctx) return;
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    if (!__atomic_load_n(&ctx->ch_sleeping, __ATOMIC_SEQ_CST)) return;
-    /* Pass through the waiter's lock first. spu_ch_wait tests its predicate and
-     * goes to sleep under ch_wait_lock, but a producer makes the predicate true
-     * outside it. A wake issued between the waiter's test and its sleep found
-     * nobody on the condition variable and was lost (on POSIX the shim's
-     * generation count is read when the sleep begins, so it misses it too);
-     * the read then completed only at the 10 ms re-poll. Taking the lock orders
-     * this wake after the waiter is either asleep or has not yet tested.
-     * Uncontended it is one lock/unlock pair. No caller holds ch_wait_lock, and
-     * the waiter takes no other lock while it does. */
-    AcquireSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
-    ReleaseSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
-    WakeAllConditionVariable((CONDITION_VARIABLE*)&ctx->ch_wait_cv);
+    if (!__atomic_load_n(&ctx->ch_sleeping, __ATOMIC_RELAXED)) return;
+    __atomic_add_fetch(&ctx->ch_wake_seq, 1u, __ATOMIC_RELEASE);
+    ps3_futex_wake_all(&ctx->ch_wake_seq);
 }
 
 /* PS3_FTRACE: when this SPU thread last left a blocking wait. The time between
@@ -758,19 +770,13 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
 
     ctx->status = SPU_STATUS_WAITING_CHANNEL;
     yz_lockstep_block_begin(ctx);          /* release the run token before the OS wait */
+    spu_ch_wait_arg a = { ctx, channel };
     while (!spu_ch_ready(ctx, channel)) {
         if (ctx->stop_request) {
             yz_lockstep_block_end(ctx);
             spu_honour_stop_request(ctx);
         }
-        AcquireSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
-        __atomic_store_n(&ctx->ch_sleeping, 1, __ATOMIC_SEQ_CST);
-        __atomic_thread_fence(__ATOMIC_SEQ_CST);
-        if (!spu_ch_ready(ctx, channel) && !ctx->stop_request)
-            SleepConditionVariableSRW((CONDITION_VARIABLE*)&ctx->ch_wait_cv,
-                                      (SRWLOCK*)&ctx->ch_wait_lock, INFINITE, 0);
-        __atomic_store_n(&ctx->ch_sleeping, 0, __ATOMIC_RELAXED);
-        ReleaseSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
+        spu_ch_park(ctx, spu_ch_wait_ready, &a);
     }
     yz_lockstep_block_end(ctx);            /* rejoin the rotation, reacquire the token */
     if (ft_t0) spu_ft_wait_span(ctx, channel, ft_t0);

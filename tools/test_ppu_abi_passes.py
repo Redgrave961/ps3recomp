@@ -190,6 +190,7 @@ uint32_t ppu_vm_size = 0x100000u, ppu_hle_inject_base = 0x20000000u, g_null_swee
 const unsigned char* g_spu_coh_bits;
 unsigned char ppu_slow_page[1u << 20];
 void ppu_store_recheck(uint64_t) { abort(); }
+void ppu_st_thunk(void) { abort(); }
 uint8_t vm_read8(uint64_t) { abort(); } uint16_t vm_read16(uint64_t) { abort(); }
 uint32_t vm_read32(uint64_t) { abort(); } uint64_t vm_read64(uint64_t) { abort(); }
 void vm_write8(uint64_t, uint8_t) { abort(); } void vm_write16(uint64_t, uint16_t) { abort(); }

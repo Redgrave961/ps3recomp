@@ -156,7 +156,14 @@ void ppu_store_recheck(uint64_t ea);
 typedef uint16_t __attribute__((aligned(1), may_alias)) vm_u16;
 typedef uint32_t __attribute__((aligned(1), may_alias)) vm_u32;
 typedef uint64_t __attribute__((aligned(1), may_alias)) vm_u64;
-static inline uint8_t  vm_ld8  (const uint8_t* p) { return *(const volatile uint8_t*)p; }
+#ifdef _MSC_VER
+#define VM_LD8V(p) ((uint8_t)__iso_volatile_load8((const volatile char*)(p)))
+#define VM_ST8V(p, v) __iso_volatile_store8((volatile char*)(p), (char)(v))
+#else
+#define VM_LD8V(p) (*(const volatile uint8_t*)(p))
+#define VM_ST8V(p, v) (*(volatile uint8_t*)(p) = (uint8_t)(v))
+#endif
+static inline uint8_t  vm_ld8  (const uint8_t* p) { return VM_LD8V(p); }
 static inline uint16_t vm_ldr16(const uint8_t* p) { return *(const volatile vm_u16*)p; }
 static inline uint32_t vm_ldr32(const uint8_t* p) { return *(const volatile vm_u32*)p; }
 static inline uint64_t vm_ldr64(const uint8_t* p) { return *(const volatile vm_u64*)p; }
@@ -231,22 +238,6 @@ VM_INL void vm_st64(uint8_t* vb, uint64_t a, uint64_t v)
     if (__builtin_expect(vm_st_slow(ea), 0)) { vm_write64(a, v); return; }
     *(volatile vm_u64*)(vb + ea) = __builtin_bswap64(v);
     if (__builtin_expect(vm_st_slow_after(ea), 0)) ppu_store_recheck(a);
-}
-VM_INL void vm_st_raw(uint8_t* vb, uint64_t a, const void* src, uint32_t n)
-{
-    const uint32_t ea = (uint32_t)a;
-    if (__builtin_expect(vm_st_slow(ea), 0)) { ppu_store_block(a, src, n); return; }
-    memcpy(vb + ea, src, n);
-    __atomic_signal_fence(__ATOMIC_SEQ_CST);
-    if (__builtin_expect(vm_st_slow(ea), 0)) ppu_store_recheck(a);
-}
-VM_INL void vm_st128(uint8_t* vb, uint64_t a, __m128i v)
-{
-    const uint32_t ea = (uint32_t)a;
-    if (__builtin_expect(vm_st_slow(ea), 0)) { uint8_t t[16]; _mm_storeu_si128((__m128i*)t, v); ppu_store_block(a, t, 16); return; }
-    *(volatile __m128i_u*)(vb + ea) = v;
-    if (__builtin_expect(vm_st_slow_after(ea), 0)) ppu_store_recheck(a);
-
 }
 static inline uint8_t  vm_read8_mm (const ppu_mm* m, uint64_t a) { return vm_ld8(m->vb + (uint32_t)a); }
 static inline uint16_t vm_read16_mm(const ppu_mm* m, uint64_t a) { return vm_ld16(m->vb + (uint32_t)a); }
@@ -558,10 +549,12 @@ extern "C" PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*);
 } while(0)
 
 #if __has_builtin(__builtin_assume_separate_storage)
-#define PPU_MM_SNAP uint8_t* const _vb = vm_base; __builtin_assume_separate_storage(ctx, _vb);
+#define PPU_SEPARATE(a, b) __builtin_assume_separate_storage(a, b)
 #else
-#define PPU_MM_SNAP uint8_t* const _vb = vm_base; (void)_vb;
+#define PPU_SEPARATE(a, b) ((void)0)
 #endif
+#define PPU_MM_SNAP uint8_t* const _vb = vm_base; PPU_SEPARATE(ctx, _vb); constexpr bool _rs = false; (void)_vb;
+#define PPU_MM_SNAP_RESV uint8_t* const _vb = vm_base; PPU_SEPARATE(ctx, _vb); constexpr bool _rs = true; (void)_vb;
 #ifndef PPU_NO_INLINE_LOADS
 #undef vm_read8
 #undef vm_read16
@@ -581,12 +574,93 @@ extern "C" PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*);
 #undef vm_write16
 #undef vm_write32
 #undef vm_write64
-#define vm_write8(a, v)  vm_st8(_vb, a, v)
-#define vm_write16(a, v) vm_st16(_vb, a, v)
-#define vm_write32(a, v) vm_st32(_vb, a, v)
-#define vm_write64(a, v) vm_st64(_vb, a, v)
-#define vm_write_raw(a, s, n) vm_st_raw(_vb, a, s, n)
-#define vm_write128(a, v) vm_st128(_vb, a, v)
+extern "C" void ppu_st_thunk(void);
+#ifdef _WIN32
+#define PPU_ST_CALL "call %P[t]"
+#else
+#define PPU_ST_CALL "lea -128(%%rsp), %%rsp\\n\\tcall %P[t]\\n\\tlea 128(%%rsp), %%rsp"
+#endif
+#ifdef __AVX512F__
+#define PPU_ST_CLOBBER "cc", "xmm16", "xmm17", "xmm18", "xmm19", "xmm20", "xmm21", "xmm22", "xmm23", "xmm24", "xmm25", \\
+    "xmm26", "xmm27", "xmm28", "xmm29", "xmm30", "xmm31", "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7"
+#else
+#define PPU_ST_CLOBBER "cc"
+#endif
+template <bool R>
+static inline __attribute__((always_inline)) uint8_t* ppu_st_slow(ppu_context* ctx, uint32_t ea, uint32_t op, uint64_t lo, uint64_t hi)
+{
+    const uint64_t w = ea | (uint64_t)op << 32;
+    register uint64_t r8 __asm__("r8") = hi;
+    if (R) {
+        *(volatile uint64_t*)&ctx->reserve_addr = ctx->reserve_addr;
+        *(volatile uint64_t*)&ctx->reserve_time = ctx->reserve_time;
+        const uint64_t o = *(volatile uint64_t*)&ctx->reserve_time;
+        ppu_context* c = ctx;
+        __asm__(PPU_ST_CALL : "+d"(lo), "+r"(c) : [t] "i"(ppu_st_thunk), "c"(w), "r"(r8), "r"(o) : PPU_ST_CLOBBER);
+        ctx->reserve_time = *(volatile uint64_t*)&c->reserve_time;
+    } else {
+        __asm__(PPU_ST_CALL : "+d"(lo) : [t] "i"(ppu_st_thunk), "c"(w), "r"(r8) : PPU_ST_CLOBBER);
+    }
+    uint8_t* const p = (uint8_t*)lo;
+    PPU_SEPARATE(ctx, p);
+    return p;
+}
+template <bool R>
+static inline __attribute__((always_inline)) void ppu_st_check(ppu_context* ctx, uint32_t ea)
+{
+    if (__builtin_expect(VM_LD8V(&ppu_slow_page[ea >> 12]), 0)) (void)VM_LD8V(ppu_st_slow<R>(ctx, ea, 0, 0, 0));
+}
+static inline uint64_t ppu_st_lo(uint64_t v) { return v; }
+static inline uint64_t ppu_st_hi(uint64_t) { return 0; }
+static inline uint64_t ppu_st_lo(__m128i v) { return (uint64_t)_mm_cvtsi128_si64(v); }
+static inline uint64_t ppu_st_hi(__m128i v) { return (uint64_t)_mm_extract_epi64(v, 1); }
+static inline void ppu_vst(uint8_t* p, uint8_t v) { VM_ST8V(p, v); }
+static inline void ppu_vst(uint8_t* p, uint16_t v) { *(volatile vm_u16*)p = v; }
+static inline void ppu_vst(uint8_t* p, uint32_t v) { *(volatile vm_u32*)p = v; }
+static inline void ppu_vst(uint8_t* p, uint64_t v) { *(volatile vm_u64*)p = v; }
+static inline void ppu_vst(uint8_t* p, __m128i v) { *(volatile __m128i_u*)p = v; }
+template <bool R, class T>
+static inline __attribute__((always_inline)) void ppu_st(ppu_context* ctx, uint8_t* vb, uint64_t a, uint32_t op, T v)
+{
+    const uint32_t ea = (uint32_t)a;
+    if (__builtin_expect(ppu_slow_page[ea >> 12], 0)) {
+        ppu_vst(ppu_st_slow<R>(ctx, ea, op, ppu_st_lo(v), ppu_st_hi(v)), v);
+        return;
+    }
+    ppu_vst(vb + ea, v);
+    ppu_st_check<R>(ctx, ea);
+}
+template <bool R>
+static inline __attribute__((always_inline)) void ppu_st_raw(ppu_context* ctx, uint8_t* vb, uint64_t a, const void* s, uint32_t n)
+{
+    const uint32_t ea = (uint32_t)a;
+    const uint8_t* q = (const uint8_t*)s;
+    uint8_t* p = vb + ea;
+    if (__builtin_expect(ppu_slow_page[ea >> 12], 0)) {
+        uint64_t d[2] = {(uint64_t)(uintptr_t)q, 0};
+        if (n <= 16) memcpy(d, q, n);
+        (void)VM_LD8V(ppu_st_slow<R>(ctx, ea, n, d[0], d[1]));
+        return;
+    }
+    if (n > 16) {
+        for (uint32_t i = 0; i < n; i += 16) ppu_vst(p + i, _mm_loadu_si128((const __m128i_u*)(q + i)));
+    } else if (n == 16) {
+        ppu_vst(p, _mm_loadu_si128((const __m128i_u*)q));
+    } else {
+        uint64_t x8; uint32_t x4; uint16_t x2;
+        if (n & 8) { memcpy(&x8, q, 8); ppu_vst(p, x8); p += 8; q += 8; }
+        if (n & 4) { memcpy(&x4, q, 4); ppu_vst(p, x4); p += 4; q += 4; }
+        if (n & 2) { memcpy(&x2, q, 2); ppu_vst(p, x2); p += 2; q += 2; }
+        if (n & 1) ppu_vst(p, *q);
+    }
+    ppu_st_check<R>(ctx, ea);
+}
+#define vm_write8(a, v)  ppu_st<_rs>(ctx, _vb, a, 0x41u, (uint8_t)(v))
+#define vm_write16(a, v) ppu_st<_rs>(ctx, _vb, a, 0x42u, (uint16_t)__builtin_bswap16((uint16_t)(v)))
+#define vm_write32(a, v) ppu_st<_rs>(ctx, _vb, a, 0x44u, (uint32_t)__builtin_bswap32((uint32_t)(v)))
+#define vm_write64(a, v) ppu_st<_rs>(ctx, _vb, a, 0x48u, (uint64_t)__builtin_bswap64((uint64_t)(v)))
+#define vm_write_raw(a, s, n) ppu_st_raw<_rs>(ctx, _vb, a, s, n)
+#define vm_write128(a, v) ppu_st<_rs>(ctx, _vb, a, 16u, (__m128i)(v))
 #endif
 
 """
@@ -3696,7 +3770,7 @@ class PPULifter:
                       f"extern int {g};", "#endif"]
         name = f"{func.name}_lifted" if func.start_addr in self.wrap else func.name
         lines.append(f"void {name}(ppu_context* __restrict ctx) {{")
-        lines.append("    PPU_MM_SNAP")
+        lines.append("    PPU_MM_SNAP_RESV" if any("ctx->reserve_" in b for b in func.body_lines) else "    PPU_MM_SNAP")
         clean = lambda m: m.group(1) if int(m.group(2), 16) in func_by_addr and int(m.group(2), 16) not in self.wrap \
             else m.group(0)
         body = [_CALL_DRAIN_RE.sub(clean, b) if "DRAIN" in b else b for b in func.body_lines]

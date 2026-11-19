@@ -144,11 +144,12 @@ int64_t sys_semaphore_post(ppu_context* ctx)
     ps3_waiter* wake = NULL;
     ps3_lock_acquire(&s->lock);
     v = __atomic_load_n(&s->value, __ATOMIC_RELAXED);
-    if ((uint32_t)count > (uint32_t)s->max_value - (uint32_t)v) {
-        ps3_lock_release(&s->lock);
-        return (int64_t)(int32_t)CELL_EBUSY;
-    }
-    v = __atomic_fetch_add(&s->value, count, __ATOMIC_RELEASE);
+    do {
+        if ((uint32_t)count > (uint32_t)s->max_value - (uint32_t)v) {
+            ps3_lock_release(&s->lock);
+            return (int64_t)(int32_t)CELL_EBUSY;
+        }
+    } while (!__atomic_compare_exchange_n(&s->value, &v, v + count, 1, __ATOMIC_RELEASE, __ATOMIC_RELAXED));
     int32_t n = v < 0 ? (-v < count ? -v : count) : 0;
     const uint32_t proto = s->protocol == 1 ? PS3_SYNC_FIFO : PS3_SYNC_PRIORITY;
     while (n-- > 0) {

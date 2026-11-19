@@ -149,11 +149,10 @@ VMX_INL void vmx_vperm(VMX_D, VMX_A, VMX_B, VMX_C) {
 }
 VMX_INL __m128i vmx_iota(void) { return _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15); }
 VMX_INL void vmx_lvlx(VMX_D, uint64_t lo, uint64_t hi, uint32_t sh) {
-    const __m128i i = _mm_add_epi8(vmx_iota(), _mm_set1_epi8((char)sh));
-    vmx_st(d_, vmx_revv(_mm_shuffle_epi8(_mm_set_epi64x((long long)hi, (long long)lo), _mm_or_si128(i, _mm_cmpgt_epi8(i, _mm_set1_epi8(15))))));
+    vmx_st(d_, _mm_shuffle_epi8(_mm_set_epi64x((long long)hi, (long long)lo), _mm_sub_epi8(_mm_set1_epi8((char)(0x7F + sh)), vmx_iota())));
 }
 VMX_INL void vmx_lvrx(VMX_D, uint64_t lo, uint64_t hi, uint32_t sh) {
-    vmx_st(d_, vmx_revv(_mm_shuffle_epi8(_mm_set_epi64x((long long)hi, (long long)lo), _mm_add_epi8(vmx_iota(), _mm_set1_epi8((char)(sh - 16))))));
+    vmx_st(d_, _mm_shuffle_epi8(_mm_set_epi64x((long long)hi, (long long)lo), _mm_sub_epi8(_mm_set1_epi8((char)(sh - 1)), vmx_iota())));
 }
 
 /* averages: (a + b + 1) >> 1 without overflow */
@@ -322,7 +321,8 @@ VMX_FBIN(vmx_vsubfp, _mm_sub_ps(x, y))
 #define VMX_FMINMAX(name, op) \
 VMX_INL void name(VMX_D, VMX_A, VMX_B, uint32_t vscr) { \
     const __m128 x = vmx_ldf(a_), y = vmx_ldf(b_); \
-    vmx_stf(d_, vmx_flushv(vmx_nanv(vmx_nanv(vmx_fixv(op), y), x), vscr)); }
+    const __m128 n = _mm_or_ps(_mm_blendv_ps(y, x, _mm_cmpunord_ps(x, x)), vmx_k(0x7FC00000u)); \
+    vmx_stf(d_, vmx_flushv(_mm_blendv_ps(op, n, _mm_cmpunord_ps(x, y)), vscr)); }
 VMX_FMINMAX(vmx_vmaxfp, _mm_and_ps(_mm_max_ps(x, y), _mm_max_ps(y, x)))
 VMX_FMINMAX(vmx_vminfp, _mm_or_ps(_mm_min_ps(x, y), _mm_min_ps(y, x)))
 

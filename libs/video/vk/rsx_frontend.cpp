@@ -196,6 +196,7 @@ void frontend::push_vertex(u32 index, u32 sub, u32 size, u32 type, u32 value)
     const push_attribute& head = push[0];
     const u32 vertex = head.size ? head.dwords / words_per_vertex(head.type, head.size) : 0u;
     push_attribute& p = push[index];
+    pushed |= 1u << index;
     p.type = type;
     p.size = size;
     const u32 per = words_per_vertex(type, size);
@@ -259,7 +260,8 @@ void frontend::begin_end(u32 value)
     draw.ranges.clear();
     draw.inline_words.clear();
     draw.elements.clear();
-    for (push_attribute& p : push) {
+    for (; pushed; pushed &= pushed - 1u) {
+        push_attribute& p = push[__builtin_ctz(pushed)];
         p.vertices = 0;
         p.dwords = 0;
         p.size = 0;

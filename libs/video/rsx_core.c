@@ -39,13 +39,17 @@ static struct {
     rsx_event_sink sink;
     volatile LONG started;
 
-    volatile u32 bell;
-    volatile u32 get_epoch;
-    volatile u32 get_waiters;
-    volatile u32 label_epoch;
-    volatile u32 label_waiters;
+    _Alignas(64) volatile u32 bell;
+    volatile u32 sleeping;
     volatile u32 immediate_flip;
-    u32 get;
+
+    _Alignas(64) volatile u32 label_epoch;
+    volatile u32 label_waiters;
+
+    _Alignas(64) volatile u32 get_epoch;
+    volatile u32 get_waiters;
+
+    _Alignas(64) u32 get;
     u32 ret;
     u32 method_reg;
     u32 method_inc;
@@ -58,28 +62,28 @@ static struct {
     u32 sema4097_off;
     u32 report_ctx;
     u32 notify_ctx;
-    u64 timestamp_last;
-
-    rsx_display_buffer display[8];
-    volatile u32 display_mask;
-    volatile u32 vsync;
-    volatile u32 flip_status;
-    volatile u64 last_flip_time;
-    volatile u32 frames;
     int free_flips;
-    volatile u64 frame_period;
-    volatile u64 hidden_period;
     u64 frame_due;
     HANDLE frame_timer;
     volatile u64 progress;
     u32 put_seen;
     u64 batch;
 
-    SRWLOCK vblank_lock;
+    _Alignas(64) u64 timestamp_last;
+    rsx_display_buffer display[8];
+    volatile u32 display_mask;
+    volatile u32 vsync;
+    volatile u32 flip_status;
+    volatile u64 last_flip_time;
+    volatile u32 frames;
+    volatile u64 frame_period;
+    volatile u64 hidden_period;
+
+    _Alignas(64) SRWLOCK vblank_lock;
     CONDITION_VARIABLE vblank_cv;
     volatile u64 vblank_count;
 
-    SRWLOCK irq_lock;
+    _Alignas(64) SRWLOCK irq_lock;
     CONDITION_VARIABLE irq_cv;
     rsx_irq irq[RSX_IRQ_RING];
     u32 irq_head;
@@ -92,19 +96,18 @@ static u16 s_next_core[RSX_3D_REGS + 1u];
 
 static inline u32 rsx_load(u32 ea)
 {
-    return __builtin_bswap32(__atomic_load_n((const u32*)(vm_base + ea), __ATOMIC_ACQUIRE));
+    return __builtin_bswap32(__atomic_load_n((const u32*)(vm_base + ea), __ATOMIC_SEQ_CST));
 }
 
 static inline void rsx_store_control(u32 ea, u32 value)
 {
-    __atomic_store_n((u32*)(vm_base + ea), __builtin_bswap32(value), __ATOMIC_RELEASE);
+    __atomic_store_n((u32*)(vm_base + ea), __builtin_bswap32(value), __ATOMIC_SEQ_CST);
 }
 
 static void rsx_publish_get(void)
 {
     rsx_store_control(RSX_GET_EA, s.get);
-    __atomic_signal_fence(__ATOMIC_SEQ_CST);
-    if (__atomic_load_n(&s.get_waiters, __ATOMIC_RELAXED)) {
+    if (__atomic_load_n(&s.get_waiters, __ATOMIC_SEQ_CST)) {
         __atomic_add_fetch(&s.get_epoch, 1u, __ATOMIC_RELEASE);
         WakeByAddressAll((PVOID)&s.get_epoch);
     }
@@ -112,21 +115,21 @@ static void rsx_publish_get(void)
 
 void rsx_core_wait_get_outside(u32 lo, u32 hi)
 {
-    __atomic_add_fetch(&s.get_waiters, 1u, __ATOMIC_ACQ_REL);
-    FlushProcessWriteBuffers();
+    __atomic_add_fetch(&s.get_waiters, 1u, __ATOMIC_SEQ_CST);
     for (;;) {
         u32 seen = __atomic_load_n(&s.get_epoch, __ATOMIC_ACQUIRE);
         const u32 get = rsx_load(RSX_GET_EA);
         if (get < lo || get > hi) break;
         WaitOnAddress((volatile VOID*)&s.get_epoch, &seen, sizeof seen, INFINITE);
     }
-    __atomic_sub_fetch(&s.get_waiters, 1u, __ATOMIC_ACQ_REL);
+    __atomic_sub_fetch(&s.get_waiters, 1u, __ATOMIC_SEQ_CST);
 }
 
-static void rsx_label_note(void)
+static void rsx_label_wake(void)
 {
+    if (!__atomic_load_n(&s.label_waiters, __ATOMIC_SEQ_CST)) return;
     __atomic_add_fetch(&s.label_epoch, 1u, __ATOMIC_SEQ_CST);
-    if (__atomic_load_n(&s.label_waiters, __ATOMIC_SEQ_CST)) WakeByAddressAll((PVOID)&s.label_epoch);
+    WakeByAddressAll((PVOID)&s.label_epoch);
 }
 
 void rsx_core_wait_label(u32 ea, u32 value)
@@ -145,7 +148,8 @@ static void rsx_store_label(u32 ea, u32 value)
     __atomic_add_fetch(&s.progress, 1u, __ATOMIC_RELAXED);
     __atomic_thread_fence(__ATOMIC_RELEASE);
     vm_write32(ea, value);
-    rsx_label_note();
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    rsx_label_wake();
 }
 
 static u64 rsx_tb_scale(u64 tb, u64 unit)
@@ -175,22 +179,16 @@ static void rsx_fault(const char* what, u32 at, u32 word)
             what, at, word, rsx_load(RSX_PUT_EA));
 }
 
-static void rsx_core_window_written(void)
-{
-    rsx_label_note();
-    rsx_core_doorbell();
-}
-
 void rsx_core_doorbell(void)
 {
-    __atomic_add_fetch(&s.bell, 1u, __ATOMIC_RELEASE);
-    WakeByAddressSingle((PVOID)&s.bell);
+    __atomic_add_fetch(&s.bell, 1u, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&s.sleeping, __ATOMIC_SEQ_CST)) WakeByAddressSingle((PVOID)&s.bell);
 }
 
-static void rsx_wait_bell(u32 seen)
+static void rsx_core_window_written(void)
 {
-    while (__atomic_load_n(&s.bell, __ATOMIC_ACQUIRE) == seen)
-        WaitOnAddress((volatile VOID*)&s.bell, &seen, sizeof seen, INFINITE);
+    rsx_core_doorbell();
+    rsx_label_wake();
 }
 
 static void rsx_irq_push(enum rsx_event event, u32 arg)
@@ -289,6 +287,18 @@ static void rsx_sleep_until(HANDLE timer, u64 target)
 
 static HANDLE rsx_timer_create(void) { return NULL; }
 #endif
+
+static void rsx_await_bell(u32 seen, DWORD ms)
+{
+    __atomic_store_n(&s.sleeping, 1u, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&s.bell, __ATOMIC_SEQ_CST) == seen) WaitOnAddress((volatile VOID*)&s.bell, &seen, sizeof seen, ms);
+    __atomic_store_n(&s.sleeping, 0u, __ATOMIC_RELAXED);
+}
+
+static void rsx_wait_bell(u32 seen)
+{
+    while (__atomic_load_n(&s.bell, __ATOMIC_ACQUIRE) == seen) rsx_await_bell(seen, INFINITE);
+}
 
 static rsx_vblank_clock s_clock;
 static void* s_clock_user;
@@ -437,7 +447,7 @@ static void rsx_semaphore_acquire(u32 value)
         const u32 seen = __atomic_load_n(&s.bell, __ATOMIC_ACQUIRE);
         rsx_service_immediate();
         if (rsx_load(ea) == value) break;
-        WaitOnAddress((volatile VOID*)&s.bell, &seen, sizeof seen, 1);
+        rsx_await_bell(seen, 1);
     }
     vm_unwatch(ea);
 }
@@ -619,7 +629,7 @@ static void rsx_park(u32 jump, u32 seen)
     for (;;) {
         rsx_service_immediate();
         if (rsx_load(ea) != jump || __atomic_load_n(&s.bell, __ATOMIC_ACQUIRE) != seen) break;
-        WaitOnAddress((volatile VOID*)&s.bell, &seen, sizeof seen, 1);
+        rsx_await_bell(seen, 1);
     }
     vm_unwatch(ea);
 }

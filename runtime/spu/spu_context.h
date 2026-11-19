@@ -101,6 +101,7 @@ extern "C" {
 #define MFC_PUTLLUC_CMD     0xB0   /* store unconditional, clears reservation */
 #define MFC_PUTQLLUC_CMD    0xB8   /* queued store unconditional              */
 #define MFC_ATOMIC_LINE     128
+#define SPU_RESV_BY_CONTENT 2u
 
 /* ---------------------------------------------------------------------------
  * Channel state
@@ -300,16 +301,7 @@ typedef struct spu_context {
     uint64_t lockstep_release_tb;
     uint64_t dec_start_tb;
 
-    /* Channel-stall contract (spu_channels.c): a blocking spu_rdch on an empty
-     * RdInMbox/RdSigNotify/RdEventStat parks the SPU host thread on this per-SPU
-     * CV until a producer (mailbox/signal write, event raise) calls spu_ch_wake.
-     * Storage for a Win32 CONDITION_VARIABLE + SRWLOCK -- each is pointer-sized
-     * and zero-init is the valid initial value (CONDITION_VARIABLE_INIT /
-     * SRWLOCK_INIT == {0}), so spu_context_init's memset is enough. Kept as
-     * void* to avoid pulling <windows.h> into this widely-included header;
-     * spu_channels.c casts to the real types. */
-    void* ch_wait_cv;
-    void* ch_wait_lock;
+    volatile uint32_t ch_wake_seq;
 
     /* --- SPU interrupt facility (faithful; WWS jobmanager depends on it) ---
      * The bi-family E/D bits (bie/bid, irete/iretd...) toggle int_enable; while

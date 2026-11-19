@@ -25,8 +25,8 @@
  *     A standalone tool that calls one of them links that file too.
  *
  * IMPORTANT -- storage size. Win32 SRWLOCK and CONDITION_VARIABLE are exactly
- * pointer-sized and zero-initialise validly, so several structs (notably
- * spu_context::ch_wait_lock / ch_wait_cv) store them inline in a `void*` slot.
+ * pointer-sized and zero-initialise validly, so several structs store
+ * them inline in a `void*` slot.
  * pthread_rwlock_t (200 B on Darwin) and pthread_cond_t (48 B) do NOT fit
  * there; casting the slot and writing a pthread object through it would
  * overflow into adjacent members. So on POSIX these map to `void*` and the

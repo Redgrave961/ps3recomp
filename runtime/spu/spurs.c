@@ -501,13 +501,29 @@ static int ss_idle_found(spu_context* c)
     return 0;
 }
 
+static void ss_idle_reserve(spu_context* c, uint32_t ea)
+{
+    c->mfc_lsa = 0x100;
+    c->mfc_eah = 0;
+    c->mfc_eal = ea;
+    c->mfc_size = MFC_ATOMIC_LINE;
+    c->mfc_tag = 0;
+    yz_lockstep_tick(c);
+    ll_begin(c, ea, 0x100);
+    memcpy(c->resv_line, c->ls + 0x100, MFC_ATOMIC_LINE);
+    __atomic_store_n(&c->resv, (ea & ~127u) | 1u | SPU_RESV_BY_CONTENT, __ATOMIC_RELAXED);
+    c->atomic_stat = 4;
+    spu_lockline_unlock(ea & ~127u);
+    spu_rdch(c, MFC_RdAtomicStat);
+}
+
 static void ss_idle(spu_context* c)
 {
     uint8_t* ls = c->ls;
     const uint32_t b = ss_bit(c), spurs = spurs_ea(c);
     spu_wrch(c, SPU_WrEventMask, pref(SPU_EVENT_LR));
     for (;;) {
-        atomic_cmd(c, 0x100, spurs, MFC_GETLLAR_CMD);
+        ss_idle_reserve(c, spurs);
         if (ls[0x174] & 0x40) spurs_fatal("32-workload SPURS is not supported by kernel 1", ls[0x174]);
         const int exit_now = (uint32_t)__builtin_popcount(ls[0x173]) == ls[0x176] && (ls[0x174] & 0x80);
         const int found = (ls[0x172] & b) || ss_idle_found(c);
