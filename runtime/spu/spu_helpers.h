@@ -685,10 +685,6 @@ static inline int spu__sf_split(uint32_t x, uint32_t* sig, int* e2) {
     for (int i = 0; i < 4; i++) { const uint32_t x = a._u32[i], y = b._u32[i]; r._u32[i] = (expr); } return r; }
 #define SPU__SF_V3(name, expr) static inline u128 name(u128 a, u128 b, u128 c) { u128 r; \
     for (int i = 0; i < 4; i++) { const uint32_t x = a._u32[i], y = b._u32[i], z = c._u32[i]; r._u32[i] = (expr); } return r; }
-/* Single precision is approximate: the host's IEEE op in the SPU's own mode (round toward zero,
- * denormals read and written as zero: SPU_MXCSR_RZ / SPU_FPCR_RZFZ, set by spu_run_with_halt),
- * then saturated to +-Smax (a NaN result becomes +Smax) and any zero made +0. Inputs with biased
- * exponent 255 are read as Inf/NaN rather than as the SPU's extended range. */
 #define SPU_FPCR_RZFZ 0x01C00000ull   /* FZ (bit 24), RMode = 0b11 round toward zero (bits 22-23) */
 #if SPU_X86
 #define SPU_MXCSR_RZ 0xFFC0u
@@ -697,7 +693,10 @@ SPU__XI u128 spu__xf_out(__m128 s) {
     const __m128 z = _mm_cmplt_ps(_mm_and_ps(c, _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF))), _mm_set1_ps(0x1p-126f));
     return spu__xs(_mm_castps_si128(_mm_andnot_ps(z, c)));
 }
-SPU__XI __m128 spu__xf(u128 a) { return _mm_castsi128_ps(spu__xl(a)); }
+SPU__XI __m128 spu__xf(u128 a) {
+    const __m128i x = spu__xl(a), m = _mm_set1_epi32(0x7FFFFFFF);
+    return _mm_castsi128_ps(_mm_or_si128(_mm_min_epu32(_mm_and_si128(x, m), _mm_set1_epi32(0x7F7FFFFF)), _mm_andnot_si128(m, x)));
+}
 #if defined(__FMA__)
 #define SPU__XFMA(a, b, c)  _mm_fmadd_ps(a, b, c)
 #define SPU__XFMS(a, b, c)  _mm_fmsub_ps(a, b, c)
@@ -714,7 +713,10 @@ static inline u128 spu_fma(u128 a, u128 b, u128 c)  { return spu__xf_out(SPU__XF
 static inline u128 spu_fms(u128 a, u128 b, u128 c)  { return spu__xf_out(SPU__XFMS(spu__xf(a), spu__xf(b), spu__xf(c))); }
 static inline u128 spu_fnms(u128 a, u128 b, u128 c) { return spu__xf_out(SPU__XFNMS(spu__xf(a), spu__xf(b), spu__xf(c))); }
 #else
-static inline float spu__sf_f(uint32_t x) { float f; memcpy(&f, &x, 4); return f; }
+static inline float spu__sf_f(uint32_t x) {
+    if ((x & 0x7F800000u) == 0x7F800000u) x = (x & 0x80000000u) | 0x7F7FFFFFu;
+    float f; memcpy(&f, &x, 4); return f;
+}
 static inline uint32_t spu__sf_out(float s) {
     if (!(s <= 0x1.fffffep127f)) s = 0x1.fffffep127f;
     if (s < -0x1.fffffep127f) s = -0x1.fffffep127f;
