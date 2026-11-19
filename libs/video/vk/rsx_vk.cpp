@@ -25,6 +25,10 @@
 #include <string>
 #include <thread>
 
+#if defined(ASURA_PGO_GEN)
+extern "C" int __llvm_profile_write_file(void);
+#endif
+
 namespace {
 
 constexpr uint32_t k_slots = 4;
@@ -874,6 +878,9 @@ void window_main()
         switch (e.type) {
         case SDL_EVENT_QUIT:
             g.r.save_caches();
+#if defined(ASURA_PGO_GEN)
+            __llvm_profile_write_file();
+#endif
             std::fflush(nullptr);
             std::_Exit(0);
         case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
