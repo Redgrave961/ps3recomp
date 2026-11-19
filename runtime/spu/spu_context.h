@@ -479,11 +479,11 @@ static inline __m128i spu_ls_bswap_words(__m128i x) {
 }
 #endif
 
-static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
+static inline u128 spu_ls_ld128(const uint8_t* ls, uint32_t lsa)
 {
     u128 v;
     lsa &= SPU_LS_MASK & ~0xFu;
-    const uint8_t* p = &ctx->ls[lsa];
+    const uint8_t* p = &ls[lsa];
 #if defined(__ARM_NEON)
     vst1q_u8(v._u8, vrev32q_u8(vld1q_u8(p)));     /* ldr q; rev32 */
 #elif SPU_LS_VEC
@@ -505,10 +505,10 @@ static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
     return v;
 }
 
-static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
+static inline void spu_ls_st128(uint8_t* ls, uint32_t lsa, u128 val)
 {
     lsa &= SPU_LS_MASK & ~0xFu;
-    uint8_t* p = &ctx->ls[lsa];
+    uint8_t* p = &ls[lsa];
 #if defined(__ARM_NEON)
     vst1q_u8(p, vrev32q_u8(vld1q_u8(val._u8)));   /* rev32; str q */
 #elif SPU_LS_VEC
@@ -528,6 +528,8 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
     }
 #endif
 }
+static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa) { return spu_ls_ld128(ctx->ls, lsa); }
+static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val) { spu_ls_st128(ctx->ls, lsa, val); }
 
 static inline u128 spu_make_preferred_u32(uint32_t val)
 {

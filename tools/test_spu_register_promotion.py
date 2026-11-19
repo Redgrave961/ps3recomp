@@ -25,7 +25,7 @@ WIDE = {"il", "ila", "ilh", "ilhu", "iohl", "fsmbi", "lqa", "stqa", "lqr", "stqr
 STORES = {"stqd", "stqa", "stqx", "stqr"}
 SKIP = {"hbr", "hbra", "hbrr", "nop", "lnop", "sync", "dsync", "syncc", "fscrwr", "mtspr",
         "heq", "heqi", "hgt", "hgti", "hlgt", "hlgti"}
-REJECT = ("TODO", "return", "goto", "SPU_", "spu_rdch", "spu_wrch", "spu_rchcnt", "spu_stop",
+REJECT = ("TODO", "return", "goto", "SPU_", "spu_func_", "spu_rdch", "spu_wrch", "spu_rchcnt", "spu_stop",
           "spu_halt", "fprintf", "ctx->pc", "ctx->stop", "ctx->mfc", "/*")
 
 
@@ -180,7 +180,11 @@ HARNESS = r"""
 SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*);
 SPU_THREAD_LOCAL uint32_t g_spu_pch[8];
 SPU_THREAD_LOCAL unsigned g_spu_pch_n;
+#ifdef SPU_TEST_SLOW_CALLS
+volatile int g_spu_direct = -1;
+#else
 volatile int g_spu_direct = 1;
+#endif
 unsigned g_spu_stack_reset_count;
 uint64_t g_spu_stack_reset_hint[SPU_LS_SIZE / 256];
 uint32_t g_spu_depth_guard_limit = 4096;
@@ -301,9 +305,12 @@ def run_variant(cc, work, image, functions, harness, promote, merge, tag, define
     b = subprocess.run(cmd, capture_output=True, text=True)
     if b.returncode:
         raise RuntimeError(f"{tag}: build failed\n{b.stderr[-3000:]}")
-    r = subprocess.run([exe], capture_output=True, text=True, timeout=60)
     with open(os.path.join(out, "spu_recomp.c")) as f:
         src = f.read()
+    try:
+        r = subprocess.run([exe], capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        return -1, "timeout", src, 0
     dispatches = int(r.stderr.split()[-1]) if r.stderr.split() and r.stderr.split()[-1].isdigit() else 0
     return r.returncode, r.stdout, src, dispatches
 
@@ -345,6 +352,7 @@ def main():
                 tag = f"{'p' if promote else 'n'}{'m' if merge else 's'}"
                 results[tag] = run_variant(cc, pdir, code, functions, harness, promote, merge, tag)
         alias = run_variant(cc, pdir, code, functions, harness, True, True, "pa", ("-DSPU_TEST_ALIAS_HINTS",))
+        slow = run_variant(cc, pdir, code, functions, harness, True, True, "pd", ("-DSPU_TEST_SLOW_CALLS",))
         ref = results["ns"]
         if ref[0] != 0:
             print(f"program {p}: reference exited {ref[0]}: {ref[1][:200]}")
@@ -356,6 +364,10 @@ def main():
         if alias[:2] != results["pm"][:2] or alias[3] != results["pm"][3]:
             failures += 1
             print(f"program {p} seed {args.seed}: aliased stack-reset hints changed the run ({alias[3]} vs {results['pm'][3]} dispatches)")
+        if slow[0] != results["pm"][0] or re.sub(r" pc=\w+", "", slow[1]) != re.sub(r" pc=\w+", "", results["pm"][1]):
+            failures += 1
+            diff = [f"  {a!r} != {b!r}" for a, b in zip(results["pm"][1].splitlines(), slow[1].splitlines()) if a != b][:6]
+            print(f"program {p} seed {args.seed}: every call on the slow path changed the run\n" + "\n".join(diff))
         for tag, res in results.items():
             dispatches[tag] = dispatches.get(tag, 0) + res[3]
             same = results["n" + tag[1]]
@@ -366,7 +378,7 @@ def main():
                     diff = [f"  {a!r} != {b!r}" for a, b in zip(want.splitlines(), got.splitlines()) if a != b][:6]
                     print(f"program {p} seed {args.seed}: variant {tag} differs\n" + "\n".join(diff))
                     break
-    print(f"{args.programs} programs x 5 variants, {promoted} with promoted registers, "
+    print(f"{args.programs} programs x 6 variants, {promoted} with promoted registers, "
           f"{narrowed} narrowed call reloads, {failures} mismatches")
     print("generic dispatches per variant: " + ", ".join(f"{k}={v}" for k, v in sorted(dispatches.items())))
     if not args.keep:

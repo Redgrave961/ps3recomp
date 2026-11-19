@@ -618,6 +618,8 @@ class SPULifter:
                     f"    {{ @O{last_k}@ SPU_DIRECT(ctx, {self._pc(end)}, {self.prefix}spu_func_{end:08X}); }}")
             else:
                 func.body_lines.append(f"    @O{last_k}@")
+        if any("(_ls, " in t for t in texts):
+            func.body_lines.insert(0, "    uint8_t* const _ls = ctx->ls;")
         if any(", _rz);" in t for t in texts):
             func.body_lines.insert(0, "    const int _rz = SPU_RZ_NOW();")
 
@@ -645,7 +647,7 @@ class SPULifter:
         self.functions.append(func)
         return func
 
-    _CALL_SAFE = {"spu_ls_read128", "spu_ls_write128", "spu_call_return", "SPU_RET", "SPU_RET_REG", "SPU_DIRECT"}
+    _CALL_SAFE = {"spu_ls_ld128", "spu_ls_st128", "spu_call_return", "SPU_RET", "SPU_RET_REG", "SPU_DIRECT"}
     _CALL_ANY = ("spu_unsupported", "spu_halt", "SPU_ICALL")
 
     def finalize(self) -> None:
@@ -1059,22 +1061,22 @@ class SPULifter:
         if mn == "lqd":
             disp, base = _disp_base(ops[1])
             if disp is not None:
-                return f"{g(rt())} = spu_ls_read128(ctx, {g(base)}._u32[0] + {disp});"
+                return f"{g(rt())} = spu_ls_ld128(_ls, {g(base)}._u32[0] + {disp});"
         if mn == "stqd":
             disp, base = _disp_base(ops[1])
             if disp is not None:
-                return f"spu_ls_write128(ctx, {g(base)}._u32[0] + {disp}, {g(rt())});"
+                return f"spu_ls_st128(_ls, {g(base)}._u32[0] + {disp}, {g(rt())});"
         if mn in ("lqa", "lqr"):
             # lqr's address is pc-relative (the disassembler gives it absolute): under --reloc it moves with the code
             a = self._pc(int(_imm(ops[1]), 0)) if mn == "lqr" and self.reloc else _imm(ops[1])
-            return f"{g(rt())} = spu_ls_read128(ctx, {a});"
+            return f"{g(rt())} = spu_ls_ld128(_ls, {a});"
         if mn in ("stqa", "stqr"):
             a = self._pc(int(_imm(ops[1]), 0)) if mn == "stqr" and self.reloc else _imm(ops[1])
-            return f"spu_ls_write128(ctx, {a}, {g(rt())});"
+            return f"spu_ls_st128(_ls, {a}, {g(rt())});"
         if mn == "lqx":
-            return f"{g(rt())} = spu_ls_read128(ctx, {g(ra())}._u32[0] + {g(rb())}._u32[0]);"
+            return f"{g(rt())} = spu_ls_ld128(_ls, {g(ra())}._u32[0] + {g(rb())}._u32[0]);"
         if mn == "stqx":
-            return f"spu_ls_write128(ctx, {g(ra())}._u32[0] + {g(rb())}._u32[0], {g(rt())});"
+            return f"spu_ls_st128(_ls, {g(ra())}._u32[0] + {g(rb())}._u32[0], {g(rt())});"
 
         # ---- channel ops ----
         if mn == "rdch":
