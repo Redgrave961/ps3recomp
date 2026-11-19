@@ -239,6 +239,32 @@ if(PS3RECOMP_BUILD_TESTS)
 
     endif()
 
+    # The native SPURS kernel, system service, taskset and job chain policy
+    # modules against the firmware's selection, request and command semantics.
+    add_executable(test_spurs
+        runtime/spu/tests/test_spurs.c
+        runtime/spu/spu_channels.c
+        runtime/spu/spu_drain.c
+        runtime/spu/spu_lockstep.c
+        runtime/spu/spu_coherency.c
+        runtime/spu/spu_workload.c
+        runtime/spu/spu_interp.c
+        runtime/platform/win32_compat.c
+        runtime/platform/ps3_sync.c
+        runtime/spu/tests/spu_fixture_ppu.c)
+    target_include_directories(test_spurs PRIVATE include runtime/spu runtime/platform)
+    target_compile_options(test_spurs PRIVATE -UNDEBUG)
+    if(WIN32)
+        target_compile_definitions(test_spurs PRIVATE _CRT_SECURE_NO_WARNINGS)
+        target_link_libraries(test_spurs PRIVATE synchronization)
+    else()
+        target_link_libraries(test_spurs PRIVATE Threads::Threads m)
+    endif()
+    foreach(mode kernel idle taskset jobchain)
+        add_test(NAME spurs_${mode} COMMAND test_spurs ${mode})
+        set_tests_properties(spurs_${mode} PROPERTIES TIMEOUT 60)
+    endforeach()
+
     # vmaddfp / vnmsubfp against fmaf, lane by lane.
     add_executable(test_vmx_fmaf tests/test_vmx_fmaf.c)
     target_compile_options(test_vmx_fmaf PRIVATE -UNDEBUG)

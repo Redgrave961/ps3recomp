@@ -1440,58 +1440,6 @@ static int spu_overlay_resolve_reloc(spu_context* ctx, uint32_t pc)
     return 0;
 }
 
-/* Register one-way runtime entries that replace the guest call stack.
- * Matching the resolved function, not just its LS address, avoids affecting
- * unrelated overlays using the same address. Entries have one registration
- * writer and are immutable after publication. */
-static struct { uint32_t entry; int image_id; } s_stack_reset[16];
-unsigned g_spu_stack_reset_count;
-uint64_t g_spu_stack_reset_hint[SPU_LS_SIZE / 256];
-void spu_register_stack_reset_entry(uint32_t entry, int image_id)
-{
-    /* Registrations have one writer; publish a complete new slot before a
-     * reader observes its count, including registration during a live run.
-     * The hint byte is written before that release store for the same reason:
-     * a reader that sees the new count must also see the hint. */
-    unsigned n = __atomic_load_n(&g_spu_stack_reset_count, __ATOMIC_ACQUIRE);
-    if (n < 16) {
-        s_stack_reset[n].entry = entry & SPU_LS_MASK;
-        s_stack_reset[n].image_id = image_id;
-        __atomic_fetch_or(&g_spu_stack_reset_hint[(entry & SPU_LS_MASK) >> 8],
-                          1ull << (((entry & SPU_LS_MASK) >> 2) & 63u), __ATOMIC_RELAXED);
-        __atomic_store_n(&g_spu_stack_reset_count, n + 1, __ATOMIC_RELEASE);
-    }
-}
-
-#if defined(_MSC_VER)
-static __declspec(noinline) void spu_check_stack_reset_scan(spu_context*, void (*)(spu_context*));
-#else
-static __attribute__((noinline, cold)) void spu_check_stack_reset_scan(spu_context*, void (*)(spu_context*));
-#endif
-/* Also called before direct trampoline transfers: generated calls can enter
- * a stack-switching routine without going through spu_indirect_branch. */
-void spu_check_stack_reset(spu_context* ctx, void (*fn)(spu_context*))
-{
-    /* Runs on every drain transfer: test the registry before the
-     * thread-local halt state, which is a function call on Darwin, and keep
-     * the scan out of line so the common return needs no frame. */
-    if (!spu_stack_reset_needed(ctx)) return;
-    spu_check_stack_reset_scan(ctx, fn);
-}
-
-static void spu_check_stack_reset_scan(spu_context* ctx, void (*fn)(spu_context*))
-{
-    if (!s_spu_halt_armed) return;
-    const unsigned count = __atomic_load_n(&g_spu_stack_reset_count, __ATOMIC_ACQUIRE);
-    for (unsigned i = 0; i < count; ++i)
-        if (ctx->pc == s_stack_reset[i].entry &&
-            fn == spu_lookup(ctx->pc, s_stack_reset[i].image_id)) {
-            g_spu_trampoline_fn = 0;
-            SPU_LONGJMP(s_spu_halt_env, 2);
-        }
-}
-
-
 /* Content-signature variant: FMOD COPIES codec overlays to the heap before
  * streaming them into the swap slot, so the source EA is unknowable ahead of
  * time -- match the first 16 bytes of the streamed content instead. */
@@ -1965,7 +1913,6 @@ void spu_indirect_branch(spu_context* ctx)
         return;
     }
     if (fn) {
-        spu_check_stack_reset(ctx, fn);
         /* MUSTTAIL: a guest loop that iterates through an indirect branch (the
          * Bink decoder's per-command dispatch does) must not grow the host
          * stack -- a plain call here leaked a resolver+callee frame per

@@ -22,7 +22,7 @@ with tempfile.TemporaryDirectory(prefix='spu-direct-') as tmp:
                     str(root/'runtime/platform/win32_compat.c'), str(root/'runtime/platform/ps3_sync.c'), str(root/'runtime/spu/tests/spu_fixture_ppu.c'), '-pthread', '-lm',
                     '-o', str(binary)], check=True)
     failed = []
-    for mode in ['direct', 'off', 'irq', 'reset-hint', 'ls0', 'nested']:
+    for mode in ['direct', 'off', 'irq', 'ls0', 'nested']:
         env = {k: v for k, v in os.environ.items()
                if not k.startswith(('SPU_', 'SPURS_', 'PS3_SPU_'))}
         if mode == 'off':

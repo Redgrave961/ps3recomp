@@ -9,7 +9,6 @@
  *               thread's stack)
  *   off         the same with PS3_SPU_DIRECT=0: one drain step per branch
  *   irq         an SPU interrupt raised mid-chain is taken at the next branch
- *   reset-hint  a branch to a registered stack-reset entry takes a drain step
  *   ls0         a branch to LS 0 takes a drain step, which ends the job there
  *   nested      after a nested spu_drain_call returns, drain_ret_pc is the
  *               enclosing drain's return pc again, not 0 */
@@ -23,7 +22,6 @@ uint8_t* vm_base;
 uint32_t ppu_vm_size;
 extern void spu_begin_image(int);
 extern void spu_register_function(uint32_t, void (*)(spu_context*));
-extern void spu_register_stack_reset_entry(uint32_t, int);
 extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
 extern void spu_halt(spu_context*);
 
@@ -115,9 +113,6 @@ int main(int argc, char** argv)
         ctx.ls[0] = 0x30; ctx.ls[1] = 0x00; ctx.ls[2] = 0x60; ctx.ls[3] = 0x00;   /* bra 0x300 */
         ctx.int_enable = 1;
         ctx.event_mask = 0x20u;
-    } else if (!strcmp(mode, "reset-hint")) {
-        s_loops = 100000;
-        spu_register_stack_reset_entry(0x280, 77);
     } else if (!strcmp(mode, "ls0")) {
         entry = to_ls0_entry;
     } else if (!strcmp(mode, "nested")) {
@@ -152,9 +147,6 @@ int main(int argc, char** argv)
     } else if (!strcmp(mode, "irq")) {
         assert(ctx.gpr[23]._u32[0] == (uint32_t)s_raise_at);   /* the very next branch */
         if (direct) assert(ctx.steps == 2);
-    } else if (!strcmp(mode, "reset-hint")) {
-        assert(ctx.gpr[10]._u32[0] == s_loops);
-        if (direct) assert(ctx.steps == s_loops - 1);   /* each a -> b; b -> a stays direct */
     } else if (!strcmp(mode, "ls0")) {
         assert(ctx.gpr[10]._u32[0] == 1 && ctx.steps == 2);
     } else if (!strcmp(mode, "nested")) {

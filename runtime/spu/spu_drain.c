@@ -40,13 +40,8 @@ extern void spu_halt(spu_context*);
 #endif
 static SPU_DRAIN_COLD void spu_task_launch_slow(spu_context* ctx);
 
-/* Keep checkpoint order: stack reset can unwind before steps increment, and
- * guest calls can change PC and steps before the next hop. */
-SPU_DRAIN_INLINE void spu_task_launch_check_inline(spu_context* ctx, void* fn)
+SPU_DRAIN_INLINE void spu_task_launch_check_inline(spu_context* ctx)
 {
-    extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
-    if (spu_stack_reset_needed(ctx))
-        spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
     if (!ctx->steps || (ctx->pc & SPU_LS_MASK)) {
         ctx->steps++;
         return;
@@ -70,22 +65,17 @@ void spu_direct_init(void)
     g_spu_direct = on;
 }
 
-void spu_task_launch_check(spu_context* ctx, void* fn)
-{
-    spu_task_launch_check_inline(ctx, fn);
-}
-
-SPU_DRAIN_INLINE void spu_drain_hop_inline(spu_context* ctx, void (*fn)(spu_context*))
+SPU_DRAIN_INLINE void spu_drain_hop_inline(spu_context* ctx)
 {
     /* Read the live gate each hop. -1 still takes the original initialization
      * path; a callee can enable lockstep before the next checkpoint. */
     if (g_yz_lockstep_on != 0) yz_lockstep_tick(ctx);
-    spu_task_launch_check_inline(ctx, (void*)fn);
+    spu_task_launch_check_inline(ctx);
 }
 
-void spu_drain_hop(spu_context* ctx, void (*fn)(spu_context*))
+void spu_drain_hop(spu_context* ctx)
 {
-    spu_drain_hop_inline(ctx, fn);
+    spu_drain_hop_inline(ctx);
 }
 
 /* A SPURS job returning to LS 0 is finished -- its crt tail-jumps to the
@@ -290,7 +280,7 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
             void (*fn)(spu_context*) = *tramp;
             *tramp = 0;
             ctx->drain_ret_pc = return_pc & SPU_LS_MASK;   /* re-set: a nested drain changed it */
-            spu_drain_hop_inline(ctx, fn);
+            spu_drain_hop_inline(ctx);
             if (ctx->int_enable && (ctx->event_status & ctx->event_mask)) {
                 void (*vf)(spu_context*) = spu_take_interrupt(ctx, fn);
                 if (!ctx->int_enable) {   /* taken (a take clears the enable; a deferral leaves it) */

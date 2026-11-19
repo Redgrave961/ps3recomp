@@ -154,18 +154,10 @@ approximation of it.
 
 ## In use
 
-The port runs libsre (SPURS, cellSync) and libresc (cellResc) this way, including libsre's
-SPU kernel, on real SPU thread groups.
-
-## SPU correctness is a prerequisite
-
-The lifted SPURS kernel includes real SPU code, the scheduler's SPU-side dispatcher and
-context-switch logic, which now actually executes on ps3recomp's SPU recompiled runtime
-instead of being bypassed by HLE. That surfaced SPU instruction decode and semantic bugs that
-existing game SPU workloads had not exercised (rare opcodes, floating-point estimate
-instructions, condition-handling edge cases). Getting the lifted kernel to run correctly
-therefore doubles as a stress test of the SPU lifter itself; fixing what it turns up is a
-practical prerequisite for this method to work, not an unrelated side project.
+The port runs libsre (SPURS, cellSync) and libresc (cellResc) this way on real SPU thread
+groups. The SPU side of SPURS (kernel, system service, taskset and job chain policy modules)
+is not lifted: `runtime/spu/spurs.c` implements it natively with the firmware's guest-visible
+behavior, registered by `spurs_register` at the kernel entry and the policy module addresses.
 
 ## Legal and redistribution
 

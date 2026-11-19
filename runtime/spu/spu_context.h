@@ -289,7 +289,7 @@ typedef struct spu_context {
 
     /* Trampoline steps taken since this context started running. Only needed
      * to tell a job's INITIAL entry at LS 0 from a later return to LS 0, which
-     * means something quite different (see spu_task_launch_check). */
+     * means something quite different (see spu_drain.c). */
     uint32_t steps;
 
     /* SPU lockstep gate (spu_lockstep.c; env SPU_LOCKSTEP, default off).
@@ -629,21 +629,7 @@ extern SPU_THREAD_LOCAL unsigned g_spu_pch_n;
 
 /* Central per-transfer hooks (stubbed in spu_drain.c until their milestones). */
 void yz_lockstep_tick(spu_context* ctx);             /* round-robin token gate */
-void spu_task_launch_check(spu_context* ctx, void* fn); /* SPURS task-launch    */
-/* Complete ordered hop; the launch-only ABI above does not tick lockstep. */
-void spu_drain_hop(spu_context* ctx, void (*fn)(spu_context*));
-extern unsigned g_spu_stack_reset_count; /* read-only outside registration */
-extern uint64_t g_spu_stack_reset_hint[SPU_LS_SIZE / 256];
-static inline int spu_stack_reset_hint(uint32_t pc)
-{
-    pc &= SPU_LS_MASK;
-    return (int)((g_spu_stack_reset_hint[pc >> 8] >> ((pc >> 2) & 63u)) & 1u);
-}
-static inline int spu_stack_reset_needed(const spu_context* ctx)
-{
-    unsigned count = __atomic_load_n(&g_spu_stack_reset_count, __ATOMIC_ACQUIRE);
-    return count && ctx->host_depth && spu_stack_reset_hint(ctx->pc);
-}
+void spu_drain_hop(spu_context* ctx);
 
 /* Wake a host thread blocked in a channel wait (channel-stall milestone). */
 void spu_ch_wake(spu_context* ctx);
@@ -687,7 +673,7 @@ static inline int spu_call_return(spu_context* ctx, uint32_t return_pc)
         while (g_spu_trampoline_fn) {                           \
             void (*_tf)(spu_context*) = g_spu_trampoline_fn;    \
             g_spu_trampoline_fn = 0;                            \
-            spu_drain_hop((ctx), _tf);                          \
+            spu_drain_hop(ctx);                                 \
             if ((ctx)->int_enable &&                            \
                 ((ctx)->event_status & (ctx)->event_mask))      \
                 _tf = spu_take_interrupt((ctx), _tf);          \
@@ -703,9 +689,8 @@ static inline int spu_call_return(spu_context* ctx, uint32_t return_pc)
  * host return, a loop pass and an indirect call per transfer. SPU_DIRECT
  * tail-calls the target instead (no host stack growth) when nothing the drain
  * loop does per step applies: the target is not LS 0 (a job's end), this is
- * not the run's first transfer (the LS 0 check counts steps from there), the
- * target is not in the stack-reset hint table, and no interrupt is pending
- * with interrupts enabled. Anything else takes the trampoline as before. Tail calls need
+ * not the run's first transfer (the LS 0 check counts steps from there), and
+ * no interrupt is pending with interrupts enabled. Anything else takes the trampoline as before. Tail calls need
  * clang's musttail; other compilers always take the trampoline. SPU_LOCKSTEP,
  * which watches each drain step, turns it off (spu_drain.c). */
 void spu_direct_init(void);
@@ -719,7 +704,7 @@ void spu_direct_init(void);
         const uint32_t _dpc = (uint32_t)(PC);                                 \
         (ctx)->pc = _dpc;                                                     \
         if (__builtin_expect(g_spu_direct > 0, 1) && (_dpc & SPU_LS_MASK) &&  \
-            (ctx)->steps && !spu_stack_reset_hint(_dpc) &&                    \
+            (ctx)->steps &&                                                   \
             !((ctx)->int_enable && ((ctx)->event_status & (ctx)->event_mask))) \
             __attribute__((musttail)) return FN(ctx);                         \
         g_spu_trampoline_fn = FN;                                             \
@@ -757,8 +742,7 @@ static inline void (*spu_icall_target(spu_context* ctx))(spu_context*)
 {
     ctx->pc &= SPU_LS_MASK;
     if (ctx->irq_saved) return 0;
-    void (*fn)(spu_context*) = spu_lifted_lookup(ctx, ctx->pc);
-    return fn && !spu_stack_reset_needed(ctx) ? fn : 0;
+    return spu_lifted_lookup(ctx, ctx->pc);
 }
 #define SPU_ICALL(ctx) do {                                                   \
         void (*_icf)(spu_context*) = spu_icall_target(ctx);                   \

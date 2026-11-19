@@ -185,8 +185,6 @@ volatile int g_spu_direct = -1;
 #else
 volatile int g_spu_direct = 1;
 #endif
-unsigned g_spu_stack_reset_count;
-uint64_t g_spu_stack_reset_hint[SPU_LS_SIZE / 256];
 uint32_t g_spu_depth_guard_limit = 4096;
 uint8_t* vm_base;
 
@@ -254,15 +252,6 @@ int main(void)
     ctx.status = SPU_STATUS_RUNNING;
     ctx.steps = 1;
     spu_recomp_register();
-#ifdef SPU_TEST_ALIAS_HINTS
-    for (int i = 0; i < g_ntab; i++) {
-        const uint32_t alias = (g_tab[i].a + 0x1000u) & SPU_LS_MASK;
-        int taken = 0;
-        for (int j = 0; j < g_ntab; j++) taken |= g_tab[j].a == alias;
-        if (!taken) g_spu_stack_reset_hint[alias >> 8] |= 1ull << ((alias >> 2) & 63u);
-    }
-    g_spu_stack_reset_count = 1;
-#endif
     spu_func_00000000(&ctx);
     while (g_spu_trampoline_fn) { void (*f)(spu_context*) = g_spu_trampoline_fn; g_spu_trampoline_fn = 0; f(&ctx); }
     uint64_t h = 1469598103934665603ull;
@@ -351,7 +340,6 @@ def main():
             for merge in (False, True):
                 tag = f"{'p' if promote else 'n'}{'m' if merge else 's'}"
                 results[tag] = run_variant(cc, pdir, code, functions, harness, promote, merge, tag)
-        alias = run_variant(cc, pdir, code, functions, harness, True, True, "pa", ("-DSPU_TEST_ALIAS_HINTS",))
         slow = run_variant(cc, pdir, code, functions, harness, True, True, "pd", ("-DSPU_TEST_SLOW_CALLS",))
         ref = results["ns"]
         if ref[0] != 0:
@@ -360,10 +348,6 @@ def main():
             continue
         promoted += results["ps"][2].count(" sr") > 0
         narrowed += results["ps"][2].count("if (_fast)")
-        dispatches["pa"] = dispatches.get("pa", 0) + alias[3]
-        if alias[:2] != results["pm"][:2] or alias[3] != results["pm"][3]:
-            failures += 1
-            print(f"program {p} seed {args.seed}: aliased stack-reset hints changed the run ({alias[3]} vs {results['pm'][3]} dispatches)")
         if slow[0] != results["pm"][0] or re.sub(r" pc=\w+", "", slow[1]) != re.sub(r" pc=\w+", "", results["pm"][1]):
             failures += 1
             diff = [f"  {a!r} != {b!r}" for a, b in zip(results["pm"][1].splitlines(), slow[1].splitlines()) if a != b][:6]
@@ -378,7 +362,7 @@ def main():
                     diff = [f"  {a!r} != {b!r}" for a, b in zip(want.splitlines(), got.splitlines()) if a != b][:6]
                     print(f"program {p} seed {args.seed}: variant {tag} differs\n" + "\n".join(diff))
                     break
-    print(f"{args.programs} programs x 6 variants, {promoted} with promoted registers, "
+    print(f"{args.programs} programs x 5 variants, {promoted} with promoted registers, "
           f"{narrowed} narrowed call reloads, {failures} mismatches")
     print("generic dispatches per variant: " + ", ".join(f"{k}={v}" for k, v in sorted(dispatches.items())))
     if not args.keep:
