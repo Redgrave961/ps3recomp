@@ -505,14 +505,14 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         /* MFC_RdAtomicStat after a GETLLAR reads 4 (GETLLAR complete), not 0:
          * Havok's SPU allocator (GH3 collide task, LS 0xA66C) re-issues the
          * GETLLAR until that bit is set, and spun forever on 0. PUTLLUC is 2. */
-        if (!llar_fast) { ctx->resv_ea = ea; ctx->resv_valid = 1; }   /* the fast path published it already */
+        if (!llar_fast) __atomic_store_n(&ctx->resv, (ea & ~127u) | 1u, __ATOMIC_RELAXED);   /* the fast path published it already */
         ctx->atomic_stat = 4;
         if (!llar_fast) spu_lockline_unlock(ea);
         return 1;
 
     case MFC_PUTLLC_CMD:
         spu_lockline_lock(ea);
-        if (ctx->resv_valid && ctx->resv_ea == ea &&
+        if (__atomic_load_n(&ctx->resv, __ATOMIC_RELAXED) == ((ea & ~127u) | 1u) &&
             memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) == 0) {
             memcpy(mem, ls, MFC_ATOMIC_LINE);          /* commit local store */
             /* A committing PUTLLC is a line write like any other, so every
@@ -527,13 +527,13 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
              * raise a self-LR: hardware CONSUMES the reservation on a
              * successful PUTLLC, it does not report it lost. Already under the
              * lock-line lock, which is what spu_coh_notify_write expects. */
-            ctx->resv_valid = 0;
+            __atomic_store_n(&ctx->resv, 0u, __ATOMIC_RELAXED);
             spu_coh_notify_write(ea);
             ctx->atomic_stat = 0;                      /* PUTLLC_SUCCESS */
         } else {
             ctx->atomic_stat = 1;                      /* PUTLLC_FAILURE -> retry */
         }
-        ctx->resv_valid = 0;                           /* reservation consumed */
+        __atomic_store_n(&ctx->resv, 0u, __ATOMIC_RELAXED);   /* reservation consumed */
         spu_lockline_unlock(ea);
         if (ctx->atomic_stat == 0) {
             spu_rsx_window_check(ea, MFC_ATOMIC_LINE);
@@ -550,7 +550,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * reservation here would commit a PUTLLC against a snapshot this store
          * has already overwritten. */
         spu_coh_notify_write(ea);
-        ctx->resv_valid = 0; ctx->atomic_stat = 2;   /* PUTLLUC complete */
+        __atomic_store_n(&ctx->resv, 0u, __ATOMIC_RELAXED); ctx->atomic_stat = 2;   /* PUTLLUC complete */
         spu_lockline_unlock(ea);
         spu_rsx_window_check(ea, MFC_ATOMIC_LINE);
         return 1;
@@ -683,12 +683,12 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
  * ===========================================================================*/
 static void spu_resv_lost_poll(spu_context* ctx)
 {
-    if (!(ctx->event_mask & 0x400u) || !ctx->resv_valid) return;
-    if (!vm_base || ctx->resv_ea == 0) return;
-    if (memcmp(vm_base + ctx->resv_ea, ctx->resv_line, 128) != 0) {
-        ctx->resv_valid = 0;
+    uint32_t r = __atomic_load_n(&ctx->resv, __ATOMIC_RELAXED);
+    if (!(ctx->event_mask & 0x400u) || !(r & 1u)) return;
+    if (!vm_base || !(r & ~127u)) return;
+    if (memcmp(vm_base + (r & ~127u), ctx->resv_line, 128) != 0 &&
+        __atomic_compare_exchange_n(&ctx->resv, &r, r & ~1u, 0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED))
         SPU_EVENT_SET(ctx, 0x400u);
-    }
 }
 
 static int spu_ch_ready(spu_context* ctx, uint32_t channel)

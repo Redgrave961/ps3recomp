@@ -44,8 +44,7 @@ static void getllar(spu_context* ctx, uint32_t ea)
     ea &= ~127u;
     spu_lockline_lock(ea);
     spu_coh_reserve(ctx, ea);
-    ctx->resv_ea = ea;
-    ctx->resv_valid = 1;
+    ctx->resv = (ea & ~127u) | 1u;
     spu_lockline_unlock(ea);
 }
 
@@ -102,7 +101,7 @@ static void test_put_semantics(void)
             reset(&g_peer, 1);
             getllar(&g_peer, probes[p]);
             put(&g_issuer, ea, size);
-            CHECK(g_peer.resv_valid == 0);
+            CHECK((g_peer.resv & 1u) == 0);
             CHECK((g_peer.event_status & SPU_EVENT_LR) != 0);
         }
         reset(&g_issuer, 0);
@@ -110,15 +109,15 @@ static void test_put_semantics(void)
         getllar(&g_peer, last + 128u);
         getllar(&g_issuer, first);
         put(&g_issuer, ea, size);
-        CHECK(g_peer.resv_valid == 1);
+        CHECK((g_peer.resv & 1u) == 1);
         CHECK((g_peer.event_status & SPU_EVENT_LR) == 0);
-        CHECK(g_issuer.resv_valid == 1);
+        CHECK((g_issuer.resv & 1u) == 1);
     }
     reset(&g_issuer, 0);
     reset(&g_peer, 1);
     getllar(&g_peer, 0x000C0000u);
     put(&g_issuer, 0x000D0000u, 16384);
-    CHECK(g_peer.resv_valid == 1);
+    CHECK((g_peer.resv & 1u) == 1);
     CHECK((g_peer.event_status & SPU_EVENT_LR) == 0);
 }
 

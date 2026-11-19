@@ -239,8 +239,7 @@ typedef struct spu_context {
      * SPU kernel threads share a lock-free queue in main memory; PUTLLC must
      * FAIL if the reserved 128-byte line changed since GETLLAR, or concurrent
      * claims corrupt the queue. */
-    uint32_t resv_ea;          /* reserved 128-byte line EA, aligned (0 = none) */
-    int      resv_valid;
+    uint32_t resv;             /* reserved 128-byte line EA | 1 while live (0 = none) */
     uint32_t atomic_stat;      /* last atomic op result -> MFC_RdAtomicStat */
     uint8_t  resv_line[128];   /* snapshot of the line at GETLLAR time */
 

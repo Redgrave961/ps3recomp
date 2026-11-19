@@ -38,17 +38,16 @@ void coh_reserve(void* p, uint32_t ea, uint8_t* copy)
     spu_lockline_lock(ea);
     spu_coh_reserve(c, ea);
     memcpy(copy, vm_base + (ea & ~127u), 128);
-    c->resv_ea = ea & ~127u;
-    c->resv_valid = 1;
+    c->resv = (ea & ~127u) | 1u;
     spu_lockline_unlock(ea);
 }
 int coh_lost(void* p)
 {
     spu_context* c = (spu_context*)p;
-    const uint32_t ea = c->resv_ea;
+    const uint32_t ea = (c->resv & ~127u);
     spu_lockline_lock(ea);
-    const int lost = !c->resv_valid && (c->event_status & SPU_EVENT_LR);
-    c->resv_valid = 0;
+    const int lost = !(c->resv & 1u) && (c->event_status & SPU_EVENT_LR);
+    c->resv = 0;
     SPU_EVENT_CLEAR(c, SPU_EVENT_LR);
     spu_lockline_unlock(ea);
     return lost;

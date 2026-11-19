@@ -96,8 +96,7 @@ static void spu_getllar(spu_context* ctx, uint32_t ea)
     ea &= ~127u;
     spu_lockline_lock(ea);
     spu_coh_reserve(ctx, ea);
-    ctx->resv_ea = ea;
-    ctx->resv_valid = 1;
+    ctx->resv = (ea & ~127u) | 1u;
     spu_lockline_unlock(ea);
 }
 
@@ -147,7 +146,7 @@ static void test_ppu_store_raises_lr(void)
     CHECK_EQ_U32(g_spu_a.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
 
     TEST("...and drops the reservation, so the SPU's PUTLLC must fail");
-    CHECK(g_spu_a.resv_valid == 0);
+    CHECK((g_spu_a.resv & 1u) == 0);
 
     TEST("...and wakes the host thread parked on the event channel");
     CHECK(g_wakes == 1);
@@ -188,7 +187,7 @@ static void test_no_false_raise(void)
     TEST("a store to a DIFFERENT line leaves the reservation alone");
     vm_write32(LINE_B + 8, 0x33333333u);
     CHECK_EQ_U32(g_spu_a.event_status, 0);
-    CHECK(g_spu_a.resv_valid == 1);
+    CHECK((g_spu_a.resv & 1u) == 1);
     CHECK(g_wakes == 0);
 
     TEST("...even when that line is itself reserved by another SPU");
@@ -197,10 +196,10 @@ static void test_no_false_raise(void)
     vm_write32(LINE_B + 8, 0x44444444u);
     CHECK_EQ_U32(g_spu_b.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
     CHECK_EQ_U32(g_spu_a.event_status, 0);
-    CHECK(g_spu_a.resv_valid == 1);
+    CHECK((g_spu_a.resv & 1u) == 1);
 
     TEST("an SPU that holds NO reservation is never notified");
-    spu_reset(&g_spu_b, 1);            /* registered, but resv_valid = 0 */
+    spu_reset(&g_spu_b, 1);            /* registered, but no live reservation */
     g_wakes = 0;
     vm_write32(LINE_B + 8, 0x55555555u);
     CHECK_EQ_U32(g_spu_b.event_status, 0);
@@ -226,7 +225,7 @@ static void test_all_store_widths(void)
         case 3: vm_write64(LINE_C + 16, 0xA5A5A5A5A5A5A5A5ull);    break;
         }
         CHECK_EQ_U32(g_spu_a.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
-        CHECK(g_spu_a.resv_valid == 0);
+        CHECK((g_spu_a.resv & 1u) == 0);
     }
 }
 
@@ -246,7 +245,7 @@ static void test_many_contexts(void)
     g_wakes = 0;
     vm_write32(LINE_A, vm_read32(LINE_A));
     for (unsigned i = 0; i < N; ++i) {
-        CHECK(c[i]->resv_valid == 0);
+        CHECK((c[i]->resv & 1u) == 0);
         CHECK(c[i]->event_status & SPU_EVENT_LR);
     }
     CHECK(g_wakes == N);
@@ -260,7 +259,7 @@ static void test_many_contexts(void)
     vm_write32(LINE_B, old ^ 1u);
     vm_write32(LINE_B, old);
     for (unsigned i = 0; i < N; ++i) {
-        CHECK(c[i]->resv_valid == 0);
+        CHECK((c[i]->resv & 1u) == 0);
         CHECK(c[i]->event_status & SPU_EVENT_LR);
     }
     CHECK(g_wakes == N);
@@ -303,7 +302,7 @@ static void test_many_contexts(void)
     free(range);
     g_wakes = 0;
     vm_write32(LINE_A, vm_read32(LINE_A));
-    CHECK(g_wakes == 1 && !g_spu_a.resv_valid);
+    CHECK(g_wakes == 1 && !(g_spu_a.resv & 1u));
     spu_coh_unregister(&g_spu_a);
 }
 

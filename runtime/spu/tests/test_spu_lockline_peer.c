@@ -168,8 +168,8 @@ static void test_putllc_breaks_peer(void)
     /* Both SPUs take the same line, exactly as five SPURS kernels do. */
     spu_atomic(&g_a, LSA_A, LINE_A, MFC_GETLLAR_CMD);
     spu_atomic(&g_b, LSA_B, LINE_A, MFC_GETLLAR_CMD);
-    CHECK(g_a.resv_valid == 1);
-    CHECK(g_b.resv_valid == 1);
+    CHECK((g_a.resv & 1u) == 1);
+    CHECK((g_b.resv & 1u) == 1);
 
     stage(&g_b, LSA_B, 0xB0, 128);
     spu_atomic(&g_b, LSA_B, LINE_A, MFC_PUTLLC_CMD);
@@ -183,13 +183,13 @@ static void test_putllc_breaks_peer(void)
     CHECK(g_spu_lr_raise == raised + 1);
 
     TEST("...and drops the peer's reservation");
-    CHECK(g_a.resv_valid == 0);
+    CHECK((g_a.resv & 1u) == 0);
 
     /* The committer consumed its reservation; hardware does not report that as
      * a loss, so it takes no event of its own. */
     TEST("...and does not raise a self-LR on the committer");
     CHECK_EQ_U32(g_b.event_status & SPU_EVENT_LR, 0);
-    CHECK(g_b.resv_valid == 0);
+    CHECK((g_b.resv & 1u) == 0);
 
     /* The whole point of the event: the peer's own commit has to lose. */
     TEST("the peer's PUTLLC then fails and writes nothing");
@@ -215,7 +215,7 @@ static void test_failed_putllc_is_quiet(void)
     spu_atomic(&g_b, LSA_B, LINE_A, MFC_PUTLLC_CMD);
     CHECK_EQ_U32(g_b.atomic_stat, 1);
     CHECK_EQ_U32(g_a.event_status, 0);
-    CHECK(g_a.resv_valid == 1);
+    CHECK((g_a.resv & 1u) == 1);
     CHECK(g_spu_lr_raise == raised);
     CHECK_EQ_U32(g_guest_mem[LINE_A + 8], 0x5A);   /* nothing was committed */
 }
@@ -234,7 +234,7 @@ static void test_putlluc_breaks_peer(void)
     stage(&g_b, LSA_B, 0xB0, 128);
     spu_atomic(&g_b, LSA_B, LINE_A, MFC_PUTLLUC_CMD);
     CHECK_EQ_U32(g_a.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
-    CHECK(g_a.resv_valid == 0);
+    CHECK((g_a.resv & 1u) == 0);
     CHECK(g_spu_lr_raise == raised + 1);
     CHECK(mem_is(LINE_A, 0xB0, 128));
 
@@ -255,7 +255,7 @@ static void test_putlluc_breaks_peer(void)
     stage(&g_b, LSA_B, 0xB0, 128);
     spu_atomic(&g_b, LSA_B, LINE_A, MFC_PUTLLUC_CMD);
     CHECK_EQ_U32(g_b.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
-    CHECK(g_b.resv_valid == 0);
+    CHECK((g_b.resv & 1u) == 0);
     CHECK(g_spu_lr_raise == raised + 1);
 }
 
@@ -314,8 +314,8 @@ static void test_registered_getllar_skips_the_lock(void)
 
     TEST("...and waits out a writer's open critical section instead of copying through it");
     CHECK(llar_completes_under_held_lock(LINE_A, LINE_A) == 0);
-    CHECK(g_a.resv_valid == 1);
-    CHECK_EQ_U32(g_a.resv_ea, LINE_A);
+    CHECK((g_a.resv & 1u) == 1);
+    CHECK_EQ_U32((g_a.resv & ~127u), LINE_A);
     CHECK_EQ_U32(g_a.ls[LSA_A + 5], 0x77);
     CHECK_EQ_U32(g_a.resv_line[5], 0x77);
     CHECK_EQ_U32(g_a.atomic_stat, 4);
@@ -324,14 +324,14 @@ static void test_registered_getllar_skips_the_lock(void)
     stage(&g_b, LSA_B, 0xB0, 128);
     spu_atomic(&g_b, LSA_B, LINE_A, MFC_PUTLLUC_CMD);
     CHECK_EQ_U32(g_a.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
-    CHECK(g_a.resv_valid == 0);
+    CHECK((g_a.resv & 1u) == 0);
 
     /* LINE_B has never been reserved, so its mark is set by this GETLLAR and
      * must be set under the lock. */
     TEST("a GETLLAR of an unmarked line still takes the lock");
     CHECK(llar_completes_under_held_lock(LINE_B + 0x80, LINE_B + 0x80) == 0);
-    CHECK(g_a.resv_valid == 1);
-    CHECK_EQ_U32(g_a.resv_ea, LINE_B + 0x80);
+    CHECK((g_a.resv & 1u) == 1);
+    CHECK_EQ_U32((g_a.resv & ~127u), LINE_B + 0x80);
 
     /* A context the holder list does not know (coh_listed clear) must link
      * itself first, under the lock, or no writer would ever find it. */
@@ -343,8 +343,8 @@ static void test_registered_getllar_skips_the_lock(void)
 
     TEST("a GETLLAR of an unmarked line does not wait for another line's lock");
     CHECK(llar_completes_under_held_lock(LINE_B + 0x100, LINE_A) == 1);
-    CHECK(g_a.resv_valid == 1);
-    CHECK_EQ_U32(g_a.resv_ea, LINE_B + 0x100);
+    CHECK((g_a.resv & 1u) == 1);
+    CHECK_EQ_U32((g_a.resv & ~127u), LINE_B + 0x100);
 }
 
 /* A write racing a lock-free GETLLAR, for real. Two threads are released
@@ -421,7 +421,7 @@ static void test_racing_write_ends_lockfree_reservation(void)
         int whole = 1;
         for (int i = 0; i < 128; i++)
             if (g_a.ls[LSA_A + i] != v || g_a.resv_line[i] != v) { whole = 0; break; }
-        if (g_a.resv_valid) {
+        if ((g_a.resv & 1u)) {
             if (whole) saw_write++; else stale_kept++;
         } else {
             lost++;
@@ -456,7 +456,7 @@ static void test_plain_put_breaks_peer(void)
     stage(&g_b, LSA_B, 0xB0, 128);
     spu_put(&g_b, LSA_B, LINE_A, 128);
     CHECK_EQ_U32(g_a.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
-    CHECK(g_a.resv_valid == 0);
+    CHECK((g_a.resv & 1u) == 0);
     CHECK(g_spu_lr_raise == raised + 1);
 
     TEST("...and the transfer itself still lands");
@@ -478,7 +478,7 @@ static void test_plain_put_breaks_peer(void)
     stage(&g_b, LSA_B, 0xC0, 16);
     spu_put(&g_b, LSA_B, LINE_A + 112, 16);
     CHECK_EQ_U32(g_a.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
-    CHECK(g_a.resv_valid == 0);
+    CHECK((g_a.resv & 1u) == 0);
     CHECK(g_spu_lr_raise == raised + 1);
 }
 
@@ -493,7 +493,7 @@ static void test_plain_put_elsewhere_is_quiet(void)
     stage(&g_b, LSA_B, 0xB0, 128);
     spu_put(&g_b, LSA_B, LINE_B, 128);
     CHECK_EQ_U32(g_a.event_status, 0);
-    CHECK(g_a.resv_valid == 1);
+    CHECK((g_a.resv & 1u) == 1);
     CHECK(g_spu_lr_raise == raised);
     CHECK(mem_is(LINE_B, 0xB0, 128));
 
@@ -501,7 +501,7 @@ static void test_plain_put_elsewhere_is_quiet(void)
     stage(&g_b, LSA_B, 0xC0, 128);
     spu_put(&g_b, LSA_B, LINE_A - 128, 128);
     CHECK_EQ_U32(g_a.event_status, 0);
-    CHECK(g_a.resv_valid == 1);
+    CHECK((g_a.resv & 1u) == 1);
     CHECK(g_spu_lr_raise == raised);
 }
 
@@ -519,7 +519,7 @@ static void test_wide_put_finds_the_reserved_line(void)
     stage(&g_b, LSA_B, 0xB0, 0x200);
     spu_put(&g_b, LSA_B, LINE_D, 0x200);
     CHECK_EQ_U32(g_a.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
-    CHECK(g_a.resv_valid == 0);
+    CHECK((g_a.resv & 1u) == 0);
     CHECK(g_spu_lr_raise == raised + 1);
 
     TEST("...and the whole span landed");
@@ -541,7 +541,7 @@ static void test_unaligned_wide_put_around_a_reserved_line(void)
     stage(&g_b, LSA_B, 0xC0, 0x100);
     spu_put(&g_b, LSA_B, LINE_D + 0x40, 0x100);
     CHECK_EQ_U32(g_a.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
-    CHECK(g_a.resv_valid == 0);
+    CHECK((g_a.resv & 1u) == 0);
     CHECK(g_spu_lr_raise == raised + 1);
 
     TEST("...the span landed, partial lines included");
@@ -599,7 +599,7 @@ static void test_ack_keeps_a_concurrent_raise(void)
 
     TEST("a raise after the acknowledge is kept");
     CHECK_EQ_U32(g_a.event_status, SPU_EVENT_LR);
-    CHECK(g_a.resv_valid == 0);
+    CHECK((g_a.resv & 1u) == 0);
 
     TEST("an acknowledge after a raise clears only what it asks for");
     g_a.event_status = ACK_TAG_EVENT | SPU_EVENT_LR;
