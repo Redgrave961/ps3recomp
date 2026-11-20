@@ -259,12 +259,20 @@ int spu_coh_reserve_fast(spu_context* ctx, uint32_t ea, uint32_t* seq)
 int (*g_spu_idle_wake)(const spu_context* ctx, const uint8_t* line);
 uint32_t (*g_spu_idle_slots)(const uint8_t* line);
 
-void spu_coh_notify_write_except(uint32_t ea, const void* self)
+static uint32_t spu_coh_free_slots(uint32_t line, unsigned n)
+{
+    const uint32_t s = g_spu_idle_slots(vm_base + line);
+    uint32_t k = 0;
+    for (unsigned i = 0; i < n; i++) {
+        const spu_context* c = spu_coh_holder(i);
+        k += c && __atomic_load_n(&c->idle_claim, __ATOMIC_RELAXED) == (line | 1u);
+    }
+    return s > k ? s - k : 0u;
+}
+
+static void spu_coh_scan(uint32_t line, const void* self, int written)
 {
     uint32_t slots = ~0u;
-    const uint32_t line = ea & ~127u;
-    spu_coh_writer_fence();
-    ppu_resv_break_line(ea);
     const unsigned n = __atomic_load_n(&s_coh_n, __ATOMIC_ACQUIRE);
     for (unsigned i = 0; i < SPU_COH_PREFETCH; i++) spu_coh_prefetch_holder(i, n);
     for (unsigned i = 0; i < n; i++) {
@@ -273,23 +281,41 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
         if (!c || (const void*)c == self) continue;
         uint32_t r = __atomic_load_n(&c->resv, __ATOMIC_RELAXED);
         if ((r & ~SPU_RESV_BY_CONTENT) != (line | 1u)) continue;
+        int need = 2;
         if (r & SPU_RESV_BY_CONTENT) {
-            const int need = g_spu_idle_wake ? g_spu_idle_wake(c, vm_base + line) : 2;
+            need = g_spu_idle_wake ? g_spu_idle_wake(c, vm_base + line) : 2;
             if (!need) continue;
             if (!memcmp(vm_base + line, c->resv_line, MFC_ATOMIC_LINE)) continue;
             if (need == 1) {
-                if (slots == ~0u) slots = g_spu_idle_slots(vm_base + line);
+                if (__atomic_load_n(&c->idle_claim, __ATOMIC_RELAXED) == (line | 1u)) continue;
+                if (slots == ~0u) slots = spu_coh_free_slots(line, n);
                 if (!slots) continue;
                 slots--;
             }
+        } else if (!written) {
+            continue;
         }
         if (__atomic_compare_exchange_n(&c->resv, &r, line, 0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED)) {
+            if (need == 1) __atomic_store_n(&c->idle_claim, line | 1u, __ATOMIC_RELAXED);
             SPU_EVENT_SET(c, SPU_EVENT_LR);
             g_spu_lr_raise++;
             spu_ll_defer_wake(c);
         }
     }
 }
+
+void spu_coh_notify_write_except(uint32_t ea, const void* self)
+{
+    spu_coh_writer_fence();
+    ppu_resv_break_line(ea);
+    spu_coh_scan(ea & ~127u, self, 1);
+}
+
+void spu_coh_recheck_idle(uint32_t ea, const void* self)
+{
+    spu_coh_scan(ea & ~127u, self, 0);
+}
+
 void spu_coh_notify_write(uint32_t ea)
 {
     spu_coh_notify_write_except(ea, NULL);

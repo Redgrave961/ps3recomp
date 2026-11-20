@@ -19,6 +19,7 @@
 #include <cstring>
 #include <cstdio>
 #include <atomic>
+#include <deque>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -221,7 +222,8 @@ private:
         std::array<fp_candidate, 4> slots;
         u32 next = 0;
     };
-    flat_map<fp_seen_key, fp_lookup> m_fp_seen;
+    std::deque<fp_lookup> m_fp_pool;
+    flat_map<fp_seen_key, fp_lookup*> m_fp_seen;
     fp_seen_key m_fp_last_key{};
     fp_lookup* m_fp_last = nullptr;
     u32 m_fp_ea = 0;

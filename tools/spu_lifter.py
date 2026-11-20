@@ -329,7 +329,7 @@ class SPULifter:
         self.bi_r0_jump: set = set()
         self.link_return: set = set()
         self.promote = True
-        self.promote_regs = 16
+        self.promote_regs = 2
         self.defer = False
         self._pending: list = []
         self._prom = False

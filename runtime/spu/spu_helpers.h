@@ -589,8 +589,7 @@ SPU__XI u128 spu__xf_out(__m128 s) {
     return spu__xs(_mm_castps_si128(_mm_andnot_ps(z, s)));
 }
 SPU__XI __m128 spu__xf(u128 a) {
-    const __m128i x = spu__xl(a), m = _mm_set1_epi32(0x7FFFFFFF);
-    return _mm_castsi128_ps(_mm_or_si128(_mm_min_epu32(_mm_and_si128(x, m), _mm_set1_epi32(0x7F7FFFFF)), _mm_andnot_si128(m, x)));
+    return _mm_castsi128_ps(_mm_min_epi32(_mm_min_epu32(spu__xl(a), _mm_set1_epi32((int)0xFF7FFFFFu)), _mm_set1_epi32(0x7F7FFFFF)));
 }
 #if defined(__FMA__)
 #define SPU__XFMA(a, b, c)  _mm_fmadd_ps(a, b, c)
@@ -649,17 +648,13 @@ SPU__SF_V2(spu_fceq_ref,  spu__sf_key(x) == spu__sf_key(y) ? 0xFFFFFFFFu : 0u)
 SPU__SF_V2(spu_fcgt_ref,  spu__sf_key(x) >  spu__sf_key(y) ? 0xFFFFFFFFu : 0u)
 SPU__SF_V2(spu_fcmeq_ref, spu__sf_mag(x) == spu__sf_mag(y) ? 0xFFFFFFFFu : 0u)
 SPU__SF_V2(spu_fcmgt_ref, spu__sf_mag(x) >  spu__sf_mag(y) ? 0xFFFFFFFFu : 0u)
-#if (defined(__SSE2__) || defined(_M_X64)) && !defined(SPU_SCALAR_HELPERS)
-#include <emmintrin.h>
+#if defined(__SSSE3__) && !defined(SPU_SCALAR_HELPERS)
+#include <tmmintrin.h>
 static inline __m128i spu__sse_mag(__m128i x) {
     const __m128i m = _mm_and_si128(x, _mm_set1_epi32(0x7FFFFFFF));
-    const __m128i denorm = _mm_cmpeq_epi32(_mm_and_si128(x, _mm_set1_epi32(0x7F800000)), _mm_setzero_si128());
-    return _mm_andnot_si128(denorm, m);
+    return _mm_and_si128(m, _mm_cmpgt_epi32(m, _mm_set1_epi32(0x7FFFFF)));
 }
-static inline __m128i spu__sse_key(__m128i x) {
-    const __m128i neg = _mm_srai_epi32(x, 31);
-    return _mm_sub_epi32(_mm_xor_si128(spu__sse_mag(x), neg), neg);
-}
+static inline __m128i spu__sse_key(__m128i x) { return _mm_sign_epi32(spu__sse_mag(x), x); }
 #define SPU__SSE_CMP(name, cmp, key) static inline u128 name(u128 a, u128 b) { \
     __m128i A, B; memcpy(&A, &a, 16); memcpy(&B, &b, 16); \
     const __m128i r = cmp(key(A), key(B)); u128 out; memcpy(&out, &r, 16); return out; }

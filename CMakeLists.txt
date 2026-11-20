@@ -188,27 +188,29 @@ if(PS3RECOMP_BUILD_TESTS)
         set_tests_properties(spurs_${mode} PROPERTIES TIMEOUT 60)
     endforeach()
 
-    add_executable(test_spurs_idle_handoff
-        runtime/spu/tests/test_spurs_idle_handoff.c
-        runtime/spu/spu_channels.c
-        runtime/spu/spu_drain.c
-        runtime/spu/spu_lockstep.c
-        runtime/spu/spu_coherency.c
-        runtime/spu/spu_workload.c
-        runtime/spu/spu_interp.c
-        runtime/platform/win32_compat.c
-        runtime/platform/ps3_sync.c
-        runtime/spu/tests/spu_fixture_ppu.c)
-    target_include_directories(test_spurs_idle_handoff PRIVATE include runtime/spu runtime/platform)
-    target_compile_options(test_spurs_idle_handoff PRIVATE -UNDEBUG)
-    if(WIN32)
-        target_compile_definitions(test_spurs_idle_handoff PRIVATE _CRT_SECURE_NO_WARNINGS)
-        target_link_libraries(test_spurs_idle_handoff PRIVATE synchronization)
-    else()
-        target_link_libraries(test_spurs_idle_handoff PRIVATE Threads::Threads m)
-    endif()
-    add_test(NAME spurs_idle_handoff COMMAND test_spurs_idle_handoff)
-    set_tests_properties(spurs_idle_handoff PROPERTIES TIMEOUT 300)
+    foreach(t spurs_idle_handoff spurs_idle_claims)
+        add_executable(test_${t}
+            runtime/spu/tests/test_${t}.c
+            runtime/spu/spu_channels.c
+            runtime/spu/spu_drain.c
+            runtime/spu/spu_lockstep.c
+            runtime/spu/spu_coherency.c
+            runtime/spu/spu_workload.c
+            runtime/spu/spu_interp.c
+            runtime/platform/win32_compat.c
+            runtime/platform/ps3_sync.c
+            runtime/spu/tests/spu_fixture_ppu.c)
+        target_include_directories(test_${t} PRIVATE include runtime/spu runtime/platform)
+        target_compile_options(test_${t} PRIVATE -UNDEBUG)
+        if(WIN32)
+            target_compile_definitions(test_${t} PRIVATE _CRT_SECURE_NO_WARNINGS)
+            target_link_libraries(test_${t} PRIVATE synchronization)
+        else()
+            target_link_libraries(test_${t} PRIVATE Threads::Threads m)
+        endif()
+        add_test(NAME ${t} COMMAND test_${t})
+        set_tests_properties(${t} PROPERTIES TIMEOUT 300)
+    endforeach()
 
     add_executable(test_spu_wake_stress
         runtime/spu/tests/test_spu_wake_stress.c

@@ -454,7 +454,9 @@ bool renderer::draw_setup()
     for (u32 k = 0; k < 4; k++)
         if (m_fb.color_format[k] != VK_FORMAT_UNDEFINED) fk.output_mask |= 1u << k;
     if (!m_fp_last || !(seen_key == m_fp_last_key)) {
-        m_fp_last = &m_fp_seen[seen_key];
+        fp_lookup*& found = m_fp_seen[seen_key];
+        if (!found) found = &m_fp_pool.emplace_back();
+        m_fp_last = found;
         m_fp_last_key = seen_key;
     }
     fp_lookup& seen = *m_fp_last;

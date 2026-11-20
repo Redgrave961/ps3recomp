@@ -117,6 +117,7 @@ static void ll_commit(spu_context* c, uint32_t ea, uint32_t lsa)
     memcpy(vm_base + ea, c->ls + lsa, MFC_ATOMIC_LINE);
     __atomic_store_n(&c->resv, 0u, __ATOMIC_RELAXED);
     c->atomic_stat = 0;
+    if (__atomic_load_n(&c->idle_claim, __ATOMIC_RELAXED) == (ea | 1u)) __atomic_store_n(&c->idle_claim, 0u, __ATOMIC_RELAXED);
     spu_coh_notify_write(ea);
     spu_lockline_unlock(ea);
     spu_rsx_window_check(ea, MFC_ATOMIC_LINE);
@@ -535,13 +536,13 @@ static uint32_t ss_idle_slots(const uint8_t* l)
     const uint32_t fm = flag == 0 && recv < 16 ? 0x8000u >> recv : 0u;
     uint32_t n = 0;
     for (uint32_t i = 0; i < 16; i++) {
-        const uint32_t ct = l[0x20 + i], rc = l[i], idle = l[0x10 + i], mc = l[0x50 + i];
+        const uint32_t ct = l[0x20 + i] + l[0x30 + i], rc = l[i], idle = l[0x10 + i], mc = l[0x50 + i];
         const uint32_t rdy = (rc > 8 ? 8 : rc) + (idle > 8 ? 8 : idle);
         if (mc <= ct) continue;
         if (rc != 0 && rdy > ct) n += (rdy < mc ? rdy : mc) - ct;
         else if (((sig | fm) >> (15 - i)) & 1) n++;
     }
-    return n ? n : 1u;
+    return n;
 }
 
 static void ss_idle_reserve(spu_context* c, uint32_t ea)
@@ -559,6 +560,10 @@ static void ss_idle_reserve(spu_context* c, uint32_t ea)
     c->idle_prio = ss_prio_mask(c->ls);
     __atomic_store_n(&c->resv, (ea & ~127u) | 1u | SPU_RESV_BY_CONTENT, __ATOMIC_RELAXED);
     c->atomic_stat = 4;
+    if (__atomic_load_n(&c->idle_claim, __ATOMIC_RELAXED) && ss_idle_wake(c, c->ls + 0x100) != 1) {
+        __atomic_store_n(&c->idle_claim, 0u, __ATOMIC_RELAXED);
+        spu_coh_recheck_idle(ea, c);
+    }
     spu_lockline_unlock(ea & ~127u);
     spu_rdch(c, MFC_RdAtomicStat);
 }

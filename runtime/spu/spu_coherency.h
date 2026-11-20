@@ -27,6 +27,7 @@ void spu_coh_notify_write(uint32_t ea);
 void spu_coh_unregister(spu_context* ctx);
 void spu_coh_forget_range(uintptr_t lo, uintptr_t hi);
 void spu_coh_notify_write_except(uint32_t ea, const void* self);
+void spu_coh_recheck_idle(uint32_t ea, const void* self);
 
 extern int (*g_spu_idle_wake)(const spu_context* ctx, const uint8_t* line);
 extern uint32_t (*g_spu_idle_slots)(const uint8_t* line);
