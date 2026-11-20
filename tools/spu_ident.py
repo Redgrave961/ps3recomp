@@ -1,25 +1,3 @@
-"""spu_ident.py - identify the SPU images embedded in a PS3 executable.
-
-Most SPU work in a shipped game is not custom code -- it is prebuilt middleware linked
-into the PPU image: Sony Edge (geometry, zlib), Bink video, Havok, Wwise audio, codec
-libraries. Debug builds prove it: their .debug_scespuversion and `_binary_<name>_elf_start`
-symbols name every embedded SPU ELF (SPU_PM, binkspurs, edgezlib_inflate_task, the Ak*FX
-Wwise jobs, ...). Knowing a blob *is* Edge zlib means you HLE it instead of lifting it.
-
-Two modes:
-  * name them (debug build): list each embedded SPU image with its name + category, and
-    optionally record a fingerprint DB so the same blobs can be found elsewhere.
-  * identify them (stripped/retail build): match each embedded SPU image against the
-    fingerprint DB built from debug builds.
-
-    python spu_ident.py EBOOT.elf                       # list this build's SPU jobs
-    python spu_ident.py *.elf --update-db spu_sigs.json # harvest fingerprints
-    python spu_ident.py RETAIL.elf --db spu_sigs.json   # identify against the DB
-
-An SPU image is located by its `_binary_..._start/_end` bracket (debug builds) or by
-scanning for the SPU ELF header (machine 23). Its identity comes from the `_binary_`
-name, the in-image `.note.spu_name`, or -- when both are stripped -- a .text hash match.
-"""
 from __future__ import annotations
 
 import argparse
@@ -37,7 +15,6 @@ from ppu_loader import read_vaddr
 
 SPU_MACHINE = 23
 
-# name-substring -> (category, "hle" | "lift") advice
 MIDDLEWARE = [
     ("edge", "Sony Edge", "hle"),
     ("bink", "Bink video", "hle"),
@@ -49,7 +26,7 @@ MIDDLEWARE = [
     ("adpcm", "ADPCM codec", "hle"),
     ("at3", "ATRAC3 codec", "hle"),
     ("scream", "SCREAM audio", "hle"),
-    ("ak", "Wwise audio", "hle"),          # AkRoomVerbFXJob etc.
+    ("ak", "Wwise audio", "hle"),
     ("fmod", "FMOD audio", "hle"),
     ("spurs", "SPURS kernel/util", "hle"),
     ("inflate", "zlib inflate", "hle"),
@@ -66,7 +43,6 @@ def classify(name: str) -> tuple[str, str]:
 
 
 def _all_symbols(elf) -> dict[str, int]:
-    """name -> value for every symbol (any type), from .symtab if present."""
     si = next((i for i, s in enumerate(elf.section_headers) if s.sh_type == 2), None)
     if si is None:
         return {}
@@ -82,8 +58,6 @@ def _all_symbols(elf) -> dict[str, int]:
 
 
 def _clean_name(binary_symbol: str) -> str:
-    """`_binary_task_binkspurs_elf` -> `binkspurs`. The linker-generated symbol is the
-    reliable identifier; just trim the boilerplate the objcopy embed adds."""
     n = binary_symbol
     for pre in ("task_", "pm_"):
         if n.startswith(pre):
@@ -95,8 +69,6 @@ def _clean_name(binary_symbol: str) -> str:
 
 
 def _text_hash(blob: bytes) -> str:
-    """SHA-1 of the SPU ELF's .text (stable across games for the same middleware),
-    or of the whole blob if it isn't a parseable ELF."""
     if blob[:4] == b"\x7fELF" and len(blob) >= 0x34:
         e_shoff = struct.unpack_from(">I", blob, 0x20)[0]
         e_shentsize, e_shnum, e_shstrndx = struct.unpack_from(">HHH", blob, 0x2E)
@@ -114,10 +86,6 @@ def _text_hash(blob: bytes) -> str:
 
 
 def spu_elf_layout(blob: bytes) -> dict | None:
-    """Parse an SPU ELF32 (big-endian) into the code/data-partition landmarks a matcher
-    needs: entry PC, code base (.init), .text range, where data (.rodata) starts, and the
-    loaded footprint (max non-NOBITS extent -- .bss beyond it is zeroed, not DMA'd). None
-    if the blob is not a parseable SPU ELF (a raw job binary)."""
     if blob[:4] != b"\x7fELF" or len(blob) < 0x34:
         return None
     if struct.unpack_from(">H", blob, 18)[0] != SPU_MACHINE:
@@ -142,7 +110,7 @@ def spu_elf_layout(blob: bytes) -> dict | None:
         if nm in (b".init", b".text", b".fini") and size:
             code_lo = addr if code_lo is None else min(code_lo, addr)
             code_hi = max(code_hi, addr + size)
-        if typ != 8 and size:                      # SHT_NOBITS (.bss) is not loaded
+        if typ != 8 and size:
             load_hi = max(load_hi, addr + size)
     if text is None:
         return None
@@ -156,10 +124,6 @@ def spu_elf_layout(blob: bytes) -> dict | None:
 
 
 def fingerprint_table(elf, min_size: int = 16) -> list[dict]:
-    """Per embedded SPU image: the layout + .text fingerprint (SPU-ELFs) or a whole-blob
-    hash (raw job binaries), so a flat local-store dump can be labelled by matching its
-    code region. Symbols smaller than min_size are skipped (stray data symbols that share
-    the _binary_ naming)."""
     syms = _all_symbols(elf)
     starts = {k[:-6]: v for k, v in syms.items()
               if k.startswith("_binary_") and k.endswith("_start")}
@@ -187,7 +151,6 @@ def fingerprint_table(elf, min_size: int = 16) -> list[dict]:
 
 
 def embedded_spu_images(elf) -> list[dict]:
-    """Every embedded SPU image: name (best available), category, size, text hash."""
     syms = _all_symbols(elf)
     starts = {k[:-6]: v for k, v in syms.items()
               if k.startswith("_binary_") and k.endswith("_start")}

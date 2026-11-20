@@ -1,36 +1,4 @@
 #!/usr/bin/env python3
-"""
-Compile-check the PPU boot scaffold, on whatever platform you are standing on.
-
-runtime/ppu/ is the one part of the runtime nothing in this repository builds.
-CMakeLists.txt excludes it from the library because those files #include
-ppu_recomp.h, which the lifter generates per game -- so the scaffold is only
-ever compiled inside somebody's game port, on their machine, on Windows. That
-is exactly the shape of a claim that rots: docs/BUILDING.md advertised macOS as
-"Full support" for months while the tree did not compile there at all, and it
-took CI to find out.
-
-This script closes that hole without needing a game. It synthesises a stub
-ppu_recomp.h from the lifter's OWN HEADER_PREAMBLE -- the same string
-ppu_lifter.py writes into the real header, imported rather than copied, so the
-stub cannot drift from what games actually get -- and compiles the scaffold
-against it. What it proves is that every declaration the scaffold reaches for
-exists on this platform. It does not link, and it cannot run anything.
-
-It is a ratchet, not a pass/fail gate, because the POSIX port is not finished:
-the baseline in ppu_scaffold_baseline.json records how many errors each file
-currently produces per toolchain, and the check fails if a number goes UP. That
-makes every step of the port measurable, and makes a regression on the platform
-that already works (Windows, where the baseline is 0) a hard failure today.
-
-  python tools/check_ppu_scaffold.py            # check against the baseline
-  python tools/check_ppu_scaffold.py --update   # re-record it after improving
-
-A toolchain with no baseline entry reports its numbers and passes, so a new
-platform's first CI run tells you what to record rather than failing on
-arrival.
-"""
-
 import argparse
 import importlib.util
 import json
@@ -64,15 +32,6 @@ INCLUDE_DIRS = [
 
 
 def stub_header() -> str:
-    """The lifter's real header preamble, plus the few externs the generated
-    header carries that the scaffold calls into.
-
-    Imported from ppu_lifter.py rather than copied: if the ppu_context layout
-    changes, this stub changes with it and the check keeps testing the truth.
-    PPU_THREAD_LOCAL arrives the same way, now that it lives in the header
-    rather than the generated source -- so this check also verifies the
-    scaffold and the lifted code agree on how to spell thread-local.
-    """
     spec = importlib.util.spec_from_file_location(
         "ppu_lifter", os.path.join(ROOT, "tools", "ppu_lifter.py"))
     lifter = importlib.util.module_from_spec(spec)
@@ -85,12 +44,6 @@ def stub_header() -> str:
 
 
 def compiler_family(cxx: str) -> str:
-    """Ask the compiler what it is, rather than guessing from its filename.
-
-    macOS's `c++` is Apple Clang, and a name-based guess called it gcc -- so the
-    first macOS CI run recorded itself under a key that names the wrong
-    compiler. `cc` on Linux is ambiguous the same way.
-    """
     try:
         out = subprocess.run([cxx, "--version"], capture_output=True, text=True,
                              timeout=15)
@@ -105,7 +58,6 @@ def compiler_family(cxx: str) -> str:
 
 
 def pick_toolchain(explicit=None):
-    """Return (key, argv-prefix). The key names the row in the baseline."""
     if explicit:
         cxx = explicit
     else:
@@ -120,10 +72,6 @@ def pick_toolchain(explicit=None):
                     break
         if not cxx:
             return None, None
-        # clang-cl, not cl: the scaffold uses __builtin_bswap*,
-        # __builtin_return_address and __int128, none of which MSVC has.
-        # -ferror-limit=0: clang stops at 20 errors by default, which would
-        # silently cap the ratchet's counts and hide regressions above it.
         return "windows-clang-cl", [cxx, "/std:c++20", "/c", "/W0", "/EHsc",
                                     "/D_CRT_SECURE_NO_WARNINGS",
                                     "/clang:-ferror-limit=0"]
@@ -134,16 +82,11 @@ def pick_toolchain(explicit=None):
     osname = "darwin" if sys.platform == "darwin" else "linux"
     argv = [cxx, "-std=c++20", "-fsyntax-only", "-w"]
     if family == "clang":
-        argv.append("-ferror-limit=0")   # see the note above
+        argv.append("-ferror-limit=0")
     return f"{osname}-{family}", argv
 
 
 def count_errors(text: str) -> int:
-    """Diagnostic lines only.
-
-    Matching a bare "error" also caught clang's "1 error generated." trailer and
-    double-counted every file that failed, so the colon is load-bearing.
-    """
     return len(re.findall(r"(?m)^[^\n]*?\berror:", text))
 
 

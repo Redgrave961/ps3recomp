@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Exercise the actual loader syscall switch bodies and real memory allocator."""
 import os
 from pathlib import Path
 import subprocess

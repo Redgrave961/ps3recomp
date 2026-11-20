@@ -1,13 +1,4 @@
 #!/usr/bin/env python3
-"""The page-map store fast path never loses a lost-reservation event.
-
-A PPU thread stores to a line through the lifter's inline store (store, then
-recheck the page byte) while an SPU thread reserves that line for the first
-time through the real spu_coh_reserve (mark the page, set the line bit, flush
-every core's store buffer, then copy the line). Raced on a fresh page each
-round: the SPU's copy must hold the store, or the store must have ended the
-reservation with SPU_EVENT_LR. Never neither.
-"""
 from __future__ import annotations
 
 import importlib.util

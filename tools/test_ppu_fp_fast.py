@@ -1,11 +1,4 @@
 #!/usr/bin/env python3
-"""The single-check scalar FP helpers equal their reference definitions bit for bit.
-
-ppu_fp_bin / ppu_fmadd_core test only the result for NaN and ppu_f2i32 /
-ppu_f2i64 are one host conversion; each is compared against the
-operand-by-operand reference (PowerISA NaN priority, saturating conversion
-with nearbyint/trunc) over special and random values.
-"""
 from __future__ import annotations
 
 import importlib.util

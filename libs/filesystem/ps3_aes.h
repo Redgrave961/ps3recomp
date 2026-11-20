@@ -8,6 +8,10 @@
 
 #define PS3_AES_TARGET __attribute__((target("aes,sse4.1")))
 
+static inline uint16_t ps3_be16(const uint8_t* p) { return (uint16_t)(p[0] << 8 | p[1]); }
+static inline uint32_t ps3_be32(const uint8_t* p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
+static inline uint64_t ps3_be64(const uint8_t* p) { return (uint64_t)ps3_be32(p) << 32 | ps3_be32(p + 4); }
+
 typedef struct { __m128i e[15], d[15]; int rounds; } ps3_aes_key;
 
 #define PS3_AES_EXPAND(a, t) do { __m128i p_ = (a); p_ = _mm_xor_si128(p_, _mm_slli_si128(p_, 4)); \

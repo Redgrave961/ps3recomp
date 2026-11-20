@@ -1,14 +1,4 @@
 #!/usr/bin/env python3
-"""--insn-patches: a patched instruction is lifted in both forms behind its guard.
-
-1. Each patch becomes `if (guard) { <new> } else { <original> }`, the guard is
-   declared before the function, and the original's branch label survives.
-2. A patch whose `orig` is not the word in the input stops the lift (serial
-   and parallel: a worker must not hang the pool).
-3. A patch at an address no lifted function covers stops the lift.
-
-Run: python tools/test_ppu_lifter_insn_patches.py
-"""
 import json
 from pathlib import Path
 import subprocess
@@ -16,10 +6,10 @@ import sys
 import tempfile
 
 CODE = bytes.fromhex(
-    "2f830002"   # 0x10000 cmpwi cr7, r3, 2
-    "419d0008"   # 0x10004 bgt   cr7, 0x1000C
-    "38600002"   # 0x10008 li    r3, 2
-    "4e800020")  # 0x1000C blr
+    "2f830002"
+    "419d0008"
+    "38600002"
+    "4e800020")
 
 
 def lift(root, patches, jobs="1"):

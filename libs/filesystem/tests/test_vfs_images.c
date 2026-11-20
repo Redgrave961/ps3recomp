@@ -1,13 +1,3 @@
-/*
- * Mounts a PS3 ISO and PKGs and compares every file they serve, and the
- * decrypted EBOOT, against an extracted copy of the same files.
- *
- * Build:
- *   clang -std=gnu17 -O2 -I include libs/filesystem/tests/test_vfs_images.c \
- *         libs/filesystem/ps3_vfs.c libs/filesystem/ps3_self.c -o test_vfs_images
- * Run:
- *   test_vfs_images <iso> <extracted disc root> <extracted hdd0 game dir> <expected EBOOT.elf> <pkg>...
- */
 #include "../ps3_self.h"
 #include "../ps3_vfs.h"
 

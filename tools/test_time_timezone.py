@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Run deterministic POSIX timezone syscall tests without a game or GPU."""
 import os
 import platform
 import subprocess

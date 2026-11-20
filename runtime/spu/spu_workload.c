@@ -2,20 +2,16 @@
 #include <stdio.h>
 #include <string.h>
 
-/* ---- fingerprint ------------------------------------------------------- */
-
 uint64_t spu_workload_fingerprint(const void* data, size_t n)
 {
     const uint8_t* p = (const uint8_t*)data;
-    uint64_t h = 1469598103934665603ULL;          /* FNV offset basis */
+    uint64_t h = 1469598103934665603ULL;
     for (size_t i = 0; i < n; i++) {
         h ^= p[i];
-        h *= 1099511628211ULL;                     /* FNV prime */
+        h *= 1099511628211ULL;
     }
     return h;
 }
-
-/* ---- registry ---------------------------------------------------------- */
 
 #ifndef SPU_WORKLOAD_MAX
 #define SPU_WORKLOAD_MAX 256
@@ -26,8 +22,6 @@ typedef struct {
     spu_lifted_entry_fn fn;
     int                 image_id;
     const char*         name;
-    /* Masked registrations only (var_len != 0): the image is `size` bytes and
-     * its fingerprint takes [var_off, var_off + var_len) as zero. */
     uint32_t            size, var_off, var_len;
 } spu_workload_entry;
 
@@ -39,7 +33,7 @@ void spu_workload_register_img(uint64_t fingerprint, spu_lifted_entry_fn fn,
 {
     if (!fn) return;
     for (unsigned i = 0; i < s_registry_count; i++) {
-        if (s_registry[i].fp == fingerprint) {     /* idempotent on fingerprint */
+        if (s_registry[i].fp == fingerprint) {
             s_registry[i].fn       = fn;
             s_registry[i].image_id = image_id;
             s_registry[i].name     = name;
@@ -56,12 +50,6 @@ void spu_workload_register_img(uint64_t fingerprint, spu_lifted_entry_fn fn,
     s_registry[s_registry_count].image_id = image_id;
     s_registry[s_registry_count].name     = name;
     s_registry_count++;
-}
-
-void spu_workload_register(uint64_t fingerprint, spu_lifted_entry_fn fn,
-                           const char* name)
-{
-    spu_workload_register_img(fingerprint, fn, 0, name);
 }
 
 spu_lifted_entry_fn spu_workload_find(uint64_t fingerprint)
@@ -112,7 +100,6 @@ spu_lifted_entry_fn spu_workload_find_img_masked(const void* data, size_t n,
     for (unsigned i = 0; i < s_registry_count; i++) {
         const spu_workload_entry* e = &s_registry[i];
         if (!e->var_len || e->size != n) continue;
-        /* spu_workload_fingerprint() with the variable area read as zero. */
         uint64_t h = 1469598103934665603ULL;
         for (size_t k = 0; k < n; k++) {
             const uint8_t b = (k - e->var_off < e->var_len) ? 0 : p[k];
@@ -130,8 +117,6 @@ spu_lifted_entry_fn spu_workload_find_img_masked(const void* data, size_t n,
 
 unsigned spu_workload_count(void) { return s_registry_count; }
 
-/* ---- SPU ELF loader (32-bit big-endian) -------------------------------- */
-
 static uint16_t rd_be16(const uint8_t* p) { return (uint16_t)((p[0] << 8) | p[1]); }
 static uint32_t rd_be32(const uint8_t* p)
 {
@@ -142,10 +127,9 @@ int spu_elf_load_to_ls(const uint8_t* image, size_t image_size, uint8_t* ls, uin
 {
     if (!image || !ls || image_size < 0x34) return 0;
 
-    /* ELF ident: 0x7F 'E' 'L' 'F', ELFCLASS32 (1), ELFDATA2MSB (2). */
     if (!(image[0] == 0x7F && image[1] == 'E' && image[2] == 'L' && image[3] == 'F'))
         return 0;
-    if (image[4] != 1 /*ELFCLASS32*/ || image[5] != 2 /*ELFDATA2MSB*/)
+    if (image[4] != 1 || image[5] != 2)
         return 0;
 
     uint32_t e_entry     = rd_be32(image + 0x18);
@@ -160,13 +144,12 @@ int spu_elf_load_to_ls(const uint8_t* image, size_t image_size, uint8_t* ls, uin
         const uint8_t* ph = image + po;
 
         uint32_t p_type   = rd_be32(ph + 0x00);
-        if (p_type != 1 /*PT_LOAD*/) continue;
+        if (p_type != 1) continue;
         uint32_t p_offset = rd_be32(ph + 0x04);
         uint32_t p_vaddr  = rd_be32(ph + 0x08);
         uint32_t p_filesz = rd_be32(ph + 0x10);
         uint32_t p_memsz  = rd_be32(ph + 0x14);
 
-        /* bounds: segment must fit in local store and in the image */
         if ((uint64_t)p_vaddr + p_memsz > SPU_LS_SIZE)            return 0;
         if ((uint64_t)p_offset + p_filesz > image_size)          return 0;
 
@@ -183,7 +166,7 @@ size_t spu_elf_image_size(const uint8_t* image, size_t max_avail)
     if (!image || max_avail < 0x34) return 0;
     if (!(image[0] == 0x7F && image[1] == 'E' && image[2] == 'L' && image[3] == 'F'))
         return 0;
-    if (image[4] != 1 || image[5] != 2) return 0;     /* ELFCLASS32, ELFDATA2MSB */
+    if (image[4] != 1 || image[5] != 2) return 0;
 
     uint32_t e_phoff     = rd_be32(image + 0x1C);
     uint32_t e_shoff     = rd_be32(image + 0x20);
@@ -194,7 +177,7 @@ size_t spu_elf_image_size(const uint8_t* image, size_t max_avail)
 
     uint64_t end = (uint64_t)e_shoff + (uint64_t)e_shnum * e_shentsize;
 
-    for (uint16_t k = 0; k < e_phnum; k++) {           /* program headers */
+    for (uint16_t k = 0; k < e_phnum; k++) {
         size_t po = (size_t)e_phoff + (size_t)k * e_phentsize;
         if (po + 0x14 > max_avail) break;
         uint32_t p_offset = rd_be32(image + po + 0x04);
@@ -202,13 +185,13 @@ size_t spu_elf_image_size(const uint8_t* image, size_t max_avail)
         uint64_t e = (uint64_t)p_offset + p_filesz;
         if (e > end) end = e;
     }
-    for (uint16_t k = 0; k < e_shnum; k++) {           /* section headers */
+    for (uint16_t k = 0; k < e_shnum; k++) {
         size_t so = (size_t)e_shoff + (size_t)k * e_shentsize;
         if (so + 0x18 > max_avail) break;
         uint32_t sh_type   = rd_be32(image + so + 0x04);
         uint32_t sh_offset = rd_be32(image + so + 0x10);
         uint32_t sh_size   = rd_be32(image + so + 0x14);
-        if (sh_type != 8 /*SHT_NOBITS*/) {
+        if (sh_type != 8) {
             uint64_t e = (uint64_t)sh_offset + sh_size;
             if (e > end) end = e;
         }

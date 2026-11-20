@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""The PPU timebase and the lv2 timers read one monotonic host clock (host_monotonic_ns)."""
 import os
 import platform
 import subprocess

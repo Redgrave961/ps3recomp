@@ -1,17 +1,7 @@
-"""dwarf_common.py - minimal DWARF2 reader for PS3 debug builds.
-
-PS3 SDK (SNC / GCC ppu-lv2) debug builds emit DWARF v2, big-endian, 4-byte addresses.
-Just enough to walk the .debug_info DIE tree and pull attribute values; the line-number
-program (.debug_line) is a separate bytecode VM handled by its own tool.
-
-Verified: walks every compilation unit of a 23 MB .debug_info (Dungeon Siege III, 1138
-CUs) with zero form-length drift.
-"""
 from __future__ import annotations
 
 import struct
 
-# DWARF tags we care about.
 DW_TAG_compile_unit = 0x11
 DW_TAG_structure_type = 0x13
 DW_TAG_union_type = 0x17
@@ -26,18 +16,11 @@ DW_TAG_volatile_type = 0x35
 DW_TAG_array_type = 0x01
 DW_TAG_enumeration_type = 0x04
 
-# Attributes.
 DW_AT_name = 0x03
 DW_AT_byte_size = 0x0b
 DW_AT_type = 0x49
 DW_AT_data_member_location = 0x38
-DW_AT_low_pc = 0x11
-DW_AT_high_pc = 0x12
-DW_AT_declaration = 0x3c
-DW_AT_prototyped = 0x27
-DW_AT_comp_dir = 0x1b
 DW_AT_stmt_list = 0x10
-DW_AT_upper_bound = 0x2f
 
 
 def uleb(d: bytes, o: int) -> tuple[int, int]:
@@ -66,8 +49,6 @@ def cstr(d: bytes, o: int) -> tuple[str, int]:
 
 
 class DwarfInfo:
-    """Reader over (.debug_info, .debug_abbrev, .debug_str)."""
-
     def __init__(self, info: bytes, abbrev: bytes, dstr: bytes):
         self.info = info
         self.abbrev = abbrev
@@ -94,65 +75,57 @@ class DwarfInfo:
         return table
 
     def _read_form(self, o: int, form: int, addr_size: int, cu_base: int):
-        """Return (value, new_offset). Values: ints for numeric/ref forms (refs are
-        absolute .debug_info offsets), str for string forms, bytes for blocks."""
         d = self.info
-        if form == 0x01:                              # addr
+        if form == 0x01:
             fmt = ">I" if addr_size == 4 else ">Q"
             return struct.unpack_from(fmt, d, o)[0], o + addr_size
-        if form == 0x0b:                              # data1
+        if form == 0x0b:
             return d[o], o + 1
-        if form == 0x05:                              # data2
+        if form == 0x05:
             return struct.unpack_from(">H", d, o)[0], o + 2
-        if form == 0x06:                              # data4
+        if form == 0x06:
             return struct.unpack_from(">I", d, o)[0], o + 4
-        if form == 0x07:                              # data8
+        if form == 0x07:
             return struct.unpack_from(">Q", d, o)[0], o + 8
-        if form == 0x08:                              # string (inline)
+        if form == 0x08:
             return cstr(d, o)
-        if form == 0x0e:                              # strp
+        if form == 0x0e:
             so = struct.unpack_from(">I", d, o)[0]
             return cstr(self.dstr, so)[0], o + 4
-        if form == 0x0f:                              # udata
+        if form == 0x0f:
             return uleb(d, o)
-        if form == 0x0d:                              # sdata
+        if form == 0x0d:
             return sleb(d, o)
-        if form == 0x0c:                              # flag
+        if form == 0x0c:
             return d[o], o + 1
-        if form == 0x11:                              # ref1
+        if form == 0x11:
             return d[o] + cu_base, o + 1
-        if form == 0x12:                              # ref2
+        if form == 0x12:
             return struct.unpack_from(">H", d, o)[0] + cu_base, o + 2
-        if form == 0x13:                              # ref4
+        if form == 0x13:
             return struct.unpack_from(">I", d, o)[0] + cu_base, o + 4
-        if form == 0x14:                              # ref8
+        if form == 0x14:
             return struct.unpack_from(">Q", d, o)[0] + cu_base, o + 8
-        if form == 0x15:                              # ref_udata
+        if form == 0x15:
             v, o = uleb(d, o)
             return v + cu_base, o
-        if form == 0x10:                              # ref_addr
+        if form == 0x10:
             return struct.unpack_from(">I", d, o)[0], o + 4
-        if form == 0x0a:                              # block1
+        if form == 0x0a:
             n = d[o]
             return d[o + 1:o + 1 + n], o + 1 + n
-        if form == 0x03:                              # block2
+        if form == 0x03:
             n = struct.unpack_from(">H", d, o)[0]
             return d[o + 2:o + 2 + n], o + 2 + n
-        if form == 0x04:                              # block4
+        if form == 0x04:
             n = struct.unpack_from(">I", d, o)[0]
             return d[o + 4:o + 4 + n], o + 4 + n
-        if form == 0x09:                              # block (exprloc)
+        if form == 0x09:
             n, o = uleb(d, o)
             return d[o:o + n], o + n
         raise ValueError(f"unhandled DWARF form 0x{form:x}")
 
     def dies(self):
-        """Yield (offset, tag, attrs_dict, depth) for every DIE across all CUs.
-
-        depth increases for a DIE's children and decreases at each sibling-chain
-        terminator, so a struct's members are exactly the depth+1 DW_TAG_member DIEs
-        that follow it before depth returns to the struct's level.
-        """
         info = self.info
         o = 0
         while o < len(info):
@@ -182,7 +155,6 @@ class DwarfInfo:
 
 
 def open_dwarf(elf) -> DwarfInfo | None:
-    """Build a DwarfInfo from a loaded elf_parser.ELFFile, or None if no DWARF."""
     sec = {s.name_str: i for i, s in enumerate(elf.section_headers) if s.name_str}
     if ".debug_info" not in sec or ".debug_abbrev" not in sec:
         return None

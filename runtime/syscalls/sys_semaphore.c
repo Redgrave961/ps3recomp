@@ -1,7 +1,3 @@
-/*
- * ps3recomp - Semaphore syscalls (implementation)
- */
-
 #include "sys_semaphore.h"
 #include "sys_ppu_thread.h"
 #include "../memory/vm.h"

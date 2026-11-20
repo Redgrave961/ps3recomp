@@ -1,28 +1,9 @@
-/*
- * ps3recomp - cellFs read after write, and write after read, on one fd
- * (ppu_fs.cpp).
- *
- * ppu_fs.cpp keeps each file as a stdio stream. C leaves a read right after a
- * write (with no flush or seek between them) undefined, and the same for a
- * write right after a read; cellFs has no such rule. FIOS creates its HDD
- * cache index, writes a 512-byte header and reads on: on the MSVC CRT the read
- * returned 3584 bytes of stale buffer and the header never reached the file.
- * This fixture drives cellFsOpen / cellFsWrite / cellFsRead / cellFsFstat /
- * cellFsLseek through that sequence and checks what the guest and the host
- * file see. The undefined case shows on the MSVC CRT; other C libraries may
- * pass either way.
- *
- *   tools/test_ppu_fs_rw_switch.py [--exe-out PATH]
- *   test_fs_rw_switch [DIR]      (DIR: where the test file goes; default the
- *                                 system temp directory)
- */
 #include "../../../libs/filesystem/ps3_vfs.c"
 #include "ppu_fs.cpp"
 #ifdef _WIN32
 #  include <windows.h>
 #endif
 
-/* ---- link stubs: nothing on the paths this test drives calls them ---- */
 extern "C" {
 uint8_t* vm_base = nullptr;
 uint32_t ppu_vm_size = 0;
@@ -37,7 +18,6 @@ void sys_fs_translate_path(const char* g, char* h, int n)
 }
 void ps3_hle_register_ctx(uint32_t, const char*, void (*)(ppu_context*)) {}
 }
-/* ps3_dev_flash_path (runtime/platform), which host_path calls for /dev_flash: the real one, it needs nothing. */
 #include "../../platform/ps3_dev_flash.c"
 #include "../../../libs/filesystem/npdrm.h"
 int npdrm_is_npd(ps3_vfile* f) { (void)f; return 0; }
@@ -53,9 +33,8 @@ static int fails = 0;
 #define CHECK(c, ...) do { printf((c) ? "[PASS] " : "[FAIL] "); printf(__VA_ARGS__); printf("\n"); \
                            if (!(c)) fails++; } while (0)
 
-/* Guest memory layout used below. */
 enum : uint32_t { PATH = 0x100, FDP = 0x500, NP = 0x508, POSP = 0x510, STATB = 0x600,
-                  WBUF = 0x1000, RBUF = 0x2000 /* 64 KB read buffer */ };
+                  WBUF = 0x1000, RBUF = 0x2000 };
 
 static uint64_t fs_write(uint32_t fd, uint32_t buf, uint64_t n)
 {
@@ -74,7 +53,7 @@ static uint64_t fs_read(uint32_t fd, uint32_t buf, uint64_t n)
 static uint64_t fs_seek(uint32_t fd, int64_t off)
 {
     ppu_context ctx; memset(&ctx, 0, sizeof ctx);
-    ctx.gpr[3] = fd; ctx.gpr[4] = (uint64_t)off; ctx.gpr[5] = 0 /* SET */; ctx.gpr[6] = POSP;
+    ctx.gpr[3] = fd; ctx.gpr[4] = (uint64_t)off; ctx.gpr[5] = 0; ctx.gpr[6] = POSP;
     cellFsLseek(&ctx);
     return rd64(POSP);
 }
@@ -106,7 +85,6 @@ int main(int argc, char** argv)
     ppu_vfs_root = dir;
     strcpy((char*)mem + PATH, "/dev_hdd1/ps3recomp_fs_rw_switch.idx");
 
-    /* FIOS's open: O_RDWR | O_CREAT on a file that does not exist yet. */
     ppu_context ctx; memset(&ctx, 0, sizeof ctx);
     ctx.gpr[3] = PATH; ctx.gpr[4] = 0x42; ctx.gpr[5] = FDP;
     cellFsOpen(&ctx);
@@ -114,10 +92,6 @@ int main(int argc, char** argv)
     CHECK((uint32_t)ctx.gpr[3] == 0, "cellFsOpen(O_RDWR|O_CREAT) returns CELL_OK (fd %u)", fd);
     if ((uint32_t)ctx.gpr[3] != 0) { printf("FAIL (could not create %s)\n", host); return 1; }
 
-    /* Write a 512-byte header, then read straight on: the file ends at the
-     * header, so the read finds nothing and the header stays written. */
-    /* CHECK evaluates its condition twice: every call that moves the file
-     * runs once, before it. */
     memset(mem + WBUF, 0xAB, 512);
     const uint64_t wrote = fs_write(fd, WBUF, 512);
     CHECK(wrote == 512, "cellFsWrite writes the 512-byte header (%llu)", (unsigned long long)wrote);
@@ -128,8 +102,6 @@ int main(int argc, char** argv)
     const uint64_t size = fs_size(fd);
     CHECK(size == 512, "cellFsFstat after the read: size %llu (want 512)", (unsigned long long)size);
 
-    /* Read the header back, then write right after the read: the write lands
-     * where the read stopped. */
     const uint64_t pos = fs_seek(fd, 0);
     CHECK(pos == 0, "cellFsLseek back to 0");
     const uint64_t back = fs_read(fd, RBUF, 16);
@@ -141,7 +113,6 @@ int main(int argc, char** argv)
     memset(&ctx, 0, sizeof ctx); ctx.gpr[3] = fd;
     cellFsClose(&ctx);
 
-    /* What reached the host file. */
     uint8_t disk[600]; size_t dn = 0;
     if (FILE* f = fopen(host, "rb")) { dn = fread(disk, 1, sizeof disk, f); fclose(f); }
     CHECK(dn == 512, "host file is %zu bytes (want 512)", dn);

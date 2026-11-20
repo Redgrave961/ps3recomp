@@ -1,24 +1,11 @@
-/*
- * prx_loader.c — see prx_loader.h for the design.
- *
- * Two steps per module: place the relocated image into guest RAM at its load
- * base, then register every lifted function in the host dispatch table.
- */
 #include "prx_loader.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-/* The runtime's guest memory: host_ptr = vm_base + guest_addr. Declared by
- * runtime/memory/vm.h; we only need the symbol, so extern it directly to keep
- * the loader independent of the memory backend's init path. */
 extern uint8_t* vm_base;
 
-/* ---- export registry ---------------------------------------------------- *
- * Flat NID -> guest-address table, filled as modules load. A handful of system
- * PRXs export a few hundred symbols total, so a linear array with linear lookup
- * is plenty (lookups happen once per import resolution, not per call). */
 typedef struct { uint32_t nid; uint32_t guest_addr; } prx_export_reg_entry;
 #define PRX_EXPORT_REG_CAP 2048
 static prx_export_reg_entry s_export_reg[PRX_EXPORT_REG_CAP];
@@ -26,8 +13,6 @@ static uint32_t             s_export_reg_n = 0;
 
 static void prx_export_register(uint32_t nid, uint32_t guest_addr)
 {
-    /* Last writer wins if two modules export the same NID (matches the PS3
-     * loader's link order). Overwrite an existing entry rather than duplicate. */
     for (uint32_t i = 0; i < s_export_reg_n; i++) {
         if (s_export_reg[i].nid == nid) {
             s_export_reg[i].guest_addr = guest_addr;
@@ -68,16 +53,8 @@ prx_load_result prx_load_module(const prx_module* m, prx_register_fn reg)
     r.base       = m->base;
     r.image_size = m->image_size;
 
-    /* Step A — place the relocated image into guest RAM at the load base.
-     * The bytes already carry base-applied addresses (prx_relocate.py), so the
-     * module's data, OPDs and pointer tables are immediately consistent with
-     * the lifted code and the OPD-walking dispatcher. */
     memcpy(vm_base + m->base, m->image, m->image_size);
 
-    /* Step B — register every lifted function at its guest address. The lift
-     * baked the load base in (--base B), so e->addr is already B + offset and
-     * needs no adjustment here. A null host function (rare: a table hole) is
-     * skipped rather than registered. */
     if (reg) {
         for (uint64_t i = 0; i < m->func_count; i++) {
             const prx_func_entry* e = &m->funcs[i];
@@ -88,9 +65,6 @@ prx_load_result prx_load_module(const prx_module* m, prx_register_fn reg)
         }
     }
 
-    /* Step C — publish exports as NID -> (base + vaddr) so a title's import
-     * resolver can dispatch into this module by NID. Function exports point at
-     * an OPD in the freshly-placed image; ps3_indirect_call walks it. */
     uint32_t exports_published = 0;
     if (m->exports) {
         for (uint32_t i = 0; i < m->export_count; i++) {

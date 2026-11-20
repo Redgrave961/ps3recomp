@@ -1,6 +1,3 @@
-/* One literal per module error base, so a base cannot drift unnoticed again. Each value is the console's (SDK
- * headers), not derived from the macros under test: CELL_ERROR_BASE_GCM was 0x80210700 and every CELL_GCM_ERROR_* came
- * out 0x802107xx. */
 #include <stdio.h>
 #include <stdlib.h>
 #include "ps3emu/error_codes.h"

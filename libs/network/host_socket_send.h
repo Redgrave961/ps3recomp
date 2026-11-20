@@ -1,6 +1,3 @@
-/* Host-only send flag: a broken peer is an I/O error, not a process signal.
- * Darwin and Linux expose MSG_NOSIGNAL. Winsock has no SIGPIPE. This flag
- * does not alter the process signal handler/mask or a socket's options. */
 #ifndef PS3RECOMP_HOST_SOCKET_SEND_H
 #define PS3RECOMP_HOST_SOCKET_SEND_H
 

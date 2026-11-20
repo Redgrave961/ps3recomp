@@ -1,26 +1,10 @@
 #!/usr/bin/env python3
-"""Self-check: a relift rewrites only the source chunks whose content changed.
-
-Drives the lifter's output stage (PPULifter.write_source_files) on 200
-synthetic functions with uneven guest sizes:
-
-1. The default line-count mode (--chunk-lines): an identical relift leaves
-   every file untouched (content and mtime).
-2. --chunks N writes N chunk files plus <base>_table.cpp; every function is
-   defined exactly once and the table lists all of them.
-3. A relift with one function's body changed rewrites exactly the chunk that
-   holds it; every other file keeps its content and its mtime.
-4. Chunk membership depends on the guest addresses only: the same functions
-   with longer C bodies land in the same files (a line-count cut would move).
-
-Run: python tools/test_ppu_lifter_chunks.py
-"""
 import os
 import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from ppu_lifter import LiftedFunction, PPULifter  # noqa: E402
+from ppu_lifter import LiftedFunction, PPULifter
 
 N_FUNCS = 200
 N_CHUNKS = 8
@@ -30,7 +14,7 @@ def make_lifter(bodies=None, long=False):
     lf = PPULifter()
     addr = 0x10000
     for i in range(N_FUNCS):
-        size = 0x20 + (i % 7) * 0x40   # uneven guest sizes, as in a real image
+        size = 0x20 + (i % 7) * 0x40
         body = [f"ctx->gpr[3] = {i};"]
         if long:
             body += [f"ctx->gpr[{k}] = 0;" for k in range(4, 20)]
@@ -43,8 +27,6 @@ def make_lifter(bodies=None, long=False):
 
 
 def age(out):
-    """Backdate every file, so a rewrite shows in the mtime even when it lands
-    within the file system's timestamp granularity."""
     for f in os.listdir(out):
         os.utime(os.path.join(out, f), ns=(10**18, 10**18))
 
@@ -71,7 +53,6 @@ def main() -> int:
         print(("ok   " if cond else "FAIL ") + what)
         ok = ok and bool(cond)
 
-    # Default (line-count) mode: an identical relift writes nothing.
     with tempfile.TemporaryDirectory() as out:
         make_lifter().write_source_files(out, base="ppu_recomp", max_lines=400)
         age(out)
@@ -99,7 +80,6 @@ def main() -> int:
         check(all(f.name in table for f in lf.functions), "table lists every function")
         check(sorted(os.path.basename(p) for p in paths) == sorted(s1), "returned paths are the files on disk")
 
-        # Relift with one body changed: one chunk rewritten, the rest untouched.
         target = chunk_of(s1, lf.functions[120].name)
         make_lifter(bodies={120: ["ctx->gpr[3] = 999;", "ctx->gpr[4] = 1;"]}).write_source_files(
             out, base="ppu_recomp", chunks=N_CHUNKS)
@@ -107,7 +87,6 @@ def main() -> int:
         changed = [f for f in s2 if s2[f] != s1.get(f)]
         check(changed == target, f"one body change rewrites only its chunk: changed={changed}, expected={target}")
 
-    # Stability: longer bodies everywhere, same chunk membership.
     with tempfile.TemporaryDirectory() as out:
         make_lifter(long=True).write_source_files(out, base="ppu_recomp", chunks=N_CHUNKS)
         s3 = snapshot(out)

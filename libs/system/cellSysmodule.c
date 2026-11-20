@@ -1,18 +1,6 @@
-/*
- * ps3recomp - cellSysmodule HLE stub implementation
- */
-
 #include "cellSysmodule.h"
 #include <stdio.h>
 
-/* ---------------------------------------------------------------------------
- * Internal state
- * -----------------------------------------------------------------------*/
-
-/* Track which modules have been "loaded". IDs come in two ranges: 0x00xx
- * (core) and 0xF0xx (extended: NP_TROPHY=0xF035, GIFDEC=0xF010, ...). The old
- * `id >= MAX_ID -> ERROR_UNKNOWN` check rejected every 0xF0xx load — LBP's
- * trophy-module load failed at boot. Map both ranges into one table. */
 static int s_module_loaded[2 * CELL_SYSMODULE_MAX_ID];
 static int sysmodule_slot(u16 id)
 {
@@ -75,12 +63,6 @@ static const char* sysmodule_id_to_name(u16 id)
     }
 }
 
-/* ---------------------------------------------------------------------------
- * API implementations
- * -----------------------------------------------------------------------*/
-
-/* NID: 0x26A6E12B */
-/* NID: 0x63FF6FF9 -- library init/teardown are no-ops in HLE. */
 s32 cellSysmoduleInitialize(void) { return CELL_OK; }
 
 s32 cellSysmoduleLoadModule(u16 id)
@@ -93,13 +75,12 @@ s32 cellSysmoduleLoadModule(u16 id)
         return CELL_SYSMODULE_ERROR_UNKNOWN;
 
     if (s_module_loaded[slot])
-        return CELL_OK;  /* Already loaded — return success (some games treat DUPLICATED as fatal) */
+        return CELL_OK;
 
     s_module_loaded[slot] = 1;
     return CELL_OK;
 }
 
-/* NID: 0x112A5EE9 */
 s32 cellSysmoduleUnloadModule(u16 id)
 {
     printf("[cellSysmodule] UnloadModule(id=0x%04X '%s')\n",
@@ -115,4 +96,3 @@ s32 cellSysmoduleUnloadModule(u16 id)
     s_module_loaded[slot] = 0;
     return CELL_OK;
 }
-

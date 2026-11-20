@@ -1,9 +1,4 @@
 #!/usr/bin/env python3
-"""Real GET discovery, residency/code epochs, list stalls and publication.
-
-Only temporary source copies acquire counters/publication observation points.
---output-dir retains the exact compiled binaries, argv and output for review.
-"""
 import argparse,json,os,pathlib,subprocess,tempfile
 if os.name == 'nt':
     print('SKIP: standalone runtime fixture requires a POSIX compiler')

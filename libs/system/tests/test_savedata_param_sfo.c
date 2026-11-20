@@ -1,20 +1,3 @@
-/*
- * test_savedata_param_sfo - cellSaveData's PARAM.SFO is a binary PSF.
- *
- * A save's PARAM.SFO has to be a PSF 1.1 file (layout: the PS3 developer wiki's
- * "PARAM.SFO" page) or RPCS3 and a PS3 reject the save. The HLE used to write a
- * ~100-byte "TITLE=..." text file. This test
- *   - writes a save's PARAM.SFO and checks it with a PSF reader that shares no
- *     code with the writer: magic and version, table offsets, alphabetical keys,
- *     4-byte alignment, formats, len/max_len and every value;
- *   - reads it back through read_param_sfo;
- *   - reads an old text-format file (existing saves must keep loading) and
- *     checks that the next write turns it into a PSF;
- *   - feeds a PSF whose last key has no terminating NUL inside the buffer to
- *     the parser, with the buffer ending at a PROT_NONE page (POSIX only).
- *
- *   cc -std=gnu17 -I include -o test_savedata_param_sfo libs/system/tests/test_savedata_param_sfo.c
- */
 #include "../cellSaveData.c"
 
 #include <assert.h>
@@ -33,7 +16,6 @@ void spu_lockline_unlock(uint32_t a) { (void)a; }
 ps3_guest_caller_fn g_ps3_guest_caller;
 void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*)) { (void)nid; (void)name; (void)fn; }
 
-/* ---- an independent PSF reader (little-endian fields read byte by byte) ---- */
 static uint32_t le16(const uint8_t* p) { return p[0] | (uint32_t)p[1] << 8; }
 static uint32_t le32(const uint8_t* p) { return le16(p) | le16(p + 2) << 16; }
 
@@ -44,15 +26,14 @@ static const char* const WANT_KEYS[] = {
     "SAVEDATA_DIRECTORY", "SAVEDATA_LIST_PARAM", "SUB_TITLE", "TITLE" };
 #define N_KEYS (sizeof WANT_KEYS / sizeof WANT_KEYS[0])
 
-/* Validates the structure and fills e[] (N_KEYS entries). */
 static void read_psf(const uint8_t* b, size_t size, entry_t* e)
 {
     assert(size >= 0x14);
     assert(b[0] == 0 && b[1] == 'P' && b[2] == 'S' && b[3] == 'F');
-    assert(b[4] == 1 && b[5] == 1 && b[6] == 0 && b[7] == 0);        /* version 1.1 */
+    assert(b[4] == 1 && b[5] == 1 && b[6] == 0 && b[7] == 0);
     uint32_t kt = le32(b + 8), dt = le32(b + 12), n = le32(b + 16);
     assert(n == N_KEYS);
-    assert(kt == 0x14 + 16 * n);                                      /* key table right after the index */
+    assert(kt == 0x14 + 16 * n);
     assert(dt % 4 == 0 && dt > kt);
     const char* prev = "";
     uint32_t total = dt;
@@ -64,7 +45,7 @@ static void read_psf(const uint8_t* b, size_t size, entry_t* e)
         e[i].max_len = le32(x + 8);
         e[i].data = b + dt + le32(x + 12);
         assert(kt + le16(x) < dt);
-        assert(i == 0 || strcmp(prev, e[i].key) < 0);                 /* alphabetical */
+        assert(i == 0 || strcmp(prev, e[i].key) < 0);
         assert(strcmp(e[i].key, WANT_KEYS[i]) == 0);
         assert(e[i].max_len % 4 == 0 && e[i].len <= e[i].max_len);
         assert(le32(x + 12) + e[i].max_len <= size - dt);
@@ -77,7 +58,7 @@ static void read_psf(const uint8_t* b, size_t size, entry_t* e)
 static void check_text(const entry_t* e, const char* key, uint32_t max_len, const char* value)
 {
     assert(strcmp(e->key, key) == 0);
-    assert(e->fmt == 0x0204 && e->max_len == max_len);                /* utf8, NUL counted in len */
+    assert(e->fmt == 0x0204 && e->max_len == max_len);
     assert(e->len == strlen(value) + 1 && e->data[e->len - 1] == 0);
     assert(memcmp(e->data, value, e->len) == 0);
 }
@@ -122,7 +103,6 @@ int main(void)
     strcpy(p.listParam, "CONFIG");
     write_param_sfo(dir, &p);
 
-    /* the file the writer produced is a PSF with the game-save field set */
     static uint8_t raw[8192];
     size_t size = slurp(sfo, raw, sizeof raw);
     entry_t e[N_KEYS];
@@ -139,7 +119,6 @@ int main(void)
     check_text(&e[9], "SUB_TITLE", 128, "Chapter 2 \xC3\xA9");
     check_text(&e[10], "TITLE", 128, "Test Game");
 
-    /* and read_param_sfo returns what was written */
     CellSaveDataSystemFileParam q;
     memset(&q, 0, sizeof q);
     read_param_sfo(dir, &q);
@@ -147,7 +126,6 @@ int main(void)
     assert(strcmp(q.detail, p.detail) == 0 && strcmp(q.listParam, p.listParam) == 0);
     assert(q.attribute == 0x20);
 
-    /* text longer than the field is cut to max_len - 1 and keeps its NUL */
     memset(p.title, 'T', 127); p.title[127] = 0;
     memset(p.listParam, 'L', 7); p.listParam[7] = 0;
     write_param_sfo(dir, &p);
@@ -155,7 +133,6 @@ int main(void)
     read_psf(raw, size, e);
     assert(e[10].len == 128 && e[8].len == 8);
 
-    /* a save written by an earlier build is the old text file: it still loads... */
     FILE* f = fopen(sfo, "wb");
     assert(f);
     fputs("TITLE=Old T\nSUB_TITLE=Old S\nDETAIL=Old D\nATTRIBUTE=5\nLIST_PARAM=LP\n", f);
@@ -164,14 +141,11 @@ int main(void)
     read_param_sfo(dir, &q);
     assert(strcmp(q.title, "Old T") == 0 && strcmp(q.subTitle, "Old S") == 0);
     assert(strcmp(q.detail, "Old D") == 0 && strcmp(q.listParam, "LP") == 0 && q.attribute == 5);
-    /* ...and the next save rewrites it as a PSF */
     write_param_sfo(dir, &q);
     size = slurp(sfo, raw, sizeof raw);
     read_psf(raw, size, e);
     check_text(&e[10], "TITLE", 128, "Old T");
 
-    /* a corrupt PSF must not make the parser run off its buffer: move the key table to the last three bytes of the
-     * file, so the first key ("TIT") has no NUL inside the buffer, and place the buffer against a PROT_NONE page */
 #ifdef PS3_PSF_H
     {
         size_t n = size;

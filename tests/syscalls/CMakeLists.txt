@@ -1,20 +1,3 @@
-# ps3recomp - tests/syscalls
-#
-# Focused unit tests for the pure logic of individual lv2 syscall handlers.
-# The first one is syscall 14's address/flags classification: split into
-# runtime/syscalls/lv2_lock_line.c precisely so this test can link one
-# translation unit instead of the whole syscall layer.
-#
-# Standalone project: its OWN build dir, never the runtime's build tree.
-#
-# Build on Linux / macOS:
-#
-#   cmake -S tests/syscalls -B tests/syscalls/build -G Ninja && ninja -C tests/syscalls/build
-#
-# Run:
-#
-#   ./tests/syscalls/build/test_lock_line
-#
 cmake_minimum_required(VERSION 3.20)
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     project(syscall_tests LANGUAGES C)
@@ -49,13 +32,12 @@ set_tests_properties(lock_line PROPERTIES
     TIMEOUT 30
 )
 
-# The raw filesystem syscalls (open flags, seek, mkdir/unlink/rmdir codes,
-# readdir, fd-table limits and concurrency) against real files in a temporary
-# directory. Links sys_fs.c alone.
 add_executable(test_sys_fs
     test_sys_fs.c
     "${PS3RECOMP_ROOT}/runtime/syscalls/sys_fs.c"
     "${PS3RECOMP_ROOT}/runtime/platform/ps3_dev_flash.c"
+    "${PS3RECOMP_ROOT}/runtime/memory/vm_track.c"
+    "${PS3RECOMP_ROOT}/libs/filesystem/ps3_vfs.c"
 )
 target_include_directories(test_sys_fs PRIVATE
     "${PS3RECOMP_ROOT}/runtime/syscalls"
@@ -78,8 +60,6 @@ set_tests_properties(sys_fs PROPERTIES
     TIMEOUT 60
 )
 
-# sys_ppu_thread_join / detach through the real sys_ppu_thread.c with host
-# threads: the slot a join frees stays free (Windows), self-join, second joiner.
 add_executable(test_ppu_thread_join test_ppu_thread_join.c
     "${PS3RECOMP_ROOT}/runtime/platform/ps3_sync.c"
 )

@@ -1,16 +1,4 @@
 #!/usr/bin/env python3
-"""sys_lwmutex_create / sys_lwmutex_trylock in the context-style HLE (runtime/ppu/ppu_sysprx.cpp).
-
-Builds the real lwmutex handlers (the block pulled verbatim out of
-ppu_sysprx.cpp) with the real park/wait layer (runtime/platform/ps3_sync.c)
-into a small host program over guest memory, and checks:
-  - sys_lwmutex_t.attribute (+0x08) is protocol | recursive, both words of
-    sys_lwmutex_attribute_t, not the protocol alone;
-  - a trylock of a lwmutex another thread holds answers CELL_EBUSY (0x8001000A),
-    not 0x8001000B, which is CELL_ETIMEDOUT;
-  - a free lwmutex is taken (recursive_count stays 0), and the owner's trylock
-    nests (recursive_count 1), as lv2's sys_lwmutex_t counts extra levels.
-"""
 import os
 import re
 import shutil

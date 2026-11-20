@@ -1,11 +1,4 @@
 #!/usr/bin/env python3
-"""lift_jobmods.py lifts each WWS job module at the link base its header names (+0x28).
-
-Resistance: Fall of Man ships job modules linked at LS 0x7000 next to the usual
-0x4000 ones; lifted at 0x4000, every function and branch target of those was
-0x3000 short of where the job manager runs them. Synthetic modules only: a
-header, a call and two returns.
-"""
 import json
 import os
 import re
@@ -17,29 +10,29 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
-import lift_jobmods  # noqa: E402
+import lift_jobmods
 
 BASE = lift_jobmods.BASE
 
 NOP, BI_R0 = 0x40200000, 0x35000000
-BRSL_R0_4 = (0x066 << 23) | (4 << 7)        # brsl $0, +4 words: +0x30 -> +0x40
+BRSL_R0_4 = (0x066 << 23) | (4 << 7)
 
 
 def module(base_word, magic=0xC0DEC0DE):
-    hdr = struct.pack(">4I", NOP, NOP, NOP, NOP)              # the four ila slots
-    hdr += struct.pack(">4I", 0x30, 0x60, 0, 0x40)          # entry offset, size
-    hdr += struct.pack(">4I", magic, 4, base_word, 4)       # magic, ., link base, .
+    hdr = struct.pack(">4I", NOP, NOP, NOP, NOP)
+    hdr += struct.pack(">4I", 0x30, 0x60, 0, 0x40)
+    hdr += struct.pack(">4I", magic, 4, base_word, 4)
     code = struct.pack(">8I", BRSL_R0_4, BI_R0, NOP, NOP, NOP, BI_R0, 0, 0)
     return hdr + code
 
 
-CASES = {                      # sha -> (header base word, magic, expected lift base)
+CASES = {
     "aaaaaaaaaaaa": (0x7000, 0xC0DEC0DE, 0x7000),
     "bbbbbbbbbbbb": (0x4000, 0xC0DEC0DE, 0x4000),
-    "cccccccccccc": (0, 0xC0DEC0DE, BASE),          # no base: the job code buffer
-    "dddddddddddd": (0x7004, 0xC0DEC0DE, BASE),     # unaligned
-    "eeeeeeeeeeee": (0x3FFF0, 0xC0DEC0DE, BASE),    # would run past local store
-    "ffffffffffff": (0x7000, 0x12345678, BASE),     # not a WWS module header
+    "cccccccccccc": (0, 0xC0DEC0DE, BASE),
+    "dddddddddddd": (0x7004, 0xC0DEC0DE, BASE),
+    "eeeeeeeeeeee": (0x3FFF0, 0xC0DEC0DE, BASE),
+    "ffffffffffff": (0x7000, 0x12345678, BASE),
 }
 
 

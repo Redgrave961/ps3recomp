@@ -1,13 +1,3 @@
-/* x86 (SSE4.1/AVX2) SPU helpers vs their scalar spu_X_ref, on random and edge inputs.
- *
- *   clang -O2 -mavx2 -Iruntime/spu -Iruntime -Iinclude \
- *         runtime/spu/tests/test_spu_int_x86.c -o test_spu_int_x86 && ./test_spu_int_x86
- *
- * With -msse4.1 in place of -mavx2 it checks the SSE4.1-only set (the variable shifts are
- * then their own references).
- *
- * The generate-controls (spu_cbd_pos & co.) lost their byte loops on every host; they are
- * checked here against those loops, kept below as the reference. */
 #include "spu_helpers.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,7 +8,6 @@
 
 static uint64_t s_rng = 0x9E3779B97F4A7C15ull;
 static uint32_t rnd(void) { s_rng ^= s_rng << 13; s_rng ^= s_rng >> 7; s_rng ^= s_rng << 17; return (uint32_t)s_rng; }
-/* Mostly random words, with the small and boundary values shifts and compares care about. */
 static uint32_t rword(void) {
     static const uint32_t edge[] = {0, 1, 2, 3, 7, 8, 15, 16, 17, 31, 32, 33, 63, 64, 0x7F, 0x80, 0xFF,
                                     0x7FFF, 0x8000, 0xFFFF, 0x10000, 0x7FFFFFFF, 0x80000000u, 0xFFFFFFFFu,
@@ -39,7 +28,6 @@ static void cmp(const char* name, u128 got, u128 want, u128 a, u128 b, u128 c, i
                got._u32[0], got._u32[1], got._u32[2], got._u32[3], want._u32[0], want._u32[1], want._u32[2], want._u32[3]);
 }
 
-/* The loops the generate-controls had. */
 static u128 ref_cbd_pos(int pos) { u128 r; for (int t = 0; t < 16; t++) r._u8[SPU_W(t)] = (uint8_t)(0x10 + t);
     r._u8[SPU_W(pos & 0xF)] = 0x03; return r; }
 static u128 ref_chd_pos(int pos) { u128 r; for (int t = 0; t < 16; t++) r._u8[SPU_W(t)] = (uint8_t)(0x10 + t);

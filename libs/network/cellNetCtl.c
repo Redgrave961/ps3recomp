@@ -1,21 +1,11 @@
-/*
- * ps3recomp - cellNetCtl HLE implementation
- *
- * Provides network control state and info queries.  Returns sensible
- * defaults so that games see an active wired network connection.
- */
-
 #include "cellNetCtl.h"
-#include "cellSysutil.h"   /* cellSysutilQueueEvent, CELL_SYSUTIL_MAX_CALLBACKS */
-#include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_write32 (guest mem) */
-#include "ps3emu/endian.h" /* ps3_bswap32 -- CellNetCtlInfo/NatInfo integer fields are guest big-endian */
+#include "cellSysutil.h"
+#include "../../runtime/ppu/ppu_memory.h"
+#include "ps3emu/endian.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
-
-/* The generic HLE adapter passes GUEST addresses for pointer args; translate to
- * a host pointer (struct out-params) or write scalars big-endian via vm_write32. */
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -28,18 +18,8 @@
 #include <ifaddrs.h>
 #endif
 
-/* ---------------------------------------------------------------------------
- * Internal state
- * -----------------------------------------------------------------------*/
-
 static int s_netctl_initialized = 0;
 
-/* Offline by default: titles gate their whole online boot path on this state
- * and hang waiting on PSN jobs that can never complete if we claim a live
- * connection. A real console with no link reports Disconnected and games take
- * their offline path (verified against LBP's working RPCS3 boot, where
- * GetState never reported a connection). PS3_NET_ONLINE=1 restores the old
- * fake-connected behaviour for online experiments. */
 static int netctl_online(void)
 {
     static int v = -1;
@@ -55,7 +35,6 @@ typedef struct {
 
 static NetCtlHandlerSlot s_handlers[CELL_NET_CTL_HANDLER_MAX];
 
-/* Try to get the host machine's IP address */
 static int netctl_get_host_ip(char* buf, size_t buflen)
 {
 #ifdef _WIN32
@@ -88,7 +67,6 @@ static int netctl_get_host_ip(char* buf, size_t buflen)
         snprintf(buf, buflen, "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
     }
     freeaddrinfo(res);
-    /* Don't WSACleanup here -- we may need it later */
     return 1;
 #else
     char hostname[256];
@@ -119,10 +97,6 @@ fallback:
     snprintf(buf, buflen, "192.168.1.100");
     return 0;
 }
-
-/* ---------------------------------------------------------------------------
- * API implementations
- * -----------------------------------------------------------------------*/
 
 s32 cellNetCtlInit(void)
 {
@@ -228,15 +202,15 @@ s32 cellNetCtlGetInfo(s32 code, CellNetCtlInfo* info)
         break;
 
     case CELL_NET_CTL_INFO_IP_CONFIG:
-        info->ip_config = 0; /* DHCP */
+        info->ip_config = 0;
         break;
 
     case CELL_NET_CTL_INFO_HTTP_PROXY_CONFIG:
-        info->http_proxy_config = 0; /* disabled */
+        info->http_proxy_config = 0;
         break;
 
     case CELL_NET_CTL_INFO_UPNP_CONFIG:
-        info->upnp_config = ps3_bswap32(1u); /* enabled */
+        info->upnp_config = ps3_bswap32(1u);
         break;
 
     default:
@@ -261,7 +235,7 @@ s32 cellNetCtlAddHandler(cellNetCtlHandler handler, void* arg, s32* hid)
             s_handlers[i].in_use  = 1;
             s_handlers[i].handler = handler;
             s_handlers[i].arg     = arg;
-            vm_write32((uint32_t)(uintptr_t)hid, (uint32_t)i);   /* guest out-param */
+            vm_write32((uint32_t)(uintptr_t)hid, (uint32_t)i);
             printf("[cellNetCtl] AddHandler(hid=%d)\n", i);
             return CELL_OK;
         }
@@ -270,23 +244,8 @@ s32 cellNetCtlAddHandler(cellNetCtlHandler handler, void* arg, s32* hid)
     return CELL_NET_CTL_ERROR_HANDLER_MAX;
 }
 
-/* ---------------------------------------------------------------------------
- * Net-start ("connect to PSN") dialog
- *
- * Real hardware shows a system dialog and signals progress asynchronously
- * through the cellSysutil callback queue (LOADED -> FINISHED), after which the
- * game calls UnloadAsync to retrieve the result. In an offline native recomp
- * there is nothing to show, so we immediately post LOADED + FINISHED to every
- * registered sysutil callback slot. On unload the result is "connected" with
- * PS3_NET_ONLINE=1 and "cancelled" otherwise, matching what GetState reports.
- * This unblocks the common boot-time "connecting to network" gate without
- * requiring a real PSN session.
- * -----------------------------------------------------------------------*/
-
 static void netstart_broadcast(u32 status)
 {
-    /* Sysutil events target a specific slot; the game may have registered its
-     * callback on any of them, so notify all and let it filter by status. */
     for (int slot = 0; slot < CELL_SYSUTIL_MAX_CALLBACKS; ++slot)
         cellSysutilQueueEvent(slot, status, 0);
 }
@@ -302,15 +261,10 @@ s32 cellNetCtlNetStartDialogLoadAsync(const CellNetCtlNetStartDialogParam* param
 
 s32 cellNetCtlNetStartDialogUnloadAsync(CellNetCtlNetStartDialogResult* result)
 {
-    /* Offline (the default), the dialog ends as if the player cancelled it,
-     * as RPCS3 reports it without a network: "connected" while GetState says
-     * there is no network sent inFAMOUS 2 on to a PSN terms-of-service check
-     * that never answers, behind an endless "Please wait...". A cancelled
-     * connection is a path every title handles. PS3_NET_ONLINE=1: connected. */
     const u32 res = netctl_online() ? 0u : (u32)CELL_NET_CTL_ERROR_DIALOG_CANCELED;
     if (result) {
         result = GUEST_PTR(result, CellNetCtlNetStartDialogResult*);
-        result->result = (s32)ps3_bswap32(res);   /* guest big-endian */
+        result->result = (s32)ps3_bswap32(res);
     }
     printf("[cellNetCtl] NetStartDialogUnloadAsync() -> result=0x%08X (%s)\n", res,
            res ? "cancelled: offline" : "connected");

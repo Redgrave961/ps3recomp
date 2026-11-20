@@ -1,38 +1,9 @@
-/*
- * ps3recomp - sys_vm virtual memory syscalls (implementation)
- *
- * sys_vm gives a process a demand-paged virtual region backed by a smaller
- * physical commitment (vsize virtual / psize physical, paged by the OS).
- * Our guest space is one flat host reservation, so committing the whole
- * vsize satisfies the contract exactly: every page is always resident and
- * the paging-control syscalls (touch/lock/flush/...) are trivially done.
- *
- * Call contract verified against the Yakuza EBOOT itself (func_00072510):
- *   r3 = vsize   (the game rounds it up to a 32 MB multiple first)
- *   r4 = psize   (the game rounds it up to a 64 KB multiple first)
- *   r5 = cid     (memory container, 0xFFFFFFFF = none)
- *   r6 = flag    (page size: SYS_MEMORY_PAGE_SIZE_64K = 0x200)
- *   r7 = policy  (1 = auto recommended)
- *   r8 = guest u32* that receives the mapped base address
- * The game reads the u32 back, passes it to sys_vm_touch (306) and uses it
- * as a heap arena base. RPCS3's sys_vm.cpp used as a read-only cross-check.
- *
- * sys_vm_test (311) and sys_vm_get_statistics (312) are intentionally NOT
- * registered: both write result structs whose layout we have not verified
- * from a primary source, and the default table handler logs any call loudly
- * instead of corrupting memory with a guessed layout.
- */
-
 #include "sys_vm.h"
 #include <stdio.h>
 #include <string.h>
 
-/* ---------------------------------------------------------------------------
- * Globals
- * -----------------------------------------------------------------------*/
 sys_vm_map_info g_sys_vm_maps[SYS_VM_MAX];
 
-/* Bump pointer inside the sys_vm window (mappings are never reused) */
 static uint32_t s_vm_bump_ptr = SYS_VM_REGION_BASE;
 
 static void write_be32(uint32_t addr, uint32_t val)
@@ -54,12 +25,6 @@ static sys_vm_map_info* find_map(uint32_t addr)
     return NULL;
 }
 
-/* ---------------------------------------------------------------------------
- * sys_vm_memory_map (300) / sys_vm_memory_map_different (313)
- *
- * r3 = vsize, r4 = psize, r5 = cid, r6 = flag, r7 = policy
- * r8 = pointer to receive mapped base address (u32*)
- * -----------------------------------------------------------------------*/
 int64_t sys_vm_memory_map(ppu_context* ctx)
 {
     uint32_t vsize    = LV2_ARG_U32(ctx, 0);
@@ -85,7 +50,6 @@ int64_t sys_vm_memory_map(ppu_context* ctx)
     uint32_t base = s_vm_bump_ptr;
     if (vm_commit(base, vsize) != CELL_OK)
         return (int64_t)(int32_t)CELL_ENOMEM;
-    /* freshly committed pages are already zeroed by the OS */
     s_vm_bump_ptr += vsize;
 
     sys_vm_map_info* m = &g_sys_vm_maps[slot];
@@ -102,11 +66,6 @@ int64_t sys_vm_memory_map(ppu_context* ctx)
     return CELL_OK;
 }
 
-/* ---------------------------------------------------------------------------
- * sys_vm_unmap (301)
- *
- * r3 = mapped base address
- * -----------------------------------------------------------------------*/
 int64_t sys_vm_unmap(ppu_context* ctx)
 {
     uint32_t addr = LV2_ARG_U32(ctx, 0);
@@ -115,22 +74,12 @@ int64_t sys_vm_unmap(ppu_context* ctx)
     if (!m)
         return (int64_t)(int32_t)CELL_EINVAL;
 
-    /* Keep the pages committed: stale guest pointers into the region then
-     * read zeros/old data instead of faulting the whole process. The window
-     * is bump-allocated, so the range is never handed out again. */
     m->active = 0;
 
     fprintf(stderr, "[sys_vm] unmap(0x%08X)\n", addr);
     return CELL_OK;
 }
 
-/* ---------------------------------------------------------------------------
- * sys_vm_append_memory (302) / sys_vm_return_memory (303)
- *
- * r3 = mapped base address, r4 = size
- * Adjusts the physical backing of a mapping. All our pages are always
- * committed, so this is pure bookkeeping.
- * -----------------------------------------------------------------------*/
 int64_t sys_vm_append_memory(ppu_context* ctx)
 {
     uint32_t addr = LV2_ARG_U32(ctx, 0);
@@ -157,20 +106,12 @@ int64_t sys_vm_return_memory(ppu_context* ctx)
     return CELL_OK;
 }
 
-/* ---------------------------------------------------------------------------
- * Paging-control hints (304-310): lock/unlock/touch/flush/invalidate/
- * store/sync. With every page permanently committed these are satisfied
- * by doing nothing.
- * -----------------------------------------------------------------------*/
 int64_t sys_vm_advisory_nop(ppu_context* ctx)
 {
     (void)ctx;
     return CELL_OK;
 }
 
-/* ---------------------------------------------------------------------------
- * Registration
- * -----------------------------------------------------------------------*/
 void sys_vm_init(lv2_syscall_table* tbl)
 {
     memset(g_sys_vm_maps, 0, sizeof(g_sys_vm_maps));
@@ -188,7 +129,4 @@ void sys_vm_init(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, SYS_VM_INVALIDATE,           sys_vm_advisory_nop);
     lv2_syscall_register(tbl, SYS_VM_STORE,                sys_vm_advisory_nop);
     lv2_syscall_register(tbl, SYS_VM_SYNC,                 sys_vm_advisory_nop);
-    /* 311 sys_vm_test / 312 sys_vm_get_statistics intentionally left on the
-     * default handler (loud ENOSYS log) until their out-struct layouts are
-     * verified from a primary source. */
 }

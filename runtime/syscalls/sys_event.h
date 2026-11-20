@@ -1,7 +1,3 @@
-/*
- * ps3recomp - Event queue and event flag syscalls
- */
-
 #ifndef SYS_EVENT_H
 #define SYS_EVENT_H
 
@@ -28,7 +24,6 @@ typedef struct sys_event_t {
 #define SYS_EVENT_QUEUE_BUF_MAX   127
 
 #define SYS_PPU_QUEUE   1
-#define SYS_SPU_QUEUE   2
 
 typedef struct sys_event_queue_info {
     ps3_lock     lock;
@@ -115,4 +110,4 @@ int sys_event_queue_push_by_id(uint32_t queue_id,
 }
 #endif
 
-#endif /* SYS_EVENT_H */
+#endif

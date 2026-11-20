@@ -1,14 +1,7 @@
-/*
- * ps3recomp - sceNpCommerce2 HLE implementation
- *
- * PlayStation Store commerce API stub. All operations return "not connected"
- * or "server error" since we don't connect to PSN.
- */
-
 #include "sceNpCommerce2.h"
 #include <stdio.h>
 #include <string.h>
-#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
+#include "../../runtime/ppu/ppu_memory.h"
 
 #define MAX_CTX 4
 static int s_ctx_in_use[MAX_CTX];
@@ -26,8 +19,6 @@ s32 sceNpCommerce2Term(void)
     return CELL_OK;
 }
 
-/* SDK signature: (version, npId, handler, arg, ctx_id). The context id goes to the FIFTH argument; with three
- * parameters the id was written over the title's handler (the third argument). */
 s32 sceNpCommerce2CreateCtx(u32 version, const void* npId, u32 handler, u32 arg,
                               SceNpCommerce2Context* ctx)
 {
@@ -86,4 +77,3 @@ s32 sceNpCommerce2DestroyReq(SceNpCommerce2Context ctx)
     (void)ctx;
     return CELL_OK;
 }
-

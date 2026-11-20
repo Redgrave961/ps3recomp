@@ -1,17 +1,3 @@
-/* SPU_DIRECT (spu_context.h): a lifted cross-function branch with a known
- * target tail-calls it when the drain loop has nothing to do on that step,
- * and takes the trampoline otherwise. The functions below are written the way
- * the lifter emits them. Built and run in each mode by tools/test_spu_direct.py.
- *
- *   direct      two functions branch to each other 2,000,000 times: only the
- *               run's first branch takes a drain step, and the host stack does
- *               not grow (a plain call per branch would need far more than a
- *               thread's stack)
- *   off         the same with PS3_SPU_DIRECT=0: one drain step per branch
- *   irq         an SPU interrupt raised mid-chain is taken at the next branch
- *   ls0         a branch to LS 0 takes a drain step, which ends the job there
- *   nested      after a nested spu_drain_call returns, drain_ret_pc is the
- *               enclosing drain's return pc again, not 0 */
 #include "../spu_helpers.h"
 #include <assert.h>
 #include <stdio.h>
@@ -27,37 +13,37 @@ extern void spu_halt(spu_context*);
 
 static spu_context ctx;
 static uint32_t s_loops = 2000000;
-static int s_raise_at = -1;            /* irq: loop count that raises the event */
+static int s_raise_at = -1;
 
 static void finish(spu_context* c)
 {
     c->status = SPU_STATUS_STOPPED_BY_STOP;
     spu_halt(c);
 }
-static void wrong(spu_context* c)      /* must never run */
+static void wrong(spu_context* c)
 {
     c->gpr[21]._u32[0]++;
     finish(c);
 }
-static void handler(spu_context* c)    /* interrupt handler at 0x300 */
+static void handler(spu_context* c)
 {
     c->gpr[23]._u32[0] = c->gpr[10]._u32[0];
     finish(c);
 }
 
 static void func_b(spu_context* c);
-static void func_a(spu_context* c)     /* at 0x240 */
+static void func_a(spu_context* c)
 {
     c->gpr[10] = spu_ai(c->gpr[10], 1);
     if (c->gpr[10]._u32[0] == (uint32_t)s_raise_at) c->event_status |= 0x20u;
     if (c->gpr[10]._u32[0] >= s_loops) { SPU_DIRECT(c, 0x380, finish); }
     SPU_DIRECT(c, 0x280, func_b);
 }
-static void func_b(spu_context* c)     /* at 0x280 */
+static void func_b(spu_context* c)
 {
     SPU_DIRECT(c, 0x240, func_a);
 }
-static void to_ls0(spu_context* c)     /* at 0x2C0 */
+static void to_ls0(spu_context* c)
 {
     c->gpr[10] = spu_ai(c->gpr[10], 1);
     SPU_DIRECT(c, 0x0, wrong);
@@ -67,7 +53,6 @@ static void to_ls0_entry(spu_context* c)
     SPU_DIRECT(c, 0x2C0, to_ls0);
 }
 
-/* nested: outer -> (drain, return pc 0x204) mid -> (drain, return pc 0x208) leaf */
 static void leaf(spu_context* c)
 {
     SPU_RET(c);
@@ -80,7 +65,7 @@ static void mid(spu_context* c)
     g_spu_trampoline_fn = leaf;
     spu_drain_call(c, 0x208);
     c->host_depth--;
-    c->gpr[22]._u32[0] = c->drain_ret_pc;   /* back in the 0x204 drain */
+    c->gpr[22]._u32[0] = c->drain_ret_pc;
     c->gpr[0] = spu_link(0x204);
     SPU_RET(c);
 }
@@ -110,7 +95,7 @@ int main(int argc, char** argv)
     void (*entry)(spu_context*) = func_a;
     if (!strcmp(mode, "irq")) {
         s_loops = 100000; s_raise_at = 1000;
-        ctx.ls[0] = 0x30; ctx.ls[1] = 0x00; ctx.ls[2] = 0x60; ctx.ls[3] = 0x00;   /* bra 0x300 */
+        ctx.ls[0] = 0x30; ctx.ls[1] = 0x00; ctx.ls[2] = 0x60; ctx.ls[3] = 0x00;
         ctx.int_enable = 1;
         ctx.event_mask = 0x20u;
     } else if (!strcmp(mode, "ls0")) {
@@ -141,11 +126,10 @@ int main(int argc, char** argv)
     if (!strcmp(mode, "direct") || !strcmp(mode, "off")) {
         assert(ctx.gpr[10]._u32[0] == s_loops);
         if (!strcmp(mode, "off")) assert(g_spu_direct == 0);
-        /* The run's first transfer is always a step (spu_context.h). */
         if (direct) assert(ctx.steps == 1);
         else        assert(ctx.steps == 2 * s_loops - 1);
     } else if (!strcmp(mode, "irq")) {
-        assert(ctx.gpr[23]._u32[0] == (uint32_t)s_raise_at);   /* the very next branch */
+        assert(ctx.gpr[23]._u32[0] == (uint32_t)s_raise_at);
         if (direct) assert(ctx.steps == 2);
     } else if (!strcmp(mode, "ls0")) {
         assert(ctx.gpr[10]._u32[0] == 1 && ctx.steps == 2);
@@ -156,7 +140,6 @@ int main(int argc, char** argv)
     return 0;
 }
 
-/* Link-only boundaries outside this CPU-only fixture. Fail if any is reached. */
 void spu_thread_publish_ctx(uint32_t tid, void* c) { (void)tid; (void)c; abort(); }
 void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; abort(); }
 unsigned long long ps3_ms_now(void) { abort(); }

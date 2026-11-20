@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""RSX tiled main memory: addressing and range copies (libs/video/tests/test_rsx_tiling.c, rsx_tiling.h/.c)."""
 import os
 from pathlib import Path
 import subprocess

@@ -1,7 +1,3 @@
-/*
- * ps3recomp - Event queue, event port and event flag syscalls (implementation)
- */
-
 #include "sys_event.h"
 #include "sys_ppu_thread.h"
 #include "../memory/vm.h"

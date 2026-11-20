@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Run the real SPU machine-status channel regression without game data."""
 import os
 import subprocess
 import tempfile

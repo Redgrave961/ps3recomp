@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Real interpreter/microstep/lifted branch feature-bit regression."""
 import os,subprocess,tempfile
 from pathlib import Path
 root=Path(__file__).resolve().parents[1];spu=root/'runtime/spu'
@@ -20,7 +19,7 @@ with tempfile.TemporaryDirectory(prefix='spu-interrupt-branches-') as tmp:
   ins=spu_decode(code,0x4000);assert ins.mnemonic!='.word'
   f=SPULifter(prefix=f'irq_{code:x}_').lift_function([ins],0x4000,0x4004)
   body+=[f'static void {f.name}(spu_context* ctx) {{',*f.body_lines]
-  if ins.mnemonic in ['biz','binz','bihz','bihnz']:body.append('ctx->pc=0x4004;') # single-instruction local fallthrough
+  if ins.mnemonic in ['biz','binz','bihz','bihnz']:body.append('ctx->pc=0x4004;')
   body.append('}')
   entries.append(f'case 0x{code:X}: {f.name}(ctx);return;')
  body+=['static void lifted_run(uint32_t opcode,spu_context* ctx){switch(opcode){',*entries,'default:abort();}}']

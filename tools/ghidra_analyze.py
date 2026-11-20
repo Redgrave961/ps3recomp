@@ -1,21 +1,4 @@
 #!/usr/bin/env python3
-"""
-ghidra_analyze.py — automate Ghidra headless analysis of a PS3 PPU ELF.
-
-Imports the (decrypted) EBOOT.elf into a throwaway Ghidra project, runs
-auto-analysis, then runs the ExportAnalysisJson post-script to dump:
-    functions.json   symbols.json   strings.json   [decompiled.json]
-
-The results feed ghidra_names.py, which builds a {addr: name} map the lifter
-uses to give recompiled functions meaningful names instead of func_ADDR.
-
-Ghidra is located via (in order): --ghidra-dir, $GHIDRA_INSTALL_DIR,
-$GHIDRA_HOME, then a list of common install paths.
-
-Usage:
-    python tools/ghidra_analyze.py game/EBOOT.elf -o ghidra_out
-    python tools/ghidra_analyze.py game/EBOOT.elf -o ghidra_out --decompile
-"""
 import argparse
 import os
 import shutil
@@ -26,7 +9,6 @@ import tempfile
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 GHIDRA_SCRIPT_DIR = os.path.join(SCRIPT_DIR, "ghidra")
 
-# PS3 PPU = Cell BE PPE: 64-bit PowerPC ISA, big-endian, 32-bit addressing.
 DEFAULT_PROCESSOR = "PowerPC:BE:64:64-32addr"
 
 COMMON_GHIDRA_PATHS = [
@@ -46,7 +28,6 @@ def find_ghidra(explicit):
         if os.environ.get(env):
             candidates.append(os.environ[env])
     candidates.extend(COMMON_GHIDRA_PATHS)
-    # Also accept a glob of versioned dirs under C:\tools\ghidra
     for root in (r"C:\tools\ghidra", "/opt"):
         if os.path.isdir(root):
             for d in sorted(os.listdir(root), reverse=True):

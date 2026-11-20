@@ -1,18 +1,4 @@
 #!/usr/bin/env python3
-"""
-Auto-generate HLE stub C files for PS3 modules.
-
-Reads the NID database (built-in + optional external JSON) and generates
-one .h / .c pair per module, with stub implementations that log
-"UNIMPLEMENTED: module::function_name" and return CELL_OK (0).
-
-Usage:
-    python generate_stubs.py --output stubs/
-    python generate_stubs.py --output stubs/ --modules cellGcmSys cellFs
-    python generate_stubs.py --output stubs/ --nid-db extra.json
-    python generate_stubs.py --output stubs/ --from-analysis report.json
-"""
-
 import argparse
 import json
 import os
@@ -23,11 +9,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from nid_database import NIDDatabase, get_default_db
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-CELL_OK = 0
 
 HEADER_TEMPLATE = """\
 /* Auto-generated HLE stubs for {module} -- do not edit by hand. */
@@ -67,30 +48,15 @@ const nid_entry_{module_safe} {module_safe}_nid_table[] = {{
 const int {module_safe}_nid_table_size = sizeof({module_safe}_nid_table) / sizeof({module_safe}_nid_table[0]);
 """
 
-# ---------------------------------------------------------------------------
-# Code generation
-# ---------------------------------------------------------------------------
 
 def _safe_identifier(name: str) -> str:
-    """Make a string safe for use as a C identifier."""
     return re.sub(r"[^a-zA-Z0-9_]", "_", name)
 
 
 def generate_module_stubs(module: str, entries: list[tuple[int, str]],
                           output_dir: str) -> tuple[str, str]:
-    """Generate .h and .c files for a module.
-
-    Args:
-        module: Module name (e.g. "cellGcmSys").
-        entries: List of (nid, function_name) tuples.
-        output_dir: Directory to write files to.
-
-    Returns:
-        (header_path, source_path) written.
-    """
     module_safe = _safe_identifier(module)
 
-    # Declarations
     decl_lines: list[str] = []
     for nid, name in entries:
         safe_name = _safe_identifier(name)
@@ -98,7 +64,6 @@ def generate_module_stubs(module: str, entries: list[tuple[int, str]],
             f"/* NID 0x{nid:08X} */ int32_t {safe_name}_stub(ppu_context* ctx);"
         )
 
-    # Definitions
     def_lines: list[str] = []
     for nid, name in entries:
         safe_name = _safe_identifier(name)
@@ -111,7 +76,6 @@ def generate_module_stubs(module: str, entries: list[tuple[int, str]],
             f'}}\n'
         )
 
-    # NID table entries
     nid_entries: list[str] = []
     for nid, name in entries:
         safe_name = _safe_identifier(name)
@@ -149,7 +113,6 @@ def generate_module_stubs(module: str, entries: list[tuple[int, str]],
 
 
 def generate_master_header(modules: list[str], output_dir: str) -> str:
-    """Generate a master header that includes all module stubs."""
     lines = [
         "/* Auto-generated master include for all HLE stubs. */",
         "#pragma once",
@@ -176,9 +139,6 @@ def generate_master_header(modules: list[str], output_dir: str) -> str:
         f.write("\n".join(lines))
     return path
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -203,7 +163,6 @@ def main() -> None:
         count = db.load_json(args.nid_db)
         print(f"Loaded {count} extra NID entries", file=sys.stderr)
 
-    # If using analysis report, parse required stubs
     analysis_stubs: dict[str, list[tuple[int, str]]] | None = None
     if args.from_analysis:
         with open(args.from_analysis) as f:
@@ -227,7 +186,6 @@ def main() -> None:
     generated_modules: list[str] = []
 
     if analysis_stubs:
-        # Generate from analysis report
         for module, entries in sorted(analysis_stubs.items()):
             h, c = generate_module_stubs(module, entries, args.output)
             generated_modules.append(module)
@@ -235,7 +193,6 @@ def main() -> None:
                   f"  ({len(entries)} stubs)")
 
     else:
-        # Generate from NID database
         target_modules = args.modules if args.modules else db.modules()
 
         for module in target_modules:

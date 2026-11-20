@@ -252,8 +252,6 @@ static void close_image(vfs_mount* m)
 }
 
 static uint32_t le32(const uint8_t* p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
-static uint32_t be32(const uint8_t* p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
-static uint64_t be64(const uint8_t* p) { return (uint64_t)be32(p) << 32 | be32(p + 4); }
 
 static int iso_walk(vfs_mount* m, uint32_t lba, uint32_t size, const char* dir, int depth, int joliet)
 {
@@ -358,10 +356,10 @@ static vfs_mount* open_pkg(const char* game_dir, const char* pkg_path, char cont
         close_image(m);
         return NULL;
     }
-    const uint32_t items = be32(h + 0x14);
+    const uint32_t items = ps3_be32(h + 0x14);
     m->pkg = 1;
-    m->data_offset = be64(h + 0x20);
-    const uint64_t data_size = be64(h + 0x28);
+    m->data_offset = ps3_be64(h + 0x20);
+    const uint64_t data_size = ps3_be64(h + 0x28);
     memcpy(m->riv, h + 0x70, 16);
     ps3_aes128_init(&m->key, PKG_KEY);
     char cid[37];
@@ -378,8 +376,8 @@ static vfs_mount* open_pkg(const char* game_dir, const char* pkg_path, char cont
     int rc = m->prefix && t && !pkg_read(m, 0, t, (size_t)table) ? 0 : -1;
     for (uint32_t i = 0; i < items && !rc; i++) {
         const uint8_t* e = t + i * 0x20;
-        const uint32_t name_off = be32(e), name_len = be32(e + 4);
-        const uint64_t off = be64(e + 8), size = be64(e + 16);
+        const uint32_t name_off = ps3_be32(e), name_len = ps3_be32(e + 4);
+        const uint64_t off = ps3_be64(e + 8), size = ps3_be64(e + 16);
         char name[512];
         if (!name_len || name_len >= sizeof name || name_off + (uint64_t)name_len > data_size ||
             off + size > data_size || pkg_read(m, name_off, name, name_len)) {

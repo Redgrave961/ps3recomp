@@ -1,12 +1,4 @@
 #!/usr/bin/env bash
-# Build and run every integration test in this directory.
-#
-# Each test is a pair of files:
-#   gen_test_<name>.py   - encodes the SPU program and wraps it in an ELF.
-#   test_<name>_main.c   - harness with channel-overriding stubs and asserts.
-#
-# Usage: ./run_tests.sh  [<gcc-path>]
-# Honours $GCC env var.
 
 set -e
 
@@ -28,8 +20,6 @@ for gen in "$HERE"/gen_test_*.py; do
     [ -f "$main" ] || { echo "[skip] $name: no test_${name}_main.c"; continue; }
 
     elf="$HERE/test_${name}.elf"
-    # Use an `out_` prefix for generated dirs so `gen_test_*.py` and
-    # `out_*` never collide under a `rm -rf gen_*` glob.
     gen_out="$HERE/out_${name}"
     exe="$HERE/test_${name}.exe"
 
@@ -38,9 +28,6 @@ for gen in "$HERE"/gen_test_*.py; do
     python "$TOOLS/spu_lifter.py" --auto-functions "$elf" \
         --output "$gen_out" > /dev/null
 
-    # Optional per-test extra build args (extra sources / -I dirs). A
-    # test_<name>.deps file is sourced with $REPO/$RUNTIME_SPU in scope and may
-    # set EXTRA="..." (e.g. to link a libs/ HLE module).
     EXTRA=""
     [ -f "$HERE/test_${name}.deps" ] && . "$HERE/test_${name}.deps"
 

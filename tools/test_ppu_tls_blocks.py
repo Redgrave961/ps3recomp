@@ -1,13 +1,4 @@
 #!/usr/bin/env python3
-"""Per-thread TLS blocks: every thread a title creates gets its own block.
-
-Builds the real ``ppu_tls_new_block`` (pulled verbatim out of
-runtime/ppu/ppu_loader.cpp) into a small host program and asks it for 100
-thread blocks with a 0x240-byte TLS image, the size of a small title's. Checks
-that every request is granted (0 means the thread silently shares the main
-thread's TLS), that no block overlaps another block or the main block's image,
-and that the .tdata image was copied into each block.
-"""
 import os
 import re
 import subprocess
@@ -28,7 +19,6 @@ while depth:
     i += 1
 func = src[m.start():i]
 tls_img = re.search(r'^#define PPU_TLS_IMG\s+(\S+)', src, re.M).group(1)
-# #296 spells it VM_PPU_TLS_BASE from runtime/memory/vm.h; resolve that to the number.
 if not tls_img[0].isdigit():
     vm_h = (root / 'runtime/memory/vm.h').read_text()
     tls_img = re.search(r'^#define ' + tls_img + r'\s+(\S+)', vm_h, re.M).group(1)

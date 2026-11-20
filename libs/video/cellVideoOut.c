@@ -1,24 +1,11 @@
-/*
- * ps3recomp - cellVideoOut HLE implementation
- *
- * Video output configuration: resolution, display mode, device info.
- * Defaults to 1280x720 (720p).
- */
-
 #include "cellVideoOut.h"
 #include "ps3emu/endian.h"
-#include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
+#include "../../runtime/ppu/ppu_memory.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
 
-/* The generic HLE adapter passes GUEST addresses for pointer args; translate to
- * a host pointer. (Values written through it stay big-endian via ps3_bswap*.) */
 #define GUEST_PTR(p, T) ((T)((p) ? (void*)(vm_base + (uint32_t)(uintptr_t)(p)) : (void*)0))
-
-/* ---------------------------------------------------------------------------
- * Internal state
- * -----------------------------------------------------------------------*/
 
 static u8  s_resolution_id  = CELL_VIDEO_OUT_RESOLUTION_720;
 static u8  s_color_format   = CELL_VIDEO_OUT_BUFFER_COLOR_FORMAT_X8R8G8B8;
@@ -26,14 +13,6 @@ static u8  s_aspect         = CELL_VIDEO_OUT_ASPECT_16_9;
 static u32 s_pitch          = 1280 * 4;
 
 static void get_resolution_wh(u32 resId, u16* w, u16* h);
-
-/* ---------------------------------------------------------------------------
- * Configuration
- * -----------------------------------------------------------------------*/
-
-/* ---------------------------------------------------------------------------
- * Helpers
- * -----------------------------------------------------------------------*/
 
 static void get_resolution_wh(u32 resId, u16* w, u16* h)
 {
@@ -59,19 +38,11 @@ static void get_resolution_wh(u32 resId, u16* w, u16* h)
     }
 }
 
-/* ---------------------------------------------------------------------------
- * API implementations
- * -----------------------------------------------------------------------*/
-
 s32 cellVideoOutGetResolution(u32 resolutionId, CellVideoOutResolution* resolution)
 {
     if (!resolution)
         return CELL_VIDEO_OUT_ERROR_ILLEGAL_PARAMETER;
 
-    /* The out-struct lives in guest memory: fields are big-endian.
-     * (Host-endian writes here fed the game byte-swapped width/height —
-     * 0xD002x0xE001 instead of 720x480 — which wrecked its display-buffer
-     * setup.) */
     u16 w, h;
     get_resolution_wh(resolutionId, &w, &h);
     resolution = GUEST_PTR(resolution, CellVideoOutResolution*);
@@ -99,7 +70,6 @@ s32 cellVideoOutConfigure(u32 videoOut, CellVideoOutConfiguration* config,
     s_color_format  = config->format;
     s_aspect        = config->aspect != CELL_VIDEO_OUT_ASPECT_AUTO ? config->aspect : CELL_VIDEO_OUT_ASPECT_16_9;
 
-    /* config is a guest BE struct: byte-swap multi-byte reads */
     if (ps3_bswap32(config->pitch) > 0) {
         s_pitch = ps3_bswap32(config->pitch);
     } else {

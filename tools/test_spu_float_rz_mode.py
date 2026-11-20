@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""SPU_FLOAT_RZ: FPCR is round toward zero inside spu_run_with_halt and the caller's afterwards."""
 import os
 import subprocess
 import tempfile

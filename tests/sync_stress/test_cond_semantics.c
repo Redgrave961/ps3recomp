@@ -20,7 +20,6 @@ static DWORD WINAPI signaler(void* raw) {
     ppu_context c={0}; c.thread_id=2;
     Sleep(20);
     if (raw) {
-        /* Host spurious wake: no guest signal has selected this waiter. */
         sys_cond_info* cond=&g_sys_conds[cid-1];
         ps3_lock_acquire(&cond->lock);
         for (ps3_waiter* w=cond->q.head; w; w=w->next) ps3_futex_wake_all(&w->done);

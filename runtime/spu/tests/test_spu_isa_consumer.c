@@ -1,5 +1,3 @@
-/* Synthetic C/C++ SDK consumer: architectural oracle uses word shifts only,
- * independently of SPU_W, SIMD intrinsics, and the helper's byte loop. */
 #ifndef _CRT_SECURE_NO_WARNINGS
 #define _CRT_SECURE_NO_WARNINGS
 #endif

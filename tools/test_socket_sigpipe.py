@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Real network writes must return EPIPE without killing the host process."""
 import os
 import pathlib
 import signal

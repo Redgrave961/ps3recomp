@@ -1,6 +1,3 @@
-/*
- * ps3recomp - Kernel condition variables.
- */
 #include "sys_cond.h"
 #include "sys_ppu_thread.h"
 #include "../memory/vm.h"

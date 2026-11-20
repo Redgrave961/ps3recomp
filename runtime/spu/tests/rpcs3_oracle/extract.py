@@ -1,20 +1,4 @@
 #!/usr/bin/env python3
-"""Assemble the RPCS3 SPU oracle source from the local RPCS3 tree.
-
-Reads rpcs3/rpcs3/Emu/Cell/SPUInterpreter.cpp (+ the LUT/imm-table definitions from
-SPUThread.cpp) and writes <out> = a translation unit that compiles RPCS3's own
-instruction functions unmodified, with three mechanical edits:
-  * the asmjit helper namespace and everything from `template <typename IT> struct
-    spu_interpreter_t` onward (the dispatch table / ctor) are dropped;
-  * the `#if 0` guarding RPCS3's precise-float implementation (spu_interpreter_precise::*)
-    is turned into `#if 1` so it is compiled;
-  * _mm_getcsr() is redirected to the host FP exception flags (x86 MXCSR bit layout), as the x86 build reads them.
-FI has no oracle here (RPCS3's interpreter FI is a TODO approximation); the
-harness skips it. Nothing from RPCS3 is in the repo: everything RPCS3 -- the
-interpreter, its tables, and the declarations they need (rpcs3_decls.h, written
-next to <out>) -- is read from the local RPCS3 tree at build time.
-usage: extract.py <rpcs3 root> <out.cpp>
-"""
 import re, sys
 root, out = sys.argv[1], sys.argv[2]
 L = open(f"{root}/rpcs3/Emu/Cell/SPUInterpreter.cpp", encoding="utf-8").read().split("\n")
@@ -23,7 +7,6 @@ TH = open(f"{root}/rpcs3/Emu/Cell/SPUThread.h", encoding="utf-8").read()
 
 
 def block(text, start):
-    """From the line starting with `start` through its matching closing brace (and `;`)."""
     i = text.index("\n" + start) + 1
     depth, j, opened = 0, i, False
     while True:
@@ -35,18 +18,14 @@ def block(text, start):
             return text[i:text.index(";", j) + 1]
 
 
-# Declarations the interpreter needs from SPUThread.h, taken from the tree
 decls = "\n".join([
     "\n".join(l for l in TH.split("\n") if re.match(r"extern const u32 spu_fr(est|sqest)_(fraction|exponent)_lut", l)),
     block(TH, "struct spu_imm_table_t"), "extern const spu_imm_table_t g_spu_imm;",
     block(TH, "enum FPSCR_EX"), block(TH, "class SPU_FPSCR")])
 
-# drop includes (first 14 lines are #includes of heavy headers) and extern decoders
 start = next(i for i, l in enumerate(L) if l.startswith("#if !defined(_MSC_VER)"))
 body = L[start:]
-# remove `const extern spu_decoder...` lines
 body = [l for l in body if not l.startswith("const extern spu_decoder")]
-# drop asmjit namespace block
 i = next(i for i, l in enumerate(body) if l.startswith("namespace asmjit"))
 depth = 0; j = i
 while True:
@@ -54,22 +33,19 @@ while True:
     j += 1
     if depth == 0 and "{" in "".join(body[i:j]): break
 body = body[:i] + body[j:]
-# drop spu_exec_select (needs RPCS3 bit-set machinery; only used by the dispatch ctor we skip)
 i = next(i for i, l in enumerate(body) if l.startswith("struct spu_exec_select"))
-i -= 1  # the template<> line above
+i -= 1
 depth = 0; j = i
 while True:
     depth += body[j].count("{") - body[j].count("}")
     j += 1
     if depth == 0 and "{" in "".join(body[i:j]): break
 body = body[:i] + body[j+1:]
-# cut at the dispatch-table struct
 k = next(i for i, l in enumerate(body) if l.startswith("template <typename IT>"))
 body = body[:k]
 src = "\n".join(body)
 assert src.count("\n#if 0\n") == 1
 src = src.replace("\n#if 0\n", "\n#if 1\n")
-# LUTs + imm tables from SPUThread.cpp
 m = re.search(r"const u32 spu_frest_fraction_lut\[32\].*?spu_frsqest_exponent_lut\[256\]\s*=\s*\{.*?\n\};\n", T, re.S)
 luts = m.group(0)
 m2 = re.search(r"const spu_imm_table_t g_spu_imm;.*?\n(?=void spu_thread::dump_regs)", T, re.S)
@@ -77,7 +53,6 @@ imm = m2.group(0)
 hdr = '''#include "oracle_shim.h"
 #define _mm_getcsr() oracle_getcsr()
 '''
-# --- generated dispatch: RPCS3's own spu_decoder over a table of wrappers ---
 H = open(f"{root}/rpcs3/Emu/Cell/SPUOpcodes.h", encoding="utf-8").read()
 ents = re.findall(r"\{ (\d), (0x[0-9a-f]+), GET\((\w+)\) \}", H)
 names = [n for _, _, n in ents]

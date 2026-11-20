@@ -1,31 +1,14 @@
-"""pkg_extract.py - extract files from a PS3 .pkg (no RPCS3 GUI needed).
-
-Handles both finalized (retail, AES-128-CTR with the public PS3_GPKG key) and
-non-finalized/debug (SHA-1 keystream) packages. DRM-free (type 3) content needs
-no per-title RAP/klicensee, so the whole PlayStation Minis catalog opens up.
-
-Files are written under out_dir with the package's own directory tree intact.
-Auto-detects the keystream by checking that the decrypted file table yields ASCII
-filenames. Both keystreams are per-block seekable, so with --only we decrypt just the
-file table plus the one requested file (a few MB) instead of the whole package -- and the
-AES runs through pycryptodome when present, so a multi-GB PKG that used to take an hour of
-pure-Python AES now finishes in seconds. Usage:
-    python pkg_extract.py <in.pkg> <out_dir> [--only EBOOT.BIN]
-"""
 import hashlib, os, struct, sys
 
 PS3_GPKG_KEY = bytes.fromhex("2e7b71d7c9c9a14ea3221f188828b8f8")
-# PSP/PS1-Classic packages (pkg_type==2, ext-header key_type 1) use the same
-# CTR construction with a different key.
 PSP_PKG_KEY  = bytes.fromhex("07f2c68290b50d2c33818d709b60e62b")
 
-try:                                    # fast C AES; a project dependency (requirements.txt)
+try:
     from Crypto.Cipher import AES as _AES
     _HAVE_PYCRYPTO = True
 except ImportError:
     _HAVE_PYCRYPTO = False
 
-# --- pure-python AES-128 ECB fallback (encrypt path only, for the CTR keystream) -------
 _sbox = []
 def _init_aes():
     p = q = 1
@@ -90,17 +73,11 @@ def _ecb_encrypt(key: bytes, blocks: bytes) -> bytes:
 
 
 def _keystream(used, riv, hdr60, start_block, nblocks) -> bytes:
-    """Keystream for blocks [start_block, start_block+nblocks) -- seekable, so only the
-    range we actually XOR is generated."""
     if used in ("finalized", "psp"):
         base = int.from_bytes(riv, "big")
         ctrs = b"".join(((base + start_block + i) & ((1 << 128) - 1)).to_bytes(16, "big")
                         for i in range(nblocks))
         return _ecb_encrypt(PS3_GPKG_KEY if used == "finalized" else PSP_PKG_KEY, ctrs)
-    # Debug/non-finalized: SHA-1 keystream over a 0x40-byte block built from the
-    # 16-byte QA digest at header 0x60 as qa[0:8] qa[0:8] qa[8:16] qa[8:16], the
-    # rest zero, with the block index in the last 8 bytes. (Matches RPCS3's
-    # PKGLoader; hashing the raw 0x40 bytes at 0x60 instead does not decrypt.)
     qa = hdr60[0x00:0x10]
     out = bytearray()
     for i in range(nblocks):
@@ -115,13 +92,6 @@ def _keystream(used, riv, hdr60, start_block, nblocks) -> bytes:
 
 
 def out_path(outd, name):
-    """Map a PKG entry name onto a path under `outd`, keeping its directories.
-
-    Basenames are not unique: PDIPFS stores files as A/YG, B/YG, C/YG ..., so
-    flattening silently overwrites most of the package. Entry names come from
-    the (decrypted, but unauthenticated) file table, so components that would
-    escape `outd` -- "..", a drive letter, a leading slash -- are dropped.
-    """
     parts = []
     for p in name.replace("\\", "/").split("/"):
         p = p.strip()
@@ -164,12 +134,8 @@ def main():
         return dec[off:off + length]
 
     def parse_table(used):
-        hdr_len = min(data_size, item_count * 0x20 + (1 << 20))   # entries + name area
+        hdr_len = min(data_size, item_count * 0x20 + (1 << 20))
         dec = decrypt_range(used, 0, hdr_len)
-        # A PSP/PS1-Classic package mixes both keys: the entry structs are PSP-keyed,
-        # but each entry's *name and payload* pick their key from bit 28 of its flags
-        # (set -> PSP key, clear -> PS3 key). A plain PS3 package never sets bit 28,
-        # so the same rule leaves it on the PS3 key throughout.
         alt = {used: dec}
         def with_key(k, off, n):
             if k not in alt:
@@ -200,8 +166,6 @@ def main():
     print(f"rev=0x{rev:04X} keystream={used} items={item_count}"
           f"{'  (pycryptodome)' if _HAVE_PYCRYPTO else '  (pure-python AES)'}")
 
-    # --list: the file table alone. Decrypting a multi-GB package to find out what is
-    # in it is a slow way to ask a cheap question.
     if "--list" in sys.argv:
         for nm, fo, fs, k in names:
             print(f"  {fs:>12}  {nm}  [{k}]")

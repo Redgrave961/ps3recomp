@@ -1,8 +1,3 @@
-/*
- * trophy_files -- a title's PS3 trophy files on the host. See trophy_files.h
- * for the formats. Written from the public format documentation; nothing here
- * comes from an emulator's code.
- */
 #include "trophy_files.h"
 #include "../filesystem/ps3_vfs.h"
 
@@ -10,12 +5,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* ---- big-endian helpers ---- */
-
 static uint32_t rd32(const uint8_t* p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
 static uint64_t rd64(const uint8_t* p) { return (uint64_t)rd32(p) << 32 | rd32(p + 4); }
-
-/* ---- TROPHY.TRP ---- */
 
 #define TRP_MAGIC 0xDCA24D00u
 
@@ -37,7 +28,7 @@ int trp_open(const char* path, trp_index* out)
         d->name[32] = 0;
         d->offset = rd64(e + 32);
         d->size = rd64(e + 40);
-        if (!d->name[0] || d->offset + d->size > fsize || d->size > (64u << 20)) continue;   /* skip a bad one */
+        if (!d->name[0] || d->offset + d->size > fsize || d->size > (64u << 20)) continue;
         out->n++;
     }
     ps3_vfile_close(f);
@@ -71,8 +62,6 @@ char* trp_read_entry_data(const trp_index* t, const char* name, size_t* size)
     return d;
 }
 
-/* ---- TROP*.SFM ---- */
-
 static void utf8_put(char** o, char* end, unsigned c)
 {
     char b[4];
@@ -86,7 +75,6 @@ static void utf8_put(char** o, char* end, unsigned c)
     *o += n;
 }
 
-/* Text between a and b, entities decoded, whitespace trimmed. */
 static void xml_text(const char* a, const char* b, char* out, size_t cap)
 {
     char* o = out;
@@ -113,7 +101,6 @@ static void xml_text(const char* a, const char* b, char* out, size_t cap)
     *o = 0;
 }
 
-/* <tag>text</tag> inside [p, end): 1 when found. */
 static int xml_elem(const char* p, const char* end, const char* tag, char* out, size_t cap)
 {
     char open[40], close[40];
@@ -130,7 +117,6 @@ static int xml_elem(const char* p, const char* end, const char* tag, char* out, 
     return 0;
 }
 
-/* attr="value" inside the tag [p, end). */
 static int xml_attr(const char* p, const char* end, const char* name, char* out, size_t cap)
 {
     const size_t nl = strlen(name);
@@ -187,7 +173,7 @@ int trophy_sfm_parse(const char* xml, trophy_set* into)
         if (xml_attr(p, gt, "ttype", buf, sizeof buf) && buf[0]) d->grade = buf[0];
         if (xml_attr(p, gt, "pid", buf, sizeof buf) && buf[0]) d->pid = atoi(buf);
         if (xml_attr(p, gt, "hidden", buf, sizeof buf)) d->hidden = !strcmp(buf, "yes");
-        if (gt[-1] == '/') continue;                           /* <trophy .../>: attributes only */
+        if (gt[-1] == '/') continue;
         const char* close = strstr(gt, "</trophy>");
         if (!close) close = end;
         xml_elem(gt, close, "name", d->name, sizeof d->name);

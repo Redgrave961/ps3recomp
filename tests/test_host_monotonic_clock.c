@@ -1,15 +1,3 @@
-/* The guest clocks on POSIX hosts come from one host clock, host_monotonic_ns
- * (runtime/syscalls/sys_timer.c): the PPU timebase (every lifted mftb),
- * sys_time_get_system_time and the lv2 timers' expiration times. On macOS it
- * is mach_absolute_time, which costs a fraction of clock_gettime there.
- *
- * Checks that it is monotonic, runs at the rate of CLOCK_MONOTONIC, and that
- * the timebase and the timers' microsecond clock read the same clock (a
- * reading of each falls between two readings of host_monotonic_ns). Prints
- * what a read costs, for information.
- *
- * tools/test_host_monotonic_clock.py builds and runs it.
- */
 #include "../runtime/syscalls/sys_timer.c"
 #include <assert.h>
 #include <stdio.h>
@@ -32,7 +20,6 @@ static uint64_t to_tb(uint64_t ns)
 
 int main(void)
 {
-    /* monotonic, read after read */
     uint64_t prev = host_monotonic_ns();
     for (int i = 0; i < 1000000; i++) {
         const uint64_t now = host_monotonic_ns();
@@ -40,8 +27,6 @@ int main(void)
         prev = now;
     }
 
-    /* the same rate as CLOCK_MONOTONIC: over a 200 ms sleep the two agree
-     * to well under a millisecond (the two reads are not simultaneous) */
     const uint64_t h0 = host_monotonic_ns(), m0 = mono_ns();
     struct timespec nap = {0, 200 * 1000 * 1000};
     nanosleep(&nap, NULL);
@@ -52,7 +37,6 @@ int main(void)
     assert(h1 - h0 >= 200000000ull);
     assert(drift < 1000000 && drift > -1000000);
 
-    /* the timebase and the timers' clock read host_monotonic_ns */
     for (int i = 0; i < 1000; i++) {
         const uint64_t a = host_monotonic_ns();
         const uint64_t tb = ppu_timebase_now();
@@ -62,7 +46,6 @@ int main(void)
         assert(us >= a / 1000ull && us <= b / 1000ull);
     }
 
-    /* cost per read, for the log */
     enum { N = 2000000 };
     uint64_t sink = 0;
     uint64_t t0 = mono_ns();

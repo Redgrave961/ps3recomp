@@ -27,19 +27,19 @@ const ext_entry k_extensions[] = {
     { VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR,
       sizeof(VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR), &vk_caps::local_read },
     { VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT,
-      sizeof(VkPhysicalDeviceConditionalRenderingFeaturesEXT), &vk_caps::conditional_rendering },
+      sizeof(VkPhysicalDeviceConditionalRenderingFeaturesEXT), nullptr },
     { VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT,
       sizeof(VkPhysicalDeviceCustomBorderColorFeaturesEXT), &vk_caps::custom_border_color },
     { VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT,
-      sizeof(VkPhysicalDeviceDepthClipControlFeaturesEXT), &vk_caps::depth_clip_control },
+      sizeof(VkPhysicalDeviceDepthClipControlFeaturesEXT), nullptr },
     { VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT,
       sizeof(VkPhysicalDeviceDepthClipEnableFeaturesEXT), &vk_caps::depth_clip_enable },
     { VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT,
       sizeof(VkPhysicalDeviceProvokingVertexFeaturesEXT), &vk_caps::provoking_vertex },
     { VK_EXT_PRIMITIVE_TOPOLOGY_LIST_RESTART_EXTENSION_NAME, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIMITIVE_TOPOLOGY_LIST_RESTART_FEATURES_EXT,
-      sizeof(VkPhysicalDevicePrimitiveTopologyListRestartFeaturesEXT), &vk_caps::list_restart },
+      sizeof(VkPhysicalDevicePrimitiveTopologyListRestartFeaturesEXT), nullptr },
     { VK_EXT_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_EXTENSION_NAME, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_FEATURES_EXT,
-      sizeof(VkPhysicalDeviceDynamicRenderingUnusedAttachmentsFeaturesEXT), &vk_caps::unused_attachments },
+      sizeof(VkPhysicalDeviceDynamicRenderingUnusedAttachmentsFeaturesEXT), nullptr },
     { VK_KHR_MAINTENANCE_5_EXTENSION_NAME, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR,
       sizeof(VkPhysicalDeviceMaintenance5FeaturesKHR), &vk_caps::maintenance5 },
     { VK_KHR_PRESENT_MODE_FIFO_LATEST_READY_EXTENSION_NAME, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_MODE_FIFO_LATEST_READY_FEATURES_KHR,
@@ -227,7 +227,6 @@ bool vk_device_create(vk_device& d, VkSurfaceKHR surface)
         if (cap) d.caps.*cap = first_feature(s);
     if (d.dynamic_state3 && !d.caps.dynamic_state3) d.caps.dynamic_state3 = d.dynamic_state3->extendedDynamicState3PolygonMode != VK_FALSE;
     d.caps.buffer_address = f12->bufferDeviceAddress != VK_FALSE;
-    d.caps.float16 = f12->shaderFloat16 != VK_FALSE;
 
     const float priority = 1.0f;
     VkDeviceQueueCreateInfo qi{ VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO };

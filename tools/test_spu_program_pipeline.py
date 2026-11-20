@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Synthetic discovery -> generated registration coverage, no guest assets."""
 import json
 from pathlib import Path
 import shutil
@@ -13,7 +12,6 @@ TOOLS = Path(__file__).resolve().parent
 
 
 def elf(value=7, *, bad_bounds=False, unsupported=False, multi=False, rodata=False):
-    # il r3,value; bi r0. Both variants deliberately share entry/LS addresses.
     code = struct.pack('>II', 0x40800003 | (value << 7), 0x35000000)
     if unsupported:
         code = struct.pack('>I', 0x01000000) + code[4:]
@@ -63,15 +61,12 @@ class Pipeline(unittest.TestCase):
 
     def write_runtime_blocks(self):
         runtime = TOOLS.parent / 'runtime' / 'spu'
-        # Compile the runtime's actual registry/fingerprint/ELF-size blocks
-        # unchanged, without the unrelated DMA/job/platform dependency graph.
         workload = (runtime / 'spu_workload.c').read_text()
         workload = workload[workload.index('uint64_t spu_workload_fingerprint('):]
         (self.root / 'workload.c').write_text('#include "spu_workload.h"\n#include <stdio.h>\n#include <string.h>\n' + workload)
         channels = (runtime / 'spu_channels.c').read_text()
         channels = channels[channels.index('typedef void (*spu_fn)'):
-                            channels.index('/* Which image registered')]
-        # SPU_TLS is defined earlier in spu_channels.c, outside the extracted block.
+                            channels.index('int spu_image_of_function(')]
         tls = '#if defined(_MSC_VER)\n#define SPU_TLS __declspec(thread)\n#else\n#define SPU_TLS __thread\n#endif\n'
         (self.root / 'registry.c').write_text('#include "spu_context.h"\n#include <stdio.h>\n' + tls + channels)
         return runtime
@@ -124,7 +119,7 @@ class Pipeline(unittest.TestCase):
     def test_ambiguous_text_fingerprint_is_rejected(self):
         a = elf(7)
         b = bytearray(a)
-        b[15] = 1  # Same loaded code, different exact ELF identity.
+        b[15] = 1
         result = self.run_pipeline(('input.bin', a + b))
         self.assertNotEqual(result.returncode, 0)
         self.assertTrue(all(p['status'] == 'unsupported' for p in self.manifest()['programs']))
@@ -152,14 +147,12 @@ class Pipeline(unittest.TestCase):
         self.assertEqual(parse_spu_elf_size(original, 0), len(original))
         self.assertEqual(list(find_spu_images(b'prefix' + original + original)),
                          [(6, len(original)), (6 + len(original), len(original))])
-        # Malformed PH/SH table dimensions and LS bounds must be rejected.
         for offset, fmt, value in [(42, '>H', 1), (28, '>I', len(original)),
                                    (46, '>H', 1), (32, '>I', len(original)),
                                    (60, '>I', 0x40000), (72, '>I', 1)]:
             malformed = bytearray(original)
             struct.pack_into(fmt, malformed, offset, value)
             self.assertIsNone(parse_spu_elf_size(malformed, 0), (offset, value))
-        # Non-LOAD content past the code is still in the runtime fingerprint.
         nonload = bytearray(elf(multi=True))
         struct.pack_into('>I', nonload, 84, 4)
         self.assertEqual(parse_spu_elf_size(nonload, 0), len(nonload))
@@ -185,8 +178,6 @@ class Pipeline(unittest.TestCase):
         for bss in (False, True):
             with self.subTest(bss=bss):
                 blob = bytearray(elf(7, multi=True))
-                # The later non-executable load writes onto the first load's
-                # code. In BSS mode its zero-filled tail reaches the same code.
                 struct.pack_into('>I', blob, 84 + 24, 4)
                 if bss:
                     struct.pack_into('>I', blob, 84 + 8, 0xf0)
@@ -205,10 +196,6 @@ class Pipeline(unittest.TestCase):
                     if __import__('os').environ.get('CI'):
                         self.fail('C compiler required for runtime overwrite control in CI')
                     continue
-                # Negative control: the compatibility CLI still demonstrates
-                # why accepting this layout is unsafe. Compile its generated
-                # entry against the actual runtime loader and observe different
-                # loaded instructions versus the instructions baked into C.
                 images = self.root / 'legacy_images'
                 images.mkdir(exist_ok=True)
                 (images / 'sample.elf').write_bytes(blob)
@@ -270,8 +257,6 @@ class Pipeline(unittest.TestCase):
                      f'int id{i} = 0; spu_lifted_entry_fn f{i} = spu_workload_find_img(fp{i}, &id{i});',
                      f'assert(f{i} && id{i} == {program["image_id"]});',
                      f'assert(spu_lookup(0x100, id{i}) == f{i});',
-                     # Each context contains a 256 KB local store. Keep the
-                     # four fixtures off Windows' default 1 MB main stack.
                      f'static spu_context c{i}; f{i}(&c{i});',
                      f'assert(c{i}.gpr[3]._u32[0] == {immediate});']
         body += ['assert(f0 != f1 && id0 != id1);', 'assert(spu_workload_count() == 8);']
@@ -282,7 +267,6 @@ class Pipeline(unittest.TestCase):
             'SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*);\n'
             'void spu_indirect_branch(spu_context* ctx) { (void)ctx; assert(0); }\n'
             'int main(void) { spu_register_all();\n' + '\n'.join(body) + '\nreturn 0; }\n')
-        # Minimal consumer uses the same CMake generation helper as the template.
         cmake_source = 'cmake_minimum_required(VERSION 3.20)\nproject(proof C)\n'
         cmake_source += f'set(PS3RECOMP_DIR "{TOOLS.parent.as_posix()}")\n'
         cmake_source += 'include("${PS3RECOMP_DIR}/cmake/PS3RecompSPU.cmake")\n'
@@ -291,9 +275,6 @@ class Pipeline(unittest.TestCase):
         cmake_source += f'target_include_directories(proof PRIVATE "{runtime.as_posix()}")\n'
         (self.root / 'CMakeLists.txt').write_text(cmake_source)
         build = self.root / 'build'
-        # Visual Studio generators select their own toolset instead of this
-        # compiler, and put the executable in a configuration subdirectory.
-        # Ninja honors the selected Clang and the same executable path as POSIX.
         generator = ['-G', 'Ninja'] if sys.platform == 'win32' else []
         configured = subprocess.run([cmake, '-S', str(self.root), '-B', str(build), *generator,
                                      '-DCMAKE_C_COMPILER=' + cc,
@@ -302,8 +283,6 @@ class Pipeline(unittest.TestCase):
         built = subprocess.run([cmake, '--build', str(build)], capture_output=True, text=True)
         self.assertEqual(built.returncode, 0, built.stderr + built.stdout)
         subprocess.run([str(build / ('proof.exe' if sys.platform == 'win32' else 'proof'))], check=True)
-        # A changed input must reconfigure and fail coverage instead of linking
-        # the previously successful registration on an incremental build.
         (self.root / 'input.bin').write_bytes(elf(unsupported=True))
         rebuild = subprocess.run([cmake, '--build', str(build)], capture_output=True, text=True)
         self.assertNotEqual(rebuild.returncode, 0)
@@ -342,8 +321,6 @@ class Pipeline(unittest.TestCase):
         report = self.manifest()
         self.assertEqual({p['sha256']: p['image_id'] for p in report['programs']}, {da: 120, db: 121})
         self.assertIn('spu_begin_image(120)', (self.output / 'spu_workloads.c').read_text())
-        # A discovered program without a pinned id fails coverage instead of
-        # taking a content-derived id.
         ids.write_text(json.dumps({da: 120}))
         result = self.run_pipeline(('input.bin', a + b), extra=['--image-ids', str(ids)])
         self.assertNotEqual(result.returncode, 0)

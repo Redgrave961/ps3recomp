@@ -1,22 +1,4 @@
 #!/usr/bin/env python3
-"""Milestone-log self-check.
-
-Compiles runtime/milestone.c together with a driver and RUNS it, three times,
-because the properties that matter are runtime ones:
-
-  --off      PS3_MILESTONE_OUT unset -> the module is inert and writes nothing.
-  --nodump   _exit(0), skipping atexit -> the ordered stream is still on disk.
-             This is the "survives a hang" property, and it is the whole reason
-             keys are appended as they are first seen instead of buffered.
-  --on       normal exit -> stream, bucketed counts and scalars all present,
-             with four threads hammering shared keys throughout.
-
-The threaded part is not decoration. Lookups are lock-free and slots are
-published with a release store; if that protocol is wrong the table hands back
-truncated or duplicated keys under load, the gate starts reporting phantom
-differences, and people learn to ignore it. So the check asserts that every key
-got exactly one ordinal and that no key outside the expected set ever appears.
-"""
 import argparse
 import os
 import shutil
@@ -28,7 +10,6 @@ from msvc_env import find_vcvars
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRATCH = os.path.join(ROOT, "scratch")
 
-# 4 threads x 1000 iterations over 8 keys = 500 hits each -> the "100-999" bucket.
 N_THREADS, N_ITERS, N_KEYS = 4, 1000, 8
 HITS_PER_KEY = N_THREADS * N_ITERS // N_KEYS
 
@@ -126,7 +107,6 @@ int main(int argc, char** argv)
 
 
 def build(driver_c, exe):
-    """Compile the driver + the real milestone.c. Returns (ok, message)."""
     if os.name == "nt":
         clang = shutil.which("clang-cl") or r"C:\Program Files\LLVM\bin\clang-cl.exe"
         if not os.path.exists(clang) and not shutil.which("clang-cl"):
@@ -172,7 +152,6 @@ def run(exe, mode, out_path):
 
 
 def parse(path):
-    """-> (ordered [(ord, key)], {key: bucket}, {key: value}, saw_end)"""
     stream, counts, kv, saw_end = [], {}, {}, False
     with open(path) as f:
         for line in f:
@@ -218,8 +197,6 @@ def main():
 
     ok, msg = build(driver_c, exe)
     if not ok:
-        # A green tick that compiled nothing is worse than a red one, so CI=1
-        # turns a missing compiler into a failure rather than a skip.
         print("[milestone] BUILD FAILED: %s" % msg.strip()[:2000])
         return 2 if os.environ.get("CI") else 0
 
@@ -227,7 +204,6 @@ def main():
                        "t:four", "t:five", "t:six", "t:seven"}
     expected_all = {"a", "b", "c", "f:7"} | expected_shared
 
-    # --- inert when unconfigured -------------------------------------------
     print("[milestone] --off (PS3_MILESTONE_OUT unset)")
     if os.path.exists(out):
         os.remove(out)
@@ -235,7 +211,6 @@ def main():
     check(cp.returncode == 0, "exits cleanly with the log disabled")
     check(not os.path.exists(out), "writes nothing when unconfigured")
 
-    # --- the ordered stream survives a kill --------------------------------
     print("[milestone] --nodump (_exit, no atexit)")
     cp = run(exe, "--nodump", out)
     check(cp.returncode == 0, "driver ran")
@@ -244,8 +219,6 @@ def main():
     check(len(stream) == len(expected_all),
           "all %d keys reached disk without a clean exit" % len(expected_all))
     check(not saw_end, "no clean-exit marker (atexit never ran)")
-    # The whole point of the checkpoint: a killed title still says how much it
-    # did, which is what "did rendering stop?" reduces to.
     check(counts.get("a") == "2-9" and counts.get("b") == "1",
           "counts survive _exit (periodic checkpoint, not atexit)")
     bad = sorted(k for k in expected_shared if counts.get(k) not in ("100-999", "1k-9k"))
@@ -255,7 +228,6 @@ def main():
     check(kv.get("scalar:answer") == 43 and kv.get("scalar:big") == 1234567890123,
           "scalars survive _exit too (they are written as they are set)")
 
-    # --- the full record ----------------------------------------------------
     print("[milestone] --on (normal exit)")
     cp = run(exe, "--on", out)
     check(cp.returncode == 0, "driver ran")

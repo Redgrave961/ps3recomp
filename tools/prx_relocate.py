@@ -1,35 +1,10 @@
 #!/usr/bin/env python3
-"""prx_relocate.py — pre-link a relocatable PS3 PRX at a fixed load base.
-
-A PS3 PRX (ET_SCE_PPURELEXEC) ships position-independent: its absolute
-addresses are stored base-0 and a PT_SCE_PPURELA table lists every word that
-must have the runtime load base added.  In a *static* recompile there is no
-guest copy of the code to fix up at load time — the lifter bakes addresses
-straight into the emitted C.  So we must commit to a fixed load base B at lift
-time, apply every relocation against B, and lift the resulting *linked* image.
-
-Empirically (libsre/libresc/libspurs_jq) the relocation model is uniform:
-
-    value        = B + r_addend          (symbol-segment field is always 0;
-    patch_site   = B + r_offset           the addend is the full PRX vaddr)
-
-    type 1  R_PPC64_ADDR32      write32(patch_site, value)
-    type 4  R_PPC64_ADDR16_LO   patch16(patch_site, value & 0xFFFF)
-    type 6  R_PPC64_ADDR16_HA   patch16(patch_site, ((value>>16)+((value>>15)&1)) & 0xFFFF)
-
-types 4/6 always come as lis/addi pairs (32 each in libsre); type 1 is the bulk
-(function descriptors / pointer tables embedded in the code+rodata segment).
-
-Output: a flat linked image (vaddr 0..memsz, relocations applied, mapped to B at
-load) plus a JSON manifest the runtime PRX loader and the re-lift step consume.
-"""
 import argparse, json, struct, sys, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import elf_parser
 
 
 def ha16(v):
-    """high-adjusted 16 bits: compensates for the sign-extended LO addi."""
     return ((v >> 16) + ((v >> 15) & 1)) & 0xFFFF
 
 
@@ -41,21 +16,11 @@ def relocate(prx_path, base):
         raise SystemExit("no PT_LOAD segments")
     memsz = max(p.p_vaddr + p.p_memsz for p in loads)
 
-    # flatten segments into one base-0 image of size memsz (gaps stay zero)
     img = bytearray(memsz)
     for p in loads:
         seg = f.raw_data[p.p_offset:p.p_offset + p.p_filesz]
         img[p.p_vaddr:p.p_vaddr + len(seg)] = seg
 
-    # SCE PPU relocations are segment-relative on BOTH ends. r_info packs two
-    # segment indices (r_sym = r_info >> 32):
-    #   patched_seg = r_sym & 0xFF        -> r_offset is relative to its vaddr
-    #   symbol_seg  = (r_sym >> 8) & 0xFF -> its vaddr is added to the value
-    # So:  patch at  seg[patched_seg].vaddr + r_offset
-    #      value  =  base + seg[symbol_seg].vaddr + addend
-    # (Most seg0 code relocs are patched_seg=symbol_seg=0 with addend = full
-    #  vaddr, but OPDs/TOC pointers in seg1 use patched_seg=1 and the data-table
-    #  loads in code use symbol_seg=1 — both must be honored.)
     seg_vaddr = [p.p_vaddr for p in loads]
     counts = {1: 0, 4: 0, 6: 0}
     skipped = 0

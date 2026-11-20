@@ -1,26 +1,4 @@
 #!/usr/bin/env python3
-"""Every thread-local qualifier in the runtime is thread-local under MinGW.
-
-MinGW-w64 GCC defines _WIN32 but not _MSC_VER, and it ignores
-__declspec(thread) ("'thread' attribute directive ignored"): a variable
-declared with it is an ordinary process-wide global. A qualifier macro that
-picks __declspec(thread) on _WIN32 therefore silently shares its variables
-between threads on the MinGW build.
-
-This test finds every macro in runtime/ and libs/ that is defined to
-__declspec(thread), keeps the preprocessor conditionals around that
-definition (and the macro's other definitions inside them), and compiles
-`static MACRO int v; int* get(void) { return &v; }` the way MinGW sees it.
-The variable must come out thread-local (a .tls entry or an emutls object).
-
-With x86_64-w64-mingw32-gcc on PATH it uses that compiler. Otherwise, on an
-ELF host (Linux, BSD), it uses the host C compiler with MinGW's view of the
-platform: _WIN32 defined, _MSC_VER not, and __declspec(x) spelled as MinGW
-spells it, __attribute__((x)), so __declspec(thread) is ignored the same way.
-Before trusting that emulation it checks the host compiler on two controls
-(`__thread` must read as thread-local, a plain static must not); if either
-fails, or the host is macOS or Windows without MinGW gcc, it prints SKIP.
-"""
 import os
 import re
 import shutil
@@ -67,14 +45,10 @@ def sites():
                 yield path.relative_to(ROOT).as_posix(), i + 1, name, '\n'.join(keep)
 
 
-# TLS access as it appears in the assembly: PE .tls / emutls (MinGW), x86-64
-# ELF (%fs, @tpoff, @tlsgd, @gottpoff), AArch64 ELF (tprel, tlsdesc, tpidr_el0).
 TLS_ASM = re.compile(r'\.tls|__emutls|%fs:|@tpoff|@tlsgd|@gottpoff|tprel|tlsdesc|tpidr_el0', re.I)
 
 
 def probe(cmd, tmp, code):
-    """Compile `code` to assembly; None if it does not compile, else whether
-    the assembly accesses thread-local storage."""
     src = Path(tmp) / 'probe.c'
     asm = Path(tmp) / 'probe.s'
     src.write_text(code)

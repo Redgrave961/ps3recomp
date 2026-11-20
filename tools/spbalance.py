@@ -1,17 +1,3 @@
-"""spbalance.py - find stack-imbalance bugs in lifted PPU output.
-
-Lifted functions form "logical functions": an entry (with a prologue
-`gpr[1] += -N`) plus tail-entry continuations reached via `PPU_TAIL` tail calls.
-Only the entry allocates the frame; some continuation restores it before a real
-`return`. A balanced logical function restores exactly what the entry allocated
-on every real-return path.
-
-This walks each entry's trampoline+goto reachable set, tracking cumulative sp
-allocation, and flags real returns whose restore != cumulative alloc. Those are
-mis-split / mis-lifted functions that corrupt sp when dispatched.
-
-Usage: python spbalance.py <dir-with-ppu_recomp_*.cpp> [--focus func_XXXXXXXX]
-"""
 import glob, os, re, sys, collections
 
 ALLOC = re.compile(r'ctx->gpr\[1\] \+= -(0x[0-9A-Fa-f]+);')
@@ -20,7 +6,6 @@ SIG   = re.compile(r'^void (func_[0-9A-Fa-f]{8})\(ppu_context\* ctx\) \{')
 TRAMP = re.compile(r'PPU_TAIL return (func_[0-9A-Fa-f]{8})\(ctx\)')
 
 def parse(d):
-    """name -> dict(alloc, real_restores=[ints], tramps=set(names), has_real_ret)"""
     funcs = {}
     for path in sorted(glob.glob(os.path.join(d, 'ppu_recomp_*.cpp'))):
         cur = None; lines = []
@@ -30,8 +15,6 @@ def parse(d):
                 alloc += int(m.group(1), 16)
             tramps = set(TRAMP.findall('\n'.join(body)))
             real = []
-            # a `return;` not on a tail-call line is a real return;
-            # capture the most recent restore before it
             last_rest = 0
             for ln in body:
                 rm = REST.search(ln)
@@ -58,8 +41,6 @@ def check(funcs, focus=None):
     if focus:
         entries = [focus] if focus in funcs else []
     for e in entries:
-        # BFS through trampolines; only the entry contributes alloc (continuations
-        # are tail-entries with alloc 0). Track real returns reached.
         seen = set([e]); q = collections.deque([e]); alloc = funcs[e]['alloc']
         chain_real = []
         steps = 0
@@ -86,7 +67,6 @@ def main():
     funcs = parse(d)
     print(f"parsed {len(funcs)} functions; {sum(1 for f in funcs.values() if f['alloc']>0)} with a prologue")
     bugs = check(funcs, focus)
-    # dedup by entry
     by_entry = collections.OrderedDict()
     for e, a, rn, r, sz in bugs:
         by_entry.setdefault(e, (a, rn, r, sz))

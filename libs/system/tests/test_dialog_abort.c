@@ -1,5 +1,3 @@
-/* macOS: clang -std=gnu17 -I include libs/system/tests/test_dialog_abort.c
- * libs/system/cellSysutil.c -Wl,-dead_strip -pthread -o /tmp/test_dialog_abort && /tmp/test_dialog_abort */
 #include "../cellMsgDialog.c"
 #include <stdlib.h>
 
@@ -44,7 +42,6 @@ int main(void)
     cellSysutilCheckCallback();
     CHECK(calls==0);
 
-    /* Closing the replacement must deliver only its own OPD and userdata. */
     calls=0;
     CHECK(cellMsgDialogOpen2(CELL_MSGDIALOG_TYPE_PROGRESSBAR_SINGLE,
         (void*)0x200,(void*)0x300,(void*)0x9876,NULL)==CELL_OK);

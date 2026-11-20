@@ -1,27 +1,3 @@
-/*
- * ps3recomp - PPU <-> SPU lock-line coherence
- *
- * An SPU that issues GETLLAR holds a reservation on a 128-byte line and then
- * spins, waiting for someone else to change it. On real hardware a store by
- * ANY other processor to that line kills the reservation and raises
- * SPU_EVENT_LR on the reserving SPU, which is how a parked SPURS idle service
- * learns that the PPU has posted work. Emulated, the two halves live on
- * different host threads with nothing between them, so the SPU half alone gets
- * PUTLLC right (it compares the line before committing) while the PPU half
- * never tells anyone it wrote. The service sleeps through the signal.
- *
- * This is the missing half. Every line an SPU reserves is marked in a bitmap;
- * the PPU store paths (runtime/ppu/ppu_memory.h and runtime/ppu/ppu_loader.cpp)
- * check the bitmap, and on a hit commit the store under the same lock-line lock
- * the SPU's GETLLAR/PUTLLC transaction takes, then notify. That does two things
- * at once: the store can no longer land inside a PUTLLC's compare/commit window
- * (where it would be silently reverted), and the reserving SPU gets its event.
- *
- * The bitmap check is a shift and a load against a global that stays zero until
- * an SPU actually reserves something, so a title that never runs SPU code pays
- * one predictable branch per store.
- */
-
 #ifndef SPU_COHERENCY_H
 #define SPU_COHERENCY_H
 
@@ -33,7 +9,6 @@
 extern "C" {
 #endif
 
-/* SPU external event: lock-line reservation lost. */
 #define SPU_EVENT_LR  0x400u
 
 void spu_lockline_lock(uint32_t ea);
@@ -41,46 +16,22 @@ void spu_lockline_unlock(uint32_t ea);
 void spu_lockline_lock_range(uint32_t ea, uint32_t size);
 void spu_lockline_unlock_range(uint32_t ea, uint32_t size);
 
-/* Mark `ea`'s 128-byte line as SPU-reserved and remember `ctx` as a possible
- * reservation holder. Called from the SPU's GETLLAR with the lock held.
- *
- * Lines are marked and never unmarked. A line the SPURS kernel reserves is
- * reserved again microseconds later, so unmarking would buy nothing; a stale
- * mark costs one locked PPU store to a line the kernel owns anyway. */
 void spu_coh_reserve(spu_context* ctx, uint32_t ea);
 
-/* GETLLAR fast path: publish ctx's reservation of ea WITHOUT the lock-line
- * lock, when ctx is already a registered holder and ea's line already marked.
- * Returns 0 when the caller must take the lock and call spu_coh_reserve
- * instead. On 1 the caller copies the line, also without the lock. */
 int spu_coh_reserve_fast(spu_context* ctx, uint32_t ea, uint32_t* seq);
 int spu_lockline_unchanged(uint32_t ea, uint32_t seq);
 
-/* Is `addr`'s line marked? The PPU store fast path -- a range-free O(1) bitmap
- * lookup guarded by a global that is zero until the first GETLLAR. */
 int spu_coh_is_reserved(uint32_t addr);
 
-/* A store by the PPU landed on `ea`'s line. Raise SPU_EVENT_LR on every SPU
- * whose live reservation covers it, drop that reservation, and wake the host
- * thread in case it is parked in `rdch SPU_RdEventStat`.
- *
- * Expects the lock-line lock held, so that the store this is reporting and the
- * reservation state it clears are seen by an SPU's PUTLLC as one transaction. */
 void spu_coh_notify_write(uint32_t ea);
-/* Remove a context from the reserving set. MUST be called before a
- * transient (stack-allocated) spu_context goes out of scope. */
 void spu_coh_unregister(spu_context* ctx);
-void spu_coh_forget_range(uintptr_t lo, uintptr_t hi);  /* thread exit */
-/* As above, but leaves `self`'s own reservation alone: an SPU's own MFC
- * write does not cost it its reservation on hardware. */
+void spu_coh_forget_range(uintptr_t lo, uintptr_t hi);
 void spu_coh_notify_write_except(uint32_t ea, const void* self);
 
-/* Count of LR events delivered. A parked SPURS service that never wakes with
- * this at zero is a coherence miss; nonzero moves the question downstream. */
 extern unsigned long g_spu_lr_raise;
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* SPU_COHERENCY_H */
+#endif

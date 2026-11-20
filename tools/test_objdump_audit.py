@@ -1,12 +1,3 @@
-"""Self-check for objdump_audit's line parser + decoder agreement.
-
-No SDK/objdump needed: feed a synthetic objdump snippet (real Cell instruction words) and
-assert the parser recovers address/word/mnemonic -- including a record-form ".": the trailing
-dot is exactly what a naive \\w+ regex drops, silently mis-diffing every dot-form. Then check
-our own decoder agrees on the same words (directly or via a known simplified-mnemonic alias).
-
-Run: python tools/test_objdump_audit.py
-"""
 import os
 import sys
 
@@ -15,7 +6,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import objdump_audit as oa
 from ppu_disasm import decode as ppu_decode
 
-# A few real PPU instruction lines in ppu-lv2-objdump's format (addr: bytes  mnemonic ops).
 SNIPPET = """\
 Disassembly of section .text:
 
@@ -32,17 +22,13 @@ def main() -> int:
     rows = oa.parse_objdump_text(SNIPPET)
     got = {addr: (word, mn) for addr, word, mn in rows}
 
-    # .long data line is dropped; the four instructions are parsed.
     assert 0x10334 not in got, "data (.long) line should be skipped"
     assert set(got) == {0x10324, 0x10328, 0x1032c, 0x10330}, sorted(hex(a) for a in got)
 
-    # The record-form trailing "." must survive parsing (the bug this guards).
     assert got[0x10328][1] == "addic.", got[0x10328]
 
-    # Words decoded big-endian: 0x7c601b78 = "mr r0,r3" alias of "or r0,r3,r3".
     assert got[0x10324][0] == 0x7C601B78, hex(got[0x10324][0])
 
-    # Our decoder agrees with objdump on each (directly, or via the alias table).
     for addr, (word, oracle) in got.items():
         ours = ppu_decode(word, addr).mnemonic.lower()
         assert ours == oracle or (ours, oracle) in oa.ALIAS, \

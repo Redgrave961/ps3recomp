@@ -1,21 +1,3 @@
-"""spu_lift_selftest.py - end-to-end SPU lifter validation against native execution.
-
-The SPU equivalent of lift_selftest.py, for the project's least-validated subsystem. We
-proved the SPU *decoder* at 100% vs spu-lv2-objdump; this proves the SPU *lifter*: compile
-a corpus of C functions with the real SPU compiler, lift the SPU code with our own
-spu_lifter, compile the lifted C on the host against runtime/spu, run it, and check every
-result is bit-exact against the same functions compiled and run natively.
-
-Clean-room: the corpus is OUR code; the tool only invokes compilers you already have and
-copies no SDK content. Requires the SPU gcc and a host C compiler:
-
-    python spu_lift_selftest.py --spu-gcc .../spu-lv2-gcc.exe --host-cc .../clang.exe
-    (or set SPU_GCC / HOST_CC)
-
-Scope: register-only compute (no DMA / channels), so args land in the SPU preferred slot
-(gpr[3+i]._u32[0]) and the result in gpr[3]; the channel/branch runtime hooks are stubbed.
-Float kept constant-free (no .rodata constant loads, no SPU estimate-based divide).
-"""
 from __future__ import annotations
 
 import argparse
@@ -33,8 +15,6 @@ REPO = os.path.dirname(HERE)
 
 
 def spu_func_addrs(elf_path: str, wanted: set[str]) -> dict[str, int]:
-    """name -> local-store address for wanted STT_FUNC symbols in an SPU ELF32 (BE).
-    (elf_symbols.py only handles the ELF64 24-byte symbol layout; SPU is ELF32/16-byte.)"""
     e = ELFFile(elf_path); e.load()
     si = next((i for i, s in enumerate(e.section_headers) if s.sh_type == 2), None)
     if si is None:
@@ -45,7 +25,7 @@ def spu_func_addrs(elf_path: str, wanted: set[str]) -> dict[str, int]:
     out: dict[str, int] = {}
     for i in range(len(sd) // ent):
         name_o, val, _size, info, _other, _shndx = struct.unpack_from(">IIIBBH", sd, i * ent)
-        if (info & 0xF) == 2:                      # STT_FUNC
+        if (info & 0xF) == 2:
             z = strd.find(b"\0", name_o)
             nm = strd[name_o:z].decode("latin1")
             if nm in wanted:
@@ -53,7 +33,6 @@ def spu_func_addrs(elf_path: str, wanted: set[str]) -> dict[str, int]:
     return out
 RUNTIME_SPU = os.path.join(REPO, "runtime", "spu")
 
-# (name, signature, source, inputs). ii->i: int(int,int); ff->f: float(float,float)
 CORPUS = [
     ("arith", "ii->i", "int arith(int a,int b){ int x=a*3+(b<<2)-(a>>1); x^=(a&b); "
                         "x+=(a>b)?a:b; return x*2-7; }",
@@ -80,7 +59,6 @@ def sh(cmd, **kw):
     return r.stdout
 
 
-# SPU runtime hooks the lifted code declares as externs; unused for pure compute.
 STUBS = r'''
 #include "spu_recomp.h"
 #include "spu_helpers.h"
@@ -119,7 +97,7 @@ void spu_drain_call(spu_context* c, uint32_t ret){
 def gen_driver(cases_meta):
     lines = [STUBS, ""]
     for name, sig, src, _inp, _addr in cases_meta:
-        lines.append(src)                         # native references (host build)
+        lines.append(src)
     lines += ["", "int main(){ setbuf(stdout,0); int fails=0,total=0;"]
     for name, sig, _src, inputs, addr in cases_meta:
         fn = f"spu_func_{addr:08X}"
@@ -132,7 +110,7 @@ def gen_driver(cases_meta):
                 read = "(int)ctx.gpr[3]._u32[0]"
                 call = f"(int){name}({','.join(refargs)})"
                 fmt = '"%s(%s): lifted=%d ref=%d %s\\n"'
-            else:  # ff->f
+            else:
                 for i, v in enumerate(inp):
                     ctxset.append(f"{{ union{{float f;uint32_t u;}} cv; cv.f={v!r}f; "
                                   f"ctx.gpr[{3+i}]._u32[0]=cv.u; }}")

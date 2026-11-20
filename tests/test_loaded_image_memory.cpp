@@ -1,4 +1,3 @@
-/* Manufactured ELF data only; exercises the production loader and allocators. */
 #include "../runtime/syscalls/sys_memory.h"
 #include <cstdio>
 #include <cstdlib>
@@ -11,7 +10,6 @@ uint8_t* vm_base;
 uint32_t ppu_hle_inject_base = 0x20000000u;
 void (*g_rsx_window_write)(void) = nullptr;
 uint32_t ppu_load_elf(const char*);
-/* These subsystems are inactive in a loader-only fixture. */
 int spu_coh_is_reserved(uint32_t) { return 0; }
 void spu_coh_notify_write(uint32_t) { std::abort(); }
 void spu_lockline_lock(uint32_t) { std::abort(); }
@@ -48,12 +46,11 @@ int main(int argc, char** argv)
     CHECK(vm_base != MAP_FAILED);
     ppu_vm_size = 0xE0000000u;
     CHECK(ppu_load_elf(argv[1]) == 0x10000);
-    /* Match boot_main: syscall initialization follows ELF loading. */
     sys_memory_init(&table);
     CHECK(!std::memcmp(vm_base + 0x10000000, "QRST", 4));
     CHECK(vm_base[0x1077FFFF] == 0);
-    vm_base[0x1077FFFF] = 0xA5;  /* live object in the loaded segment's BSS */
-    vm_base[0x4020FFFF] = 0x5A;  /* BSS-only mapper-domain segment */
+    vm_base[0x1077FFFF] = 0xA5;
+    vm_base[0x4020FFFF] = 0x5A;
     CHECK(allocate(0xA400000) == CELL_OK);
     ppu_context c{};
     c.gpr[3] = 0x10000; c.gpr[4] = 0x500000;
@@ -69,8 +66,7 @@ int main(int argc, char** argv)
     CHECK(vm_base[0x1077FFFF] == 0xA5);
     CHECK(!std::memcmp(vm_base + 0x40000000, "MAPS", 4));
     CHECK(vm_base[0x4020FFFF] == 0x5A);
-    /* Reservation search must also avoid the image, including an aligned
-     * candidate that lands in the second, BSS-only PT_LOAD. */
+
     sys_memory_init(&table);
     c = {};
     c.gpr[3] = 0x200000; c.gpr[5] = 0x100000; c.gpr[6] = 0x10000;
@@ -83,7 +79,6 @@ int main(int argc, char** argv)
     std::memset(vm_base + block, 0xEE, 0x100000);
     CHECK(vm_base[0x4020FFFF] == 0x5A);
     CHECK(!std::memcmp(vm_base + 0x40000000, "MAPS", 4));
-    /* Replacing the executable replaces the range list, without stale holes. */
     CHECK(ppu_load_elf(argv[2]) == 0x10000);
     sys_memory_init(&table);
     CHECK(allocate(0x100000) == CELL_OK);

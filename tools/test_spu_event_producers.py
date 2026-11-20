@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Run real SPU channel event producers against concurrent reservation writes."""
 import os, subprocess, tempfile
 from pathlib import Path
 if os.name=='nt':print('SKIP: POSIX compiler/linker fixture');raise SystemExit(0)

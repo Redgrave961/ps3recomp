@@ -1,20 +1,4 @@
 #!/usr/bin/env python3
-"""
-Print a lifted function's C code and/or its original PowerPC disassembly.
-
-The lifted chunks are too big to browse comfortably in an editor, so this
-pulls out just the function you care about.
-
-Usage:
-    py -3 tools\\show_func.py 937840            # lifted C
-    py -3 tools\\show_func.py 0x00937840 --asm  # original PowerPC
-    py -3 tools\\show_func.py 937840 --both
-    py -3 tools\\show_func.py 937840 --max 0    # no length cap
-
-Defaults assume the repo layout (recomp\\ chunks, game\\EBOOT.elf,
-functions.json); override with --dir / --elf / --functions.
-"""
-
 import argparse
 import glob
 import json
@@ -44,7 +28,6 @@ def find_lifted(addr: int, recomp_dir: str, max_lines: int) -> bool:
         m = pat.search(text)
         if not m:
             continue
-        # function body ends at the first '}' on its own line
         end = text.find("\n}", m.start())
         body = text[m.start():end + 2] if end != -1 else text[m.start():m.start() + 8000]
         lines = body.splitlines()
@@ -72,7 +55,6 @@ def find_asm(addr: int, elf_path: str, functions_path: str, max_lines: int) -> N
     size = (end - addr) if end else 0x200
 
     data = open(elf_path, "rb").read()
-    # text segment: vaddr 0x10000 at file offset 0 (PS3 EBOOT layout)
     off = addr - 0x10000
     if off < 0 or off + size > len(data):
         print(f"address 0x{addr:08X} is outside the text segment")

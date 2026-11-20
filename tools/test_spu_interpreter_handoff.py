@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Exercise real SPU interpretation/drain boundaries without game binaries."""
 import os
 import subprocess
 import tempfile

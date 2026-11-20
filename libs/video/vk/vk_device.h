@@ -22,18 +22,13 @@ struct vk_caps {
     bool pipeline_library;
     bool shader_object;
     bool local_read;
-    bool conditional_rendering;
     bool custom_border_color;
-    bool depth_clip_control;
     bool depth_clip_enable;
     bool provoking_vertex;
-    bool list_restart;
-    bool unused_attachments;
     bool maintenance5;
     bool host_memory;
     bool memory_budget;
     bool buffer_address;
-    bool float16;
     bool fifo_latest_ready;
 };
 

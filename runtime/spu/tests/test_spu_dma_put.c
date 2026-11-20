@@ -1,16 +1,3 @@
-/*
- * MFC PUT against reserved lines: the reserved-range scan agrees with a
- * per-line scan for every span, a PUT over a peer's reserved line costs that
- * peer its reservation, the issuer keeps its own, and an unreserved PUT copies
- * exactly and touches no reservation.
- *
- * Build:
- *   clang -std=gnu17 -I include -I runtime/spu \
- *         -o /tmp/test_spu_dma_put runtime/spu/tests/test_spu_dma_put.c \
- *         runtime/spu/tests/spu_fixture_ppu.c runtime/platform/win32_compat.c \
- *         runtime/platform/ps3_sync.c -lpthread
- */
-
 #include "../spu_coherency.c"
 #include "../../ppu/ppu_memory.h"
 #include "../spu_dma.h"

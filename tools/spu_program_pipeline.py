@@ -1,8 +1,3 @@
-"""Validated discovery and fresh generation for build_spu_workloads --input.
-
-Uses the existing detector, lifter CLI and registry emitter. Owns its entire
-output directory; manifests and logs remain available after failed generation.
-"""
 import hashlib
 import json
 from pathlib import Path
@@ -20,11 +15,6 @@ def sha256(buf):
 
 
 def code_ranges(info, blob=None):
-    # The loader applies every PT_LOAD in header order, including zero filling.
-    # Lifting a segment in isolation is unsafe if another load can replace its
-    # bytes. Treat any overlapping memory layout as unsupported until generation
-    # explicitly models the final deployed local store. Adjacent/empty loads
-    # remain valid.
     loads = sorted((p['addr'], p['addr'] + p['memsz']) for p in info['loads'] if p['memsz'])
     if any(b > c for (_, b), (c, _) in zip(loads, loads[1:])):
         raise ValueError('overlapping PT_LOAD memory ranges (including BSS) are unsupported')
@@ -66,7 +56,6 @@ def guest_ea(buf, offset):
 
 
 def publish(stage, destination):
-    """Replace owned output as a unit, never reuse a previous generated lift."""
     backup = destination.with_name(destination.name + '.previous')
     if backup.exists():
         raise ValueError('previous interrupted publication exists: ' + str(backup))
@@ -109,8 +98,6 @@ def build_programs(args, registry_writer):
             raise ValueError('--input always generates fresh code; --skip-lift is incompatible')
         if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', args.register_fn):
             raise ValueError('--register-fn must be a C identifier')
-        # Hash every tool contributing to generation; fresh execution means changed
-        # source/options/input can never validate an old registration implicitly.
         tool_names = ['spu_program_pipeline.py', 'build_spu_workloads.py', 'spu_elf.py',
                       'find_spu_functions.py', 'spu_disasm.py']
         tool_paths = [Path(__file__).with_name(n) for n in tool_names] + [Path(args.lifter).resolve()]
@@ -157,15 +144,13 @@ def build_programs(args, registry_writer):
                     unique[digest]['occurrences'].append(occurrence)
                     continue
                 name = 'spu_' + digest
-                image_id = 0x10000000 | int(digest[:7], 16)  # positive signed-int range, away from legacy IDs
+                image_id = 0x10000000 | int(digest[:7], 16)
                 if pinned_ids is not None and digest in pinned_ids:
                     image_id = pinned_ids[digest]
                 p = dict(name=name, sha256=digest, size=len(blob), entry=info['entry'], image_id=image_id,
                          fingerprint=f'{fnv1a64(blob):016X}', status='discovered', occurrences=[occurrence])
                 unique[digest], blobs[digest], layouts[digest] = p, blob, info
                 report['programs'].append(p)
-        # Runtime keys cannot distinguish collisions, including identical text
-        # with differing data or one image's text matching another's full ELF.
         owners = {}
         ids = {}
         for digest, program in sorted(unique.items()):
@@ -268,7 +253,6 @@ def build_programs(args, registry_writer):
                     hi = max(b for _, b in program['executable_ranges'])
                     regions[name] = [(eas[digest] + seg['off'] + (lo - seg['addr']), lo, hi - lo)]
                     program['guest_ea'] = hex(eas[digest])
-        # Default runtime capacity is 256 registrations, including text aliases.
         if sum(len({fp, text_fps[name]}) for name, _, fp, _ in imgs) > 256:
             report['errors'].append('generated registrations exceed default runtime capacity (256)')
         if sum(len(p.get('diagnostics', {}).get('functions', [])) for p in report['programs']
@@ -282,7 +266,6 @@ def build_programs(args, registry_writer):
                                                         register_fn=args.register_fn, constructor=args.constructor))()
             registry_writer(registry_args, imgs, text_fps, image_ids, regions)
             sources = [destination / name / 'spu_recomp.c' for name, _, _, _ in imgs] + [registry]
-            # Bracket arguments preserve spaces and avoid expansion of $ in paths.
             cmake = 'set(SPU_GENERATED_SOURCES\n' + ''.join(f'  [==[{p.as_posix()}]==]\n' for p in sources) + ')\n'
             (stage / 'sources.cmake').write_text(cmake)
         if not usable:

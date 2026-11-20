@@ -1,28 +1,10 @@
 #!/usr/bin/env python3
-"""Callee-save pass: a register set by a carry-form instruction is redefined there.
-
-The pass pairs one `std rN, off(r1)` with one `ld rN, off(r1)` as a callee-save
-save/restore when the store comes before rN's first redefinition, and rewrites
-the reload to the value rN had at function entry (`_cs_N`). The first
-redefinition was looked up only on lines that START with `ctx->gpr[N] = `. The
-carry forms (addic, addic., addc, adde, addze, subfc, subfic) are emitted as
-`{ uint64_t _a = ...; ctx->gpr[N] = _r; ... }`, so their definition was
-invisible: a function that computed a value with one of them, spilled it and
-reloaded it later got the stale entry value back (a frozen AI waypoint search in
-Killzone 2).
-
-    addic r22,r27,1 ; std r22,0xA8(r1) ; mr r3,r4 ; ld r22,0xA8(r1) ; blr
-
-The spill follows the only definition of r22, so the reload is a real load.
-
-Run: python tools/test_ppu_cs_carry_forms.py
-"""
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import ppu_disasm                       # noqa: E402
-from ppu_lifter import PPULifter        # noqa: E402
+import ppu_disasm
+from ppu_lifter import PPULifter
 
 BASE = 0x10000
 
@@ -50,7 +32,6 @@ def test_carry_form_definition_is_seen():
 
 
 def test_plain_definition_unchanged():
-    # addi starts its line with the assignment: it was seen before, and must be after
     body = lift(w_addi(22, 27, 1))
     assert "_cs_22" not in body, body
     assert "ctx->gpr[22] = vm_read64(ctx->gpr[1] + 0xA8);" in body, body

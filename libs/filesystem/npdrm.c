@@ -4,7 +4,6 @@
 #include <string.h>
 #include "ps3_aes.h"
 
-
 #define FLAG_COMPRESSED    0x00000001u
 #define FLAG_PLAIN         0x00000002u
 #define FLAG_ENCRYPTED_KEY 0x00000008u
@@ -138,8 +137,6 @@ static void hmac_sha1(const uint8_t* key, size_t key_len, const uint8_t* m, size
     sha1_init(&c); sha1_update(&c, opad, 64); sha1_update(&c, inner, 20); sha1_final(&c, out);
 }
 
-static uint32_t be32(const uint8_t* p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
-
 static uint8_t s_klic[16][16];
 static volatile int s_klic_n;
 
@@ -262,11 +259,11 @@ npdrm_file* npdrm_open(ps3_vfile* f)
     d->f = f;
     d->cached = -1;
     if (ps3_vfile_seek(f, 0, SEEK_SET) || ps3_vfile_read(d->hdr, 0x100, f) != 0x100 || memcmp(d->hdr, "NPD", 4)) goto fail;
-    d->version = be32(d->hdr + 4);
-    const uint32_t license = be32(d->hdr + 8);
-    d->flags = be32(d->hdr + 0x80);
-    d->block_size = be32(d->hdr + 0x84);
-    d->size = (uint64_t)be32(d->hdr + 0x88) << 32 | be32(d->hdr + 0x8C);
+    d->version = ps3_be32(d->hdr + 4);
+    const uint32_t license = ps3_be32(d->hdr + 8);
+    d->flags = ps3_be32(d->hdr + 0x80);
+    d->block_size = ps3_be32(d->hdr + 0x84);
+    d->size = (uint64_t)ps3_be32(d->hdr + 0x88) << 32 | ps3_be32(d->hdr + 0x8C);
     if ((d->flags & FLAG_COMPRESSED) || !d->block_size || d->block_size > (1u << 24)) goto fail;
     d->blocks = (uint32_t)((d->size + d->block_size - 1) / d->block_size);
     if (d->flags & FLAG_SDAT) {
@@ -330,7 +327,7 @@ int npdrm_license_available(const char* host_path, const uint8_t* klicensee)
     npdrm_file* d = npdrm_open(f);
     if (!d) {
         uint8_t hdr[0x10];
-        const int license2 = ps3_vfile_seek(f, 0, SEEK_SET) == 0 && ps3_vfile_read(hdr, 0x10, f) == 0x10 && (be32(hdr + 8) & 3) != 3;
+        const int license2 = ps3_vfile_seek(f, 0, SEEK_SET) == 0 && ps3_vfile_read(hdr, 0x10, f) == 0x10 && (ps3_be32(hdr + 8) & 3) != 3;
         ps3_vfile_close(f);
         return (int)(license2 ? NPDRM_ERROR_LICENSE_NOT_FOUND : NPDRM_ERROR_NO_ENTITLEMENT);
     }

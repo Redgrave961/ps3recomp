@@ -1,11 +1,3 @@
-/* SPU lifter torture-KAT harness. See gen_test_torture.py for the KAT list --
- * each targets a bug class the LBP Bink bring-up hit in the wild (preferred-
- * halfword branches, ila-continuations, computed-branch stack growth).
- *
- * Run with clang (GCC=clang ./run_tests.sh): K6's 100k-iteration bi-loop needs
- * guaranteed-flat dispatch (musttail); under gcc the fallback relies on
- * sibling-call optimization and may fail for harness reasons, not lifter bugs.
- */
 #include "spu_recomp.h"
 #include "spu_helpers.h"
 #include <stdio.h>
@@ -15,7 +7,6 @@
 
 uint8_t* vm_base = 0;
 
-/* ---- marker collection (SPU_WrOutMbox) ---- */
 static uint32_t g_marks[64];
 static int g_nmarks = 0;
 static int g_stopped = 0;
@@ -30,7 +21,6 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value) {
 void spu_stop(spu_context* ctx) { (void)ctx; g_stopped = 1; }
 void spu_halt(spu_context* ctx) { (void)ctx; g_stopped = 1; }
 
-/* ---- minimal real dispatch: registry + (musttail) resolver ---- */
 typedef void (*fnp)(spu_context*);
 static struct { uint32_t addr; fnp fn; } g_reg[4096];
 static int g_nreg = 0;
@@ -56,8 +46,6 @@ void spu_indirect_branch(spu_context* ctx) {
 
 void spu_recomp_register(void);
 void spu_func_00000000(spu_context* ctx);
-
-/* diagnostics externs referenced from spu_dma.h in the full runtime */
 
 int main(void) {
     spu_context* ctx = (spu_context*)calloc(1, sizeof(spu_context));

@@ -1,25 +1,4 @@
 #!/usr/bin/env python3
-"""cellFs sizes and offsets past 4 GiB in runtime/ppu/ppu_fs.cpp.
-
-On Windows (LLP64) `long` is 32 bits: fseek(long)/ftell and a `struct stat`
-whose st_size is 32 bits cannot describe a file past 2 GiB, and depending on
-the CRT cellFsStat either failed or returned a truncated size. This builds
-runtime/ppu/tests/test_fs_large_file.cpp (which includes ppu_fs.cpp) against
-a ppu_recomp.h made from the lifter's own HEADER_PREAMBLE and runs it: a
-sparse 5 GiB file is checked through cellFsStat, cellFsLseek, cellFsRead and
-cellFsFstat.
-
-The bug only shows on an LLP64 target. On Linux/macOS the test passes on
-both sides; build with a Windows compiler (CXX=x86_64-w64-mingw32-g++,
-clang++ from llvm-mingw) and run the exe on Windows or Wine to see it.
-
-It needs a host C++ compiler (under CI=1 a missing one fails instead of
-skipping).
-
-Usage:
-    python3 tools/test_ppu_fs_large_file.py [--exe-out PATH] [--build-only]
-"""
-
 import argparse
 import importlib.util
 import os

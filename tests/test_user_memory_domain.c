@@ -1,4 +1,3 @@
-/* Manufactured allocation-domain regression; no title code or data. */
 #include "../runtime/syscalls/sys_memory.h"
 #include <stdio.h>
 #include <stdlib.h>

@@ -1,21 +1,4 @@
 #!/usr/bin/env python3
-"""SPU RI10 decode: every 8-bit-opcode immediate form, and the interpreter's
-tables built from it.
-
-RI10 is opcd(8) i10(10) ra(7) rt(7). A form missing from RI10_TABLE decodes as
-`.word`; the lifter then emits spu_unsupported() in its place and the job runs
-on with a wrong register, which is how Twisted Metal's 0x29F5F1C692D71C34 job
-lost four `orbi`s. The lifter already maps orbi/xorhi/xorbi to their helpers;
-only the decoder lacked them.
-
-The pure interpreter's opcode tables (runtime/spu/spu_interp_tables.inc) are
-generated from the same decoder by gen_spu_interp.py, so the second check
-regenerates them and fails if the committed copy is stale.
-
-Usage:
-    python3 tools/test_spu_disasm_ri10.py
-"""
-
 import os
 import subprocess
 import sys
@@ -24,9 +7,8 @@ TOOLS = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(TOOLS)
 sys.path.insert(0, TOOLS)
 
-import spu_disasm  # noqa: E402
+import spu_disasm
 
-# mnemonic -> 8-bit opcode, from the Cell BE SPU ISA's RI10 encodings.
 RI10_FORMS = {
     "ori": 0x04, "orhi": 0x05, "orbi": 0x06,
     "sfi": 0x0C, "sfhi": 0x0D,
@@ -53,7 +35,6 @@ def check_decode():
         if text != mnem:
             print(f"[FAIL] op8 0x{op8:02X} decodes as {text!r}, want {mnem!r}")
             failures += 1
-    # The four words Twisted Metal's job carries, with their fields.
     for word, want in ((0x06004C11, "orbi $r17, $r24, 1"),
                        (0x06020B0D, "orbi $r13, $r22, 8"),
                        (0x06010B10, "orbi $r16, $r22, 4"),

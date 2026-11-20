@@ -1,15 +1,3 @@
-/*
- * test_np_commerce2 - sceNpCommerce2CreateCtx's arguments.
- *
- * The SDK signature is (version, npId, handler, arg, ctx_id): the new context
- * id goes to the FIFTH argument, a guest pointer. The call below is made the
- * way the flat HLE adapter makes it, through a function pointer taking five
- * integer arguments (r3..r7), with guest addresses in the pointer slots. With
- * the three-parameter declaration the id was written over the title's handler
- * descriptor (third argument) and the title's own ctx_id variable never got set.
- *
- *   cc -std=gnu17 -I include -o test_np_commerce2 libs/network/tests/test_np_commerce2.c
- */
 #include "../sceNpCommerce2.c"
 
 #include <assert.h>
@@ -38,20 +26,19 @@ int main(void)
     create_ctx5_t create = (create_ctx5_t)(void*)sceNpCommerce2CreateCtx;
     sceNpCommerce2Init();
 
-    memset(mem + HANDLER, 0xAA, 16);      /* the title's handler descriptor */
-    memset(mem + CTX_ID, 0xBB, 4);        /* the title's ctx_id variable */
+    memset(mem + HANDLER, 0xAA, 16);
+    memset(mem + CTX_ID, 0xBB, 4);
 
     assert(create(2, NPID, HANDLER, 0, CTX_ID) == CELL_OK);
     for (int i = 0; i < 16; i++)
-        assert(mem[HANDLER + i] == 0xAA);                 /* handler untouched */
-    assert(vm_read32(CTX_ID) == 0);                       /* first id, stored big-endian */
+        assert(mem[HANDLER + i] == 0xAA);
+    assert(vm_read32(CTX_ID) == 0);
 
     assert(create(2, NPID, HANDLER, 0, CTX_ID) == CELL_OK);
-    assert(vm_read32(CTX_ID) == 1);                       /* a second context gets the next id */
+    assert(vm_read32(CTX_ID) == 1);
     for (int i = 0; i < 16; i++)
         assert(mem[HANDLER + i] == 0xAA);
 
-    /* no id pointer: invalid argument, nothing written */
     assert(create(2, NPID, HANDLER, 0, 0) == (int32_t)SCE_NP_COMMERCE2_ERROR_INVALID_ARGUMENT);
     for (int i = 0; i < 16; i++)
         assert(mem[HANDLER + i] == 0xAA);

@@ -1,15 +1,3 @@
-"""rsp.py - Minimal GDB Remote Serial Protocol client for RPCS3's GDB stub.
-
-Dependency-free (raw sockets). Speaks just enough RSP to drive RPCS3's PPU GDB
-server: handshake, register-layout discovery via qXfer:features (target.xml),
-read registers/memory, software breakpoints, continue/step, and async interrupt.
-
-RPCS3 PPU state is big-endian; the `g` register block and `m` memory reads come
-back as ASCII hex. Guest effective addresses are 32-bit (low word of each 64-bit
-register/stack slot).
-
-This is title-agnostic: nothing here knows about any specific game.
-"""
 import socket
 import time
 import xml.etree.ElementTree as ET
@@ -24,16 +12,15 @@ def _checksum(payload: bytes) -> int:
 
 
 def _unescape(data: bytes) -> bytes:
-    """Undo RSP run-length encoding (`x*<n>`) and `}` binary escaping."""
     out = bytearray()
     i = 0
     while i < len(data):
         c = data[i]
-        if c == 0x7D:  # '}' escape: next byte XOR 0x20
+        if c == 0x7D:
             out.append(data[i + 1] ^ 0x20)
             i += 2
-        elif i + 1 < len(data) and data[i + 1] == 0x2A:  # '*' RLE
-            count = data[i + 2] - 29          # additional repeats
+        elif i + 1 < len(data) and data[i + 1] == 0x2A:
+            count = data[i + 2] - 29
             out.append(c)
             out.extend([c] * count)
             i += 3
@@ -51,10 +38,9 @@ class RSPClient:
         self.sock = None
         self.buf = b""
         self.no_ack = False
-        self.reg_layout = []   # ordered list of (name, byte_offset, byte_size)
-        self.reg_by_name = {}  # name -> (byte_offset, byte_size)
+        self.reg_layout = []
+        self.reg_by_name = {}
 
-    # ---- connection ---------------------------------------------------------
     def connect(self, retries=40, delay=0.5):
         last = None
         for _ in range(retries):
@@ -75,7 +61,6 @@ class RSPClient:
             finally:
                 self.sock = None
 
-    # ---- low-level packet I/O ----------------------------------------------
     def _read_raw(self, n=4096) -> bytes:
         try:
             data = self.sock.recv(n)
@@ -105,15 +90,12 @@ class RSPClient:
                 return
             if ch == b"-":
                 raise RSPError("packet NAK")
-            # stray data before ack; push back and bail
             self.buf = ch + self.buf
             return
         raise RSPError("timeout waiting for ack")
 
     def _recv_packet(self, deadline=None) -> bytes:
-        """Read one $...#cc packet, send ack, return the unescaped payload."""
         deadline = deadline or (time.time() + self.timeout)
-        # find start
         while time.time() < deadline:
             start = self.buf.find(b"$")
             if start >= 0:
@@ -122,7 +104,6 @@ class RSPClient:
             self.buf += self._read_raw()
         else:
             raise RSPError("timeout waiting for packet start")
-        # find end '#' + 2 checksum chars
         while True:
             hi = self.buf.find(b"#")
             if hi >= 0 and len(self.buf) >= hi + 3:
@@ -137,23 +118,19 @@ class RSPClient:
         return _unescape(payload)
 
     def interrupt(self):
-        """Async interrupt (Ctrl-C) to halt a running target."""
         self.sock.sendall(b"\x03")
 
-    # ---- handshake / capabilities ------------------------------------------
     def handshake(self):
         self._send_packet("qSupported:multiprocess+;xmlRegisters=powerpc;qXfer:features:read+")
         reply = self._recv_packet().decode("latin-1", "replace")
         self.features = reply
         if "QStartNoAckMode+" in reply:
             self._send_packet("QStartNoAckMode")
-            self._recv_packet()  # OK
+            self._recv_packet()
             self.no_ack = True
-        # discover register layout
         try:
             self._load_registers()
         except Exception as e:
-            # fall back to standard PPC layout (32 GPR x8, then pc/msr/cr/lr/ctr/xer)
             self._fallback_registers()
             self._reg_err = str(e)
         return reply
@@ -177,7 +154,6 @@ class RSPClient:
 
     def _load_registers(self):
         xml = self.qxfer_read("features", "target.xml").decode("latin-1", "replace")
-        # target.xml may <xi:include> a core file; follow one level
         regs = self._parse_reg_xml(xml)
         if not regs:
             for annex in self._included_annexes(xml):
@@ -226,12 +202,9 @@ class RSPClient:
             self.reg_by_name[name] = (off, 8)
             off += 8
 
-    # ---- state access -------------------------------------------------------
     def read_registers(self) -> dict:
         self._send_packet("g")
         hexdata = self._recv_packet().decode("latin-1")
-        # GDB marks unavailable register bytes with 'x'/'X'; map to 00 so the
-        # fixed-width layout stays aligned (those regs read back as 0).
         unavail = set()
         if "x" in hexdata or "X" in hexdata:
             clean = []
@@ -247,7 +220,7 @@ class RSPClient:
         for name, off, size in self.reg_layout:
             chunk = raw[off:off + size]
             if len(chunk) == size and not any((off + k) in unavail for k in range(size)):
-                out[name] = int.from_bytes(chunk, "big")  # PPU big-endian
+                out[name] = int.from_bytes(chunk, "big")
         return out
 
     def reg(self, regs: dict, *names):
@@ -275,7 +248,6 @@ class RSPClient:
     def read_u64(self, addr: int) -> int:
         return int.from_bytes(self.read_mem(addr, 8), "big")
 
-    # ---- execution control --------------------------------------------------
     def add_breakpoint(self, addr: int, kind=4):
         self._send_packet(f"Z0,{addr & 0xFFFFFFFF:x},{kind}")
         return self._recv_packet() == b"OK"
@@ -291,10 +263,6 @@ class RSPClient:
         self._send_packet("s")
 
     def wait_stop(self, deadline=None):
-        """Return the stop-reply payload (e.g. b'T05...') after c/s/interrupt.
-
-        Skips empty/ack/notification packets until a real stop reply
-        (S/T = signalled, W/X = exited/terminated, O = console output)."""
         deadline = deadline or (time.time() + self.timeout)
         last = b""
         while time.time() < deadline:
@@ -304,7 +272,7 @@ class RSPClient:
                 break
             if pkt[:1] in (b"S", b"T", b"W", b"X"):
                 return pkt
-            if pkt[:1] == b"O":   # console output; keep waiting
+            if pkt[:1] == b"O":
                 continue
             last = pkt or last
         return last

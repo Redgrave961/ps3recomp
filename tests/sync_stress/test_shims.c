@@ -1,13 +1,8 @@
-/*
- * Standalone definitions for services that the sync sources call through
- * optional title/runtime integration hooks. The stress suite tests the
- * primitives directly, without linking a generated title.
- */
 #include <stdint.h>
 
 extern uint8_t* vm_base;
 
-void ppu_thread_note_block(uint64_t tid) { (void)tid; }   /* sys_ppu_thread.c: PS3_PRIO_START */
+void ppu_thread_note_block(uint64_t tid) { (void)tid; }
 int32_t ppu_thread_priority(uint64_t tid) { (void)tid; return 0; }
 int ppu_thread_exists(uint64_t tid) { return tid != 0; }
 

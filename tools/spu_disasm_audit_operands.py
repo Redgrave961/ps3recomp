@@ -86,12 +86,9 @@ from collections import Counter, defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from elf_parser import ELFFile, PT_LOAD  # noqa: E402
-from spu_disasm import spu_decode  # noqa: E402
+from elf_parser import ELFFile, PT_LOAD
+from spu_disasm import spu_decode
 
-# Never shipped in this repo -- see tools/spu_disasm_audit.py's module
-# docstring for the build recipe. Point --oracle-exe at your build, or set
-# the SPU_DUMP_TOOL_EXE environment variable.
 DEFAULT_ORACLE_EXE = os.environ.get("SPU_DUMP_TOOL_EXE")
 DEFAULT_WHITELIST = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
@@ -100,13 +97,6 @@ DEFAULT_WHITELIST = os.path.join(
 
 PF_X = 0x1
 
-# ---------------------------------------------------------------------------
-# Oracle's own register/channel name tables (SPUDisAsm.h, GPLv2 -- table
-# CONTENTS reproduced here as data only, not code/logic, purely so the
-# Python side can invert "lr"/"sp"/"r2"/"MFC_Cmd"/etc back to an index for
-# canonicalization; see SPUDisAsm.h line ~9 spu_reg_name[128] and line ~49
-# spu_ch_name[128]).
-# ---------------------------------------------------------------------------
 ORACLE_REG_NAMES = ["lr", "sp"] + [f"r{i}" for i in range(2, 128)]
 ORACLE_REG_INDEX = {name: i for i, name in enumerate(ORACLE_REG_NAMES)}
 
@@ -121,13 +111,11 @@ ORACLE_CH_NAMES = [
 ]
 ORACLE_CH_INDEX = {name: i for i, name in enumerate(ORACLE_CH_NAMES)}
 
-# Ours: tools/spu_disasm.py CHANNEL_NAMES (addr -> name); invert it.
-from spu_disasm import CHANNEL_NAMES as OUR_CHANNEL_NAMES  # noqa: E402
+from spu_disasm import CHANNEL_NAMES as OUR_CHANNEL_NAMES
 OUR_CH_INDEX = {name: i for i, name in OUR_CHANNEL_NAMES.items()}
 
 
 def canon_reg_token(tok: str):
-    """A register-like token -> integer index, or None if not a register."""
     tok = tok.strip()
     if tok.startswith("$r"):
         try:
@@ -143,7 +131,6 @@ def canon_reg_token(tok: str):
 
 
 def canon_channel_token(tok: str, ours: bool):
-    """A channel-name-or-fallback token -> channel index, or None."""
     tok = tok.strip()
     m = re.fullmatch(r"ch(\d+)", tok)
     if m:
@@ -163,7 +150,6 @@ def canon_spreg_token(tok: str):
 
 
 def parse_int_token(tok: str):
-    """A hex/decimal/negative-immediate token -> Python int, or None."""
     tok = tok.strip()
     neg = False
     if tok.startswith("-"):
@@ -180,8 +166,6 @@ def parse_int_token(tok: str):
 
 
 def strip_comment(text: str) -> str:
-    """Drop a trailing ' #...' comment (comment_constant()/stop-syscall
-    annotation on the oracle side; ours never emits one)."""
     idx = text.find("#")
     if idx < 0:
         return text.strip()
@@ -189,23 +173,11 @@ def strip_comment(text: str) -> str:
 
 
 def split_operands(mnemonic: str, operands: str, ours: bool):
-    """Return a list of canonical atoms for one side's operand string.
-
-    Atom = ("reg", idx) | ("imm", value) | ("spr", idx) | ("ch", idx) |
-           ("sym", raw_lowercased_string)   -- last resort, compared as text.
-
-    A disp(reg) operand (e.g. "0x10(sp)" or "-0x50(sp)") is split into two
-    atoms: ("imm", disp) then ("reg", idx), matching the register-then-
-    immediate-then-register token order used by both decoders for
-    lqd/stqd/lqa/stqa/lqr/stqr (ours already prints "rt, disp(ra)"; the
-    oracle prints "rt,disp(ra)" -- same order once tokenized).
-    """
     operands = strip_comment(operands)
     if not operands:
         return []
 
     atoms = []
-    # First split top-level commas (but not commas inside "(...)").
     parts = []
     depth = 0
     cur = ""
@@ -268,13 +240,6 @@ def split_operands(mnemonic: str, operands: str, ours: bool):
     return atoms
 
 
-# ---------------------------------------------------------------------------
-# Whitelist: (mnemonic) -> reason, for KNOWN-benign canonicalization gaps.
-# Format: one "mnemonic:reason text" per line in the whitelist file, '#'
-# comments and blank lines ignored. A whitelisted mnemonic's residual
-# mismatches are still counted and reported (as INFO), just excluded from
-# the "residual real divergences" bucket that gates the acceptance check.
-# ---------------------------------------------------------------------------
 def load_whitelist(path: str) -> dict:
     wl = {}
     if not path or not os.path.isfile(path):
@@ -396,7 +361,7 @@ def audit_one(image_path: str, oracle_exe: str, samples: int, whitelist: dict):
             continue
         oracle_mn, oracle_ops = oracle_entry
         if our_mn != oracle_mn:
-            continue  # v1's job
+            continue
         mnemonic_matched += 1
 
         our_atoms = split_operands(our_mn, our_ops, ours=True)

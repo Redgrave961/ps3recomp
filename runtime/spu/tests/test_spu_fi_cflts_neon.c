@@ -1,16 +1,3 @@
-/*
- * The NEON spu_fi and spu_cflts against their scalar references
- * (spu_fi_ref, spu_cflts_ref in spu_helpers.h), lane for lane.
- *
- * Inputs: every exponent and sign with random fractions, the borrow edge of
- * fi (step * y around base << 19), zero and exponent-255 lanes, and every
- * cflts scale. Run once in the default FPCR and once with round-toward-zero
- * plus flush-to-zero, the mode SPU_FLOAT_RZ runs lifted code in.
- *
- * Build:
- *   clang -std=gnu17 -O2 -I include -I runtime/spu \
- *         -o /tmp/test_spu_fi_cflts_neon runtime/spu/tests/test_spu_fi_cflts_neon.c
- */
 #include "spu_helpers.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,8 +19,8 @@ static uint32_t edge_float(void)
 {
     uint32_t r = rnd();
     switch (r & 7) {
-    case 0: return r & 0x807FFFFFu;                       /* exponent 0 */
-    case 1: return r | 0x7F800000u;                       /* exponent 255 */
+    case 0: return r & 0x807FFFFFu;
+    case 1: return r | 0x7F800000u;
     default: return r;
     }
 }
@@ -43,7 +30,6 @@ static void run(void)
     for (int round = 0; round < 400000; ++round) {
         u128 a, b;
         for (int i = 0; i < 4; ++i) { a._u32[i] = edge_float(); b._u32[i] = edge_float(); }
-        /* fi near its borrow edge: step * y close to base << 19 */
         if (round & 1) for (int i = 0; i < 4; ++i) {
             uint32_t base = rnd() & 0x1FFFu, step = (rnd() & 0x3FFu) | 1u;
             uint32_t y = (uint32_t)(((uint64_t)base << 19) / step) + (rnd() % 5) - 2;
@@ -62,7 +48,7 @@ int main(void)
 #if defined(__aarch64__)
     run();
     uint64_t fpcr; __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
-    __asm__ volatile("msr fpcr, %0" :: "r"(fpcr | (3ull << 22) | (1ull << 24)));   /* RZ + FZ */
+    __asm__ volatile("msr fpcr, %0" :: "r"(fpcr | (3ull << 22) | (1ull << 24)));
     run();
     __asm__ volatile("msr fpcr, %0" :: "r"(fpcr));
 #else

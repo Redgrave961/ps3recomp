@@ -21,8 +21,8 @@ CALL = re.compile(r'\b(func_[0-9A-Fa-f]+)\(ctx\)')
 TRAMP = re.compile(r'PPU_TAIL return (func_[0-9A-Fa-f]+)\(ctx\)')
 
 def build(d):
-    callers = collections.defaultdict(set)   # callee -> callers
-    callees = collections.defaultdict(set)   # caller -> callees
+    callers = collections.defaultdict(set)
+    callees = collections.defaultdict(set)
     defined = set()
     for fn in sorted(os.listdir(d)):
         if not fn.endswith('.cpp'):
@@ -39,7 +39,6 @@ def build(d):
                     t = m.group(1)
                     if t != cur:
                         callees[cur].add(t); callers[t].add(cur)
-                # a lifted tail call is a real edge, just a deferred one
                 for m in TRAMP.finditer(line):
                     t = m.group(1)
                     callees[cur].add(t); callers[t].add(cur)
@@ -83,7 +82,6 @@ def main():
 
     t = opt('--why')
     if t:
-        # walk up to any function that itself has no callers (a root)
         seen = {t}; parent = {}; frontier = [t]; roots = []
         while frontier:
             nxt = []

@@ -1,7 +1,3 @@
-/* spu_shufb (pshufb / NEON tbl path) must match the byte-loop reference for
- * every selector class: a/b sources, 0x00 / 0xFF / 0x80 specials. Build with
- * -msse4.1 on x86 so the SIMD version is the one under test (NEON is always
- * on for arm64). */
 #include "../spu_helpers.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,7 +13,7 @@ int main(void)
         u128 a, b, c;
         for (int i = 0; i < 16; i++) {
             a._u8[i] = (uint8_t)rand(); b._u8[i] = (uint8_t)rand();
-            c._u8[i] = (uint8_t)rand();          /* covers all 256 selector values */
+            c._u8[i] = (uint8_t)rand();
         }
         u128 x = spu_shufb(a, b, c), y = spu_shufb_ref(a, b, c);
         if (memcmp(&x, &y, 16)) {

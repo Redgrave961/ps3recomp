@@ -1,4 +1,3 @@
-/* Second object of test_shared_header_data.c: C++ readers of the header-defined data. */
 #include "spu_coh_bitmap.h"
 #include "ps3emu/ps3_ftrace.h"
 

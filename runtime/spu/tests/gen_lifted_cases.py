@@ -1,13 +1,4 @@
 #!/usr/bin/env python3
-"""Lift single SPU instruction words with tools/spu_lifter.py and emit them as C functions for the
-differential test (spu_interp_diff_test.c, --lifted mode).
-
-usage: gen_lifted_cases.py cases.txt > lifted_cases.inc
-cases.txt: one "<insn hex> <pc hex>" per line (produced by `spu_interp_diff_test --emit-cases`).
-Each case i becomes `static void lc_<i>(spu_context* ctx)` holding exactly what the lifter emits for that word
-at that pc (via lift_function over a one-instruction function, so labels / fall-through chaining are the real
-ones), plus stubs for the lifted-function symbols it references.
-"""
 import os, re, sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "..", "..", "tools"))

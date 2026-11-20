@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Verify SDCRZ storage controls using synthetic data and real channels."""
 import os
 import shlex
 import subprocess

@@ -11,8 +11,8 @@ the lifter rewrites into ps3_hle_call.
 import argparse, json, os, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from elf_parser import ELFFile                            # noqa: E402
-from nid_database import get_default_db                  # noqa: E402
+from elf_parser import ELFFile
+from nid_database import get_default_db
 
 
 def main() -> None:

@@ -49,80 +49,45 @@ ROOT   = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 LIFTER = os.path.join(os.path.dirname(__file__), "spu_lifter.py")
 BASE   = 0x4000
 
-# Per-module code/data boundary, keyed by the module's content hash -- so this
-# table is title-agnostic by construction: any title shipping a byte-identical
-# module gets the same fixup, and a module not listed here is simply not fixed
-# up. A few images embed a large rodata/const tail
-# inside the executable segment; its bytes decode as in-range branches that
-# seed spurious "functions", disassembling the data as code (garbage + `.word`
-# for undecodable words). The boundary was found by disassembly: after the
-# last real unconditional `br`, a zlib-inflate error-string table + float
-# const tables run to the image end. Passed to spu_lifter.py --code-end so the
-# tail is left un-disassembled. Without it, these two physics jobmods each lift
-# ~97 `.word` unsupported (was 0 in the original, pre-git-clean lift).
 CODE_END = {
-    "jobmod_ef33c6c99dc7_e0A40": 0xAE68,   # real code ends at br 0xA554 @ 0xAE60
-    "jobmod_6943e26934ea_e0A20": 0xAE48,   # real code ends at br 0xA534 @ 0xAE40
+    "jobmod_ef33c6c99dc7_e0A40": 0xAE68,
+    "jobmod_6943e26934ea_e0A20": 0xAE48,
 }
 
 def manual_link_targets(raw, base=BASE):
-    """Return targets built into the link register by hand:
-        ila  $r0, off
-        a    $r0, $r0, $r126        (r126 = module load base, from the entry's
-        br   fn                      ila/brsl/sf base probe)
-    Every job module's entry does this once (`ila $r0, entry+0xAC ... br body`):
-    the body returns with `bi $r0` to base+off, an address no branch names, so
-    the lift has no entry there. Without it the return unwinds to the manager's
-    drain (drain-mismatch return_pc=0x3258 pc=0x4AEC), the restart re-enters the
-    entry function from its start, the prologue runs twice and the job leaves
-    on a garbage r0 (`exit: synthesised stop at LS 0xE81C`). Seeding base+off
-    is exact: the offset is an immediate."""
     return sorted(set(t for _, t in manual_link_sites(raw, base)))
 
 
 def manual_link_sites(raw, base=BASE):
-    """(LS address of the `ila`, target) for each manual_link_targets entry."""
     out = []
     for off in range(0x30, len(raw) - 20, 4):
         w = struct.unpack_from(">I", raw, off)[0]
-        if (w >> 25) & 0x7F != 0x21 or (w & 0x7F) != 0:          # ila $r0, i18
+        if (w >> 25) & 0x7F != 0x21 or (w & 0x7F) != 0:
             continue
         imm = (w >> 7) & 0x3FFFF
         for k in range(1, 5):
             w2 = struct.unpack_from(">I", raw, off + 4 * k)[0]
             if (w2 >> 21) & 0x7FF == 0x0C0 and (w2 & 0x7F) == 0 and ((w2 >> 7) & 0x7F) == 0:
-                if imm % 4 == 0 and 0x30 <= imm < len(raw):        # a $r0, $r0, $rX
+                if imm % 4 == 0 and 0x30 <= imm < len(raw):
                     out.append((base + off, base + imm))
                 break
     return out
 
 
-
 def switch_table_targets(raw, base=BASE):
-    """Return the targets of position-independent switch tables.  The
-    compiler emits, for `switch`:
-        ila  $rT, tbl_off ; a $rT, $rT, $r126      ($rT = LS address of table)
-        ... lqx/rotqby entry ... a $r2, $entry, $rT ; bi $r2
-        tbl: .word target0 - tbl, target1 - tbl, ...  (right after the bi)
-    Entries are relative to the table itself and the table follows the `bi`,
-    so no absolute address of any case ever appears in the code: the lift
-    only ever reached the cases by luck (`bi $r2` computed at run time,
-    BRANCH-TO-0 unresolved pc=0x7A08 in jobmod ef33c6c99dc7). A table is
-    accepted only when some `ila` in the module names its offset."""
     return sorted(set(t for _, t in switch_table_sites(raw, base)))
 
 
 def switch_table_sites(raw, base=BASE):
-    """(LS address of the `bi`, target) for each switch_table_targets entry."""
     ilas = set()
     for off in range(0x30, len(raw) - 4, 4):
         w = struct.unpack_from(">I", raw, off)[0]
-        if (w >> 25) & 0x7F == 0x21:                          # ila $rX, i18
+        if (w >> 25) & 0x7F == 0x21:
             ilas.add((w >> 7) & 0x3FFFF)
     out = []
     for off in range(0x30, len(raw) - 16, 4):
         w = struct.unpack_from(">I", raw, off)[0]
-        if (w >> 21) & 0x7FF != 0x1A8 or (w & 0x7F) != 0:     # bi $rA (rt field 0)
+        if (w >> 21) & 0x7FF != 0x1A8 or (w & 0x7F) != 0:
             continue
         tbl = off + 4
         if tbl not in ilas:
@@ -139,34 +104,21 @@ def switch_table_sites(raw, base=BASE):
     return out
 
 
-
 def module_base(raw):
-    """The LS address the module is linked for. The header carries it at +0x28,
-    after the 0xC0DEC0DE magic at +0x20: 0x4000, the job code buffer, for
-    almost every module, but Resistance: Fall of Man also ships modules linked
-    at 0x7000, and lifting those at 0x4000 put every lifted address 0x3000
-    short of where the job manager runs them. Anything implausible (no magic,
-    0, unaligned, or an image that would run past local store) falls back to
-    BASE."""
     if len(raw) >= 0x2C and raw[0x20:0x24] == b"\xC0\xDE\xC0\xDE":
         b = struct.unpack_from(">I", raw, 0x28)[0]
         if b and b % 0x10 == 0 and b + len(raw) <= 0x40000:
             return b
     return BASE
 
-# SPU branch encodings (SPU ISA): RI16 branches by 9-bit opcode, indirect
-# branches by 11-bit opcode.
-_RELATIVE_JUMP = {0x064}                            # br
-_RELATIVE_CONT = {0x066, 0x040, 0x042, 0x044, 0x046}  # brsl, brz/brnz/brhz/brhnz
-_ABSOLUTE_JUMP = {0x060}                            # bra
-_ABSOLUTE_CONT = {0x062}                            # brasl
-_INDIRECT_END  = {0x1A8, 0x1AA}                     # bi, iret: no fallthrough
+_RELATIVE_JUMP = {0x064}
+_RELATIVE_CONT = {0x066, 0x040, 0x042, 0x044, 0x046}
+_ABSOLUTE_JUMP = {0x060}
+_ABSOLUTE_CONT = {0x062}
+_INDIRECT_END  = {0x1A8, 0x1AA}
 
 
 def reachable(raw, entries, hi, base=BASE):
-    """LS addresses of the instructions reachable from `entries` by direct
-    branches and fallthrough, within [base + 0x30, hi). Indirect targets are
-    unknown, so code reached only through them is not followed."""
     lo = base + 0x30
     seen, work = set(), [e for e in entries if lo <= e < hi]
     while work:
@@ -188,13 +140,6 @@ def reachable(raw, entries, hi, base=BASE):
 
 
 def module_code_end(raw, name, base=BASE):
-    """End of a module's code: one past the highest instruction reachable from
-    its seeded entries, never past its CODE_END entry. The entry and +0x30 seed
-    it directly; a manual link or switch table
-    target seeds it once the `ila`/`bi` that names it is itself reachable, so a
-    pattern decoded from the data tail cannot pull the end into the data. The
-    lifter is then given only the seeds below this end, so every seeded entry
-    it lifts lies inside the registered span."""
     hi = min(base + len(raw), CODE_END.get(name, base + len(raw)))
     seeds = {base + struct.unpack_from(">I", raw, 0x10)[0], base + 0x30}
     derived = manual_link_sites(raw, base) + switch_table_sites(raw, base)
@@ -210,17 +155,6 @@ def module_code_end(raw, name, base=BASE):
 
 
 def module_seeds(raw, base=BASE):
-    """Extra function entries offered to the lifter for one module."""
-    # The module's first function starts right after the 0x30-byte header
-    # (`4 ila | entry | size | 0 | 0 | C0DEC0DE | 0 | 0 | n`). Usually it is
-    # reached by a branch and found anyway, but in two modules it is a bare
-    # `bi $r0` stub reached only through a function pointer the job builds at
-    # run time (base + 0x30, relocated via the entry's ila/brsl base probe), so
-    # nothing in the code references it and the lift had no entry there: the
-    # job's indirect call fell off the lifted set and came back with a
-    # corrupted stack (drain-mismatch return_pc=0x50C8 pc=0xA800, jobmod
-    # ef33c6c99dc7). Seeding it is exact, not a heuristic: every module's
-    # first instruction is at +0x30.
     inside = [hex(base + 0x30)]
     inside += [hex(a) for a in manual_link_targets(raw, base)]
     inside += [hex(a) for a in switch_table_targets(raw, base)]
@@ -229,15 +163,10 @@ def module_seeds(raw, base=BASE):
 
 def lift_module(raw, name, outdir, tmp_elf, merge_chunks, code_end=None,
                 base=BASE):
-    """Lift one module image at `base` into <outdir>/<name>/. Returns its
-    manifest entry, or None if the lifter failed. `base` is the LS address the
-    module is linked for -- module_base() reads it out of the header, and it is
-    not always BASE."""
     entry_off = struct.unpack_from(">I", raw, 0x10)[0]
     entry = base + entry_off
     prefix = f"{name}_"
     outsub = os.path.join(outdir, name)
-    # content signature: first 16 bytes (the 4 ila header uniquely identify a module)
     sig = raw[:16]
 
     elf = wrap(raw, base=base, entry=entry)
@@ -261,7 +190,6 @@ def lift_module(raw, name, outdir, tmp_elf, merge_chunks, code_end=None,
     if r.returncode != 0:
         print(f"  FAIL {name}\n{r.stderr}", file=sys.stderr)
         return None
-    # parse stats from lifter stdout
     funcs = unsup = 0
     for line in r.stdout.splitlines():
         s = line.strip()
@@ -279,7 +207,6 @@ def lift_module(raw, name, outdir, tmp_elf, merge_chunks, code_end=None,
 
 
 def elf_load_segments(elf):
-    """(vaddr, file bytes) of each PT_LOAD segment of a big-endian ELF64."""
     if elf[:4] != b"\x7fELF" or elf[4] != 2 or elf[5] != 2:
         sys.exit("--engine-elf: expected a big-endian ELF64")
     phoff = struct.unpack_from(">Q", elf, 0x20)[0]
@@ -293,12 +220,6 @@ def elf_load_segments(elf):
 
 
 def find_engine_modules(elf):
-    """Job module images embedded in an engine ELF: a 16-byte aligned header
-    with C0DEC0DE at +0x20 and the load base (0x4000) at +0x28, entry offset
-    at +0x10 and image size at +0x14. Like extract_jobmods.py, the module is
-    the initialised image, imageSize - 32 (the rest is bss), so a module gets
-    the same name, and CODE_END fixup, from either source.
-    Returns [(ea, raw)] sorted by EA."""
     out = []
     for vaddr, blob in elf_load_segments(elf):
         at = blob.find(b"\xc0\xde\xc0\xde")
@@ -348,7 +269,7 @@ def main():
     tmp_elf = os.path.join(OUTDIR, "_tmp.elf")
     for path in mods:
         raw = open(path, "rb").read()
-        name = os.path.splitext(os.path.basename(path))[0]         # jobmod_<sha>_e<entry>
+        name = os.path.splitext(os.path.basename(path))[0]
         m = lift_module(raw, name, OUTDIR, tmp_elf, args.merge_chunks,
                         base=module_base(raw))
         if m:
@@ -365,9 +286,6 @@ def main():
 
 
 def lift_engine_elf(args, register_c):
-    """--engine-elf: lift each module found in the ELF once (byte-identical
-    copies at several EAs share one lift) with its code bounded at code_end,
-    and register every EA as a verified streamed region."""
     found = find_engine_modules(open(args.engine_elf, "rb").read())
     if not found:
         sys.exit(f"no job modules found in {args.engine_elf}")
@@ -399,15 +317,9 @@ def lift_engine_elf(args, register_c):
     print(f"\nLifted {len(manifest)} module(s), {tot_unsup} total unsupported instruction(s)")
     print(f"Manifest: {os.path.join(args.out, 'jobmods_manifest.json')}")
 
-# Image ids for the job-code overlays. Well clear of the fingerprint-dispatched
-# images (1..25), the FMOD overlays (60..65) and the taskset policy (100).
 JOBMOD_IMAGE_BASE = 200
 
 def emit_register(manifest, REGISTER_C, sym_prefix):
-    """Generate the registration TU: register every job module's lifted
-    functions under a distinct image id, plus its 16-byte content signature so
-    spu_overlay_note_get flips resident_ovl when the module DMAs into the job
-    code buffer (LS 0x4000). Dispatched exactly like the FMOD codec overlays."""
     L = []
     L.append("/* jobmods_register.c -- GENERATED by tools/lift_jobmods.py.")
     L.append(" * WWS SPU job-code modules extracted from patch.sdat/data.sdat. Every module")
@@ -448,19 +360,6 @@ def emit_register(manifest, REGISTER_C, sym_prefix):
           f"{JOBMOD_IMAGE_BASE}..{JOBMOD_IMAGE_BASE + len(manifest) - 1})")
 
 def emit_register_verified(manifest, code, REGISTER_C, sym_prefix):
-    """Generate the registration TU for --engine-elf: register every job
-    module's lifted functions under a distinct image id and each EA it is
-    streamed from as a verified region (spu_overlay_register_verified_region).
-    A GET from that EA into LS 0x4000 makes the module resident; the first
-    dispatch into the span compares the code bytes once per load.
-
-    The span is the lifted code alone, [0x4000, code_end), and the one verified
-    segment is [0x4030, code_end). Jobs DMA their own data into the module
-    image above the code; any GET into a span from another source clears the
-    resident owner, so a whole-image span sent every later indirect branch of
-    the running job to the interpreter. A GET of another module into the
-    buffer still overlaps the code span and clears it. The 0x30-byte header
-    holds no code and is not compared."""
     L = []
     L.append("/* jobmods_register.c -- GENERATED by tools/lift_jobmods.py --engine-elf.")
     L.append(" * WWS SPU job-code modules embedded in the engine ELF. Every module streams")

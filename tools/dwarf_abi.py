@@ -1,20 +1,3 @@
-"""dwarf_abi.py - authoritative firmware ABI from debug-build DWARF.
-
-Unstripped PS3 debug builds (see unfself.py) compiled the SDK headers with debug info,
-so their DWARF carries the real layout of every Cell*/Sce* struct the game used and the
-prototype of every function it declared. That is ground truth for the ABI bug class this
-toolkit keeps hand-fixing (struct member offsets, field widths, arg counts) -- e.g. the
-CellFsStat 52-byte packing and the CellGcmContextData "callback at +0xC" fixes both fall
-straight out of the DWARF.
-
-    python dwarf_abi.py EBOOT.elf --struct CellFsStat CellGcmContextData
-    python dwarf_abi.py EBOOT.elf --func   cellFsRead cellGcmSetFlip
-    python dwarf_abi.py EBOOT.elf --diff-headers        # diff struct layouts vs repo *.h
-    python dwarf_abi.py EBOOT.elf --json -o abi.json    # dump everything
-
---diff-headers parses the toolkit's own `typedef struct { ... }` blocks and reports any
-member whose DWARF offset disagrees -- the layout bugs, found automatically.
-"""
 from __future__ import annotations
 
 import argparse
@@ -30,37 +13,22 @@ from elf_parser import ELFFile
 import dwarf_common as dw
 
 
-# ---------------------------------------------------------------------------
-# Extraction
-# ---------------------------------------------------------------------------
-
 def _member_offset(v):
-    """DW_AT_data_member_location is either a udata offset (DWARF4-ish) or a
-    location expression block: DW_OP_plus_uconst <uleb>."""
     if isinstance(v, int):
         return v
-    if v and v[0] == 0x23:                 # DW_OP_plus_uconst
+    if v and v[0] == 0x23:
         return dw.uleb(v, 1)[0]
     return None
 
 
 def extract(dinfo: dw.DwarfInfo):
-    """Return (structs, funcs, types).
-
-    structs: name -> {"size": int, "members": [(offset, name, type_off)]}
-    funcs:   name -> {"return": type_off, "params": [type_off]}
-    types:   die_offset -> a resolvable type record (for naming member/param types)
-    """
     structs: dict[str, dict] = {}
     funcs: dict[str, dict] = {}
     types: dict[int, dict] = {}
 
-    # A shallow stack of "currently open aggregate" per depth, so members/params
-    # attach to the right parent.
     open_at: dict[int, dict | None] = {}
 
     for off, tag, vals, depth in dinfo.dies():
-        # Record every type DIE so member/param type references resolve later.
         if tag in (dw.DW_TAG_base_type, dw.DW_TAG_typedef, dw.DW_TAG_pointer_type,
                    dw.DW_TAG_const_type, dw.DW_TAG_volatile_type, dw.DW_TAG_structure_type,
                    dw.DW_TAG_union_type, dw.DW_TAG_enumeration_type, dw.DW_TAG_array_type):
@@ -73,14 +41,13 @@ def extract(dinfo: dw.DwarfInfo):
             name = vals.get(dw.DW_AT_name)
             size = vals.get(dw.DW_AT_byte_size)
             rec = None
-            # Keep the richest definition (declarations carry no size / no members).
             if name and size is not None:
                 rec = structs.get(name)
                 if rec is None or rec.get("size") is None:
                     rec = {"size": size, "members": []}
                     structs[name] = rec
                 elif rec["members"]:
-                    rec = None        # already have a populated definition; ignore dup
+                    rec = None
                 else:
                     rec["size"] = size
             open_at[depth] = rec
@@ -110,7 +77,6 @@ def extract(dinfo: dw.DwarfInfo):
 
 
 def type_name(types: dict, off, depth=0) -> str:
-    """Resolve a DW_AT_type reference to a C-ish type string."""
     if off is None:
         return "void"
     if depth > 12 or off not in types:
@@ -128,22 +94,16 @@ def type_name(types: dict, off, depth=0) -> str:
     return t["name"] or ("struct?" if tag == dw.DW_TAG_structure_type else "?")
 
 
-# ---------------------------------------------------------------------------
-# Diff against the repo's own struct definitions
-# ---------------------------------------------------------------------------
-
 _STRUCT_RE = re.compile(
     r"typedef\s+struct\s+(?:\w+\s*)?\{(?P<body>[^}]*)\}\s*(?P<name>\w+)\s*;", re.S)
 _MEMBER_RE = re.compile(r"^\s*([A-Za-z_][\w\s\*]*?)\s+([A-Za-z_]\w*)\s*(\[[^\]]*\])?\s*;", re.M)
 
-# width of the leaf C types the headers use, for computing expected offsets
 _WIDTH = {"u8": 1, "s8": 1, "char": 1, "u16": 2, "s16": 2, "be_t<u16>": 2,
           "u32": 4, "s32": 4, "int": 4, "float": 4, "f32": 4, "be_t<u32>": 4,
           "u64": 8, "s64": 8, "f64": 8, "double": 8, "be_t<u64>": 8}
 
 
 def _repo_structs(repo_root: str) -> dict[str, list[tuple[str, str, bool]]]:
-    """name -> [(c_type, member_name, is_array)] parsed from the toolkit's headers."""
     out: dict[str, list[tuple[str, str, bool]]] = {}
     for path in glob.glob(os.path.join(repo_root, "**", "*.h"), recursive=True):
         try:
@@ -161,17 +121,12 @@ def _repo_structs(repo_root: str) -> dict[str, list[tuple[str, str, bool]]]:
 
 
 def diff_headers(structs: dict, repo_root: str):
-    """Return (mismatches, uncertain). Only structs whose every member is a known
-    scalar (no arrays, no nested aggregates) are checked, so a reported mismatch is
-    a real repo-header-vs-ABI disagreement -- not an artifact of the header regex
-    being unable to size an array or nested struct."""
     repo = _repo_structs(repo_root)
     mismatches: list[str] = []
     uncertain: list[str] = []
     for name, layout in sorted(structs.items()):
         if name not in repo:
             continue
-        # bail on anything the scalar model can't size exactly
         if any(is_arr or ctype not in _WIDTH for ctype, _, is_arr in repo[name]):
             uncertain.append(name)
             continue
@@ -180,7 +135,7 @@ def diff_headers(structs: dict, repo_root: str):
         bad = []
         for ctype, mn, _ in repo[name]:
             w = _WIDTH[ctype]
-            if off % w:                     # natural alignment
+            if off % w:
                 off += w - (off % w)
             d = dwarf_off.get(mn)
             if d is not None and d != off:
@@ -190,10 +145,6 @@ def diff_headers(structs: dict, repo_root: str):
             mismatches.append(f"{name}: " + "; ".join(bad))
     return mismatches, uncertain
 
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Extract firmware ABI (structs, signatures) "
@@ -270,7 +221,6 @@ def main() -> int:
             print()
         return 0
 
-    # default: summary of the firmware-shaped names present
     fw = sorted(n for n in structs if n.startswith(("Cell", "Sce", "cell", "sce")))
     print(f"firmware structs with layouts: {len(fw)}")
     for n in fw[:40]:

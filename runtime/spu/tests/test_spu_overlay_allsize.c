@@ -1,5 +1,3 @@
-/* Real runtime; temporary source instrumentation observes discovery work and
- * single-writer publication boundaries without adding production test hooks. */
 #define main allsize_unused_mfc_main
 #include "allsize_fixture.h"
 #undef main
@@ -17,8 +15,6 @@ static spu_context* fresh(void)
 void allsize_sig_published(void)
 {
     if(!signature_ctx)return;
-    /* A reader admitted immediately at count publication must not falsely
-     * reject a signature whose flag was published too late. */
     signature_ctx->resident_ovl=0;
     spu_overlay_note_get(signature_ctx,0x77000040,signature_ctx->ls+0x20000,512);
     CHECK(signature_ctx->resident_ovl==777);++publication_checks;
@@ -27,7 +23,7 @@ static void absence_and_hits(spu_context* c)
 {
     for(unsigned i=0;i<30;++i)spu_overlay_register_source(0x70000000+i*0x10000,600+i);
     spu_overlay_register_source(0,650);
-    spu_overlay_register_source(0x70000000,651); /* first matching source wins */
+    spu_overlay_register_source(0x70000000,651);
     static const unsigned sizes[]={4,16,128,511,512,1024,16384};
     for(unsigned k=0;k<sizeof sizes/sizeof sizes[0];++k){
         allsize_scans=0;c->resident_ovl=17;
@@ -53,8 +49,6 @@ static void residency_and_epochs(spu_context* c)
     CHECK(spu_lifted_lookup(c,base)==lifted);
     CHECK(c->resident_code[0].verify_state==SPU_OVERLAY_VERIFIED);
     uint32_t epoch=c->dcache_residency;
-    /* A continuation's EA is not a registered source: negative discovery
-     * must still reset verification, and changed code must fail validation. */
     c->ls[base+4]^=0xff;allsize_scans=0;
     spu_overlay_note_get(c,source+4,c->ls+base+4,512);
     CHECK(allsize_scans==0);CHECK(c->dcache_residency!=epoch);
@@ -63,7 +57,6 @@ static void residency_and_epochs(spu_context* c)
     memcpy(c->ls+base,code,sizeof code);
     spu_overlay_note_get(c,source,c->ls+base,512);
     CHECK(spu_lifted_lookup(c,base)==lifted);
-    /* Partial foreign overwrite starts below the resident range. */
     epoch=c->dcache_residency;
     memset(c->ls+base-16,0x33,512);
     spu_overlay_note_get(c,0x79000000,c->ls+base-16,512);
@@ -73,8 +66,6 @@ static void residency_and_epochs(spu_context* c)
 }
 static void old_matcher_edges(spu_context* c)
 {
-    /* An early exact-EA hit with a wrong fixed load must continue to the
-     * later exact-EA hit, rather than adopting the first indexed source. */
     static const uint8_t code[]={1,2,3,4};
     const spu_overlay_code_segment a={0x24000,4,code},b={0x25000,4,code};
     CHECK(spu_overlay_register_verified_region(0x72000000,0x24000,0x400,710,&a,1));
@@ -103,7 +94,6 @@ static void list_resume(spu_context* c)
     CHECK(c->ls[0x28000]==0x51 && c->ls[0x28200]==0);
     CHECK(c->list_stall_mask==(1u<<4) && !(m->tag_completed&(1u<<4)));
     CHECK(c->event_status&2);CHECK(c->list_stall_dest_lsa[4]==0x28200);
-    /* Resume must read this modified remaining element live. */
     spu_ls_write32(c,0x3014,0x21000);
     CHECK(mfc_list_stall_ack(m,c,4)==0);
     CHECK(c->ls[0x28200]==0x51 && !c->list_stall_mask);
@@ -118,7 +108,6 @@ static void signatures(spu_context* c)
     CHECK(c->resident_ovl==19);
     spu_overlay_note_get(c,0x77000040,c->ls+0x20000,512);
     CHECK(c->resident_ovl==777);
-    /* Known EA and signature both match: registration order remains exact. */
     spu_overlay_note_get(c,0x70000000,c->ls+0x20000,512);
     CHECK(c->resident_ovl==600);
 }
@@ -130,7 +119,6 @@ int main(int argc,char** argv)
     if(argc>1 && !strcmp(argv[1],"full")){
         for(unsigned i=0;i<128;++i)spu_overlay_register_source(0x70000000+i*0x10000,600+i);
         unsigned count=s_ovl_src_count;
-        /* Rejection must occur before reading the inaccessible signature. */
         spu_overlay_register_sig((const uint8_t*)(uintptr_t)1,999);
         CHECK(s_ovl_src_count==(int)count);
         allsize_scans=0;c->resident_ovl=19;

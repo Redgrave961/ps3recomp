@@ -1,25 +1,15 @@
 #!/usr/bin/env python3
-"""Self-check: the lifter emits one definition per start address.
-
-Two discovery passes can seed the same function start with different ends.
-Emitting both is a C redefinition error (the file never compiles), and keeping
-the shorter one silently drops real instructions -- libsre's 0x30001848 lost
-its `stdu r1,-0xB0(r1)` frame setup and six register saves that way, which
-would corrupt the stack of anything that called it.
-
-Run: python tools/test_lifter_dedupe.py
-"""
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from ppu_lifter import LiftedFunction, PPULifter  # noqa: E402
+from ppu_lifter import LiftedFunction, PPULifter
 
 
 def _lifter():
     try:
         return PPULifter.__new__(PPULifter)
-    except Exception as exc:  # pragma: no cover
+    except Exception as exc:
         print(f"cannot construct lifter: {exc}")
         raise
 
@@ -27,7 +17,6 @@ def _lifter():
 def main() -> int:
     lf = _lifter()
     lf.functions = [
-        # the truncated copy comes first, exactly as the libsre lift emitted it
         LiftedFunction(name="f_1848", start_addr=0x1848, end_addr=0x1850,
                        body_lines=["/* truncated */"]),
         LiftedFunction(name="f_1848", start_addr=0x1848, end_addr=0x1874,
@@ -45,21 +34,15 @@ def main() -> int:
     assert kept.end_addr == 0x1874, (
         f"kept the truncated body (end=0x{kept.end_addr:X}); widest extent must win")
 
-    # order is preserved: 0x1848 still precedes 0x1874
     assert starts == [0x1848, 0x1874], f"emission order changed: {starts}"
 
-    # a list with no duplicates must pass through untouched
     lf.functions = [
         LiftedFunction(name="a", start_addr=0x10, end_addr=0x20),
         LiftedFunction(name="b", start_addr=0x20, end_addr=0x30),
     ]
     assert len(lf._emit_functions()) == 2
 
-    # --- symbol prefix must be normalised to end in "_" -------------------
-    # "libsre" concatenates to libsrefunc_XXXX / libsrefunction_table, which
-    # links against nothing when the integration TU declares the documented
-    # libsre_function_table. YDKJ's real-libsre boot path died on this.
-    from spu_lifter import SPULifter  # noqa: E402
+    from spu_lifter import SPULifter
     for cls, kw in ((PPULifter, {}), (SPULifter, {})):
         assert cls(prefix="libsre", **kw).prefix == "libsre_", (
             f"{cls.__name__} left a prefix without a trailing underscore")
@@ -68,12 +51,6 @@ def main() -> int:
         assert cls(prefix="", **kw).prefix == "", (
             f"{cls.__name__} invented a prefix from an empty one")
 
-    # --- an import stub above --code-end is still a callable target ---------
-    # --code-end stops data being lifted as code; --hle-stubs exists because a
-    # PRX's import PLT sits ABOVE its last real function. Together they used to
-    # cancel: every `bl` to an import became a "non-code" comment and the call
-    # vanished. libsre lost 1,324 calls that way, including the only one that
-    # reached sys_spu_image_import, which killed SPURS bring-up silently.
     lf2 = _lifter()
     lf2.code_lo, lf2.code_hi = 0x10000, 0x1D718
     lf2.hle_stub_nids = {0x1DA98: 0xEBE5F72F}

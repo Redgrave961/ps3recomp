@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Check Abort suppression and normal Close delivery through the sysutil pump."""
 import os
 from pathlib import Path
 import subprocess

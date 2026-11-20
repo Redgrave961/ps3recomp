@@ -1,7 +1,3 @@
-/*
- * ps3recomp - Kernel mutex syscalls
- */
-
 #ifndef SYS_MUTEX_H
 #define SYS_MUTEX_H
 
@@ -74,4 +70,4 @@ void sys_mutex_init(lv2_syscall_table* tbl);
 }
 #endif
 
-#endif /* SYS_MUTEX_H */
+#endif

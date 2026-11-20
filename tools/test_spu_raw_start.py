@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Raw SPU start through the real spu_raw.c: SPU_RunCntl runs the program on a host thread of its own."""
 import os
 import subprocess
 import tempfile

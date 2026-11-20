@@ -1,74 +1,40 @@
 #!/usr/bin/env python3
-"""
-PS3 ELF / SELF / PRX binary parser.
-
-Parses standard ELF64 (PPU) and ELF32 headers, SELF (Signed ELF) wrappers,
-program headers, section headers, PRX module info, export/import tables,
-NID tables, and relocations.
-
-Usage:
-    python elf_parser.py <input_file> [--json] [--sections] [--segments]
-                         [--imports] [--exports] [--relocs] [--all]
-"""
-
 import argparse
 import json
 import os
 import struct
 import sys
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
 
-# ELF magic
 ELF_MAGIC = b"\x7fELF"
 
-# SELF magic  "SCE\0"
 SELF_MAGIC = 0x53434500
 
-# ELF classes
-ELFCLASS32 = 1
 ELFCLASS64 = 2
 
-# Endianness
-ELFDATA2MSB = 2  # big-endian  (PS3 native)
-ELFDATA2LSB = 1  # little-endian
+ELFDATA2MSB = 2
 
-# OS/ABI
-ELFOSABI_CELL_LV2 = 0x66
-
-# ELF types
 ET_EXEC = 2
-ET_SCE_PPURELEXEC = 0xFFA4  # PRX
+ET_SCE_PPURELEXEC = 0xFFA4
 
-# Machine
 EM_PPC64 = 21
 
-# Program header types
 PT_NULL = 0
 PT_LOAD = 1
 PT_NOTE = 4
 PT_SCE_PPURELA = 0x700000A4
-# Main-executable (ET_EXEC) process param segments. The PRX param segment
-# points at the sys_proc_prx_param structure that describes the lib entry
-# (export) and lib stub (import) tables for a fixed EBOOT.
 PT_PROC_PARAM = 0x60000001
 PT_PROC_PRX_PARAM = 0x60000002
 
-# Magic in sys_proc_prx_param ("PRX param")
 PROC_PRX_PARAM_MAGIC = 0x1B434CEC
 
-# Section header types
 SHT_NULL = 0
 SHT_PROGBITS = 1
 SHT_SYMTAB = 2
 SHT_STRTAB = 3
 SHT_RELA = 4
 SHT_NOBITS = 8
-SHT_REL = 9
 
-# Relocation types (R_PPC64_*)
 R_PPC64_NONE = 0
 R_PPC64_ADDR32 = 1
 R_PPC64_ADDR16_LO = 4
@@ -104,13 +70,8 @@ PT_TYPE_NAMES = {
     PT_PROC_PRX_PARAM: "PT_PROC_PRX_PARAM",
 }
 
-# ---------------------------------------------------------------------------
-# Helper: endian-aware unpacker
-# ---------------------------------------------------------------------------
 
 class BinaryReader:
-    """Thin wrapper around a bytes buffer with endian-aware reads."""
-
     def __init__(self, data: bytes, big_endian: bool = True):
         self.data = data
         self.endian = ">" if big_endian else "<"
@@ -133,23 +94,15 @@ class BinaryReader:
     def s64(self, off: int) -> int:
         return struct.unpack_from(self.endian + "q", self.data, off)[0]
 
-    def bytes_at(self, off: int, size: int) -> bytes:
-        return self.data[off:off + size]
-
     def cstring(self, off: int, max_len: int = 256) -> str:
         end = self.data.find(b"\x00", off, off + max_len)
         if end == -1:
             end = off + max_len
         return self.data[off:end].decode("utf-8", errors="replace")
 
-# ---------------------------------------------------------------------------
-# SELF header
-# ---------------------------------------------------------------------------
 
 class SELFHeader:
-    """SCE SELF header – wraps an encrypted/signed ELF."""
-
-    SIZE = 32  # minimum SCE header size
+    SIZE = 32
 
     def __init__(self):
         self.magic = 0
@@ -160,7 +113,7 @@ class SELFHeader:
         self.header_size = 0
         self.data_size = 0
         self.is_self = False
-        self.elf_offset = 0  # offset to the embedded ELF
+        self.elf_offset = 0
 
     @classmethod
     def parse(cls, data: bytes) -> "SELFHeader":
@@ -168,11 +121,10 @@ class SELFHeader:
             raise ValueError("Data too small for SELF header")
 
         hdr = cls()
-        # SELF header is always big-endian
         rd = BinaryReader(data, big_endian=True)
         hdr.magic = rd.u32(0)
         if hdr.magic != SELF_MAGIC:
-            return hdr  # not a SELF
+            return hdr
 
         hdr.is_self = True
         hdr.version = rd.u32(4)
@@ -182,20 +134,15 @@ class SELFHeader:
         hdr.header_size = rd.u64(16)
         hdr.data_size = rd.u64(24)
 
-        # The embedded ELF starts at header_size in most SELF variants.
-        # For retail SELFs the ELF header is actually at a fixed offset
-        # after the extended header + section info entries.  We search
-        # for the ELF magic within the first 0x1000 bytes as a fallback.
         candidate = int(hdr.header_size)
         if candidate < len(data) and data[candidate:candidate + 4] == ELF_MAGIC:
             hdr.elf_offset = candidate
         else:
-            # brute search
             idx = data.find(ELF_MAGIC, 0, min(len(data), 0x10000))
             if idx != -1:
                 hdr.elf_offset = idx
             else:
-                hdr.elf_offset = 0  # give up – caller should handle
+                hdr.elf_offset = 0
         return hdr
 
     def to_dict(self) -> dict:
@@ -210,16 +157,11 @@ class SELFHeader:
             "elf_offset": self.elf_offset,
         }
 
-# ---------------------------------------------------------------------------
-# ELF header
-# ---------------------------------------------------------------------------
 
 class ELFHeader:
-    """ELF32 / ELF64 file header."""
-
     def __init__(self):
-        self.ei_class = 0      # 1=32, 2=64
-        self.ei_data = 0       # 1=LE, 2=BE
+        self.ei_class = 0
+        self.ei_data = 0
         self.ei_osabi = 0
         self.e_type = 0
         self.e_machine = 0
@@ -297,13 +239,8 @@ class ELFHeader:
             "shstrndx": self.e_shstrndx,
         }
 
-# ---------------------------------------------------------------------------
-# Program header
-# ---------------------------------------------------------------------------
 
 class ProgramHeader:
-    """Single ELF program header (PHDR) entry."""
-
     def __init__(self):
         self.p_type = 0
         self.p_flags = 0
@@ -354,13 +291,8 @@ class ProgramHeader:
             "align": f"0x{self.p_align:X}",
         }
 
-# ---------------------------------------------------------------------------
-# Section header
-# ---------------------------------------------------------------------------
 
 class SectionHeader:
-    """Single ELF section header entry."""
-
     def __init__(self):
         self.sh_name = 0
         self.sh_type = 0
@@ -416,13 +348,8 @@ class SectionHeader:
             "entsize": f"0x{self.sh_entsize:X}",
         }
 
-# ---------------------------------------------------------------------------
-# Relocation entry
-# ---------------------------------------------------------------------------
 
 class RelaEntry:
-    """ELF RELA relocation entry."""
-
     def __init__(self):
         self.r_offset = 0
         self.r_info = 0
@@ -459,25 +386,8 @@ class RelaEntry:
             "addend": f"0x{self.r_addend:X}" if self.r_addend >= 0 else f"-0x{-self.r_addend:X}",
         }
 
-# ---------------------------------------------------------------------------
-# PRX module info
-# ---------------------------------------------------------------------------
 
 class PRXModuleInfo:
-    """PS3 PRX sys_process_prx_info_t structure.
-
-    Typically located at the start of the first PT_LOAD segment for PRX files.
-    Layout (big-endian, 64-bit pointers):
-        u16  attributes
-        u8   version[2]
-        char name[28]
-        u32  toc
-        u64  exports_start
-        u64  exports_end
-        u64  imports_start
-        u64  imports_end
-    """
-
     SIZE = 0x48
 
     def __init__(self):
@@ -499,8 +409,6 @@ class PRXModuleInfo:
         m.attributes = rd.u16(offset)
         m.version = (rd.u8(offset + 2), rd.u8(offset + 3))
         m.name = rd.cstring(offset + 4, 28)
-        # PS3 user PRX module_info uses 32-bit pointers (PPU32 prx_module_info_t):
-        #   off 0x20 gp(toc), 0x24 ent_top, 0x28 ent_end, 0x2C stub_top, 0x30 stub_end.
         m.toc = rd.u32(offset + 32)
         m.exports_start = rd.u32(offset + 36)
         m.exports_end = rd.u32(offset + 40)
@@ -520,13 +428,8 @@ class PRXModuleInfo:
             "imports_end": f"0x{self.imports_end:X}",
         }
 
-# ---------------------------------------------------------------------------
-# PRX export / import table entry helpers
-# ---------------------------------------------------------------------------
 
 class PRXExportEntry:
-    """PRX export table entry (variable size, 0x1C minimum)."""
-
     SIZE_MIN = 0x1C
 
     def __init__(self):
@@ -541,7 +444,7 @@ class PRXExportEntry:
         self.stub_table_ptr = 0
         self.name_str = ""
         self.nids: list[int] = []
-        self.addrs: list[int] = []   # stub-table entry per NID (OPD vaddr for funcs)
+        self.addrs: list[int] = []
 
     @classmethod
     def parse(cls, data: bytes, offset: int, big_endian: bool = True) -> "PRXExportEntry":
@@ -549,13 +452,11 @@ class PRXExportEntry:
         e = cls()
         e.size = rd.u8(offset + 0)
         e.attributes = rd.u8(offset + 1) << 8 | rd.u8(offset + 2) if e.size > 2 else 0
-        # Typical layout:
         e.version = rd.u16(offset + 2) if e.size >= 4 else 0
         e.attributes = rd.u16(offset + 4) if e.size >= 6 else 0
         e.num_funcs = rd.u16(offset + 6) if e.size >= 8 else 0
         e.num_vars = rd.u16(offset + 8) if e.size >= 10 else 0
         e.num_tlsvars = rd.u16(offset + 10) if e.size >= 12 else 0
-        # skip reserved
         e.name_ptr = rd.u32(offset + 16) if e.size >= 20 else 0
         e.nid_table_ptr = rd.u32(offset + 20) if e.size >= 24 else 0
         e.stub_table_ptr = rd.u32(offset + 24) if e.size >= 28 else 0
@@ -571,8 +472,6 @@ class PRXExportEntry:
 
 
 class PRXImportEntry:
-    """PRX import table entry."""
-
     SIZE_MIN = 0x2C
 
     def __init__(self):
@@ -587,7 +486,7 @@ class PRXImportEntry:
         self.stub_table_ptr = 0
         self.name_str = ""
         self.nids: list[int] = []
-        self.addrs: list[int] = []   # stub-table entry per NID (OPD vaddr for funcs)
+        self.addrs: list[int] = []
 
     @classmethod
     def parse(cls, data: bytes, offset: int, big_endian: bool = True) -> "PRXImportEntry":
@@ -599,7 +498,6 @@ class PRXImportEntry:
         i.num_funcs = rd.u16(offset + 6) if i.size >= 8 else 0
         i.num_vars = rd.u16(offset + 8) if i.size >= 10 else 0
         i.num_tlsvars = rd.u16(offset + 10) if i.size >= 12 else 0
-        # reserved[4]
         i.name_ptr = rd.u32(offset + 16) if i.size >= 20 else 0
         i.nid_table_ptr = rd.u32(offset + 20) if i.size >= 24 else 0
         i.stub_table_ptr = rd.u32(offset + 24) if i.size >= 28 else 0
@@ -613,12 +511,8 @@ class PRXImportEntry:
             "nids": [f"0x{n:08X}" for n in self.nids],
         }
 
-# ---------------------------------------------------------------------------
-# Top-level ELF file
-# ---------------------------------------------------------------------------
 
 def vaddr_to_offset(phdrs: list[ProgramHeader], vaddr: int) -> int | None:
-    """Convert a virtual address to a file offset using PT_LOAD segments."""
     for ph in phdrs:
         if ph.p_type == PT_LOAD and ph.p_filesz > 0:
             if ph.p_vaddr <= vaddr < ph.p_vaddr + ph.p_filesz:
@@ -627,8 +521,6 @@ def vaddr_to_offset(phdrs: list[ProgramHeader], vaddr: int) -> int | None:
 
 
 class ELFFile:
-    """Represents a parsed PS3 ELF / SELF / PRX file."""
-
     def __init__(self, path: str):
         self.path = path
         self.raw_data: bytes = b""
@@ -642,21 +534,17 @@ class ELFFile:
         self.imports: list[PRXImportEntry] = []
         self.relocations: list[RelaEntry] = []
 
-    # ---- loading ----
 
     def load(self) -> None:
-        """Read the file and parse all structures."""
         with open(self.path, "rb") as f:
             self.raw_data = f.read()
 
-        # Detect SELF wrapper
         if len(self.raw_data) >= 4:
             maybe_self = SELFHeader.parse(self.raw_data)
             if maybe_self.is_self:
                 self.self_header = maybe_self
                 self.elf_offset = maybe_self.elf_offset
 
-        # Parse ELF header
         if self.raw_data[self.elf_offset:self.elf_offset + 4] != ELF_MAGIC:
             raise ValueError("Could not locate ELF header in file")
 
@@ -665,9 +553,6 @@ class ELFFile:
         self._parse_section_headers()
         self._resolve_section_names()
 
-        # If this is a PRX, parse module info. If it is a fixed main
-        # executable (EBOOT), locate its import/export tables via the
-        # PT_PROC_PRX_PARAM segment instead.
         if self.elf_header.e_type == ET_SCE_PPURELEXEC:
             self._parse_prx_module_info()
         else:
@@ -675,7 +560,6 @@ class ELFFile:
 
         self._parse_relocations()
 
-    # ---- internal parsing ----
 
     def _rd(self) -> BinaryReader:
         return BinaryReader(self.raw_data, self.elf_header.big_endian)
@@ -714,12 +598,8 @@ class ELFFile:
                 sh.name_str = rd.cstring(strtab_off + sh.sh_name)
 
     def _parse_prx_module_info(self) -> None:
-        """Extract module info from the first PT_LOAD segment of a PRX."""
         for ph in self.program_headers:
             if ph.p_type == PT_LOAD and ph.p_filesz > 0:
-                # For SCE PRX, the first PT_LOAD's p_paddr holds the module_info
-                # as an absolute FILE offset (== module_info vaddr + p_offset),
-                # not a segment-relative vaddr. Use it directly.
                 info_off = int(ph.p_paddr & 0xFFFFFFFF)
                 if info_off + PRXModuleInfo.SIZE <= len(self.raw_data):
                     try:
@@ -732,24 +612,6 @@ class ELFFile:
                 break
 
     def _parse_proc_prx_param(self) -> None:
-        """Locate import/export tables for a fixed main executable (ET_EXEC).
-
-        A main EBOOT does not carry a PRX module_info at the head of its first
-        segment. Instead a PT_PROC_PRX_PARAM (0x60000002) program header points
-        at a sys_proc_prx_param structure:
-
-            u32 size;
-            u32 magic;         // 0x1B434CEC
-            u32 version;
-            u32 unk0;
-            u32 libentstart;   // exports (lib entry) table start vaddr
-            u32 libentend;     // exports table end vaddr
-            u32 libstubstart;  // imports (lib stub) table start vaddr
-            u32 libstubend;    // imports table end vaddr
-
-        We reuse PRXModuleInfo purely as a carrier for the four table pointers
-        and then run the shared export/import table walker.
-        """
         rd = self._rd()
         for ph in self.program_headers:
             if ph.p_type != PT_PROC_PRX_PARAM or ph.p_filesz < 0x20:
@@ -773,7 +635,6 @@ class ELFFile:
         mi = self.module_info
         rd = self._rd()
 
-        # exports
         if mi.exports_start and mi.exports_end and mi.exports_end > mi.exports_start:
             off = vaddr_to_offset(self.program_headers, mi.exports_start)
             end_off = vaddr_to_offset(self.program_headers, mi.exports_end)
@@ -782,12 +643,10 @@ class ELFFile:
                     entry = PRXExportEntry.parse(self.raw_data, off, self.elf_header.big_endian)
                     if entry.size == 0:
                         break
-                    # resolve name
                     if entry.name_ptr:
                         name_off = vaddr_to_offset(self.program_headers, entry.name_ptr)
                         if name_off is not None:
                             entry.name_str = rd.cstring(name_off)
-                    # read NID table
                     total = entry.num_funcs + entry.num_vars + entry.num_tlsvars
                     if entry.nid_table_ptr and total > 0:
                         nid_off = vaddr_to_offset(self.program_headers, entry.nid_table_ptr)
@@ -801,7 +660,6 @@ class ELFFile:
                     self.exports.append(entry)
                     off += entry.size
 
-        # imports
         if mi.imports_start and mi.imports_end and mi.imports_end > mi.imports_start:
             off = vaddr_to_offset(self.program_headers, mi.imports_start)
             end_off = vaddr_to_offset(self.program_headers, mi.imports_end)
@@ -828,10 +686,8 @@ class ELFFile:
                     off += entry.size
 
     def _parse_relocations(self) -> None:
-        """Parse RELA entries from PT_SCE_PPURELA segments and SHT_RELA sections."""
         eh = self.elf_header
 
-        # From program headers (PT_SCE_PPURELA)
         for ph in self.program_headers:
             if ph.p_type == PT_SCE_PPURELA and ph.p_filesz > 0:
                 entry_size = 24 if eh.is64 else 12
@@ -842,7 +698,6 @@ class ELFFile:
                     self.relocations.append(r)
                     off += entry_size
 
-        # From section headers (SHT_RELA)
         for sh in self.section_headers:
             if sh.sh_type == SHT_RELA and sh.sh_size > 0:
                 entry_size = int(sh.sh_entsize) if sh.sh_entsize else (24 if eh.is64 else 12)
@@ -855,20 +710,16 @@ class ELFFile:
                     self.relocations.append(r)
                     off += entry_size
 
-    # ---- public query helpers ----
 
     def get_segment_data(self, index: int) -> bytes:
-        """Return the raw bytes of program header *index*."""
         ph = self.program_headers[index]
         return self.raw_data[ph.p_offset:ph.p_offset + ph.p_filesz]
 
     def get_section_data(self, index: int) -> bytes:
-        """Return the raw bytes of section header *index*."""
         sh = self.section_headers[index]
         off = self.elf_offset + sh.sh_offset
         return self.raw_data[off:off + sh.sh_size]
 
-    # ---- JSON report ----
 
     def to_dict(self, sections=True, segments=True, imports=True,
                 exports=True, relocs=True) -> dict:
@@ -901,9 +752,6 @@ class ELFFile:
 
         return result
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 def main() -> None:
     parser = argparse.ArgumentParser(

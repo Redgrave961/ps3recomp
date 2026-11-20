@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""sys_ppu_thread_create's JOINABLE flag through the real sys_ppu_thread.c: non-joinable threads free their slot."""
 import os
 from pathlib import Path
 import subprocess

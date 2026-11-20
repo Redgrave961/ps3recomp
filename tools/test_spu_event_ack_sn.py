@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""SPU_WrEventAck keeps a stall-and-notify pending while a DMA list is parked."""
 import os
 import subprocess
 import tempfile

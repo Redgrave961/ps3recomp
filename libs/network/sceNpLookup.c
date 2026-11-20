@@ -1,20 +1,3 @@
-/*
- * ps3recomp - sceNpLookup (player profiles and avatars), answered locally
- *
- * A player's profile is their online ID, so the lookup needs no server. The name comes back as the NP ID's handle,
- * with an empty "about me", English, country "us" and no avatar (an image
- * of size 0). Transactions complete immediately; PollAsync reports done.
- *
- * Simpsons Arcade retries Lookup title-context creation every frame until it
- * succeeds and holds its online session until it does, so a context that
- * merely "fakes OK" (id 0) kept every match from starting.
- *
- * Layouts (SDK ABI):
- *   SceNpUserInfo { SceNpId userId (36); SceNpOnlineName name (48); SceNpAvatarUrl icon (128) }
- *   SceNpAvatarImage { u8 data[200 KB]; u32 size; u8 reserved[12] }
- *   SceNpMyLanguages { s32 language1..3; pad } / SceNpCountryCode { char data[2]; term; pad }
- */
-
 #include "sceNp.h"
 #include "../../runtime/ppu/ppu_memory.h"
 
@@ -27,7 +10,7 @@
 #define TRANS_MAX 32
 
 static int s_titles[TITLE_MAX + 1];
-static int s_trans[TRANS_MAX + 1];   /* 0 free, else owning title */
+static int s_trans[TRANS_MAX + 1];
 
 s32 sceNpLookupInit(void)  { return CELL_OK; }
 s32 sceNpLookupTerm(void)  { return CELL_OK; }
@@ -67,7 +50,6 @@ s32 sceNpLookupDestroyTransactionCtx(s32 transId)
 
 static int trans_ok(s32 id) { return id >= 1 && id <= TRANS_MAX && s_trans[id]; }
 
-/* Everything completes at the call. */
 s32 sceNpLookupPollAsync(s32 transId, u32 result)
 {
     if (!trans_ok(transId)) return (s32)LOOKUP_ERROR_INVALID_ID;
@@ -82,10 +64,9 @@ s32 sceNpLookupWaitAsync(s32 transId, u32 result)
 
 static void empty_avatar(u32 image)
 {
-    if (image) vm_write32(image + AVATAR_IMAGE_DATA_SIZE, 0);   /* size = 0 */
+    if (image) vm_write32(image + AVATAR_IMAGE_DATA_SIZE, 0);
 }
 
-/* (transId, npId*, userInfo*, aboutMe*, languages*, countryCode*, avatarImage*, prio, option) */
 s32 sceNpLookupUserProfileAsync(s32 transId, u32 npId, u32 userInfo, u32 aboutMe,
                                 u32 languages, u32 countryCode, u32 avatarImage, s32 prio)
 {
@@ -94,8 +75,8 @@ s32 sceNpLookupUserProfileAsync(s32 transId, u32 npId, u32 userInfo, u32 aboutMe
     if (!npId) return (s32)SCE_NP_ERROR_INVALID_ARGUMENT;
     if (userInfo) {
         memset(vm_ptr8(userInfo), 0, 36 + 48 + 128);
-        memcpy(vm_ptr8(userInfo), vm_ptr8(npId), 36);               /* userId */
-        memcpy(vm_ptr8(userInfo + 36), vm_ptr8(npId), 16);          /* name = handle */
+        memcpy(vm_ptr8(userInfo), vm_ptr8(npId), 36);
+        memcpy(vm_ptr8(userInfo + 36), vm_ptr8(npId), 16);
     }
     if (aboutMe) memset(vm_ptr8(aboutMe), 0, 64);
     if (languages) {
@@ -107,4 +88,3 @@ s32 sceNpLookupUserProfileAsync(s32 transId, u32 npId, u32 userInfo, u32 aboutMe
     empty_avatar(avatarImage);
     return CELL_OK;
 }
-

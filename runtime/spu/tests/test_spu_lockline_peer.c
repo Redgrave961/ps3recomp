@@ -1,43 +1,3 @@
-/*
- * SPU-to-SPU lock-line coherence: a write by one SPU against a line another
- * SPU has reserved (runtime/spu/spu_channels.c, runtime/spu/spu_dma.h).
- *
- * test_spu_coherency.c covers the PPU as the writer. This covers the other
- * writer, which is the one a SPURS title actually spends its time on: five SPU
- * kernel threads sharing one management line, every one of them reserving it
- * with GETLLAR and committing with PUTLLC. If a commit does not break the
- * peers' reservations, a peer's pending PUTLLC compares its snapshot against a
- * line the committer has already replaced, finds what it expects, and commits
- * over the top. Both SPUs believe they won the same compare-and-swap. Nothing
- * in the tree reports it: the queue is simply wrong afterwards.
- *
- * So the assertions are on the peer, not the writer: after a PUTLLC commit, a
- * PUTLLUC and a plain DMA PUT into a reserved line, the peer holds SPU_EVENT_LR
- * and no reservation, and its own PUTLLC then FAILS and writes nothing. The
- * cases that must stay quiet are here for the same reason they are in the PPU
- * test -- an over-eager notify is a livelock, not a safe approximation.
- *
- * Two more, after the PUTLLUC cases, cover the GETLLAR that skips the lock
- * (spu_coh_reserve_fast): that it really is lock-free for a registered holder
- * on a marked line and still waits otherwise, and -- raced for real this
- * time, because the point is the memory ordering -- that a write racing it is
- * either in the copy or ends the reservation with SPU_EVENT_LR, never neither.
- *
- * spu_channels.c is compiled in rather than linked, because spu_mfc_atomic()
- * is file-static: the same reason test_spu_mfc_slots.c does it.
- *
- * Build:
- *   clang -std=gnu17 -I include -I runtime/spu -I runtime/platform \
- *         -o /tmp/test_spu_lockline_peer \
- *         runtime/spu/tests/test_spu_lockline_peer.c \
- *         runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
- *         runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
- *         runtime/spu/spu_interp.c \
- *         runtime/platform/win32_compat.c runtime/platform/ps3_sync.c -lpthread -lm
- *
- * Exit code: 0 if all passed, 1 if any failed. Final line prints a summary.
- */
-
 #include <pthread.h>
 #include <sched.h>
 #include <stdatomic.h>
@@ -46,19 +6,12 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Guest memory. The DMA and atomic paths index straight off this, so it has to
- * cover every EA the test uses; a PUT below 0x10000 is rejected as malformed
- * (the null-destination guard), so the lines live well above that. */
 static uint8_t g_guest_mem[1u << 20];
 uint8_t* vm_base = g_guest_mem;
 uint32_t ppu_vm_size = 0;
 
-/* The unit under test. */
 #include "../spu_channels.c"
 
-/* ---------------------------------------------------------------------------
- * Harness
- * -----------------------------------------------------------------------*/
 static int g_pass, g_fail;
 static const char* g_current = "(none)";
 
@@ -84,8 +37,6 @@ static const char* g_current = "(none)";
     }                                                             \
 } while (0)
 
-/* Three 128-byte lines, and a local-store address per context to stage from.
- * LINE_D..LINE_D+0x180 is the multi-line span the wide PUT covers. */
 #define LINE_A   0x00020000u
 #define LINE_B   0x00020180u
 #define LINE_D   0x00020400u
@@ -93,15 +44,8 @@ static const char* g_current = "(none)";
 #define LSA_A    0x00001000u
 #define LSA_B    0x00002000u
 
-/* 256 KB of local store each: not on the stack. */
 static spu_context g_a, g_b;
 
-/* ---------------------------------------------------------------------------
- * Driving the real channel path
- *
- * Every command goes through spu_wrch, so what runs is spu_mfc_atomic() and
- * mfc_do_transfer() themselves rather than a copy of their reservation rules.
- * -----------------------------------------------------------------------*/
 static void wrch(spu_context* ctx, uint32_t channel, uint32_t v)
 {
     spu_wrch(ctx, channel, spu_make_preferred_u32(v));
@@ -125,9 +69,6 @@ static void spu_put(spu_context* ctx, uint32_t lsa, uint32_t ea, uint32_t size)
     wrch(ctx, MFC_Cmd, MFC_PUT_CMD);
 }
 
-/* Fill a context's staging buffer with a recognisable pattern, so "the write
- * landed" and "the write landed from the SPU that should have won" are
- * different assertions. */
 static void stage(spu_context* ctx, uint32_t lsa, uint8_t tag, uint32_t len)
 {
     for (uint32_t i = 0; i < len; i++)
@@ -141,9 +82,6 @@ static int mem_is(uint32_t ea, uint8_t tag, uint32_t len)
     return 1;
 }
 
-/* A context is reset rather than re-created: spu_coherency.c's table of
- * reserving contexts keys on the address and is never emptied, so reusing the
- * two keeps the test inside the eight slots it holds. */
 static void reset_ctx(spu_context* ctx, uint32_t spu_id)
 {
     spu_context_init(ctx, 0);
@@ -157,15 +95,11 @@ static void reset_pair(void)
     memset(g_guest_mem + LINE_A, 0, 0x600);
 }
 
-/* ===========================================================================
- * A peer's PUTLLC commit
- * ===========================================================================*/
 static void test_putllc_breaks_peer(void)
 {
     reset_pair();
     unsigned long raised = g_spu_lr_raise;
 
-    /* Both SPUs take the same line, exactly as five SPURS kernels do. */
     spu_atomic(&g_a, LSA_A, LINE_A, MFC_GETLLAR_CMD);
     spu_atomic(&g_b, LSA_B, LINE_A, MFC_GETLLAR_CMD);
     CHECK((g_a.resv & 1u) == 1);
@@ -185,13 +119,10 @@ static void test_putllc_breaks_peer(void)
     TEST("...and drops the peer's reservation");
     CHECK((g_a.resv & 1u) == 0);
 
-    /* The committer consumed its reservation; hardware does not report that as
-     * a loss, so it takes no event of its own. */
     TEST("...and does not raise a self-LR on the committer");
     CHECK_EQ_U32(g_b.event_status & SPU_EVENT_LR, 0);
     CHECK((g_b.resv & 1u) == 0);
 
-    /* The whole point of the event: the peer's own commit has to lose. */
     TEST("the peer's PUTLLC then fails and writes nothing");
     stage(&g_a, LSA_A, 0xA0, 128);
     spu_atomic(&g_a, LSA_A, LINE_A, MFC_PUTLLC_CMD);
@@ -199,15 +130,13 @@ static void test_putllc_breaks_peer(void)
     CHECK(mem_is(LINE_A, 0xB0, 128));
 }
 
-/* A PUTLLC that fails its own compare stored nothing, so there is nothing to
- * report -- the peer keeps its reservation. */
 static void test_failed_putllc_is_quiet(void)
 {
     reset_pair();
     unsigned long raised = g_spu_lr_raise;
 
     spu_atomic(&g_b, LSA_B, LINE_A, MFC_GETLLAR_CMD);
-    g_guest_mem[LINE_A + 8] = 0x5A;          /* the line moves under B */
+    g_guest_mem[LINE_A + 8] = 0x5A;
     spu_atomic(&g_a, LSA_A, LINE_A, MFC_GETLLAR_CMD);
 
     TEST("a PUTLLC that fails its compare raises nothing");
@@ -217,12 +146,9 @@ static void test_failed_putllc_is_quiet(void)
     CHECK_EQ_U32(g_a.event_status, 0);
     CHECK((g_a.resv & 1u) == 1);
     CHECK(g_spu_lr_raise == raised);
-    CHECK_EQ_U32(g_guest_mem[LINE_A + 8], 0x5A);   /* nothing was committed */
+    CHECK_EQ_U32(g_guest_mem[LINE_A + 8], 0x5A);
 }
 
-/* ===========================================================================
- * A peer's PUTLLUC
- * ===========================================================================*/
 static void test_putlluc_breaks_peer(void)
 {
     reset_pair();
@@ -244,9 +170,6 @@ static void test_putlluc_breaks_peer(void)
     CHECK_EQ_U32(g_a.atomic_stat, 1);
     CHECK(mem_is(LINE_A, 0xB0, 128));
 
-    /* Unlike PUTLLC, a PUTLLUC is unconditional: it invalidates every
-     * reservation on the line including the issuer's own, and the issuer is
-     * told, because it never made the compare that would have said so. */
     reset_pair();
     raised = g_spu_lr_raise;
     spu_atomic(&g_b, LSA_B, LINE_A, MFC_GETLLAR_CMD);
@@ -259,14 +182,6 @@ static void test_putlluc_breaks_peer(void)
     CHECK(g_spu_lr_raise == raised + 1);
 }
 
-/* ===========================================================================
- * GETLLAR without the lock-line lock
- *
- * Which path a GETLLAR took is not visible in its result, so the first test
- * pins it the way the acknowledge test does: hold the lock and see whether a
- * GETLLAR on another thread completes. The waits decide nothing about the
- * outcome; a GETLLAR that has not yet started cannot complete either.
- * ===========================================================================*/
 static atomic_int g_llar_ea_sel, g_llar_entered, g_llar_done;
 
 static void* llar_thread(void* arg)
@@ -278,7 +193,6 @@ static void* llar_thread(void* arg)
     return NULL;
 }
 
-/* 1 if a GETLLAR of ea by g_a completed while this thread held the lock. */
 static int llar_completes_under_held_lock(uint32_t ea, uint32_t held)
 {
     atomic_store(&g_llar_ea_sel, (int)ea);
@@ -291,9 +205,6 @@ static int llar_completes_under_held_lock(uint32_t ea, uint32_t held)
         return -1;
     }
     while (!atomic_load(&g_llar_entered)) YieldProcessor();
-    /* About 2 s either way. Windows rounds Sleep(1) up to its ~15.6 ms timer
-     * tick, so 2000 x Sleep(1) was ~31 s per expected-blocking case there and
-     * the harness's 30 s timeout killed a passing run. */
     for (int i = 0; i < 200 && !atomic_load(&g_llar_done); i++) Sleep(10);
     int done = atomic_load(&g_llar_done);
     spu_lockline_unlock(held);
@@ -304,7 +215,7 @@ static int llar_completes_under_held_lock(uint32_t ea, uint32_t held)
 static void test_registered_getllar_skips_the_lock(void)
 {
     reset_pair();
-    spu_atomic(&g_a, LSA_A, LINE_A, MFC_GETLLAR_CMD);   /* registers, marks */
+    spu_atomic(&g_a, LSA_A, LINE_A, MFC_GETLLAR_CMD);
     g_guest_mem[LINE_A + 5] = 0x77;
 
     TEST("a registered holder's GETLLAR of a marked line skips the lock when no writer holds it");
@@ -326,15 +237,11 @@ static void test_registered_getllar_skips_the_lock(void)
     CHECK_EQ_U32(g_a.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
     CHECK((g_a.resv & 1u) == 0);
 
-    /* LINE_B has never been reserved, so its mark is set by this GETLLAR and
-     * must be set under the lock. */
     TEST("a GETLLAR of an unmarked line still takes the lock");
     CHECK(llar_completes_under_held_lock(LINE_B + 0x80, LINE_B + 0x80) == 0);
     CHECK((g_a.resv & 1u) == 1);
     CHECK_EQ_U32((g_a.resv & ~127u), LINE_B + 0x80);
 
-    /* A context the holder list does not know (coh_listed clear) must link
-     * itself first, under the lock, or no writer would ever find it. */
     TEST("an unregistered context's GETLLAR of a marked line still takes the lock");
     spu_coh_unregister(&g_a);
     CHECK(g_a.coh_listed == 0);
@@ -347,14 +254,6 @@ static void test_registered_getllar_skips_the_lock(void)
     CHECK_EQ_U32((g_a.resv & ~127u), LINE_B + 0x100);
 }
 
-/* A write racing a lock-free GETLLAR, for real. Two threads are released
- * together each round, with skewed start delays so the copy and the write
- * overlap at varying offsets: g_a's GETLLAR on one, and on the other a write
- * of the whole line with a new byte -- alternately the PPU's coherent store
- * (lock, write, notify) and a peer SPU's PUTLLUC. Afterwards g_a must hold
- * either a valid reservation whose copy is the new line throughout, or no
- * reservation and SPU_EVENT_LR. A reservation that survives with an old or
- * torn copy is the lost update the fences exist to prevent. */
 #define RACE_ROUNDS 200000
 static atomic_int g_race_go, g_race_reader_done, g_race_writer_done;
 
@@ -396,7 +295,7 @@ static void* race_writer(void* arg)
 static void test_racing_write_ends_lockfree_reservation(void)
 {
     reset_pair();
-    spu_atomic(&g_a, LSA_A, LINE_A, MFC_GETLLAR_CMD);   /* registers, marks */
+    spu_atomic(&g_a, LSA_A, LINE_A, MFC_GETLLAR_CMD);
     spu_atomic(&g_b, LSA_B, LINE_A, MFC_GETLLAR_CMD);
     atomic_store(&g_race_go, 0);
     atomic_store(&g_race_reader_done, 0);
@@ -442,9 +341,6 @@ static void test_racing_write_ends_lockfree_reservation(void)
     CHECK(lost > 0);
 }
 
-/* ===========================================================================
- * A peer's plain DMA PUT
- * ===========================================================================*/
 static void test_plain_put_breaks_peer(void)
 {
     reset_pair();
@@ -468,8 +364,6 @@ static void test_plain_put_breaks_peer(void)
     CHECK_EQ_U32(g_a.atomic_stat, 1);
     CHECK(mem_is(LINE_A, 0xB0, 128));
 
-    /* A PUT smaller than a line still covers it: the reservation is per line,
-     * not per byte. */
     reset_pair();
     raised = g_spu_lr_raise;
     spu_atomic(&g_a, LSA_A, LINE_A, MFC_GETLLAR_CMD);
@@ -505,15 +399,12 @@ static void test_plain_put_elsewhere_is_quiet(void)
     CHECK(g_spu_lr_raise == raised);
 }
 
-/* A bulk PUT covers many lines at once, and the reserved one can be anywhere
- * in the span -- including the last, which is the case a scan that stops early
- * gets wrong. */
 static void test_wide_put_finds_the_reserved_line(void)
 {
     reset_pair();
     unsigned long raised = g_spu_lr_raise;
 
-    spu_atomic(&g_a, LSA_A, LINE_D + 0x180, MFC_GETLLAR_CMD);   /* the 4th line */
+    spu_atomic(&g_a, LSA_A, LINE_D + 0x180, MFC_GETLLAR_CMD);
 
     TEST("a PUT spanning four lines raises once, for the reserved one");
     stage(&g_b, LSA_B, 0xB0, 0x200);
@@ -526,16 +417,13 @@ static void test_wide_put_finds_the_reserved_line(void)
     CHECK(mem_is(LINE_D, 0xB0, 0x200));
 }
 
-/* The reserved line is copied under the lock and the rest of the span outside
- * it, so the partial first and last lines are their own pieces: each has to
- * land exactly, and nothing either side of the span may move. */
 static void test_unaligned_wide_put_around_a_reserved_line(void)
 {
     reset_pair();
     memset(g_guest_mem + LINE_D, 0xEE, 0x200);
     unsigned long raised = g_spu_lr_raise;
 
-    spu_atomic(&g_a, LSA_A, LINE_D + 0x80, MFC_GETLLAR_CMD);    /* the middle line */
+    spu_atomic(&g_a, LSA_A, LINE_D + 0x80, MFC_GETLLAR_CMD);
 
     TEST("an unaligned PUT over a reserved line raises once");
     stage(&g_b, LSA_B, 0xC0, 0x100);
@@ -720,9 +608,6 @@ static void test_concurrent_putllc_on_shared_and_own_lines(void)
 }
 
 
-/* Hold the reservation-writer lock while a real MFC producer starts, and raise
- * a peer's LR meanwhile: the DMA notification must survive it. Atomic fixture
- * flags synchronize the host threads. */
 static atomic_int g_raise_entered, g_raise_done;
 static unsigned g_raise_mode;
 static void* raise_thread(void* ignored)
@@ -730,7 +615,6 @@ static void* raise_thread(void* ignored)
     (void)ignored;
     atomic_store(&g_raise_entered, 1);
     if (g_raise_mode == 2) {
-        /* One zero-length, stall-and-notify list element, tag five. */
         g_a.ls[0x1000] = 0x80;
         mfc_run_list(&g_a, 0x1000, 1, 0, 0, MFC_GET_CMD, 5);
     } else {
@@ -756,9 +640,6 @@ static void test_producer_keeps_peer_event(unsigned bit)
     }
     while (!atomic_load(&g_raise_entered)) YieldProcessor();
     Sleep(10);
-    /* #418 had the producer wait for this lock; since #492 every event_status
-     * write is an atomic OR/AND, so it need not, and may already be done. What
-     * must hold either way is checked below: neither bit is lost. */
     spu_coh_notify_write(LINE_A);
     spu_lockline_unlock(LINE_A);
     pthread_join(t, NULL);
@@ -771,9 +652,6 @@ static void test_producer_keeps_peer_event(unsigned bit)
     }
 }
 
-/* ===========================================================================
- * main
- * ===========================================================================*/
 int main(void)
 {
     test_putllc_breaks_peer();
@@ -796,12 +674,6 @@ int main(void)
     return g_fail == 0 ? 0 : 1;
 }
 
-/* ---------------------------------------------------------------------------
- * The runtime beyond the SPU channel layer, stubbed. These are what
- * spu_channels.c reaches for outside its own subsystem: the PPU's reservation
- * and watch helpers, the host clock, and the title-specific SPURS hooks. None
- * of them is on the path this test drives.
- * -----------------------------------------------------------------------*/
 void ps3_ww_report_inline(uint32_t a, uint64_t v, int w)
 {
     (void)a; (void)v; (void)w;
@@ -812,6 +684,5 @@ uint32_t g_ww_lo = 0xFFFFFFFFu, g_ww_hi = 0;
 void (*g_spurs_kernel_hook)(uint32_t) = 0;
 void spurs_ef_set_from_spu(uint32_t ea, uint16_t bits) { (void)ea; (void)bits; }
 
-/* Loader diagnostics and worker publication are outside this fixture. */
 uint32_t g_spu_image_src_ea, g_spu_image_ls_start, g_spu_image_span;
 void spu_thread_publish_ctx(uint32_t tid, void* ctx) { (void)tid; (void)ctx; }

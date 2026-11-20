@@ -1,17 +1,3 @@
-/* An SPU's user event (send_event through the interrupt mailbox) goes to the queue its port is bound to.
- *
- * The port is bound by the PPU with sys_spu_thread_connect_event (this SPU thread) or
- * sys_spu_thread_group_connect_event_all_threads (the group). The SPU thread starts running at
- * sys_spu_thread_group_start while the PPU is still on its way to those calls, so an event for a port that is not
- * bound yet has to wait for the binding for a while instead of being answered with ENOTCONN at once, which makes
- * the SPU program fail its first request. A binding made with sys_spu_thread_connect_event has to be found as well.
- *
- * clang -std=gnu17 -I include -I runtime -I runtime/syscalls -I runtime/spu -I libs/video
- *   runtime/spu/tests/test_spu_user_event_port.c -Wl,-dead_strip -pthread -o /tmp/test_spu_user_event_port
- *   && /tmp/test_spu_user_event_port
- */
-/* Syscall 14's classifier (#341) lives in lv2_lock_line.c, which pulls in the
- * VM map table; nothing here issues syscall 14. */
 #include <stdint.h>
 int64_t lv2_spu_lock_line_classify(uint32_t a, uint64_t f) { (void)a; (void)f; return 0; }
 #include "../../syscalls/lv2_register.c"
@@ -22,11 +8,10 @@ int64_t lv2_spu_lock_line_classify(uint32_t a, uint64_t f) { (void)a; (void)f; r
 
 uint8_t* vm_base;
 uint32_t ppu_vm_size;
-void SetLastError(DWORD e) { (void)e; }                       /* the POSIX shim's condition variable reports a timeout */
+void SetLastError(DWORD e) { (void)e; }
 uint32_t spurs_port_queue(uint32_t port) { (void)port; return 0; }
 int64_t sys_event_flag_set(ppu_context* c) { (void)c; return 0; }
 
-/* What the delivery pushes at the queue, recorded instead of sent. */
 static uint32_t pushed_queue, pushed_data;
 static int pushes;
 int sys_event_queue_push_by_id(uint32_t queue_id, uint64_t source, uint64_t d1, uint64_t d2, uint64_t d3)
@@ -49,7 +34,6 @@ static spu_group_t*  grp;
 static spu_thread_t* thr;
 static spu_context   spu;
 
-/* sys_spu_thread_connect_event(tid, queue, et = 1, port) */
 static void bind_thread(uint32_t queue, uint32_t port)
 {
     ppu_context c = {0};
@@ -57,7 +41,6 @@ static void bind_thread(uint32_t queue, uint32_t port)
     assert(sys_spu_thread_connect_event_handler(&c) == 0);
 }
 
-/* sys_spu_thread_group_connect_event_all_threads(group, queue, ports_mask, &port) */
 static void bind_group(uint32_t queue, uint32_t port)
 {
     ppu_context c = {0};
@@ -82,7 +65,6 @@ static void* late_binder(void* p)
     return NULL;
 }
 
-/* One send_event on `port` with data 0xBEEF; returns the SPU's answer, and how long the delivery took. */
 static uint32_t send_event(uint32_t port, double* took_ms)
 {
     spu_channel_write(&spu.ch_out_mbox, 0xBEEFu);
@@ -132,7 +114,7 @@ int main(void)
     CHECK(ms >= 150.0 && ms < 1000.0, "the wait for a port nobody binds took %.0f ms (bounded, about 200)", ms);
 
     reset();
-    spu.spu_id = 0x7FFFFF;                       /* no such thread: nothing will ever bind its port */
+    spu.spu_id = 0x7FFFFF;
     r = send_event(0x2A, &ms);
     CHECK(r == CELL_ENOTCONN && ms < 50.0, "an SPU with no thread: answer 0x%08X after %.0f ms (no wait)", r, ms);
 

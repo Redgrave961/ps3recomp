@@ -1,13 +1,3 @@
-"""dwarf_line.py - resolve a code address to source file:line from debug-build DWARF.
-
-When a recompiled proto crashes at guest address 0x004F4A98, .debug_line turns that into
-`scene/scene.cpp:1204` -- the DWARF2 line-number program maps every instruction address
-back to the source line it came from. Only useful on the unstripped debug builds, but for
-those it makes a recomp crash address point straight at the offending source line.
-
-    python dwarf_line.py EBOOT.elf 0x4F4A98 0x662100     # addr -> file:line
-    python dwarf_line.py EBOOT.elf --dump | head          # full address->line table
-"""
 from __future__ import annotations
 
 import argparse
@@ -24,11 +14,6 @@ from dwarf_common import uleb, sleb, cstr
 
 
 def parse_one_unit(data: bytes, o: int):
-    """Yield (address, file_path, line) rows for the line program starting at *o*.
-
-    Driven by DW_AT_stmt_list offsets rather than by walking unit_length -- the SNC
-    linker leaves padding between units, so `o += unit_length` lands in a gap.
-    """
     if o + 4 <= len(data):
         unit_len = struct.unpack_from(">I", data, o)[0]
         end = o + 4 + unit_len
@@ -38,7 +23,7 @@ def parse_one_unit(data: bytes, o: int):
         p = o + 10
         min_inst = data[p]; p += 1
         if version >= 4:
-            p += 1                              # max_ops_per_inst
+            p += 1
         default_is_stmt = data[p]; p += 1
         line_base = struct.unpack_from(">b", data, p)[0]; p += 1
         line_range = data[p]; p += 1
@@ -49,7 +34,7 @@ def parse_one_unit(data: bytes, o: int):
         while data[p] != 0:
             s, p = cstr(data, p); include_dirs.append(s)
         p += 1
-        files = [("", 0)]                       # (name, dir_index)
+        files = [("", 0)]
         while data[p] != 0:
             name, p = cstr(data, p)
             dir_idx, p = uleb(data, p)
@@ -65,49 +50,47 @@ def parse_one_unit(data: bytes, o: int):
             d = include_dirs[di] if di < len(include_dirs) else ""
             return f"{d}/{name}" if d and not name.startswith(("/", "\\")) and ":" not in name else name
 
-        # state machine
         addr = 0; file = 1; line = 1; p = prog_start
         addr_size = 4
         while p < end:
             op = data[p]; p += 1
-            if op >= opcode_base:               # special opcode
+            if op >= opcode_base:
                 adj = op - opcode_base
                 addr += (adj // line_range) * min_inst
                 line += line_base + (adj % line_range)
                 yield (addr, filepath(file), line)
-            elif op == 0:                       # extended
+            elif op == 0:
                 length, p = uleb(data, p)
                 sub = data[p]
-                if sub == 1:                    # end_sequence
-                    yield (addr, None, 0)       # marks the end of covered range
+                if sub == 1:
+                    yield (addr, None, 0)
                     addr = 0; file = 1; line = 1
-                elif sub == 2:                  # set_address
+                elif sub == 2:
                     addr = struct.unpack_from(">I" if addr_size == 4 else ">Q", data, p + 1)[0]
                 p += length
-            else:                               # standard opcode
-                if op == 1:                     # copy
+            else:
+                if op == 1:
                     yield (addr, filepath(file), line)
-                elif op == 2:                   # advance_pc
+                elif op == 2:
                     v, p = uleb(data, p); addr += v * min_inst
-                elif op == 3:                   # advance_line
+                elif op == 3:
                     v, p = sleb(data, p); line += v
-                elif op == 4:                   # set_file
+                elif op == 4:
                     file, p = uleb(data, p)
-                elif op == 5:                   # set_column
+                elif op == 5:
                     _v, p = uleb(data, p)
-                elif op == 8:                   # const_add_pc
+                elif op == 8:
                     addr += ((255 - opcode_base) // line_range) * min_inst
-                elif op == 9:                   # fixed_advance_pc
+                elif op == 9:
                     addr += struct.unpack_from(">H", data, p)[0]; p += 2
-                elif op in (6, 7, 10, 11):      # negate_stmt/basic_block/prologue/epilogue
+                elif op in (6, 7, 10, 11):
                     pass
-                else:                           # unknown std opcode: skip its uleb args
+                else:
                     for _ in range(std_lengths[op - 1]):
                         _v, p = uleb(data, p)
 
 
 def _stmt_list_offsets(elf) -> list[int]:
-    """Every CU's DW_AT_stmt_list (its line-program start in .debug_line)."""
     dinfo = dw.open_dwarf(elf)
     if dinfo is None:
         return []
@@ -128,18 +111,11 @@ def build_table(elf):
         try:
             rows.update(parse_one_unit(data, o))
         except (struct.error, IndexError):
-            continue                            # one malformed unit shouldn't sink the rest
-    # sort by address; end_sequence markers (file None) sort after real rows at the
-    # same address so a real line start still wins there.
+            continue
     return sorted(rows, key=lambda r: (r[0], r[1] is None, r[1] or "", r[2]))
 
 
 def resolve(rows, addr):
-    """The (addr, file, line) row covering *addr*, or None if it falls in a gap.
-
-    A row covers [its address, the next row's address). end_sequence markers carry a
-    None file, so if the covering row is one, *addr* is past the end of that sequence
-    -- in a hole with no line info (e.g. a prebuilt lib linked without DWARF)."""
     addrs = [r[0] for r in rows]
     i = bisect.bisect_right(addrs, addr) - 1
     if i < 0 or rows[i][1] is None:

@@ -1,29 +1,13 @@
-/*
- * ps3recomp - cellPngDec HLE implementation
- *
- * Real PNG decoding using stb_image.h.
- * Guest memory is accessed through vm_base (host_ptr = vm_base + guest_addr).
- */
-
 #include "cellPngDec.h"
 #include "../filesystem/ps3_vfs.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-/* vm_base: base pointer for the PS3 guest address space */
-extern uint8_t* vm_base;
 void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size);
 
-/* Guest memory access (translate + byte-swap). The guest passes POINTERS as
- * 32-bit big-endian addresses into vm_base; every struct field the guest reads
- * or writes is big-endian, so we marshal each field explicitly rather than
- * overlaying a host struct (which would be little-endian and mis-packed --
- * e.g. the real CellPngDecSrc.fileName is a char* at +4, not an inline array).
- * The real SDK <cell/codec/pngdec.h> is the ABI source of truth. */
 #include "../../runtime/ppu/ppu_memory.h"
 
-/* Read a NUL-terminated guest string into a host buffer. */
 static void vm_read_str(u32 addr, char* dst, size_t cap)
 {
     size_t i = 0;
@@ -42,10 +26,6 @@ static void vm_read_str(u32 addr, char* dst, size_t cap)
 #define STBI_ONLY_GIF
 #include "stb_image.h"
 
-/* ---------------------------------------------------------------------------
- * Internal state
- * -----------------------------------------------------------------------*/
-
 #define PNGDEC_MAX_HANDLES      4
 #define PNGDEC_MAX_SUBHANDLES   8
 
@@ -61,30 +41,20 @@ typedef struct {
     CellPngDecInParam in_param;
     int               header_read;
     int               param_set;
-    /* Source data loaded into host memory for stb_image */
     u8*               src_data;
     u32               src_size;
-    int               src_allocated; /* 1 if we malloc'd src_data */
-    char              filename[CELL_PNGDEC_MAX_PATH]; /* host copy of guest path */
+    int               src_allocated;
+    char              filename[CELL_PNGDEC_MAX_PATH];
 } PngDecSubState;
 
 static PngDecMainState s_png_main[PNGDEC_MAX_HANDLES];
 static PngDecSubState  s_png_sub[PNGDEC_MAX_SUBHANDLES];
 
-/* ---------------------------------------------------------------------------
- * Helper: load source data into host memory
- *
- * For BUFFER sources, the guest provides a PS3 address — we translate it
- * through vm_base. For FILE sources, we translate the PS3 path to a host
- * path and read the file.
- * -----------------------------------------------------------------------*/
-
 static int pngdec_load_source(PngDecSubState* sub)
 {
-    if (sub->src_data) return 0; /* already loaded */
+    if (sub->src_data) return 0;
 
     if (sub->src.srcSelect == CELL_PNGDEC_BUFFER) {
-        /* streamPtr is a 32-bit guest address */
         u32 guest_addr = (u32)sub->src.streamPtr;
         if (!vm_base) {
             printf("[cellPngDec] ERROR: vm_base is NULL, cannot translate guest addr 0x%08X\n", guest_addr);
@@ -97,8 +67,6 @@ static int pngdec_load_source(PngDecSubState* sub)
     }
 
     if (sub->src.srcSelect == CELL_PNGDEC_FILE) {
-        /* Translate PS3 path (e.g. "/dev_hdd0/game/NPUA80001/ICON0.PNG")
-         * to a host filesystem path. */
         char host_path[1024];
         sys_fs_translate_path(sub->src.fileName, host_path, (int)sizeof(host_path));
 
@@ -155,15 +123,6 @@ static void pngdec_free_source(PngDecSubState* sub)
     sub->src_allocated = 0;
 }
 
-/* ---------------------------------------------------------------------------
- * API implementations
- * -----------------------------------------------------------------------*/
-
-/* All public entry points take GUEST addresses (u32) for pointer parameters --
- * the HLE bridge passes the raw gpr values, so a `CellPngDecMainHandle*` arrives
- * as a big-endian guest address, NOT a host pointer. Handles are opaque to the
- * guest, so we hand back small indices. */
-
 s32 cellPngDecDestroy(CellPngDecMainHandle mainHandle)
 {
     printf("[cellPngDec] Destroy(handle=%u)\n", mainHandle);
@@ -182,10 +141,6 @@ s32 cellPngDecDestroy(CellPngDecMainHandle mainHandle)
     return CELL_OK;
 }
 
-/* CellPngDecSrc guest layout (real SDK, 32 bytes):
- *   +0  srcSelect(u32)  +4 fileName(char*)  +8 fileOffset(s64)
- *   +16 fileSize(u32)   +20 streamPtr(void*) +24 streamSize(u32)
- *   +28 spuThreadEnable(u32) */
 s32 cellPngDecOpen(CellPngDecMainHandle mainHandle,
                    u32 subHandle_addr, u32 src_addr, u32 openInfo_addr)
 {
@@ -207,7 +162,7 @@ s32 cellPngDecOpen(CellPngDecMainHandle mainHandle,
             sub->src.srcSelect = srcSelect;
             sub->src.fileOffset = (u64)vm_read64(src_addr + 8);
             sub->src.fileSize   = vm_read32(src_addr + 16);
-            sub->src.streamPtr  = vm_read32(src_addr + 20);  /* guest addr as value */
+            sub->src.streamPtr  = vm_read32(src_addr + 20);
             sub->src.streamSize = vm_read32(src_addr + 24);
             if (srcSelect == CELL_PNGDEC_FILE) {
                 u32 name_addr = vm_read32(src_addr + 4);
@@ -221,7 +176,7 @@ s32 cellPngDecOpen(CellPngDecMainHandle mainHandle,
 
             vm_write32(subHandle_addr, i);
             if (openInfo_addr)
-                vm_write32(openInfo_addr + 0, 0);   /* initSpaceAllocated */
+                vm_write32(openInfo_addr + 0, 0);
             return CELL_OK;
         }
     }
@@ -229,8 +184,6 @@ s32 cellPngDecOpen(CellPngDecMainHandle mainHandle,
     return CELL_PNGDEC_ERROR_BUSY;
 }
 
-/* CellPngDecInfo guest layout (7 x u32): imageWidth, imageHeight,
- * numComponents, colorSpace, bitDepth, interlaceMethod, chunkInformation. */
 static void pngdec_write_info(u32 addr, const CellPngDecInfo* in)
 {
     vm_write32(addr + 0,  in->imageWidth);
@@ -290,12 +243,6 @@ s32 cellPngDecReadHeader(CellPngDecMainHandle mainHandle,
     }
 }
 
-/* CellPngDecInParam guest layout (7 x u32): commandPtr, outputMode,
- * outputColorSpace, outputBitDepth, outputPackFlag, outputAlphaSelect,
- * outputColorAlpha.
- * CellPngDecOutParam guest layout: outputWidthByte(u64 @0), then u32s at
- * +8 width, +12 height, +16 components, +20 bitDepth, +24 mode, +28 colorSpace,
- * +32 useMemorySpace. */
 s32 cellPngDecSetParameter(CellPngDecMainHandle mainHandle,
                            CellPngDecSubHandle subHandle,
                            u32 inParam_addr, u32 outParam_addr)
@@ -324,7 +271,6 @@ s32 cellPngDecSetParameter(CellPngDecMainHandle mainHandle,
     printf("[cellPngDec] SetParameter(sub=%u, outputColorSpace=%u)\n",
            subHandle, sub->in_param.outputColorSpace);
 
-    /* Compute output parameters */
     u32 out_cs = sub->in_param.outputColorSpace;
     u32 out_comp;
     switch (out_cs) {
@@ -336,27 +282,25 @@ s32 cellPngDecSetParameter(CellPngDecMainHandle mainHandle,
     }
 
     u64 widthByte = (u64)(sub->info.imageWidth * out_comp);
-    vm_write64(outParam_addr + 0,  widthByte);                 /* outputWidthByte */
-    vm_write32(outParam_addr + 8,  sub->info.imageWidth);      /* outputWidth */
-    vm_write32(outParam_addr + 12, sub->info.imageHeight);     /* outputHeight */
-    vm_write32(outParam_addr + 16, out_comp);                  /* outputComponents */
-    vm_write32(outParam_addr + 20, 8);                         /* outputBitDepth */
-    vm_write32(outParam_addr + 24, 0);                         /* outputMode (top-to-bottom) */
-    vm_write32(outParam_addr + 28, out_cs);                    /* outputColorSpace */
-    vm_write32(outParam_addr + 32, (u32)(widthByte * sub->info.imageHeight)); /* useMemorySpace */
+    vm_write64(outParam_addr + 0,  widthByte);
+    vm_write32(outParam_addr + 8,  sub->info.imageWidth);
+    vm_write32(outParam_addr + 12, sub->info.imageHeight);
+    vm_write32(outParam_addr + 16, out_comp);
+    vm_write32(outParam_addr + 20, 8);
+    vm_write32(outParam_addr + 24, 0);
+    vm_write32(outParam_addr + 28, out_cs);
+    vm_write32(outParam_addr + 32, (u32)(widthByte * sub->info.imageHeight));
 
     return CELL_OK;
 }
 
-/* CellPngDecDataOutInfo guest layout (4 x u32): chunkInformation, numText,
- * numUnknownChunk, status. */
 static void pngdec_write_outinfo(u32 addr, u32 status)
 {
     if (!addr) return;
-    vm_write32(addr + 0,  0);       /* chunkInformation */
-    vm_write32(addr + 4,  0);       /* numText */
-    vm_write32(addr + 8,  0);       /* numUnknownChunk */
-    vm_write32(addr + 12, status);  /* status */
+    vm_write32(addr + 0,  0);
+    vm_write32(addr + 4,  0);
+    vm_write32(addr + 8,  0);
+    vm_write32(addr + 12, status);
 }
 
 s32 cellPngDecDecodeData(CellPngDecMainHandle mainHandle,
@@ -398,7 +342,6 @@ s32 cellPngDecDecodeData(CellPngDecMainHandle mainHandle,
 
         u32 row_bytes = (u32)w * (u32)desired_comp;
 
-        /* ARGB output: stb gives RGBA; swizzle to the PS3-native ARGB order. */
         if (sub->in_param.outputColorSpace == CELL_PNGDEC_COLOR_SPACE_ARGB && desired_comp == 4) {
             u32 total_bytes = row_bytes * (u32)h;
             for (u32 i = 0; i < total_bytes; i += 4) {
@@ -407,9 +350,6 @@ s32 cellPngDecDecodeData(CellPngDecMainHandle mainHandle,
             }
         }
 
-        /* Destination is a GUEST buffer at data_addr; the guest supplies the row
-         * pitch in dataCtrlParam.outputBytesPerLine (u64 @0). Copy row-by-row so
-         * a padded/tiled pitch is honoured. Pixel bytes are endian-neutral. */
         u64 dst_pitch = dataCtrlParam_addr ? vm_read64(dataCtrlParam_addr + 0) : 0;
         if (dst_pitch < row_bytes) dst_pitch = row_bytes;
         for (u32 y = 0; y < (u32)h; y++)

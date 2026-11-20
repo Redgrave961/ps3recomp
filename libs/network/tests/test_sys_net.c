@@ -1,20 +1,7 @@
-/*
- * test_sys_net - libnet's host-socket path, end to end over loopback.
- *
- * Self-contained: it compiles sysNet.c into this file, gives it a 1 MB guest
- * arena, and calls every handler through the NID it registered -- so a wrong
- * export name fails here, not silently in a title (the old sysNet.c hashed
- * its C function names and no guest call ever reached it).
- *
- *   clang-cl /I include /Fe:test_sys_net.exe libs/network/tests/test_sys_net.c ws2_32.lib
- *   cc -std=gnu17 -I include -o test_sys_net libs/network/tests/test_sys_net.c
- */
-
 #include "../sysNet.c"
 
 #include <assert.h>
 
-/* ppu_memory.h hooks the runtime supplies; inert here. */
 uint8_t* vm_base;
 uint32_t g_ww_lo = 0, g_ww_hi = 0;
 int  spu_coh_is_reserved(uint32_t addr) { (void)addr; return 0; }
@@ -53,7 +40,6 @@ static unsigned int bump_alloc(unsigned int size, unsigned int align)
     return a;
 }
 
-/* Call an import by name, the way a lifted title does: by its NID. */
 static int64_t call(const char* name, uint64_t a3, uint64_t a4, uint64_t a5,
                     uint64_t a6, uint64_t a7, uint64_t a8)
 {
@@ -72,7 +58,6 @@ static int64_t call(const char* name, uint64_t a3, uint64_t a4, uint64_t a5,
 #define C3(n, a, b, c)       (int32_t)call(n, a, b, c, 0, 0, 0)
 #define C5(n, a, b, c, d, e) (int32_t)call(n, a, b, c, d, e, 0)
 
-/* Guest scratch addresses */
 enum { ADDR_A = 0x1000, ADDR_B = 0x1100, LEN = 0x1200, OPT = 0x1300,
        BUF = 0x2000, POLLFD = 0x3000, RSET = 0x4000, TV = 0x4100, STR = 0x5000 };
 
@@ -92,11 +77,10 @@ int main(void)
     vm_base = (uint8_t*)calloc(1, 1u << 20);
     set_p2p_port(36658);
     ps3_net_host_register(bump_alloc);
-    assert(s_reg[0].nid == 0x9C056962u);   /* "socket", as nid_database.py has it */
+    assert(s_reg[0].nid == 0x9C056962u);
 
     const uint32_t LOOP = 0x7F000001u;
 
-    /* UDP: bind A to an ephemeral port, send from B, poll, receive. */
     int32_t a = C3("socket", SYS_NET_AF_INET, SYS_NET_SOCK_DGRAM, 0);
     int32_t b = C3("socket", SYS_NET_AF_INET, SYS_NET_SOCK_DGRAM, 0);
     assert(a > 0 && b > 0 && a != b);
@@ -121,7 +105,6 @@ int main(void)
     assert(memcmp(vm_base + BUF, "hello", 5) == 0);
     assert(vm_read32(ADDR_B + 4) == LOOP);
 
-    /* Nothing queued: SO_NBIO and MSG_DONTWAIT both give -1 / EWOULDBLOCK (35). */
     assert((uint32_t)call("recvfrom", a, BUF, 64, SYS_NET_MSG_DONTWAIT, 0, 0) == 0x80010223u);
     assert(errno_cell() == SYS_NET_EWOULDBLOCK);
     vm_write32(OPT, 1);
@@ -132,7 +115,6 @@ int main(void)
     assert(C5("getsockopt", a, SYS_NET_SOL_SOCKET, SYS_NET_SO_NBIO, OPT, LEN) == 0);
     assert(vm_read32(OPT) == 1);
 
-    /* TCP: listen, connect, accept, select for readability, round-trip. */
     int32_t l = C3("socket", SYS_NET_AF_INET, SYS_NET_SOCK_STREAM, 0);
     put_sockaddr(ADDR_A, LOOP, 0);
     assert(C3("bind", l, ADDR_A, 16) == 0);
@@ -147,7 +129,7 @@ int main(void)
     assert(call("send", c, BUF, 4, 0, 0, 0) == 4);
     memset(vm_base + RSET, 0, 128);
     vm_write32(RSET + (uint32_t)srv / 32 * 4, 1u << (srv % 32));
-    vm_write64(TV, 1);       /* 1 s */
+    vm_write64(TV, 1);
     vm_write64(TV + 8, 0);
     assert(C5("socketselect", srv + 1, RSET, 0, 0, TV) == 1);
     assert(vm_read32(RSET + (uint32_t)srv / 32 * 4) & (1u << (srv % 32)));
@@ -155,13 +137,10 @@ int main(void)
     assert(call("recv", srv, BUF, 16, 0, 0, 0) == 4);
     assert(memcmp(vm_base + BUF, "ping", 4) == 0);
 
-    /* Address helpers and DNS. */
     strcpy((char*)vm_base + STR, "1.2.3.4");
     assert((uint32_t)call("inet_addr", STR, 0, 0, 0, 0, 0) == 0x01020304u);
     uint32_t s = (uint32_t)call("inet_ntoa", LOOP, 0, 0, 0, 0, 0);
     assert(strcmp((const char*)vm_base + s, "127.0.0.1") == 0);
-    /* Real retail NID8AF3825E: AF_INET, source string, raw network bytes.
-     * Guard bytes catch host-endian stores and output-length mistakes. */
     assert(ps3_compute_nid("inet_pton") == 0x8AF3825Eu);
     const char* addresses[] = {"127.0.0.1", "1.2.3.4", "0.0.0.0", "255.255.255.255"};
     const uint8_t expected[][4] = {{127,0,0,1},{1,2,3,4},{0,0,0,0},{255,255,255,255}};
@@ -179,7 +158,6 @@ int main(void)
         assert(C3("inet_pton", SYS_NET_AF_INET, STR, BUF+1) == 0);
         for (unsigned j=0;j<8;j++) assert(vm_base[BUF+j] == 0xA5);
     }
-    /* Unknown families and invalid pointers fail; no fake valid address. */
     assert(C3("inet_pton", 99, STR, BUF+1) == -1 && errno_cell() == 47);
     assert(C3("inet_pton", SYS_NET_AF_INET, 0, BUF+1) == -1 && errno_cell() == 14);
     assert(C3("inet_pton", SYS_NET_AF_INET, STR, 0) == -1 && errno_cell() == 14);
@@ -187,13 +165,10 @@ int main(void)
     strcpy((char*)vm_base + STR, "localhost");
     uint32_t h = (uint32_t)call("gethostbyname", STR, 0, 0, 0, 0, 0);
     assert(h && vm_read32(h + 12) == 4);
-    assert(vm_read32(vm_read32(vm_read32(h + 16))) == LOOP);   /* *h_addr_list[0] */
+    assert(vm_read32(vm_read32(vm_read32(h + 16))) == LOOP);
 
-    /* P2P: the title binds its own IP and port 3658 with vport 1000; the host
-     * socket lands on this instance's P2P port on every interface, so a peer
-     * on loopback reaches it, and received addresses carry the vport back. */
-    int32_t p2p = C3("socket", SYS_NET_AF_INET, 6 /* SOCK_DGRAM_P2P */, 0);
-    put_sockaddr(ADDR_A, 0x0A000001u /* 10.0.0.1: not ours */, 3658);
+    int32_t p2p = C3("socket", SYS_NET_AF_INET, 6 , 0);
+    put_sockaddr(ADDR_A, 0x0A000001u , 3658);
     vm_write16(ADDR_A + 8, 1000);
     assert(C3("bind", p2p, ADDR_A, 16) == 0);
     vm_write32(LEN, 16);
@@ -201,7 +176,7 @@ int main(void)
     assert(vm_read16(ADDR_B + 2) == 36658 && vm_read32(ADDR_B + 4) == 0);
     put_sockaddr(ADDR_A, LOOP, 36658);
     memcpy(vm_base + BUF, "p2p", 3);
-    assert(call("sendto", p2p, BUF, 3, 0, ADDR_A, 16) == 3);   /* to itself */
+    assert(call("sendto", p2p, BUF, 3, 0, ADDR_A, 16) == 3);
     assert(C3("socketpoll", POLLFD, 0, 0) == 0);
     vm_write32(POLLFD, (uint32_t)p2p);
     vm_write16(POLLFD + 4, SYS_NET_POLLIN);
@@ -210,13 +185,8 @@ int main(void)
     assert(vm_read16(ADDR_B + 8) == 1000);
     assert(C1("socketclose", p2p) == 0);
 
-    /* P2P streams: an instance's listener and the socket it connects out
-     * with share its P2P port, so the peer accepts a connection whose source
-     * port is the P2P port signaling reported -- titles check it. */
-    /* Each run needs fresh TCP endpoints: macOS keeps the previous fixed
-     * source/destination pair in TIME_WAIT when this fixture runs twice. */
     set_p2p_port(0);
-    int32_t l1 = C3("socket", SYS_NET_AF_INET, 10 /* SOCK_STREAM_P2P */, 0);
+    int32_t l1 = C3("socket", SYS_NET_AF_INET, 10 , 0);
     put_sockaddr(ADDR_A, LOOP, 4099);
     assert(C3("bind", l1, ADDR_A, 16) == 0 && C1("listen", l1) == 0);
     vm_write32(LEN, 16);
@@ -234,7 +204,7 @@ int main(void)
     assert(C3("bind", out, ADDR_A, 16) == 0);
     vm_write32(LEN, 16);
     assert(C3("getsockname", out, ADDR_B, LEN) == 0 && vm_read16(ADDR_B + 2) == port_l2);
-    vm_write16(ADDR_A + 8, port_l1);            /* vport = the peer's P2P port */
+    vm_write16(ADDR_A + 8, port_l1);
     assert(C3("connect", out, ADDR_A, 16) == 0);
     vm_write32(LEN, 16);
     int32_t in = C3("accept", l1, ADDR_B, LEN);
@@ -242,7 +212,6 @@ int main(void)
     assert(C1("socketclose", in) == 0 && C1("socketclose", out) == 0);
     assert(C1("socketclose", l2) == 0 && C1("socketclose", l1) == 0);
 
-    /* A bad fd is EBADF (9), and closing works. */
     assert((uint32_t)C1("socketclose", 99) == 0x80010209u && errno_cell() == SYS_NET_EBADF);
     assert(C1("socketclose", a) == 0 && C1("socketclose", b) == 0);
     assert(C1("socketclose", c) == 0 && C1("socketclose", srv) == 0 && C1("socketclose", l) == 0);

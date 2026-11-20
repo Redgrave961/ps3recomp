@@ -1,6 +1,3 @@
-/* Primary reference: SPU_ISA_v12_e.pdf pp178-179,181,186-189,251.
- * Literal target/link/interrupt expectations exercise encoded instructions.
- * E/D=11 is reserved and deliberately has no invented expectation. */
 #include "../spu_helpers.h"
 #include "../spu_interp.h"
 #include <assert.h>
@@ -22,16 +19,16 @@ static unsigned checks;
 static void run(uint32_t opcode,uint32_t cond,int initial,uint32_t target,int want_enable,int alias,int mode){
  memset(&ctx,0,sizeof(ctx));spu_context_init(&ctx,0);ctx.image_id=77;
  unsigned ra=(opcode>>7)&127,rt=opcode&127;ctx.pc=0x4000;ctx.int_enable=initial;ctx.srr0=0x240;
- ctx.gpr[ra]=spu_splat_u32(mode==2?0x240:0x40243); /* interpreter/microstep also verify target masking */
+ ctx.gpr[ra]=spu_splat_u32(mode==2?0x240:0x40243);
  if((opcode>>21)>=0x128 && (opcode>>21)<=0x12b)ctx.gpr[rt]=spu_splat_u32(cond);
  if(alias) {opcode=(opcode&~127u)|ra;rt=ra;ctx.gpr[ra]=spu_splat_u32(cond);}
  link_rt=rt;
  ctx.gpr[8]=spu_splat_u32(0x4004);
  if(target==0x4004 && (opcode>>21)>=0x1a8)ctx.gpr[ra]=spu_splat_u32(mode==2?0x4004:0x4007);
- u128 before[128];memcpy(before,ctx.gpr,sizeof(before));word(0x4000,opcode);word(0x4004,0x35000400); /* bi r8 terminates a microstep fallthrough without changing state */
+ u128 before[128];memcpy(before,ctx.gpr,sizeof(before));word(0x4000,opcode);word(0x4004,0x35000400);
  seen_target=seen_enable=-1;g_spu_trampoline_fn=0;
  if(mode==0)spu_interp_run_until(&ctx,0x4000,alias && (opcode>>21)==0x1a9 ? 0x4004 : target);
- else if(mode==1)spu_indirect_branch(&ctx); /* known opcode: real SMC microstep */
+ else if(mode==1)spu_indirect_branch(&ctx);
 #ifdef BRANCH_LIFTED
  else lifted_run(opcode,&ctx);
 #endif
@@ -42,14 +39,12 @@ static void run(uint32_t opcode,uint32_t cond,int initial,uint32_t target,int wa
   fprintf(stderr,"branch opcode=%08X mode=%d alias=%d pc=%X expected=%X enable=%u expected=%d\n",opcode,mode,alias,got_pc,target,ctx.int_enable,want_enable);exit(1);}
  for(unsigned i=0;i<128;i++){
   if(bisl && i==rt){const uint32_t link[4]={0x4004,0,0,0};
-   /* Microstep historically splats links; compare architectural preferred slot there. */
    assert(ctx.gpr[i]._u32[0]==0x4004);if(mode!=1)assert(!memcmp(ctx.gpr[i]._u32,link,16));
   } else assert(!memcmp(&ctx.gpr[i],&before[i],16));
  }
  checks++;
 }
 static void cases(int mode){
- /* Exact original WWS instructions: LS2CDC bid r0;22AC bid r74;2CD4 bie r2. */
  run(0x35080000,0,1,0x240,0,0,mode);run(0x35082500,0,1,0x240,0,0,mode);run(0x35040100,0,0,0x240,1,0,mode);
  const unsigned ops[]={0x1a8,0x1a9,0x1aa,0x128,0x129,0x12a,0x12b};
  const unsigned flags[]={0,0x40000,0x80000};
@@ -61,22 +56,16 @@ static void cases(int mode){
    uint32_t taken=(op==0x128||op==0x12a)?0:1;
    uint32_t untaken=(op==0x128||op==0x12a)?1:0;
    run(code,taken,initial,0x240,enabled,0,mode);run(code,untaken,initial,0x4004,initial,0,mode);
-   /* Halfword predicates must ignore a nonzero upper halfword. */
    if(op==0x12a)run(code,0xABCD0000,initial,0x240,enabled,0,mode);
    if(op==0x12b)run(code,0xABCD0000,initial,0x4004,initial,0,mode);
   }
  }
- /* Condition/target aliases preserve the pre-instruction register and predicate. */
  for(unsigned op=0x128;op<=0x12b;op++){
   int taken=op==0x129||op==0x12b;
   run((op<<21)|0x80000|(7<<7)|7,0x240,1,taken?0x240:0x4004,taken?0:1,1,mode);
  }
- /* BISL reads its target before writing an aliased link destination.
-  * The compiled lifter has a separate existing alias limitation, so this
-  * control covers the corrected interpreter and already-correct microstep. */
  if(mode!=2)for(unsigned f=0;f<3;f++)for(int initial=0;initial<2;initial++)
   run((0x1a9<<21)|flags[f]|(7<<7)|7,0x240,initial,0x240,f==1?1:f==2?0:initial,1,mode);
- /* Target==fallthrough is still a TAKEN branch and must apply its feature bits. */
  run(0x35080000|(7<<7),0,1,0x4004,0,0,mode);
 }
 int main(void){spu_begin_image(77);spu_register_function(0x240,callee);cases(0);cases(1);

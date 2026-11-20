@@ -32,11 +32,11 @@ def sdata_decrypt(d: bytes):
     flags      = struct.unpack_from(">I", d, 0x80)[0]
     block_size = struct.unpack_from(">I", d, 0x84)[0]
     file_size  = struct.unpack_from(">Q", d, 0x88)[0]
-    if not (flags & 0x01000000):        # not SDATA
+    if not (flags & 0x01000000):
         return None
     if block_size == 0 or file_size == 0 or file_size > len(d):
         return None
-    if (flags & 0x01) or (flags & 0x20):  # compressed / 0x20-metadata variants
+    if (flags & 0x01) or (flags & 0x20):
         return None
     enc_key = (flags & 0x08) != 0
     crypt_key = bytes(dh ^ sk for dh, sk in zip(dev_hash, SDAT_KEY))
@@ -60,7 +60,6 @@ def sdata_decrypt(d: bytes):
     return bytes(out[:file_size])
 
 def is_module(b: bytes) -> bool:
-    # 4 ila (top byte 0x42/0x43) then C0DEC0DE marker at 0x20
     if len(b) < 0x30:
         return False
     if b[0] not in (0x42, 0x43):
@@ -68,7 +67,6 @@ def is_module(b: bytes) -> bool:
     return b[0x20:0x24] == b"\xc0\xde\xc0\xde"
 
 def _inflate_at(plain: bytes, i: int):
-    """Inflate the zlib stream at offset i. Return (decompressed, compressed_len) or None."""
     if not (plain[i] == 0x78 and ((plain[i] << 8 | plain[i + 1]) % 31 == 0)):
         return None
     try:
@@ -80,10 +78,6 @@ def _inflate_at(plain: bytes, i: int):
     return out, len(plain[i:]) - len(dobj.unused_data)
 
 def find_modules(plain: bytes):
-    """Yield each SPU module. The FSHb stores files as 32 KiB-chunked zlib
-    streams: a module = its header chunk + the following continuation chunks,
-    concatenated. The module's total initialised (code+rodata) image is
-    `imageSize(0x14) - 32`; keep appending consecutive streams until we reach it."""
     mods = []
     i = 0
     n = len(plain)
@@ -94,7 +88,7 @@ def find_modules(plain: bytes):
             continue
         out, clen = r
         if is_module(out):
-            target = struct.unpack_from(">I", out, 0x14)[0] - 32   # image minus fixed bss tail
+            target = struct.unpack_from(">I", out, 0x14)[0] - 32
             buf = bytearray(out)
             i += clen
             while len(buf) < target and i < n - 1:
@@ -103,7 +97,7 @@ def find_modules(plain: bytes):
                     i += 1
                     continue
                 cont, clen2 = r2
-                if is_module(cont):          # ran into the next module -> stop
+                if is_module(cont):
                     break
                 buf += cont
                 i += clen2
@@ -130,14 +124,14 @@ def main():
     outdir = os.path.abspath(args.out)
     os.makedirs(outdir, exist_ok=True)
 
-    seen = {}   # sha1 -> module bytes
+    seen = {}
     for name in (args.sdat or ["patch.sdat", "data.sdat"]):
         path = os.path.join(usrdir, name)
         if not os.path.exists(path):
             print(f"  MISSING {path}", file=sys.stderr); continue
         raw = open(path, "rb").read()
         if raw[:4] == b"FSHb":
-            plain = raw                       # hdd0 patch.sdat ships already-decrypted
+            plain = raw
         else:
             plain = sdata_decrypt(raw)
         if plain is None:
@@ -149,7 +143,6 @@ def main():
             h = hashlib.sha1(m).hexdigest()
             seen.setdefault(h, m)
 
-    # write, dedup by content
     written = 0
     for h, m in sorted(seen.items()):
         entry = struct.unpack_from(">I", m, 0x10)[0]

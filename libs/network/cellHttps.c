@@ -1,23 +1,9 @@
-/*
- * ps3recomp - cellHttps HLE implementation
- *
- * HTTPS (HTTP over TLS) client.
- */
-
 #include "cellHttps.h"
-#include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host pointer */
+#include "../../runtime/ppu/ppu_memory.h"
 #include <stdio.h>
 #include <string.h>
 
-/* ---------------------------------------------------------------------------
- * Internal state
- * -----------------------------------------------------------------------*/
-
 static int s_https_initialized = 0;
-
-/* ---------------------------------------------------------------------------
- * API
- * -----------------------------------------------------------------------*/
 
 s32 cellHttpsInit(u32 caCertNum, const CellHttpsData* caList)
 {
@@ -41,4 +27,3 @@ s32 cellHttpsEnd(void)
     s_https_initialized = 0;
     return CELL_OK;
 }
-

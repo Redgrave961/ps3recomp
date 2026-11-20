@@ -1,38 +1,22 @@
 cmake_minimum_required(VERSION 3.20)
-# Keep in step with CHANGELOG.md. This sat at 0.3.0 until August
-# 2026 while the project shipped 0.6.x through 0.8.0, so every build printed
-# "ps3recomp runtime v0.3.0" and was believed. v0.9.0 is the first TAGGED one.
 project(ps3recomp_runtime
     VERSION 0.19.0
     LANGUAGES C CXX
     DESCRIPTION "ps3recomp - Static recompilation runtime for PS3 games"
 )
 
-# ---------------------------------------------------------------------------
-# Standards
-# ---------------------------------------------------------------------------
 set(CMAKE_C_STANDARD 17)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# ---------------------------------------------------------------------------
-# Options
-# ---------------------------------------------------------------------------
 option(PS3RECOMP_BUILD_TESTS "Build unit tests" OFF)
 set(PS3RECOMP_OPT_FLAG "-O2" CACHE STRING "Optimisation flag for every non-Debug configuration of the runtime and the lifted SPU code")
 
-# x86-64-v3 (AVX2, FMA) is the baseline: runtime/ppu/ppu_vmx.h maps VMX onto it.
-# A -march / /arch already in the flags (e.g. native) takes precedence.
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64" AND NOT "${CMAKE_C_FLAGS} ${CMAKE_C_FLAGS_RELEASE}" MATCHES "march|/arch")
     add_compile_options($<IF:$<STREQUAL:${CMAKE_C_COMPILER_FRONTEND_VARIANT},MSVC>,/arch:AVX2,-march=x86-64-v3>)
 endif()
 
-# ---------------------------------------------------------------------------
-# Collect source files
-# ---------------------------------------------------------------------------
-
-# HLE library sources
 file(GLOB_RECURSE HLE_SOURCES
     "libs/system/*.c"
     "libs/filesystem/*.c"
@@ -43,25 +27,14 @@ file(GLOB_RECURSE HLE_SOURCES
     "libs/codec/*.c"
     "libs/misc/*.c"
 )
-# Exclude test harnesses (e.g. libs/video/tests/*): they define their own main().
 list(FILTER HLE_SOURCES EXCLUDE REGEX "/tests/")
 
-# Runtime core (syscalls, PPU, SPU, memory)
 file(GLOB_RECURSE RUNTIME_SOURCES
     "runtime/*.c"
     "runtime/*.cpp"
 )
-# Exclude:
-#  - test harnesses (runtime/*/tests/*): they have their own main() and #include
-#    per-game generated headers (spu_recomp.h) that a plain library build lacks.
-#  - the PPU boot scaffold (runtime/ppu/): compiled by the port against the
-#    lifter-generated ppu_recomp.h, not as part of the runtime library. See
-#    docs/PPU_RECOMP.md.
 list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/tests/|/runtime/ppu/")
 
-# ---------------------------------------------------------------------------
-# Static library
-# ---------------------------------------------------------------------------
 add_library(ps3recomp_runtime STATIC
     ${HLE_SOURCES}
     ${RUNTIME_SOURCES}
@@ -71,7 +44,6 @@ target_include_directories(ps3recomp_runtime PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
 )
 
-# HLE modules include their own headers
 target_include_directories(ps3recomp_runtime PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/libs/system"
     "${CMAKE_CURRENT_SOURCE_DIR}/libs/filesystem"
@@ -113,48 +85,21 @@ else()
     target_link_libraries(ps3recomp_runtime PRIVATE Threads::Threads)
 endif()
 
-# ---------------------------------------------------------------------------
-# Compiler flags
-# ---------------------------------------------------------------------------
 if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(ps3recomp_runtime PRIVATE
         $<IF:$<STREQUAL:${CMAKE_C_COMPILER_FRONTEND_VARIANT},MSVC>,/W4,-Wall$<SEMICOLON>-Wextra>
         -Wno-unused-parameter
         -fno-strict-aliasing
         $<$<STREQUAL:${CMAKE_C_COMPILER_FRONTEND_VARIANT},MSVC>:/Zc:tlsGuards->
-        # No spontaneous fused multiply-add. MSVC never contracts, and x86-64
-        # without -mfma has nothing to contract into, so every validated
-        # result came from separate multiplies and adds; arm64 has FMA in
-        # the base ISA and Clang fuses by default there. A PPC fmadd is
-        # spelt as one where the lifter means one.
         $<IF:$<STREQUAL:${CMAKE_C_COMPILER_FRONTEND_VARIANT},MSVC>,/clang:-ffp-contract=off,-ffp-contract=off>
-        # Explicit, because the per-config defaults cannot be trusted: this
-        # tree's caches carry CMAKE_C_FLAGS_RELEASE="" and CMAKE_CXX_FLAGS_RELEASE="",
-        # and clang-cl with no /O flag compiles at /Od -- a "Release" runtime
-        # was unoptimised without a word. Duplicating a default -O2 is harmless.
-        # Every configuration but Debug, including none: a port configured
-        # without CMAKE_BUILD_TYPE matched neither name and compiled the whole
-        # runtime -- the FIFO walker, the draw engine, the MFC -- at -O0.
         $<$<NOT:$<CONFIG:Debug>>:${PS3RECOMP_OPT_FLAG}>
     )
-    # SSE4.1 (any x86-64 since ~2008): pshufb/blendv for spu_shufb, the
-    # hottest SPU op in lifted audio code. Probed rather than assumed: recent
-    # Apple clang rejects the flag outright for arm64 ("unsupported option
-    # '-msse4.1'"), which stops the whole runtime from building there.
     include(CheckCCompilerFlag)
     check_c_compiler_flag(-msse4.1 PS3RECOMP_HAS_MSSE41)
     if(PS3RECOMP_HAS_MSSE41)
-        # Lifted consumers compile the same static-inline SPU helpers. Export
-        # the runtime's existing ISA requirement so their fast path agrees.
         target_compile_options(ps3recomp_runtime PUBLIC -msse4.1)
     endif()
 elseif(MSVC)
-    # Real cl.exe -- clang-cl reports its id as Clang and is handled above.
-    #
-    # This does not currently build. The runtime and the lifted output use GCC/
-    # Clang builtins that cl has no equivalent for, and the failure lands as a
-    # wall of errors in whichever file the build happens to reach first rather
-    # than as anything that names the cause. Say it here instead.
     message(WARNING
         "Building with cl.exe (MSVC). This is not currently supported.\n"
         "  The runtime uses __atomic_* builtins, __int128 and __builtin_bswap*, "
@@ -169,7 +114,7 @@ elseif(MSVC)
     target_compile_options(ps3recomp_runtime PRIVATE
         /W3 /wd4100 /wd4244 /wd4267 /wd4996
         /Zc:__cplusplus
-        /experimental:c11atomics   # Enable C11 <stdatomic.h> support
+        /experimental:c11atomics
     )
     target_compile_definitions(ps3recomp_runtime PRIVATE
         _CRT_SECURE_NO_WARNINGS
@@ -177,36 +122,18 @@ elseif(MSVC)
 endif()
 
 if(NOT MSVC AND NOT WIN32)
-    # dladdr/Dl_info (runtime/platform/win32_backtrace.h) are GNU extensions
-    # that glibc hides unless _GNU_SOURCE is set. g++ defines it implicitly,
-    # so the C++ boot scaffold never noticed; a C file including the same
-    # shim does not get it for free.
     target_compile_definitions(ps3recomp_runtime PRIVATE _GNU_SOURCE)
 endif()
 
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
 if(PS3RECOMP_BUILD_TESTS)
     include(CTest)
-    # sync_stress is written directly against the Win32 threading API
-    # (WaitForMultipleObjects, joinable HANDLEs, Interlocked*, CRITICAL_SECTION).
-    # Off Windows all of that comes from runtime/platform/win32_compat.h, so
-    # the suite runs everywhere -- and is the arm64 memory-model regression
-    # net for the lv2 sync primitives.
     add_subdirectory(tests/sync_stress)
-    # Syscall 14's address/flags classification as a plain unit test: the
-    # check is pure, so the test links one runtime translation unit
-    # (lv2_lock_line.c) and nothing else.
     add_subdirectory(tests/syscalls)
-    # PS3_LOG_FIRST, the saturating counter behind the "first n times" log lines.
     add_executable(test_log_first tests/test_log_first.c)
     target_include_directories(test_log_first PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
     add_test(NAME log_first COMMAND test_log_first)
 
     if(NOT WIN32)
-        # The interpreter's op/immediate decode at the opcode-width and
-        # immediate-form boundaries, against ISA-layout encodings.
         add_executable(test_spu_decode
             runtime/spu/tests/test_spu_decode.c
             runtime/platform/ps3_sync.c
@@ -217,8 +144,6 @@ if(PS3RECOMP_BUILD_TESTS)
         add_test(NAME spu_decode COMMAND test_spu_decode)
         set_tests_properties(spu_decode PROPERTIES TIMEOUT 30)
 
-        # fi and cflts (NEON on ARM64) against their scalar references, in the
-        # default FPCR and under round-toward-zero plus flush-to-zero.
         add_executable(test_spu_fi_cflts_neon
             runtime/spu/tests/test_spu_fi_cflts_neon.c)
         target_include_directories(test_spu_fi_cflts_neon PRIVATE include runtime/spu)
@@ -239,8 +164,6 @@ if(PS3RECOMP_BUILD_TESTS)
 
     endif()
 
-    # The native SPURS kernel, system service, taskset and job chain policy
-    # modules against the firmware's selection, request and command semantics.
     add_executable(test_spurs
         runtime/spu/tests/test_spurs.c
         runtime/spu/spu_channels.c
@@ -308,7 +231,6 @@ if(PS3RECOMP_BUILD_TESTS)
     add_test(NAME spu_channel_semantics COMMAND test_spu_channel_semantics)
     set_tests_properties(spu_channel_semantics PROPERTIES TIMEOUT 60)
 
-    # vmaddfp / vnmsubfp against fmaf, lane by lane.
     add_executable(test_vmx_fmaf tests/test_vmx_fmaf.c)
     target_compile_options(test_vmx_fmaf PRIVATE -UNDEBUG)
     if(NOT WIN32)
@@ -322,17 +244,11 @@ if(PS3RECOMP_BUILD_TESTS)
         add_test(NAME spu_sdcrz
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_sdcrz.py")
-    endif()
-    if(NOT WIN32)
-        find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
-        if(Python3_Interpreter_FOUND)
+        if(NOT WIN32)
             add_test(NAME spu_fnms_zero_extended
                 COMMAND "${Python3_EXECUTABLE}"
                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_spu_fnms_zero_extended.py")
         endif()
-    endif()
-    find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
-    if(Python3_Interpreter_FOUND)
         add_test(NAME loaded_image_memory
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_loaded_image_memory.py")
@@ -345,9 +261,6 @@ if(PS3RECOMP_BUILD_TESTS)
     endif()
 endif()
 
-# ---------------------------------------------------------------------------
-# Install
-# ---------------------------------------------------------------------------
 install(TARGETS ps3recomp_runtime
     ARCHIVE DESTINATION lib
     LIBRARY DESTINATION lib
@@ -358,9 +271,6 @@ install(DIRECTORY include/ps3emu
     FILES_MATCHING PATTERN "*.h"
 )
 
-# ---------------------------------------------------------------------------
-# Summary
-# ---------------------------------------------------------------------------
 message(STATUS "")
 message(STATUS "ps3recomp runtime v${PROJECT_VERSION}")
 message(STATUS "  C compiler:   ${CMAKE_C_COMPILER_ID} ${CMAKE_C_COMPILER_VERSION}")

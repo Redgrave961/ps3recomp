@@ -1,32 +1,3 @@
-/*
- * ps3_tprof -- an in-process sampling profile of chosen host threads.
- *
- * PS3_TPROF=<path> samples every thread that called ps3_tprof_thread() once
- * per PS3_TPROF_INTERVAL_US (default 1000) for PS3_TPROF_SECONDS (default
- * 10), starting when PS3_TPROF_TRIGGER=<file> exists (immediately when
- * unset). For hosts where an external sampler cannot attach to the process.
- *
- * A sampler thread does what a debugger would: thread_suspend, read the
- * registers, walk the frame-pointer chain, thread_resume. Nothing runs on the
- * sampled thread, so no wait it is in gets interrupted -- a SIGPROF-based
- * sampler wedged the SPURS workers inside pthread_rwlock waits. The sampler
- * neither allocates nor takes a lock while a thread is stopped, since that
- * thread may hold the allocator's.
- *
- * <path> gets one sample per line:
- *   <kind> <who> <t us> <pc> <lr> <return addresses...>
- * kind is S (SPU, who = SPU id) or P (PPU, who = thread id); PPU threads are
- * sampled only with PS3_TPROF_PPU=1. Main-image addresses are written
- * image-relative in hex for offline symbolizing; frames in other images are
- * named "@symbol" with dladdr. Times are on the PS3_FTRACE clock, relative to
- * its base when it is recording, so samples join with the job spans of the
- * same run.
- *
- * Header-only and weak-shared like ps3_ftrace.h, so the hooked files keep
- * building on their own in self-contained tests. Off (the default),
- * ps3_tprof_thread() reads the environment once and returns. macOS arm64;
- * elsewhere it compiles to nothing.
- */
 #ifndef PS3EMU_PS3_TPROF_H
 #define PS3EMU_PS3_TPROF_H
 
@@ -47,8 +18,6 @@
 extern "C" {
 #endif
 
-/* Declared here rather than through <mach/mach.h>, whose vm_map.h collides
- * with the runtime's own vm_protect. */
 extern kern_return_t thread_suspend(thread_act_t target_act);
 extern kern_return_t thread_resume(thread_act_t target_act);
 extern kern_return_t thread_get_state(thread_act_t target_act, thread_state_flavor_t flavor,
@@ -64,18 +33,15 @@ typedef struct {
 } ps3_tprof_rec;
 
 typedef struct {
-    int on;                       /* 0 unknown, 1 initialising, 2 armed, 3 off/done */
-    int nthreads;                 /* slots claimed; a slot is sampled once ready */
+    int on;
+    int nthreads;
     uint32_t cap, n;
     ps3_tprof_rec* buf;
-    /* ready: 0 not sampled, 1 sampled, 2 being sampled right now */
     struct { mach_port_t port; uintptr_t lo, hi; uint32_t who; uint8_t kind; int ready; } th[PS3_TPROF_THREADS];
 } ps3_tprof_state;
 
 PS3_FT_SHARED ps3_tprof_state g_ps3_tprof = { 0 };
 
-/* One sample of a stopped thread. Reads only its registers and its own
- * stack, bounded to the stack's range. */
 static inline int ps3_tprof_take(int k, ps3_tprof_rec* r)
 {
     ps3_tprof_state* s = &g_ps3_tprof;
@@ -86,12 +52,12 @@ static inline int ps3_tprof_take(int k, ps3_tprof_rec* r)
     unsigned d = 0;
     if (thread_get_state(port, ARM_THREAD_STATE64, (thread_state_t)&st, &count) == KERN_SUCCESS) {
         r->pc[d++] = (uintptr_t)__darwin_arm_thread_state64_get_pc(st);
-        r->pc[d++] = (uintptr_t)__darwin_arm_thread_state64_get_lr(st);   /* a frameless leaf's caller */
+        r->pc[d++] = (uintptr_t)__darwin_arm_thread_state64_get_lr(st);
         uintptr_t fp = (uintptr_t)__darwin_arm_thread_state64_get_fp(st);
         const uintptr_t lo = s->th[k].lo, hi = s->th[k].hi;
         while (d < PS3_TPROF_DEPTH && fp >= lo && fp + 16 <= hi && !(fp & 7u)) {
             const uintptr_t next = ((const uintptr_t*)fp)[0];
-            const uintptr_t ret = ((const uintptr_t*)fp)[1] & 0x0000FFFFFFFFFFFFull;   /* strip a PAC */
+            const uintptr_t ret = ((const uintptr_t*)fp)[1] & 0x0000FFFFFFFFFFFFull;
             if (!ret) break;
             r->pc[d++] = ret;
             if (next <= fp) break;
@@ -111,11 +77,8 @@ static inline void ps3_tprof_write(const char* out, uint32_t n)
     FILE* f = fopen(out, "w");
     if (!f) { fprintf(stderr, "[tprof] cannot write %s\n", out); return; }
     const intptr_t slide = _dyld_get_image_vmaddr_slide(0);
-    /* The main image's text range is written as offsets without asking
-     * dladdr, and the few other addresses go through a small cache: one
-     * dladdr per frame made a 40k-sample dump take minutes. */
     const struct mach_header_64* mh = (const struct mach_header_64*)_dyld_get_image_header(0);
-    uintptr_t text_size = 0;   /* the main image's __TEXT, from its load commands */
+    uintptr_t text_size = 0;
     {
         const struct load_command* lc = (const struct load_command*)(mh + 1);
         for (uint32_t i = 0; mh && i < mh->ncmds; i++) {
@@ -178,9 +141,6 @@ static inline void* ps3_tprof_sampler(void* arg)
     while (ps3_ft_now() < end && n < s->cap) {
         const int nt = __atomic_load_n(&s->nthreads, __ATOMIC_ACQUIRE);
         for (int k = 0; k < nt && k < PS3_TPROF_THREADS && n < s->cap; k++) {
-            /* Claim the slot so ps3_tprof_thread_exit waits for this sample:
-             * the thread cannot end, and its port and stack cannot go away,
-             * while it is suspended or its stack is being read. */
             int ready = 1;
             if (!__atomic_compare_exchange_n(&s->th[k].ready, &ready, 2, 0,
                                              __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) continue;
@@ -210,7 +170,6 @@ static inline int ps3_tprof_init(void)
         s->cap = c && atol(c) > 0 ? (uint32_t)atol(c) : 400000u;
         s->buf = (ps3_tprof_rec*)calloc(s->cap, sizeof(ps3_tprof_rec));
         if (s->buf) {
-            /* Armed before the sampler starts, so it never sees "unknown". */
             __atomic_store_n(&s->on, 2, __ATOMIC_RELEASE);
             pthread_t t;
             if (!pthread_create(&t, NULL, ps3_tprof_sampler, NULL)) { pthread_detach(t); on = 2; }
@@ -221,8 +180,6 @@ static inline int ps3_tprof_init(void)
     return on == 2;
 }
 
-/* Add the calling thread to the sampled set: kind 'S' or 'P', who its id.
- * A registered thread calls ps3_tprof_thread_exit() before it ends. */
 static inline void ps3_tprof_thread(char kind, uint32_t who)
 {
     ps3_tprof_state* s = &g_ps3_tprof;
@@ -234,8 +191,6 @@ static inline void ps3_tprof_thread(char kind, uint32_t who)
         if (!ppu || strcmp(ppu, "1")) return;
     }
     const pthread_t self = pthread_self();
-    /* Each header copy has its own statics, so slots are claimed atomically
-     * from the shared state rather than under a lock. */
     const int k = __atomic_fetch_add(&s->nthreads, 1, __ATOMIC_ACQ_REL);
     if (k >= PS3_TPROF_THREADS) return;
     s->th[k].port = pthread_mach_thread_np(self);
@@ -246,9 +201,6 @@ static inline void ps3_tprof_thread(char kind, uint32_t who)
     __atomic_store_n(&s->th[k].ready, 1, __ATOMIC_RELEASE);
 }
 
-/* Remove the calling thread before it ends; the sampler skips its slot. A
- * sample in progress is waited out (the sampler holds the slot at 2), so the
- * thread is never suspended or its stack read after it has gone. */
 static inline void ps3_tprof_thread_exit(void)
 {
     ps3_tprof_state* s = &g_ps3_tprof;
@@ -261,7 +213,7 @@ static inline void ps3_tprof_thread_exit(void)
                 int ready = 1;
                 if (__atomic_compare_exchange_n(&s->th[k].ready, &ready, 0, 0,
                                                 __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE) || ready == 0) break;
-                sched_yield();   /* 2: the sampler is reading this thread */
+                sched_yield();
             }
         }
 }

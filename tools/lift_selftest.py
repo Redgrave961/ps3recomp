@@ -1,20 +1,3 @@
-"""lift_selftest.py - end-to-end lifter validation against native execution.
-
-Compiles a small corpus of C functions with the real PS3 PPU compiler, lifts the resulting
-PowerPC with our own pipeline (ppu_lifter), compiles the lifted C on the host, runs it, and
-checks every result is bit-exact against the SAME functions compiled and run natively. Unlike
-test_ppu_lift.py (hand-written per-instruction cases), this exercises whatever the optimizing
-compiler actually emits -- register allocation, branch layout, idioms -- end to end.
-
-Clean-room: the corpus is OUR code; the tool only *invokes* compilers you already have and
-copies no SDK/toolchain content. Requires the PPU gcc and a host C++ compiler:
-
-    python lift_selftest.py --ppu-gcc .../ppu-lv2-gcc.exe --host-cxx .../clang++.exe
-    (or set PPU_GCC / HOST_CXX)
-
-Scope: pure-compute functions (no guest memory / HLE), so the only runtime needed is the
-generated ppu_context -- args in gpr[3..]/fpr[1..], result in gpr[3]/fpr[1] per the PPC ABI.
-"""
 from __future__ import annotations
 
 import argparse
@@ -28,10 +11,6 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import elf_symbols
 
-# Each case: source, signature, and inputs. Signatures drive how the driver marshals
-# arguments into registers and reads the result back.
-#   ii->i : int(int,int)   i->i : int(int)   ll->l : int64(int64,int64)
-#   ff->f : float(float,float)   dd->d : double(double,double)
 CORPUS = [
     ("arith",  "ii->i", "int arith(int a,int b){ int x=a*3+(b<<2)-(a>>1); x^=(a&b); "
                         "x+=(a>b)?a:b; return x*2-7; }",
@@ -46,12 +25,8 @@ CORPUS = [
     ("mul64", "ll->l", "long long mul64(long long a,long long b){ return a*b - (a>>3) + "
                        "(b<<5); }",
      [(3, 5), (-7, 11), (0x100000001, 0x30), (-1, -1), (0x7fffffffffffffff, 2)]),
-    # cntlzw only, on a guaranteed-nonzero input (|1): avoids __builtin_clz(0), which is
-    # UB on the host but defined (=32) on PPC, and avoids popcount's .rodata lookup table.
     ("clz", "i->i", "int clz(int x){ return __builtin_clz((unsigned)x|1) + (int)((unsigned)x>>28); }",
      [(1,), (0x40000000, ), (0xffff, ), (0x00010000,), (0x7fffffff,)]),
-    # Float/double kept constant-free so they stay in registers -- a literal like 0.5f
-    # would be loaded from .rodata, which a .text-only lift does not map.
     ("dwork", "dd->d", "double dwork(double a,double b){ return a*b + a/b - b*b + a; }",
      [(1.5, 2.0), (-3.25, 0.5), (100.0, 7.0), (2.0, 1.0)]),
     ("fwork", "ff->f", "float fwork(float a,float b){ return a*b + b - a/b + a*a; }",
@@ -66,18 +41,11 @@ def sh(cmd):
     return r.stdout
 
 
-# result register per signature: (kind, is_float)
 _RET = {"ii->i": "i32", "i->i": "i32", "ll->l": "i64", "ff->f": "f32", "dd->d": "f64"}
 
 
 def gen_driver(cases_meta):
-    """Emit the C++ driver that runs each lifted func vs its native reference."""
     lines = ['#include "ppu_recomp.h"', "#include <cstdio>", "#include <cstdint>", ""]
-    # Runtime stubs: the corpus is register-only, so lifted code never actually reads
-    # guest memory or takes an indirect/trampoline path. These definitions exist only
-    # to satisfy the linker for symbols the generated .c declares. If a corpus function
-    # secretly needed one of these (e.g. a spilled constant), it would return a wrong
-    # value and the test would FAIL -- which is the signal we want.
     lines += [
         'extern "C" {',
         "  uint8_t* vm_base = nullptr;",
@@ -93,15 +61,13 @@ def gen_driver(cases_meta):
         "}",
         "",
     ]
-    # native references, compiled here on the host for ground truth
     for name, sig, src, _inputs, _addr in cases_meta:
         lines.append(src)
     lines += ["", "int main(){", "    setbuf(stdout,0);", "    int fails=0, total=0;"]
     for name, sig, _src, inputs, addr in cases_meta:
-        fn = f"func_{addr:08X}"          # lifter names functions with uppercase hex
+        fn = f"func_{addr:08X}"
         ret = _RET[sig]
         for inp in inputs:
-            total_setup = []
             ctxset, refargs = [], []
             if sig in ("ii->i", "i->i", "ll->l"):
                 for i, v in enumerate(inp):
@@ -112,7 +78,7 @@ def gen_driver(cases_meta):
                     else:
                         ctxset.append(f"ctx.gpr[{reg}]=(uint64_t)(int64_t)({v});")
                         refargs.append(f"({v})")
-            else:  # float / double args go in fpr[1..]
+            else:
                 for i, v in enumerate(inp):
                     ctxset.append(f"ctx.fpr[{1+i}]={v!r};")
                     refargs.append(f"{v!r}{'f' if sig=='ff->f' else ''}")
@@ -130,14 +96,11 @@ def gen_driver(cases_meta):
                 read, cmp = "(double)ctx.fpr[1]", f"(double){call}"
                 fmt = '"%s(%s): lifted=%g ref=%g %s\\n"'
             argstr = ",".join(str(x) for x in inp)
-            eq = "l==r" if ret in ("i32", "i64") else "l==r"  # exact match expected
+            eq = "l==r" if ret in ("i32", "i64") else "l==r"
             lines += [
                 "    { ppu_context ctx={};",
                 f"      {' '.join(ctxset)}",
                 f"      {fn}(&ctx);",
-                # The lifter fragments a function and chains the pieces through
-                # g_trampoline_fn; the runtime drains them after each guest call, so
-                # the driver must too, or only the first fragment runs.
                 "      while(g_trampoline_fn){ auto _tf=g_trampoline_fn; "
                 "g_trampoline_fn=nullptr; _tf(&ctx); }",
                 f"      auto l={read}; auto r={cmp}; total++;",
@@ -163,9 +126,6 @@ def main() -> int:
                          "This test requires the PS3 SDK PPU compiler and a host C++ compiler.")
 
     work = tempfile.mkdtemp(prefix="lift_selftest_")
-    # The corpus is compiled AND LINKED into a real ELF: an unlinked .o leaves inter-block
-    # branches as "b ." + relocations, which lift to bogus self-loops. A main() that
-    # address-takes every function keeps the optimizer from dropping them.
     names = [c[0] for c in CORPUS]
     keep = ",".join(f"(void*){n}" for n in names)
     src = os.path.join(work, "corpus.c")
@@ -176,8 +136,6 @@ def main() -> int:
     elf = os.path.join(work, "corpus.elf")
     sh([args.ppu_gcc, "-O2", "-o", elf, src])
 
-    # code address per function name (STT_FUNC value in .text), and the lifter's
-    # function list -- elf_symbols emits exactly the {start,end} shape ppu_lifter wants.
     syms = elf_symbols.load_symbols(elf)
     addr = {s["name"]: int(s["start"], 16) for s in syms}
     missing = [n for n in names if n not in addr]

@@ -1,31 +1,16 @@
-/*
- * ps3recomp - cellOskDialog HLE implementation
- *
- * Provides an on-screen keyboard stub.  When a game requests text input,
- * the prompt is logged and an empty string (or configurable default) is
- * returned immediately.  In a full implementation this would show an
- * actual input dialog.
- */
-
 #include "cellOskDialog.h"
 #include <stdio.h>
 #include <string.h>
-#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
-#include "../guest_struct.h"   /* GUEST_EA, vm_read/vm_write: guest EA -> host */
-
-/* ---------------------------------------------------------------------------
- * Internal state
- * -----------------------------------------------------------------------*/
+#include "../../runtime/ppu/ppu_memory.h"
+#include "../guest_struct.h"
 
 static int  s_osk_initialized = 0;
 static int  s_osk_loaded = 0;
 static char s_default_response[CELL_OSK_MAX_TEXT_LENGTH + 1] = "";
 
-/* Stored input result (UTF-16) */
 static CellOskDialogChar s_result_text[CELL_OSK_MAX_TEXT_LENGTH + 1];
 static u32               s_result_length = 0;
 
-/* Convert narrow string to UTF-16LE (simple ASCII subset) */
 static void osk_ascii_to_utf16(const char* src, CellOskDialogChar* dst,
                                 u32 maxChars)
 {
@@ -35,7 +20,6 @@ static void osk_ascii_to_utf16(const char* src, CellOskDialogChar* dst,
     dst[i] = 0;
 }
 
-/* Convert UTF-16LE to narrow string for logging (ASCII subset) */
 static void osk_utf16_to_ascii(const CellOskDialogChar* src, char* dst,
                                 u32 maxChars)
 {
@@ -45,27 +29,11 @@ static void osk_utf16_to_ascii(const CellOskDialogChar* src, char* dst,
     dst[i] = '\0';
 }
 
-/* ---------------------------------------------------------------------------
- * Configuration
- * -----------------------------------------------------------------------*/
-
-/* ---------------------------------------------------------------------------
- * Guest struct access
- *
- * CellOskDialogInputFieldInfo is { CellOskDialogChar* message;
- * CellOskDialogChar* init_text; u32 limit_length; } and
- * CellOskDialogCallbackReturnParam is { s32 result; u32 numCharsResultString;
- * CellOskDialogChar* pResultString; }. Both lead with (or contain) pointers,
- * which the guest stores in four bytes and we in eight, so a cast misplaces
- * every field after the first. The strings are UTF-16 and big-endian, so the
- * code units come across one at a time too.
- * -----------------------------------------------------------------------*/
 enum {
-    OSKIF_O_MESSAGE = 0, OSKIF_O_INIT_TEXT = 4, OSKIF_O_LIMIT_LENGTH = 8,
+    OSKIF_O_MESSAGE = 0, OSKIF_O_INIT_TEXT = 4,
     OSKRET_O_RESULT = 0, OSKRET_O_NUMCHARS = 4, OSKRET_O_PRESULTSTRING = 8
 };
 
-/* Copy a NUL-terminated big-endian UTF-16 string out of guest memory. */
 static u32 osk_guest_utf16(u32 ea, CellOskDialogChar* dst, u32 max)
 {
     u32 n = 0;
@@ -80,10 +48,6 @@ static u32 osk_guest_utf16(u32 ea, CellOskDialogChar* dst, u32 max)
     dst[n] = 0;
     return n;
 }
-
-/* ---------------------------------------------------------------------------
- * API implementations
- * -----------------------------------------------------------------------*/
 
 s32 cellOskDialogLoadAsync(u32 container,
                            const CellOskDialogParam* dialogParam,
@@ -106,7 +70,6 @@ s32 cellOskDialogLoadAsync(u32 container,
     static CellOskDialogChar host_init[CELL_OSK_MAX_TEXT_LENGTH + 1];
     u32 init_len = osk_guest_utf16(init_ea, host_init, CELL_OSK_MAX_TEXT_LENGTH);
 
-    /* Log the prompt if available */
     if (message_ea) {
         static CellOskDialogChar host_msg[CELL_OSK_MAX_TEXT_LENGTH + 1];
         osk_guest_utf16(message_ea, host_msg, CELL_OSK_MAX_TEXT_LENGTH);
@@ -123,7 +86,6 @@ s32 cellOskDialogLoadAsync(u32 container,
         printf("[cellOskDialog] Initial text: \"%s\"\n", init);
     }
 
-    /* Prepare the result: use default response or empty string */
     memset(s_result_text, 0, sizeof(s_result_text));
     if (s_default_response[0] != '\0') {
         osk_ascii_to_utf16(s_default_response, s_result_text,
@@ -132,7 +94,6 @@ s32 cellOskDialogLoadAsync(u32 container,
         printf("[cellOskDialog] Returning default response: \"%s\"\n",
                s_default_response);
     } else if (init_ea) {
-        /* Copy initial text as the response */
         memcpy(s_result_text, host_init,
                (init_len + 1) * sizeof(CellOskDialogChar));
         s_result_length = init_len;
@@ -160,7 +121,6 @@ s32 cellOskDialogUnloadAsync(CellOskDialogCallbackReturnParam* result)
         vm_write32(res_ea + OSKRET_O_NUMCHARS, s_result_length);
         u32 str_ea = vm_read32(res_ea + OSKRET_O_PRESULTSTRING);
         if (str_ea && s_result_length > 0) {
-            /* UTF-16, big-endian in guest memory: one unit at a time. */
             for (u32 i = 0; i <= s_result_length; i++)
                 vm_write16(str_ea + i * 2, s_result_text[i]);
         }
@@ -194,4 +154,3 @@ s32 cellOskDialogSetLayoutMode(u32 mode)
     printf("[cellOskDialog] SetLayoutMode(%u)\n", mode);
     return CELL_OK;
 }
-

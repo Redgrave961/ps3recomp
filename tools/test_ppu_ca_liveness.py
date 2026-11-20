@@ -1,12 +1,4 @@
 #!/usr/bin/env python3
-"""Dead XER[CA] updates are dropped, live ones are kept.
-
-A CA write is dropped only when no path reaches a CA read (or a tail call,
-which continues the guest function) before the next CA write; calls and real
-returns do not read it (XER is volatile across calls in the PPC64 ELF ABI).
-Each program is compiled with and without the pass and run over the same
-inputs: the GPRs must match.
-"""
 from __future__ import annotations
 
 import importlib.util

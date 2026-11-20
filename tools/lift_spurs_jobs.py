@@ -94,8 +94,6 @@ def main():
                     "(SPU ELF code linked at LS 0x3000 and up) are not jobs and are skipped.")
     ap.add_argument("elf")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--first-image-id", type=lambda x: int(x, 0), default=0x20000000)
-    ap.add_argument("--register-fn", default="spu_jobs_register_all")
     a = ap.parse_args()
 
     os.makedirs(a.out, exist_ok=True)
@@ -163,7 +161,7 @@ def main():
             debase_includes(os.path.join(d, fn))
         if "/* TODO spu:" in open(os.path.join(d, "spu_recomp.c")).read():
             raise SystemExit("%s: unresolved instruction or branch" % name)
-        image_id = a.first_image_id + n
+        image_id = 0x20000000 + n
         regs.append((name, ea, raw, canon, image_id))
         sources.append(os.path.join(d, "spu_recomp.c"))
         report.append(dict(name=name, ea="0x%08X" % ea, span="0x%X" % span, link_base="0x%X" % canon,
@@ -181,14 +179,14 @@ def main():
         for k in range(0, len(code), 24):
             lines.append("    " + "".join("0x%02X," % c for c in code[k:k + 24]))
         lines.append("};")
-    lines += ["", "void %s(void)" % a.register_fn, "{"]
+    lines += ["", "void spu_jobs_register_all(void)", "{"]
     for name, ea, code, canon, image_id in regs:
         lines.append("    spu_begin_image(%d);" % image_id)
         lines.append("    %s_spu_recomp_register();" % name)
         lines.append("    spu_overlay_register_reloc_content(%s_code, 0x%Xu, 0x%Xu, %d);" % (name, len(code), canon, image_id))
     lines += ["    spu_begin_image(0);", "}", "",
-              "__attribute__((constructor)) static void %s_ctor(void)" % a.register_fn, "{",
-              "    %s();" % a.register_fn, "}", ""]
+              "__attribute__((constructor)) static void spu_jobs_register_all_ctor(void)", "{",
+              "    spu_jobs_register_all();", "}", ""]
     reg = os.path.join(a.out, "spu_jobs_register.c")
     open(reg, "w").write("\n".join(lines))
     sources.append(reg)

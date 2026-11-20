@@ -1,17 +1,4 @@
 #!/usr/bin/env python3
-"""lift_jobmods.py --engine-elf: modules embedded in an engine ELF register as
-verified streamed regions whose span is the lifted code only.
-
-A synthetic big-endian ELF64 holds two hand-assembled job modules (and a
-byte-identical copy of the first at another EA), each with a data tail after
-its code. Checks that the modules are found at their EAs, that code_end stops
-before the data tail (and grows to a manual-link return target reached only
-through `bi $r0`), that the registration TU registers span == code_end - 0x4000
-with exactly the code bytes, and that the default --jobmods mode still emits
-signature registration. On POSIX it then links the registration TU and the
-lifted C against the SPU runtime: a GET of a job's own data above its code
-keeps the module resident, while a GET of another module clears it.
-No game data is involved."""
 import json
 import os
 import re
@@ -25,7 +12,6 @@ ROOT = Path(__file__).resolve().parents[1]
 TOOL = ROOT / "tools/lift_jobmods.py"
 BASE = 0x4000
 
-# SPU encodings used below.
 def ila(rt, imm): return (0x21 << 25) | ((imm & 0x3FFFF) << 7) | rt
 def il(rt, imm):  return (0x081 << 23) | ((imm & 0xFFFF) << 7) | rt
 def ai(rt, ra, imm): return (0x1C << 24) | ((imm & 0x3FF) << 14) | (ra << 7) | rt
@@ -36,7 +22,6 @@ BI_R0, LNOP, STOP = 0x35000000, 0x00200000, 0x00000000
 
 
 def module(words, tag, entry_off=0x34):
-    """`4 ila | entry | size | 0 | 0 | C0DEC0DE | 0 | load base | 0` + words."""
     body = b"".join(struct.pack(">I", w) for w in words)
     size = 0x30 + len(body)
     hdr = b"".join(struct.pack(">I", ila(3, tag + i)) for i in range(4))
@@ -44,33 +29,29 @@ def module(words, tag, entry_off=0x34):
     return hdr + body
 
 
-# Module A: entry calls f and stops; data tail decodes as a branch.
 A = module([
-    BI_R0,                          # 0x30  stub reached only by a function pointer
-    il(3, 1),                       # 0x34  entry
-    brsl(0x38, 0x40),               # 0x38
-    STOP,                           # 0x3C
-    ai(3, 3, 1),                    # 0x40  f
-    BI_R0,                          # 0x44
-    br(0x48, 0x4C), 0x12345678, 0xDEADBEEF, 0, 0x01020304, 0, 0, 0,   # 0x48 data
+    BI_R0,
+    il(3, 1),
+    brsl(0x38, 0x40),
+    STOP,
+    ai(3, 3, 1),
+    BI_R0,
+    br(0x48, 0x4C), 0x12345678, 0xDEADBEEF, 0, 0x01020304, 0, 0, 0,
 ], tag=0x10)
 A_CODE_END = BASE + 0x48
 
-# Module B: entry builds its return address by hand (ila $r0 / a $r0,$r0,$r126),
-# so 0x50 is reached only through `bi $r0`. The data tail repeats the pattern;
-# being unreachable, it must not extend the code.
 B = module([
-    BI_R0,                          # 0x30
-    ila(0, 0x50),                   # 0x34  entry
-    a(0, 0, 126),                   # 0x38
-    br(0x3C, 0x44),                 # 0x3C
-    LNOP,                           # 0x40
-    il(3, 7),                       # 0x44  body
-    BI_R0,                          # 0x48
-    LNOP,                           # 0x4C
-    il(4, 2),                       # 0x50  manual-link return target
-    BI_R0,                          # 0x54
-    ila(0, 0x70), a(0, 0, 126), 0xCAFEF00D, 0, 0, 0, 0, 0, il(5, 9), BI_R0,   # 0x58 data
+    BI_R0,
+    ila(0, 0x50),
+    a(0, 0, 126),
+    br(0x3C, 0x44),
+    LNOP,
+    il(3, 7),
+    BI_R0,
+    LNOP,
+    il(4, 2),
+    BI_R0,
+    ila(0, 0x70), a(0, 0, 126), 0xCAFEF00D, 0, 0, 0, 0, 0, il(5, 9), BI_R0,
 ], tag=0x20)
 B_CODE_END = BASE + 0x58
 
@@ -82,7 +63,6 @@ def engine_elf():
     seg = bytearray(0x800)
     for ea, m in ((A_EA, A), (B_EA, B), (A2_EA, A)):
         seg[ea - SEG_VA:ea - SEG_VA + len(m)] = m
-    # A decoy: magic at an aligned header but no load base at +0x28.
     seg[0x620:0x624] = b"\xC0\xDE\xC0\xDE"
     phoff, data_off = 0x40, 0x100
     eh = b"\x7fELF" + bytes([2, 2, 1]) + bytes(9)
@@ -145,7 +125,6 @@ with tempfile.TemporaryDirectory(prefix="lift-jobmods-verified-") as tmp:
         check(got == raw[0x30:end - BASE], f"image {img}: segment bytes are exactly the code")
     check(reg.count("{0x4030u, sizeof code_") == 2, "segment starts after the header")
 
-    # Default mode keeps signature registration and the old manifest shape.
     (tmp / "bins").mkdir()
     for raw in (A, B):
         import hashlib
@@ -165,7 +144,6 @@ with tempfile.TemporaryDirectory(prefix="lift-jobmods-verified-") as tmp:
                           capture_output=True, text=True)
     check(both.returncode != 0, "--jobmods and --engine-elf are mutually exclusive")
 
-    # Residency against the real runtime: link the registration TU + lifted C.
     if os.name == "nt":
         print("SKIP runtime residency: fixture requires the POSIX compiler/linker")
     else:

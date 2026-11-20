@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Module error bases: one literal per base against the console's value (tests/test_error_bases.c)."""
 import os
 from pathlib import Path
 import subprocess

@@ -1,18 +1,3 @@
-# ps3recomp - tests/sync_stress
-#
-# Deterministic lv2 sync-primitive stress suite.
-# Standalone project with its own build dir:
-#
-#   cmake -S tests/sync_stress -B tests/sync_stress/build -G Ninja && ninja -C tests/sync_stress/build
-#
-# Run:
-#   .\tests\sync_stress\build\sync_stress.exe [seed]     (Windows)
-#   ./tests/sync_stress/build/sync_stress [seed]          (POSIX)
-#
-# The harness is written against Win32 threads, events and interlocked ops.
-# Off Windows those come from runtime/platform/win32_compat.h, so the same
-# source runs on every host -- and doubles as a stress test of that shim.
-#
 cmake_minimum_required(VERSION 3.20)
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     project(sync_stress LANGUAGES C)
@@ -22,17 +7,6 @@ endif()
 set(CMAKE_C_STANDARD 17)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
-# ---------------------------------------------------------------------------
-# Location of the ps3recomp runtime sources under test. Overridable so a
-# seeded-bug self-test can point PS3RECOMP_TREE_ROOT at a temp MIRROR of the
-# runtime/+include/ tree (e.g. with sys_cond.c mutated) without touching the
-# real one. The mirror must keep the same relative layout (runtime/syscalls,
-# runtime/ppu, runtime/memory, include/ps3emu) because the runtime headers
-# use relative includes like "../ppu/ppu_context.h".
-#   cmake -DPS3RECOMP_TREE_ROOT=C:\path\to\temp\tree ...
-#   (RUNTIME_SYNC_DIR alone can also be overridden if only the four .c/.h
-#   sync files were copied into an otherwise-normal tree layout.)
-# ---------------------------------------------------------------------------
 get_filename_component(PS3RECOMP_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
 
 if(NOT DEFINED PS3RECOMP_TREE_ROOT)
@@ -53,7 +27,6 @@ add_executable(sync_stress
     "${RUNTIME_SYNC_DIR}/sys_rwlock.c"
 )
 if(NOT WIN32)
-    # The Win32 handle, wait and thread API the harness drives.
     target_sources(sync_stress PRIVATE
         "${PS3RECOMP_TREE_ROOT}/runtime/platform/win32_compat.c")
 endif()
@@ -81,11 +54,6 @@ set_tests_properties(sync_stress PROPERTIES
     LABELS "stress;runtime;sync"
     TIMEOUT 120
 )
-# The same suite with MUTEX_WATCH=1, which turns an infinite sys_mutex_lock
-# into 5 s timed slices that report the owner, and with MUTEX_WATCH=2, which
-# keeps the blocking lock and has a reporter thread name long waiters (POSIX;
-# Windows ignores both). The diagnostic must not cost the lock any of its
-# guarantees.
 foreach(watch 1 2)
     add_test(NAME sync_stress_mutex_watch${watch} COMMAND sync_stress)
     set_tests_properties(sync_stress_mutex_watch${watch} PROPERTIES
@@ -95,8 +63,6 @@ foreach(watch 1 2)
     )
 endforeach()
 
-# Error returns and timeouts of the lv2 mutex, semaphore, rwlock and cond
-# (trylock EDEADLK, destroy EBUSY, timed rwlock, huge timeouts, attribute names).
 add_executable(test_sync_semantics
     test_sync_semantics.c test_shims.c
     "${RUNTIME_SYNC_DIR}/sys_mutex.c"
@@ -109,7 +75,7 @@ if(NOT WIN32)
     find_package(Threads REQUIRED)
     target_link_libraries(test_sync_semantics PRIVATE Threads::Threads)
 else()
-    target_link_libraries(test_sync_semantics PRIVATE winmm)   # timeBeginPeriod
+    target_link_libraries(test_sync_semantics PRIVATE winmm)
 endif()
 target_include_directories(test_sync_semantics PRIVATE
     "${PS3RECOMP_TREE_ROOT}" "${PS3RECOMP_TREE_ROOT}/include"
@@ -123,8 +89,6 @@ endif()
 add_test(NAME sync_semantics COMMAND test_sync_semantics)
 set_tests_properties(sync_semantics PROPERTIES LABELS "runtime;sync" TIMEOUT 60)
 
-# sys_mutex_destroy: EBUSY while the mutex is held or a thread is blocked
-# acquiring it. Win32 host threads, through the shim off Windows.
 add_executable(test_mutex_destroy
     test_mutex_destroy.c test_shims.c
     "${RUNTIME_SYNC_DIR}/sys_mutex.c"
@@ -144,7 +108,6 @@ endif()
 add_test(NAME mutex_destroy COMMAND test_mutex_destroy)
 set_tests_properties(mutex_destroy PROPERTIES LABELS "runtime;sync" TIMEOUT 20)
 
-# The focused condition tests use Win32 host threads.
 add_executable(test_cond_semantics
     test_cond_semantics.c test_shims.c
     "${RUNTIME_SYNC_DIR}/sys_mutex.c"
@@ -165,9 +128,6 @@ foreach(mode owner recursive spurious)
     set_tests_properties(cond_${mode} PROPERTIES TIMEOUT 10)
 endforeach()
 
-# sys_event_queue_destroy modes (EINVAL / EBUSY / FORCE -> ECANCELED), ports
-# disconnected from a destroyed queue, and the absolute deadline of a timed
-# receive. Links sys_event.c alone.
 add_executable(test_event_queue_destroy
     test_event_queue_destroy.c test_shims.c
     "${RUNTIME_SYNC_DIR}/sys_event.c")

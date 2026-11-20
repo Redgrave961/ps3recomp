@@ -1,4 +1,3 @@
-/* included at the end of the generated oracle TU */
 #include "oracle.h"
 namespace utils { bool has_avx() { return false; } u64 _get_main_tid() { return 0; } }
 static spu_thread g_o_spu;
@@ -32,7 +31,7 @@ extern "C" int rpcs3_oracle_run(uint32_t insn, uint32_t pc, const uint8_t gpr[12
 	if (s.last_ref != ~0u) {
 		out->mem = 1; out->mem_addr = s.last_ref;
 		memcpy(out->mem_quad, g_o_ls + s.last_ref, 16);
-		memcpy(g_o_ls + s.last_ref, g_o_ls0 + s.last_ref, 16);   /* undo the store */
+		memcpy(g_o_ls + s.last_ref, g_o_ls0 + s.last_ref, 16);
 	}
 	return 1;
 }

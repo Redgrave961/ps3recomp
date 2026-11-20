@@ -1,11 +1,3 @@
-"""trace.py - hardened stack walk + single-step PC tracer for RPCS3.
-
-Two upgrades over diag.py:
-  1. validated stack walk: a frame's return addr is only kept if the instruction
-     at ret-4 is a *linking branch* (bl/bcl/bctrl/blrl) -> filters spurious frames.
-  2. single-step trace: steps the PPU N times recording PC -> reveals the actual
-     loop cycle without needing to get past a title/pause screen.
-"""
 import argparse, os, subprocess, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rsp import RSPClient
@@ -15,11 +7,11 @@ def pcof(regs): return next((regs[n] & 0xFFFFFFFF for n in PCN if n in regs), No
 
 def is_link_branch(insn):
     op = insn >> 26
-    if insn & 1 != 1:           # LK bit
+    if insn & 1 != 1:
         return False
-    if op in (16, 18):          # bcl / bl(a)
+    if op in (16, 18):
         return True
-    if op == 19:                # bclrl / bcctrl
+    if op == 19:
         return ((insn >> 1) & 0x3FF) in (16, 528)
     return False
 
@@ -65,7 +57,6 @@ def main():
         for i, (f, tag) in enumerate(walk(r, regs)):
             print(f"    #{i:2d} 0x{(f or 0):08X}  {tag}")
 
-        # single-step trace
         print(f"\n[trace] single-stepping {a.steps}x ...")
         pcs = []
         t0 = time.time()
@@ -80,7 +71,6 @@ def main():
         dt = time.time() - t0
         if pcs:
             print(f"[trace] stepped {len(pcs)} insns in {dt:.1f}s")
-            # PC histogram (hot spots) + range
             from collections import Counter
             hot = Counter(pcs).most_common(12)
             lo, hi = min(pcs), max(pcs)
@@ -88,7 +78,6 @@ def main():
             print("[trace] hottest PCs:")
             for pc, n in hot:
                 print(f"    0x{pc:08X}  x{n}")
-            # detect the loop span (min..max of the most common cluster)
             uniq = sorted(set(pcs))
             print(f"[trace] {len(uniq)} distinct PCs; first 0x{uniq[0]:08X} last 0x{uniq[-1]:08X}")
         try:

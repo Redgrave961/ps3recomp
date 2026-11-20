@@ -1,20 +1,3 @@
-/*
- * ps3recomp - test for runtime/platform/ps3_dev_flash.c (the host path of a
- * file under /dev_flash, for a PS3_DEV_FLASH of one or several roots)
- *
- *   - one root: the path is root + "/" + rel, whether or not the file exists;
- *   - several roots: the first one that holds the file wins, wherever it is in
- *     the list, and a root that does not have it is skipped;
- *   - a file that no root has resolves under the first root, so the caller's
- *     open fails the way a missing file does;
- *   - an empty entry in the list is skipped, and a trailing separator is fine.
- *
- * Build (any host):
- *   cc -std=gnu17 -Wall -Wextra -o test_dev_flash_path \
- *      runtime/platform/tests/test_dev_flash_path.c runtime/platform/ps3_dev_flash.c
- *
- * Exit status is the number of failed checks, so it works as a CI step.
- */
 #include "../ps3_dev_flash.h"
 
 #include <stdio.h>
@@ -116,7 +99,6 @@ int main(void)
     ps3_dev_flash_path(tiny, sizeof tiny, a, "a/very/long/relative/path.bin");
     CHECK(strlen(tiny) == sizeof tiny - 1, "a small buffer is cut, not overrun");
 
-    /* clean up */
     const char* dirs[3] = { a, b, c };
     const char* files[4] = { "only_in_b.bin", "in_a_and_c.bin", "only_in_c.bin", NULL };
     for (int d = 0; d < 3; d++) {

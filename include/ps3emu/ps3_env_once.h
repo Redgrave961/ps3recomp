@@ -1,27 +1,3 @@
-/*
- * ps3recomp - ps3_env_once(): an environment switch looked up once per name
- *
- * Diagnostic switches are tested with getenv on hot paths (every cellFsRead,
- * every HLE SPURS job, every SPU workload dispatch). The Windows CRT takes its
- * environment lock in getenv, so each test is a lock round trip and the
- * threads making them serialize (upstream PR #437 measured it); elsewhere
- * getenv walks the whole environment each time.
- *
- * ps3_env_once("NAME") returns what getenv("NAME") returned the first time
- * this translation unit asked for NAME, and never calls getenv for it again.
- * The environment does not change while a title runs. Use it only for
- * switches read that way: a variable a program sets at run time and expects
- * the next read to see must stay a plain getenv.
- *
- * It is an ordinary function, so it does the same thing under every compiler
- * (MSVC, clang-cl, gcc, clang), leaves getenv itself alone, and caches only
- * where it is called. The cache is keyed by the name's text, not by the call
- * site, so any argument works, string literal or not. One table per
- * translation unit (a static inline function's static): two files that read
- * the same name look it up once each. A name of PS3_ENV_ONCE_NAME_MAX
- * characters or more, or one arriving after the table is full, goes to
- * getenv every time -- still correct, just not cached.
- */
 #ifndef PS3EMU_PS3_ENV_ONCE_H
 #define PS3EMU_PS3_ENV_ONCE_H
 
@@ -30,16 +6,16 @@
 
 #if defined(_MSC_VER) && !defined(__clang__)
 #include <intrin.h>
-#define PS3_ENV_ONCE_INLINE static __inline   /* MSVC's C mode before /std:c11 */
+#define PS3_ENV_ONCE_INLINE static __inline
 #else
 #define PS3_ENV_ONCE_INLINE static inline
 #endif
 
-#define PS3_ENV_ONCE_SLOTS    64   /* a power of two */
+#define PS3_ENV_ONCE_SLOTS    64
 #define PS3_ENV_ONCE_NAME_MAX 48
 
 typedef struct {
-    volatile long state;           /* 0 empty, 1 being filled, 2 ready */
+    volatile long state;
     unsigned hash;
     char name[PS3_ENV_ONCE_NAME_MAX];
     const char* value;
@@ -49,16 +25,16 @@ typedef struct {
 static __forceinline long ps3_env_once_load(volatile long* p)
 {
 #if defined(_M_ARM64) || defined(_M_ARM)
-    return _InterlockedOr(p, 0);           /* full barrier */
+    return _InterlockedOr(p, 0);
 #else
-    const long v = *p;                     /* x86/x64 loads are acquire */
+    const long v = *p;
     _ReadWriteBarrier();
     return v;
 #endif
 }
 static __forceinline void ps3_env_once_publish(volatile long* p, long v)
 {
-    _InterlockedExchange(p, v);            /* full barrier */
+    _InterlockedExchange(p, v);
 }
 static __forceinline int ps3_env_once_claim(volatile long* p)
 {
@@ -101,12 +77,10 @@ PS3_ENV_ONCE_INLINE const char* ps3_env_once(const char* name)
             }
             state = ps3_env_once_load(&s->state);
         }
-        /* Another thread is still filling this slot, for this name or
-         * another: read the variable directly this once. */
         if (state != 2) return getenv(name);
         if (s->hash == hash && memcmp(s->name, name, len + 1) == 0) return s->value;
     }
-    return getenv(name);                   /* the table is full */
+    return getenv(name);
 }
 
-#endif /* PS3EMU_PS3_ENV_ONCE_H */
+#endif

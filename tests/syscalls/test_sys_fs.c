@@ -1,14 +1,3 @@
-/* sys_fs: the raw lv2 filesystem syscalls, against real files in a temporary
- * directory.
- *
- * Covers what a guest libc and a directory walker depend on and what used to be
- * wrong: the SDK's octal open flags (O_CREAT 0100, O_EXCL 0200, O_APPEND 02000),
- * a failed seek leaving the offset alone, 64-bit offsets, the error codes of
- * mkdir/unlink/rmdir, readdir's per-entry byte count and its "." / ".." entries,
- * and the fd tables handing out distinct slots to concurrent opens and
- * reporting EMFILE when full.
- *
- * Links sys_fs.c alone; the pieces it reaches for are stubbed below. */
 #include "sys_fs.h"
 #include <errno.h>
 #include <stdio.h>
@@ -25,11 +14,9 @@
 #  define MKDIR(p) mkdir((p), 0755)
 #endif
 
-/* ---- what sys_fs.c links against ---------------------------------------- */
 uint8_t* vm_base;
-uint32_t ppu_vm_size = 0x20000;           /* sys_fs_read clamps to it */
+uint32_t ppu_vm_size = 0x20000;
 
-/* ---- harness ------------------------------------------------------------- */
 static int failures;
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #x); failures++; } } while (0)
 #define CHECK_RC(call, want) do { int32_t _rc = (int32_t)(call); \
@@ -37,17 +24,16 @@ static int failures;
         __LINE__, #call, (unsigned)_rc, (unsigned)(want)); failures++; } } while (0)
 
 #define VM_SIZE   0x20000u
-#define A_PATH    0x1000u   /* guest path strings */
-#define A_OUT     0x2000u   /* fd / position / nread out-values */
-#define A_BUF     0x3000u   /* read / write buffer */
-#define A_DIRENT  0x4000u   /* CellFsDirent */
+#define A_PATH    0x1000u
+#define A_OUT     0x2000u
+#define A_BUF     0x3000u
+#define A_DIRENT  0x4000u
 
 static char s_root[512];
 
 static uint32_t rd32(uint32_t a) { const uint8_t* p = vm_base + a; return (uint32_t)p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3]; }
 static uint64_t rd64(uint32_t a) { return (uint64_t)rd32(a) << 32 | rd32(a + 4); }
 
-/* Calls handler f with up to six arguments; r3..r8. */
 static int64_t sc(int64_t (*f)(ppu_context*), uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e)
 {
     ppu_context ctx;
@@ -57,7 +43,6 @@ static int64_t sc(int64_t (*f)(ppu_context*), uint64_t a, uint64_t b, uint64_t c
 }
 static void set_path(uint32_t at, const char* guest) { strcpy((char*)vm_base + at, guest); }
 
-/* Open guest path "/dev_bdvd/<name>" (maps to <root>/<name>) with flags. */
 static int32_t sys_open_named(const char* name, int32_t flags, int32_t* fd_out)
 {
     char g[256];
@@ -104,8 +89,6 @@ static void host_put(const char* name, const char* content)
     if (f) { fputs(content, f); fclose(f); }
 }
 
-/* SDK open flags, spelt out in octal so the test does not depend on the header
- * it is checking. */
 #define F_WRONLY 0001
 #define F_RDWR   0002
 #define F_CREAT  0100
@@ -125,36 +108,30 @@ static void test_flag_values(void)
 static void test_open_flags(void)
 {
     int32_t fd = -1;
-    /* libc open(O_WRONLY|O_CREAT) of a file that does not exist: created. */
     CHECK_RC(sys_open_named("created.txt", F_WRONLY | F_CREAT, &fd), CELL_OK);
     CHECK(fd >= 3);
     CHECK(write_all(fd, "hello"));
     CHECK_RC(sc(sys_fs_close, (uint32_t)fd, 0, 0, 0, 0), CELL_OK);
     CHECK(host_file_equals("created.txt", "hello"));
 
-    /* O_CREAT on an existing file keeps its contents. */
     CHECK_RC(sys_open_named("created.txt", F_WRONLY | F_CREAT, &fd), CELL_OK);
     CHECK_RC(sc(sys_fs_close, (uint32_t)fd, 0, 0, 0, 0), CELL_OK);
     CHECK(host_file_equals("created.txt", "hello"));
 
-    /* O_CREAT|O_EXCL: an existing file is EEXIST, a new one is created. */
     CHECK_RC(sys_open_named("created.txt", F_WRONLY | F_CREAT | F_EXCL, &fd), CELL_EEXIST);
     CHECK_RC(sys_open_named("excl.txt", F_WRONLY | F_CREAT | F_EXCL, &fd), CELL_OK);
     CHECK_RC(sc(sys_fs_close, (uint32_t)fd, 0, 0, 0, 0), CELL_OK);
     CHECK(host_exists("excl.txt"));
 
-    /* fopen("a"): O_WRONLY|O_CREAT|O_APPEND appends instead of overwriting. */
     CHECK_RC(sys_open_named("created.txt", F_WRONLY | F_CREAT | F_APPEND, &fd), CELL_OK);
     CHECK(write_all(fd, "!!"));
     CHECK_RC(sc(sys_fs_close, (uint32_t)fd, 0, 0, 0, 0), CELL_OK);
     CHECK(host_file_equals("created.txt", "hello!!"));
 
-    /* O_TRUNC empties it. */
     CHECK_RC(sys_open_named("created.txt", F_WRONLY | F_TRUNC, &fd), CELL_OK);
     CHECK_RC(sc(sys_fs_close, (uint32_t)fd, 0, 0, 0, 0), CELL_OK);
     CHECK(host_file_equals("created.txt", ""));
 
-    /* No O_CREAT: a missing file is ENOENT and nothing is created. */
     CHECK_RC(sys_open_named("absent.txt", F_WRONLY, &fd), CELL_ENOENT);
     CHECK(!host_exists("absent.txt"));
     CHECK_RC(sys_open_named("absent.txt", 0, &fd), CELL_ENOENT);
@@ -173,17 +150,14 @@ static void test_lseek(void)
     CHECK_RC(sc(sys_fs_lseek, (uint32_t)fd, (uint64_t)-3, CELL_FS_SEEK_END, A_OUT, 0), CELL_OK);
     CHECK(rd64(A_OUT) == 7);
 
-    /* Before the start of the file: EINVAL, and the offset is unchanged. */
     CHECK_RC(sc(sys_fs_lseek, (uint32_t)fd, (uint64_t)-100, CELL_FS_SEEK_SET, A_OUT, 0), CELL_EINVAL);
     CHECK_RC(sc(sys_fs_lseek, (uint32_t)fd, 0, CELL_FS_SEEK_CUR, A_OUT, 0), CELL_OK);
     CHECK(rd64(A_OUT) == 7);
     CHECK_RC(sc(sys_fs_read, (uint32_t)fd, A_BUF, 3, A_OUT, 0), CELL_OK);
     CHECK(rd64(A_OUT) == 3 && memcmp(vm_base + A_BUF, "789", 3) == 0);
 
-    /* An unknown whence. */
     CHECK_RC(sc(sys_fs_lseek, (uint32_t)fd, 0, 3, A_OUT, 0), CELL_EINVAL);
 
-    /* 64-bit offsets: past 4 GiB, no truncation to 32 bits. */
     CHECK_RC(sc(sys_fs_lseek, (uint32_t)fd, 0x140000000ull, CELL_FS_SEEK_SET, A_OUT, 0), CELL_OK);
     CHECK(rd64(A_OUT) == 0x140000000ull);
     CHECK_RC(sc(sys_fs_close, (uint32_t)fd, 0, 0, 0, 0), CELL_OK);
@@ -192,9 +166,9 @@ static void test_lseek(void)
 static void test_dir_calls(void)
 {
     CHECK_RC(sys_path_call(sys_fs_mkdir, "d1"), CELL_OK);
-    CHECK_RC(sys_path_call(sys_fs_mkdir, "d1"), CELL_EEXIST);      /* a directory */
+    CHECK_RC(sys_path_call(sys_fs_mkdir, "d1"), CELL_EEXIST);
     host_put("afile", "x");
-    CHECK_RC(sys_path_call(sys_fs_mkdir, "afile"), CELL_EEXIST);   /* a file of that name */
+    CHECK_RC(sys_path_call(sys_fs_mkdir, "afile"), CELL_EEXIST);
 
     CHECK_RC(sys_path_call(sys_fs_unlink, "d1"), CELL_EISDIR);
     CHECK_RC(sys_path_call(sys_fs_unlink, "nothing"), CELL_ENOENT);
@@ -228,7 +202,7 @@ static void test_readdir(void)
         CHECK_RC(sc(sys_fs_readdir, dfd, A_DIRENT, A_OUT, 0, 0), CELL_OK);
         const uint64_t n = rd64(A_OUT);
         if (n == 0) break;
-        CHECK(n == 0x102);                       /* one dirent, whatever the name */
+        CHECK(n == 0x102);
         entries++;
         const uint8_t type = vm_base[A_DIRENT];
         const char* name = (const char*)vm_base + A_DIRENT + 2;
@@ -252,17 +226,15 @@ static void test_table_full(void)
         opened++;
     }
     CHECK(opened == SYS_FS_FD_MAX);
-    /* Full: EMFILE (lv2's code), not ENOMEM, and nothing leaks. */
     int32_t extra = -1;
     CHECK_RC(sys_open_named("full.bin", 0, &extra), CELL_EMFILE);
     CHECK_RC(sc(sys_fs_close, (uint32_t)fds[10], 0, 0, 0, 0), CELL_OK);
     CHECK_RC(sys_open_named("full.bin", 0, &extra), CELL_OK);
-    CHECK(extra == fds[10]);                     /* the freed slot is the one reused */
+    CHECK(extra == fds[10]);
     CHECK_RC(sc(sys_fs_close, (uint32_t)extra, 0, 0, 0, 0), CELL_OK);
     for (int i = 0; i < opened; i++)
         if (i != 10) sc(sys_fs_close, (uint32_t)fds[i], 0, 0, 0, 0);
 
-    /* Same for directory handles. */
     uint32_t dfds[SYS_FS_DIR_MAX];
     int dopened = 0;
     set_path(A_PATH, "/dev_bdvd/walk");
@@ -275,8 +247,6 @@ static void test_table_full(void)
     for (int i = 0; i < dopened; i++) sc(sys_fs_closedir, dfds[i], 0, 0, 0, 0);
 }
 
-/* Concurrent opens: every thread gets a slot of its own. Each thread has its own
- * guest scratch area and ppu_context (the handlers only share the fd table). */
 #define NTHREADS 8
 #define PER_THREAD 12
 static volatile int32_t s_thread_fds[NTHREADS][PER_THREAD];
@@ -323,7 +293,7 @@ static void test_concurrent_open(void)
         for (int i = 0; i < PER_THREAD; i++) {
             const int32_t fd = s_thread_fds[t][i];
             if (fd < 3 || fd >= SYS_FS_FD_MAX + 3) { CHECK(0); continue; }
-            CHECK(!seen[fd]);                    /* never the same slot twice */
+            CHECK(!seen[fd]);
             seen[fd] = 1;
             total++;
         }
@@ -338,7 +308,6 @@ int main(void)
     vm_base = (uint8_t*)calloc(1, VM_SIZE);
     if (!vm_base) return 2;
 
-    /* A fresh directory under the temp area; the guest's "/dev_bdvd/" maps to it. */
     const char* tmp = getenv("TMPDIR");
     if (!tmp) tmp = getenv("TEMP");
     if (!tmp) tmp = getenv("TMP");
@@ -361,8 +330,6 @@ int main(void)
     test_table_full();
     test_concurrent_open();
 
-    /* Remove what the test made, by name, and then its directory (which only
-     * goes if everything else is gone). */
     {
         static const char* const files[] = {
             "created.txt", "excl.txt", "seek.bin", "full.bin", "conc.bin",

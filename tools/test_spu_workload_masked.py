@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""A raw-SPU image registered with its parameter area masked out is found whatever that area holds."""
 import os
 import subprocess
 import tempfile

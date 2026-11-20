@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Exercise the real libnet NID handlers with guest memory and loopback I/O."""
 import os
 from pathlib import Path
 import subprocess

@@ -32,7 +32,6 @@ from spu_elf import InvalidSPUELF, scan_spu_candidates, validate_spu_elf
 
 
 def parse_spu_elf_size(buf: bytes, off: int) -> int | None:
-    """Return the bounded runtime-compatible extent, or None if invalid."""
     try:
         return validate_spu_elf(buf, off)["size"]
     except InvalidSPUELF:
@@ -40,7 +39,6 @@ def parse_spu_elf_size(buf: bytes, off: int) -> int | None:
 
 
 def find_spu_images(buf: bytes):
-    """Yield (offset, size) for every valid embedded SPU ELF occurrence."""
     for offset, info, error in scan_spu_candidates(buf):
         if info is not None:
             yield offset, info["size"]

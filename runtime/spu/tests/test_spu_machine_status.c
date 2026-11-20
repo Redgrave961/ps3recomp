@@ -1,6 +1,3 @@
-/* Architecture regression: machine-status IE follows the interrupt latch,
- * independently of run/stop/channel state. Exercises the real channel, full
- * interpreter channel instruction, and SMC branch feature bits. */
 #include "../spu_helpers.h"
 #include "../spu_interp.h"
 #include <assert.h>
@@ -41,8 +38,8 @@ int main(void) {
         }
     for (unsigned ie=0;ie<2;ie++) {
         ctx.image_id=-1;ctx.int_enable=ie;
-        word(0x4000,0x01A00683); /* rdch $3, SPU_RdMachStat */
-        word(0x4004,0x00002000); /* stop 0x2000 */
+        word(0x4000,0x01A00683);
+        word(0x4004,0x00002000);
         spu_interp_run(&ctx,0x4000);
         if(ctx.gpr[3]._u32[0]!=ie) {
             fprintf(stderr,"interpreter: IE=%u read=%X\n",ie,ctx.gpr[3]._u32[0]);return 1;
@@ -53,7 +50,7 @@ int main(void) {
     for(unsigned ie=0;ie<2;ie++) {
         ctx.image_id=77;ctx.status=SPU_STATUS_RUNNING;
         ctx.int_enable=1-ie;ctx.gpr[7]=spu_splat_u32(0x240);ctx.pc=0x4000;
-        word(0x4000,0x35000000|(7<<7)|(ie?0x40000:0x80000)); /* bi E/D $7 */
+        word(0x4000,0x35000000|(7<<7)|(ie?0x40000:0x80000));
         spu_indirect_branch(&ctx);
         assert(ctx.int_enable==ie);check("branch feature bit",ie);
         g_spu_trampoline_fn=0;
@@ -66,5 +63,4 @@ uint32_t g_ww_lo=0xFFFFFFFFu,g_ww_hi;
 
 void spurs_ef_set_from_spu(uint32_t ea, uint16_t bits) { (void)ea; (void)bits; abort(); }
 uint32_t g_spu_image_src_ea, g_spu_image_ls_start, g_spu_image_span;
-/* LV2 worker publication is outside the machine-status paths exercised here. */
 void spu_thread_publish_ctx(uint32_t tid, void* c) { (void)tid; (void)c; abort(); }

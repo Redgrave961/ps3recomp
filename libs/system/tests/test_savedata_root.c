@@ -1,5 +1,3 @@
-/* clang -std=gnu17 -I include libs/system/tests/test_savedata_root.c
- * -Wl,-dead_strip -o /tmp/test_savedata_root && /tmp/test_savedata_root */
 #include "../cellSaveData.c"
 #include <assert.h>
 uint8_t* vm_base;
@@ -19,13 +17,11 @@ int main(void)
     assert(mkdtemp(root));
     setenv("PS3_GAMEDATA_ROOT", root, 1);
 
-    /* The env root replaces ./gamedata for the save path. */
     char path[1024], want[1024];
     build_save_path(path, sizeof(path), "TEST00000");
     snprintf(want, sizeof(want), "%s/dev_hdd0/home/00000001/savedata/TEST00000", root);
     assert(strcmp(path, want) == 0);
 
-    /* Adopted once: a later change of the env does not move the saves. */
     setenv("PS3_GAMEDATA_ROOT", "/nonexistent", 1);
     build_save_path(path, sizeof(path), "TEST00000");
     snprintf(want, sizeof(want), "%s/dev_hdd0/home/00000001/savedata/TEST00000", root);

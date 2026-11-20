@@ -1,20 +1,4 @@
 #!/usr/bin/env python3
-"""The lifted store path: inline page check, out-of-line slow store through ppu_st_thunk.
-
-Lifted-style functions are compiled with the lifter's real source preamble and
-run twice, once with every page fast and once with every page slow, against a
-runtime whose ppu_store_slow performs the store. Checked:
-  - every store form (8/16/32/64/128-bit, raw 1..16 bytes, dcbz) lands the same
-    bytes either way, and the slow path reports the exact address, form, value
-    and the lifted caller's return address;
-  - values live across slow stores (GPRs and vectors) survive the thunk;
-  - a function that holds the reservation in registers hands the runtime its
-    current reserve_addr/reserve_time and reads back the time the runtime set;
-  - a stack walk from inside the slow store reaches the lifted function and its
-    caller;
-  - racing an SPU's first GETLLAR of a line (the real spu_coh_reserve), the
-    store is either in the SPU's copy or ends the reservation, never neither.
-"""
 from __future__ import annotations
 
 import importlib.util

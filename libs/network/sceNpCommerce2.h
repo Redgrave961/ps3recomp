@@ -1,10 +1,3 @@
-/*
- * ps3recomp - sceNpCommerce2 HLE
- *
- * PlayStation Store commerce API (NP Commerce 2).
- * Used for in-game purchases and DLC. Safe to stub for offline play.
- */
-
 #ifndef PS3RECOMP_SCE_NP_COMMERCE2_H
 #define PS3RECOMP_SCE_NP_COMMERCE2_H
 
@@ -15,15 +8,11 @@
 extern "C" {
 #endif
 
-/* Error codes */
-#define SCE_NP_COMMERCE2_ERROR_NOT_INITIALIZED  (s32)0x80024401
 #define SCE_NP_COMMERCE2_ERROR_INVALID_ARGUMENT (s32)0x80024402
 #define SCE_NP_COMMERCE2_ERROR_SERVER_ERROR     (s32)0x80024410
 
-/* Context handle */
 typedef u32 SceNpCommerce2Context;
 
-/* Functions */
 s32 sceNpCommerce2Init(void);
 s32 sceNpCommerce2Term(void);
 s32 sceNpCommerce2CreateCtx(u32 version, const void* npId, u32 handler, u32 arg,

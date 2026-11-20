@@ -1,5 +1,3 @@
-/* Standalone check of spu_xswd: sign-extend SPU words 1 and 3 to doublewords.
- * SPU word N lives at _u32[N]; a doubleword result is (high,low) = (_u32[2d], _u32[2d+1]). */
 #include <stdio.h>
 #include <stdint.h>
 #include "../spu_helpers.h"
@@ -20,7 +18,6 @@ static void check(const char* name, uint32_t w1, uint32_t w3,
 int main(void)
 {
     printf("spu_xswd:\n");
-    /* the case that was silently returning zero */
     check("small positive (1, 2)",      1u, 2u,          0u, 1u,          0u, 2u);
     check("larger positive",            0x00001234u, 0x0000ABCDu, 0u, 0x00001234u, 0u, 0x0000ABCDu);
     check("negative sign-extends",      0xFFFFFFFFu, 0x80000000u, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0x80000000u);

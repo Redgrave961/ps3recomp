@@ -1,7 +1,3 @@
-/*
- * ps3recomp - Condition variable syscalls
- */
-
 #ifndef SYS_COND_H
 #define SYS_COND_H
 
@@ -44,4 +40,4 @@ void sys_cond_init(lv2_syscall_table* tbl);
 }
 #endif
 
-#endif /* SYS_COND_H */
+#endif

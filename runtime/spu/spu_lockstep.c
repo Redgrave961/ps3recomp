@@ -1,17 +1,3 @@
-/*
- * SPU lockstep gate implementation (faithful-adopt, from canersaka's fork).
- *
- * One global run token (spu_context* s_holder) shared by every registered SPU
- * host thread, protected by a single mutex+condvar. Members live in a fixed
- * ring (registration order; tombstoned, never compacted, on unregister). At
- * quantum expiry (yz_lockstep_tick) the holder hands the token to the next
- * RUNNABLE member (skipping members mid-block in a channel wait) and blocks
- * until granted the token again -- cooperative round robin, not a scheduler.
- *
- * Adapted for this tree: timestamps use a local monotonic-ns clock (our RdDec
- * uses dec_base_ns, not the guest timebase, so the decrementer-freeze anchor is
- * kept on the unused dec_start_tb field -- a refinement for a later pass).
- */
 #include "spu_lockstep.h"
 #include "spu_context.h"
 
@@ -64,12 +50,12 @@ volatile int g_yz_lockstep_on = -1;
 #define YZ_LOCKSTEP_MAX_SPUS         32
 #define YZ_LOCKSTEP_DEFAULT_QUANTUM  65536ull
 #define YZ_LOCKSTEP_STARVE_PRINTS    10
-#define YZ_LOCKSTEP_STARVE_NS        (5ull * 1000000000ull)   /* 5s wall */
+#define YZ_LOCKSTEP_STARVE_NS        (5ull * 1000000000ull)
 
 typedef struct {
     spu_context* ctx;
-    int active;     /* 0 = free/tombstoned slot */
-    int runnable;   /* 0 = mid channel wait (not eligible to receive the token) */
+    int active;
+    int runnable;
 } yz_ls_slot;
 
 static yz_ls_slot          s_ring[YZ_LOCKSTEP_MAX_SPUS];
@@ -118,7 +104,6 @@ static int ls_hot(void)
     return 1;
 }
 
-/* --- ring helpers; all callers hold s_ls_lock --- */
 static int ls_find_slot(spu_context* ctx)
 {
     for (int i = 0; i < s_ring_count; i++)
@@ -146,7 +131,7 @@ static int ls_any_other_active(int after)
 static void ls_acquire_locked(spu_context* ctx)
 {
     uint64_t now = ls_now_ns();
-    ctx->dec_start_tb += (now - ctx->lockstep_release_tb);  /* freeze anchor */
+    ctx->dec_start_tb += (now - ctx->lockstep_release_tb);
     s_holder = ctx;
     s_holder_acquired_ns = now;
 }
@@ -181,7 +166,6 @@ static int ls_release_locked(spu_context* ctx, int keep_runnable)
     return 0;
 }
 
-/* --- public API --- */
 void yz_lockstep_register(spu_context* ctx)
 {
     if (!yz_lockstep_enabled()) return;
@@ -198,7 +182,7 @@ void yz_lockstep_register(spu_context* ctx)
                 fprintf(stderr, "[lockstep] WARNING ring full -- spu=%X runs UNGATED\n", ctx->spu_id);
                 fflush(stderr); }
             LS_UNLOCK();
-            return;   /* fail-open */
+            return;
         }
         idx = s_ring_count++;
     }
@@ -238,7 +222,7 @@ void yz_lockstep_tick(spu_context* ctx)
     ctx->lockstep_quantum_ctr = 0;
 
     LS_LOCK();
-    if (ls_release_locked(ctx, /*keep_runnable=*/1)) {
+    if (ls_release_locked(ctx, 1)) {
         while (s_holder != ctx) LS_WAIT();
     }
     ls_acquire_locked(ctx);
@@ -249,7 +233,7 @@ void yz_lockstep_block_begin(spu_context* ctx)
 {
     if (!ls_hot()) return;
     LS_LOCK();
-    ls_release_locked(ctx, /*keep_runnable=*/0);
+    ls_release_locked(ctx, 0);
     LS_UNLOCK();
 }
 

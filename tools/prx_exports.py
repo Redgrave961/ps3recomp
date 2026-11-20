@@ -1,17 +1,4 @@
 #!/usr/bin/env python3
-"""prx_exports.py — emit a PRX's export table as a C array for the PRX loader.
-
-Reads a PRX's SCE module-info export tables (via elf_parser) and writes a
-`prx_export` array of {nid, base-0 vaddr} pairs plus a count. The runtime
-loader registers these as NID -> (load_base + vaddr), so a title's NID-import
-resolver can dispatch into the loaded module (see runtime/prx/prx_loader.h).
-
-Function exports point at an OPD; var exports at data. The loader treats both
-uniformly (the indirect dispatcher walks an OPD; data vars are read directly).
-
-Usage:
-    prx_exports.py <prx> --symbol libsre --out libsre_exports.c [--json out.json]
-"""
 import argparse, json, os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import elf_parser
@@ -20,7 +7,7 @@ import elf_parser
 def collect_exports(prx_path):
     f = elf_parser.ELFFile(prx_path)
     f.load()
-    out = []  # (nid, vaddr, lib, kind)
+    out = []
     for e in f.exports:
         lib = e.name_str or "(module)"
         nfun = e.num_funcs

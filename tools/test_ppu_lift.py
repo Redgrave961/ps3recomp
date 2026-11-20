@@ -1,33 +1,4 @@
 #!/usr/bin/env python3
-"""PPU lifter conformance suite.
-
-Tests the lifter's ACTUAL EMISSIONS (not a parallel implementation): each case
-encodes a real instruction word, round-trips it through ppu_disasm.decode
-(verifying the encoding), asks PPULifter for the C statement it would emit for
-that instruction, and wraps all statements in a generated C driver that runs
-them against edge-case register inputs and compares results with expectations
-computed here in Python straight from the PowerISA definitions.
-
-Why this exists: two multi-session silent-miscompile hunts (spu_disasm il
-double sign-extension; cntlzw(0) = raw __builtin_clz UB that dropped every
-SPURS-queue wakeup signal) were single-instruction semantics bugs that a suite
-like this catches in milliseconds. Sweep the class, don't spot-fix.
-
-Usage:
-    py -3 tools\\test_ppu_lift.py            # generate + compile + run
-    py -3 tools\\test_ppu_lift.py --emit     # just write the C file
-The compile step needs cl on PATH (the script self-launches vcvars64 like
-scratch\\dobuild2.bat when cl is absent).
-
-Scope (tranche 1): integer ALU/rotate/shift/carry/compare classes -- the
-proven silent-miscompile territory. Memory ops, FP, and VMX are follow-on
-tranches (VMX semantics already have manual-verified handling; loads/stores
-need a vm stub harness). A minimal vm stub now backs the FP D-form
-load/store-with-update RA writeback cases below (CASES gained optional
-in_mem/exp_mem/in_fpr/exp_fpr fields); it is self-contained on purpose and
-can grow with later memory-op tranches.
-"""
-
 import argparse
 import os
 import random
@@ -40,23 +11,18 @@ TOOLS = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(TOOLS)
 sys.path.insert(0, TOOLS)
 
-import ppu_disasm                    # noqa: E402
-from ppu_lifter import (PPULifter, LiftedFunction,          # noqa: E402
+import ppu_disasm
+from ppu_lifter import (PPULifter, LiftedFunction,
                         FENCE_PREAMBLE, HEADER_PREAMBLE)
 
 MASK64 = (1 << 64) - 1
 MASK32 = (1 << 32) - 1
 
-# ---------------------------------------------------------------------------
-# Instruction encoders (big-endian words). Every encoded word is round-tripped
-# through ppu_disasm.decode and the mnemonic checked, so an encoding mistake
-# here is reported as ENCODING, never as a false lifter failure.
-# ---------------------------------------------------------------------------
 
 def xo_form(xo, rt, ra, rb, oe=0, rc=0):
     return (31 << 26) | (rt << 21) | (ra << 16) | (rb << 11) | (oe << 10) | (xo << 1) | rc
 
-def x_logic(xo, rs, ra, rb, rc=0):   # and/or/... rs sits in the rt slot
+def x_logic(xo, rs, ra, rb, rc=0):
     return (31 << 26) | (rs << 21) | (ra << 16) | (rb << 11) | (xo << 1) | rc
 
 def d_form(op, rt, ra, imm):
@@ -65,7 +31,7 @@ def d_form(op, rt, ra, imm):
 def m_form(op, rs, ra, sh, mb, me, rc=0):
     return (op << 26) | (rs << 21) | (ra << 16) | (sh << 11) | (mb << 6) | (me << 1) | rc
 
-def md_form(xo3, rs, ra, sh, mbe, rc=0):   # rldicl/rldicr/rldic/rldimi
+def md_form(xo3, rs, ra, sh, mbe, rc=0):
     return ((30 << 26) | (rs << 21) | (ra << 16) | ((sh & 31) << 11)
             | ((mbe & 31) << 6) | ((mbe >> 5) << 5) | (xo3 << 2) | ((sh >> 5) << 1) | rc)
 
@@ -82,27 +48,23 @@ def cmpi_form(op, bf, l, ra, imm):
 def vx_form(xo, vd, va, vb):
     return (4 << 26) | (vd << 21) | (va << 16) | (vb << 11) | xo
 
-def fp_x_form(xo, bt, rc=0):   # opcd-63 X-form FPSCR bit ops (mtfsb0/mtfsb1/mtfsfi); RA/RB unused
+def fp_x_form(xo, bt, rc=0):
     return (63 << 26) | (bt << 21) | (xo << 1) | rc
 
-def spr_form(xo, rt, spr_num):   # mfspr/mtspr; the 10-bit spr field is two 5-bit halves swapped
+def spr_form(xo, rt, spr_num):
     spr_raw = ((spr_num & 0x1F) << 5) | ((spr_num >> 5) & 0x1F)
     return (31 << 26) | (rt << 21) | (spr_raw << 11) | (xo << 1)
 
-def sync_form(lfield):   # sync/lwsync/ptesync differ only by the 2-bit L field (bits 9..10)
+def sync_form(lfield):
     return (31 << 26) | ((lfield & 3) << 21) | (598 << 1)
 
 EIEIO_WORD = (31 << 26) | (854 << 1)
 ISYNC_WORD = (19 << 26) | (150 << 1)
 
-# ---------------------------------------------------------------------------
-# PowerISA reference semantics (independent of the lifter). 64-bit registers;
-# CA per the 64-bit operation (PowerISA v2.03, the manual in the repo root).
-# ---------------------------------------------------------------------------
 
 def s64(v): v &= MASK64; return v - (1 << 64) if v >> 63 else v
 def s32(v): v &= MASK32; return v - (1 << 32) if v >> 31 else v
-def sxw(v): return s32(v) & MASK64          # sign-extend low word to 64
+def sxw(v): return s32(v) & MASK64
 
 def ref_add(a, b):        return (a + b) & MASK64, None
 def ref_addc(a, b):       s = a + b; return s & MASK64, s >> 64
@@ -121,7 +83,7 @@ def ref_extsb(a):         v = a & 0xFF; return (v - 0x100 if v >> 7 else v) & MA
 def ref_extsh(a):         v = a & 0xFFFF; return (v - 0x10000 if v >> 15 else v) & MASK64, None
 def ref_extsw(a):         return sxw(a), None
 def ref_mullw(a, b):      return (s32(a) * s32(b)) & MASK64, None
-def ref_mulhw(a, b):      return ((s32(a) * s32(b)) >> 32) & MASK32, None   # low32 defined; high undefined -> mask32 compare
+def ref_mulhw(a, b):      return ((s32(a) * s32(b)) >> 32) & MASK32, None
 def ref_mulhwu(a, b):     return (((a & MASK32) * (b & MASK32)) >> 32) & MASK32, None
 def ref_mulld(a, b):      return (s64(a) * s64(b)) & MASK64, None
 def ref_mulhd(a, b):      return ((s64(a) * s64(b)) >> 64) & MASK64, None
@@ -145,7 +107,7 @@ def mask64(mb, me):
 def ref_rlwinm(a, sh, mb, me):   return rotl32(a, sh) & mask32(mb, me), None
 def ref_rlwimi(ra, rs, sh, mb, me):
     m = mask32(mb, me)
-    return ((rotl32(rs, sh) & m) | (ra & MASK32 & ~m)) & MASK32, None   # low32 compare
+    return ((rotl32(rs, sh) & m) | (ra & MASK32 & ~m)) & MASK32, None
 def ref_rldicl(a, sh, mb): return rotl64(a, sh) & mask64(mb, 63), None
 def ref_rldicr(a, sh, me): return rotl64(a, sh) & mask64(0, me), None
 def ref_rldimi(ra, rs, sh, mb):
@@ -201,7 +163,7 @@ def ref_subfic(a, imm):
 def ref_divw(a, b):
     d, n = s32(a), s32(b)
     if n == 0 or (d == -(1 << 31) and n == -1):
-        return None, None                        # UNDEFINED: assert no-crash only
+        return None, None
     return (int(d / n) if (d < 0) != (n < 0) else d // n) & MASK32, None
 def ref_divwu(a, b):
     d, n = a & MASK32, b & MASK32
@@ -219,28 +181,17 @@ def ref_divdu(a, b):
         return None, None
     return (a // b) & MASK64, None
 
-# --- vupk*: AltiVec sign-extend unpacks. Element SELECTION (which half of
-# the 16 input bytes feeds the op) follows the AltiVec PEM (6-172..6-176):
-# high = storage bytes 0-7, low = storage bytes 8-15. ppu_lifter.py's vupk*
-# handlers now route every multi-byte lane through the vrh/vsth (halfword
-# source of vupkhsh/vupklsh) and vsth (halfword result of vupkhsb/vupklsb)
-# big-endian accessors, matching every other multi-byte-lane VMX handler
-# (ppu: vmx element wise ops read big endian lanes fix). These references
-# therefore use '>' (true big-endian) struct formats to predict the lifter's
-# corrected output -- this used to be '<' (host LE), which modeled the
-# pre-fix byte-reversed behavior as "correct"; it wasn't, it was the same
-# class of bug this change fixes everywhere else.
 def ref_vupkhsh(vb16):
-    halfs = struct.unpack(">4h", vb16[0:8])          # high 4 halfwords, big-endian
+    halfs = struct.unpack(">4h", vb16[0:8])
     return struct.pack(">4i", *halfs)
 def ref_vupklsh(vb16):
-    halfs = struct.unpack(">4h", vb16[8:16])         # low 4 halfwords, big-endian
+    halfs = struct.unpack(">4h", vb16[8:16])
     return struct.pack(">4i", *halfs)
 def ref_vupkhsb(vb16):
-    bytes8 = struct.unpack(">8b", vb16[0:8])         # high 8 bytes (byte lanes: order-agnostic)
+    bytes8 = struct.unpack(">8b", vb16[0:8])
     return struct.pack(">8h", *bytes8)
 def ref_vupklsb(vb16):
-    bytes8 = struct.unpack(">8b", vb16[8:16])        # low 8 bytes (byte lanes: order-agnostic)
+    bytes8 = struct.unpack(">8b", vb16[8:16])
     return struct.pack(">8h", *bytes8)
 
 def cr_nibble_signed(a, b):
@@ -257,21 +208,14 @@ def cr_nibble_unsigned(a, b, bits):
     if (a & m) > (b & m): return 4
     return 2
 
-# ---------------------------------------------------------------------------
-# Test-case construction
-# ---------------------------------------------------------------------------
 
 E64 = [0, 1, 2, MASK64, 0x7FFFFFFFFFFFFFFF, 0x8000000000000000,
        0xFFFFFFFF, 0x80000000, 0x7FFFFFFF, 0x100000000,
        0x123456789ABCDEF0, 0xFEDCBA9876543210]
-rng = random.Random(0x59414B5A)   # deterministic
+rng = random.Random(0x59414B5A)
 E64 += [rng.getrandbits(64) for _ in range(4)]
 
-CASES = []   # dicts: name, word, in_regs {idx:val}, in_ca, expects [(reg, val, mask)], exp_ca, exp_cr(nibble,pos), may_trap
-             # in_mem/exp_mem {addr: bytes} and in_fpr {freg: raw64 bits} /
-             # exp_fpr [(freg, raw64 bits)] back the FP update-form cases below
-             # (ctx->fpr is a double[32]; bits are compared as the raw
-             # IEEE-754 pattern via memcpy, not value).
+CASES = []
 
 def case(name, word, in_regs, expects, in_ca=None, exp_ca=None, exp_cr=None, may_trap=False,
          in_mem=None, exp_mem=None, in_fpr=None, exp_fpr=None):
@@ -280,19 +224,7 @@ def case(name, word, in_regs, expects, in_ca=None, exp_ca=None, exp_cr=None, may
                       in_mem=in_mem or {}, exp_mem=exp_mem or {},
                       in_fpr=in_fpr or {}, exp_fpr=exp_fpr or []))
 
-# VMX/vector cases: unlike the GPR CASES above, a vupk-family op reads/writes
-# ctx->vr[] directly (no memory load/store instructions needed to exercise
-# it), so a case here just seeds one input vector register's 16 raw bytes
-# and checks one output vector register's 16 raw bytes. The byte contents
-# are opaque here (chosen only to span sign/lane patterns); the ref_vupk*
-# functions above are what predict the lifter's actual output for a given
-# input, including its big-endian element read/write convention.
-#
-# va_reg/va_bytes and vc_reg/vc_bytes are optional: the original harness only
-# covered unary vupk* (one input, vB); binary ops (vcmpgtsw, vadduwm, ...)
-# also seed vA, and the VA-form vmaddfp also seeds vC. Kept at the end of the
-# signature so the existing unary vcase(...) call sites above are untouched.
-VCASES = []   # dicts: name, word, vb_reg, vb_bytes, vd_reg, exp_bytes, va_reg, va_bytes, vc_reg, vc_bytes
+VCASES = []
 
 def vcase(name, word, vb_reg, vb_bytes, vd_reg, exp_bytes,
           va_reg=None, va_bytes=None, vc_reg=None, vc_bytes=None):
@@ -301,14 +233,14 @@ def vcase(name, word, vb_reg, vb_bytes, vd_reg, exp_bytes,
                        va_reg=va_reg, va_bytes=va_bytes,
                        vc_reg=vc_reg, vc_bytes=vc_bytes))
 
-def be_w(vals):    # N x uint32 (big-endian lane values) -> 4N raw bytes
+def be_w(vals):
     return struct.pack(f">{len(vals)}I", *(v & 0xFFFFFFFF for v in vals))
-def be_h(vals):    # N x uint16 (big-endian lane values) -> 2N raw bytes
+def be_h(vals):
     return struct.pack(f">{len(vals)}H", *(v & 0xFFFF for v in vals))
-def be_f(vals):    # N x float (big-endian lane values) -> 4N raw bytes
+def be_f(vals):
     return struct.pack(f">{len(vals)}f", *vals)
 
-def va_form(xo6, vd, va, vb, vc):   # VA-form (vmaddfp/vnmsubfp/vsel/vperm/vsldoi/...)
+def va_form(xo6, vd, va, vb, vc):
     return (4 << 26) | (vd << 21) | (va << 16) | (vb << 11) | (vc << 6) | xo6
 
 def pairs(n=6):
@@ -320,9 +252,8 @@ def pairs(n=6):
     return ps
 
 def build_cases():
-    R = 3, 4, 5   # rt, ra, rb
+    R = 3, 4, 5
 
-    # --- XO-form arithmetic + carry family -------------------------------
     xo_ops = [
         ("add",    266, lambda a, b, ca: ref_add(a, b)),
         ("subf",    40, lambda a, b, ca: ref_subf(a, b)),
@@ -349,19 +280,6 @@ def build_cases():
                      {R[1]: a, R[2]: b}, [(R[0], v, mask)],
                      in_ca=ca, exp_ca=(cout if sets_ca else None))
 
-    # --- OE-form (oe=1) encodings of adde/subfe/mulhw/mulhwu ---------------
-    # This lifter does not track XER[OV]/[SO] for ANY OE-form op (see add,
-    # subf, mullw, addc, subfc above and addme/subfme/subfze below, none of
-    # which write OV either) -- so the OE-form must be lifted identically to
-    # the plain form: same result, same XER[CA] behavior where applicable.
-    # These cases encode the o/o. mnemonics (oe=1 in the XO-form word, per
-    # ppu_disasm's "if oe: mne += 'o'") and reuse the plain-form reference
-    # functions, since the expected result does not change with OE.
-    # mulhw/mulhwu have no architected OE form at all (PowerISA gives OE only
-    # to mullw/mulld); XO=75/11 with OE=1 is a reserved encoding that
-    # ppu_disasm's shared decode still labels mulhwo/mulhwuo, so the case
-    # here is a guard against the lifter mishandling that reserved encoding
-    # (e.g. falling through to the unhandled-opcode TODO stub).
     oe_ops = [
         ("adde",   138, lambda a, b, ca: ref_adde(a, b, ca), True, True),
         ("subfe",  136, lambda a, b, ca: ref_subfe(a, b, ca), True, True),
@@ -391,7 +309,6 @@ def build_cases():
         v, _ = ref_neg(a)
         case(f"neg a={a:#x}", xo_form(104, R[0], R[1], 0), {R[1]: a}, [(R[0], v, MASK64)])
 
-    # divides: defined-result vectors + UNDEFINED vectors as no-crash probes
     for name, xo, ref, m in [("divw", 491, ref_divw, MASK32), ("divwu", 459, ref_divwu, MASK32),
                              ("divd", 489, ref_divd, MASK64), ("divdu", 457, ref_divdu, MASK64)]:
         for a, b in [(100, 7), (MASK64, 3), (0x80000000, 0xFFFFFFFF),
@@ -404,7 +321,6 @@ def build_cases():
             case(f"{name} UNDEF a={a:#x} b={b:#x}", xo_form(xo, R[0], R[1], R[2]),
                  {R[1]: a, R[2]: b}, [], may_trap=True)
 
-    # --- X-form logicals / extends / counts ------------------------------
     for name, xo in [("and", 28), ("or", 444), ("xor", 316), ("nand", 476),
                      ("nor", 124), ("andc", 60), ("orc", 412), ("eqv", 284)]:
         for a, b in pairs(3):
@@ -421,7 +337,6 @@ def build_cases():
             case(f"{name} a={a:#x}", x_logic(xo, R[0], R[1], 0),
                  {R[0]: a}, [(R[1], v, MASK64)])
 
-    # --- shifts -----------------------------------------------------------
     for name, xo, ref in [("slw", 24, ref_slw), ("srw", 536, ref_srw),
                           ("sld", 27, ref_sld), ("srd", 539, ref_srd)]:
         for a in (0x1, 0x80000000, MASK32, 0x8000000000000000, MASK64):
@@ -446,10 +361,9 @@ def build_cases():
             case(f"sradi a={a:#x} sh={sh}", xs_sradi(R[0], R[1], sh),
                  {R[0]: a}, [(R[1], v, MASK64)], exp_ca=ca)
 
-    # --- rotates ----------------------------------------------------------
     for a in (0x12345678, 0x80000001, MASK32, 0xFEDCBA9876543210):
         for sh, mb, me in [(0, 0, 31), (1, 0, 31), (13, 5, 20), (16, 16, 31),
-                           (4, 28, 3), (31, 31, 0), (0, 31, 31)]:   # incl. mb>me wraps
+                           (4, 28, 3), (31, 31, 0), (0, 31, 31)]:
             v, _ = ref_rlwinm(a, sh, mb, me)
             case(f"rlwinm a={a:#x} sh={sh} mb={mb} me={me}",
                  m_form(21, R[0], R[1], sh, mb, me),
@@ -474,7 +388,6 @@ def build_cases():
                 case(f"rldimi a={a:#x} sh={sh} mb={mb}", md_form(3, R[0], R[1], sh, mb),
                      {R[0]: a, R[1]: r0}, [(R[1], v, MASK64)])
 
-    # --- D-form immediates (negative-immediate class) ---------------------
     for a in (0, 5, MASK64, 0x7FFFFFFFFFFFFFFF):
         for imm in (0, 1, -1, -4, 0x7FFF, -0x8000):
             v, _ = ref_addi(a, imm)
@@ -493,7 +406,6 @@ def build_cases():
             case(f"mulli a={a:#x} imm={imm}", d_form(7, R[0], R[1], imm),
                  {R[1]: a}, [(R[0], v, MASK64)])
 
-    # --- compares (CR field placement; cr0 and cr7) -----------------------
     for a, b in [(0, 0), (1, 2), (2, 1), (MASK64, 1), (0x80000000, 0x7FFFFFFF),
                  (0xFFFFFFFF80000000, 0x7FFFFFFF)]:
         for bf in (0, 7):
@@ -511,71 +423,42 @@ def build_cases():
         case(f"cmpwi a={a:#x}", cmpi_form(11, 0, 0, R[1], 1),
              {R[1]: a}, [], exp_cr=(cr_nibble_signed32(a, 1), 28))
 
-    # --- Rc=1 CR0 recording ------------------------------------------------
     for a, b in [(1, 1), (0, 0), (MASK64, 1), (0x8000000000000000, 0)]:
         v, _ = ref_add(a, b)
         nib = 8 if s64(v) < 0 else (4 if s64(v) > 0 else 2)
         case(f"add. a={a:#x} b={b:#x}", xo_form(266, R[0], R[1], R[2], rc=1),
              {R[1]: a, R[2]: b}, [(R[0], v, MASK64)], exp_cr=(nib, 28))
 
-    # --- FP D-form load/store-with-update RA writeback ---------------------
-    # lfsu/lfdu/stfsu/stfdu (opcodes 49/51/53/55) sat in the plain lfs/lfd/
-    # stfs/stfd handling, so the access happened but RA never got EA written
-    # back. PowerISA_V2.03_Final_Public.pdf p.129 (Load Floating-Point Single
-    # with Update), p.130 (...Double with Update), p.132 (Store
-    # Floating-Point Single with Update) and p.133 (...Double with Update)
-    # all give RA <- EA as part of the update form and all four state RA=0
-    # is itself an invalid instruction on these forms, so no rA=0 guard
-    # belongs in the update handlers.
     pi_bits = struct.unpack(">Q", struct.pack(">d", 3.14159265358979))[0]
-    fp_val = 2.5   # exactly representable in both float and double
+    fp_val = 2.5
     fp_double_bits = struct.unpack(">Q", struct.pack(">d", fp_val))[0]
     fp_float_bytes = struct.pack(">f", fp_val)
 
-    # lfsu f7,0x10(r3): single-load-with-update -- checks the widened double
-    # bits AND the updated RA.
     case("lfsu loaded single widened and ra writeback", d_form(49, 7, 3, 0x10),
          {3: 0x4000}, [(3, 0x4010, MASK64)],
          in_mem={0x4010: fp_float_bytes},
          exp_fpr=[(7, fp_double_bits)])
 
-    # lfdu f8,0x40(r4): checks BOTH the loaded double bits and the updated RA.
     case("lfdu loaded double and ra writeback", d_form(51, 8, 4, 0x40),
          {4: 0x5000}, [(4, 0x5040, MASK64)],
          in_mem={0x5040: struct.pack(">Q", pi_bits)},
          exp_fpr=[(8, pi_bits)])
 
-    # stfsu f9,0x30(r5): checks BOTH the stored float bytes and the updated RA.
     case("stfsu stored float and ra writeback", d_form(53, 9, 5, 0x30),
          {5: 0x6000}, [(5, 0x6030, MASK64)],
          in_fpr={9: fp_double_bits},
          exp_mem={0x6030: fp_float_bytes})
 
-    # stfdu f11,0x20(r12): double-store-with-update -- checks BOTH the stored
-    # double bytes and the updated RA.
     case("stfdu stored double and ra writeback", d_form(55, 11, 12, 0x20),
          {12: 0x8000}, [(12, 0x8020, MASK64)],
          in_fpr={11: pi_bits},
          exp_mem={0x8020: struct.pack(">Q", pi_bits)})
 
-    # lfd f10,0x20(r6): non-update regression check -- RA must be left alone.
     case("lfd non-update leaves ra untouched", d_form(50, 10, 6, 0x20),
          {6: 0x7000}, [(6, 0x7000, MASK64)],
          in_mem={0x7020: struct.pack(">Q", pi_bits)},
          exp_fpr=[(10, pi_bits)])
 
-    # --- Memory barriers -------------------------------------------------
-    # What a barrier is FOR cannot be tested here: this driver is one thread,
-    # and a fence's whole effect is on what a second one observes. What can be
-    # tested, and is what regressed the day these were no-ops, is the rest of
-    # it: that the barrier reaches the compiler as a real fence (checked as
-    # text by check_barrier_lowering below and asserted again against the
-    # generated driver in emit_c), that the fence COMPILES in the same
-    # translation unit as the lifted code on every host toolchain, that it
-    # runs, and that it changes no architected state on the way past. The last
-    # is the trap a hand-written fence macro falls into -- one that clobbers a
-    # scratch register, or that a compiler turns into a call with its own
-    # side effects, would corrupt the guest for the sake of ordering it.
     for nm, word in (("sync", sync_form(0)), ("lwsync", sync_form(1)),
                      ("ptesync", sync_form(2)), ("eieio", EIEIO_WORD),
                      ("isync", ISYNC_WORD)):
@@ -588,16 +471,13 @@ def build_cases():
 build_cases()
 
 def build_vcases():
-    VD, VB = 2, 5   # arbitrary distinct vector registers; VD != VB probes aliasing-free operation
+    VD, VB = 2, 5
 
-    # Input vectors span: all-positive, all-negative (top bit set in every
-    # lane), and a mixed-sign lane pattern, so each unpack's sign-extension
-    # is exercised on both a 0-extend and a 1-extend path per lane.
-    vb_h_pos = bytes(range(1, 17))                                    # 8 positive halfwords
-    vb_h_neg = bytes([0xFF, 0x80] * 8)                                 # 8 negative halfwords (-128)
+    vb_h_pos = bytes(range(1, 17))
+    vb_h_neg = bytes([0xFF, 0x80] * 8)
     vb_h_mix = struct.pack(">8h", 1, -1, 0x7FFF, -0x8000, 0, -2, 100, -100)
-    vb_b_pos = bytes(range(1, 17))                                     # 16 positive bytes
-    vb_b_neg = bytes([0x80] * 16)                                      # 16 negative bytes (-128)
+    vb_b_pos = bytes(range(1, 17))
+    vb_b_neg = bytes([0x80] * 16)
     vb_b_mix = bytes([1, 0xFF, 0x7F, 0x80, 0, 2, 0xFE, 3,
                       0x81, 0x01, 0x7E, 0x00, 0xFF, 0x02, 0x80, 0x10])
 
@@ -608,61 +488,24 @@ def build_vcases():
         vcase(f"vupkhsb {label}", vx_form(526, VD, 0, VB), VB, vb, VD, ref_vupkhsb(vb))
         vcase(f"vupklsb {label}", vx_form(654, VD, 0, VB), VB, vb, VD, ref_vupklsb(vb))
 
-    # --- VMX per-lane byte-order discrimination cases -----------------------
-    # (ppu: vmx element wise ops read big endian lanes fix). Each pair below
-    # is chosen so the PRE-FIX (native-cast) lifter and the POST-FIX
-    # (vrh/vrw/vrf accessor) lifter compute DIFFERENT results -- i.e. these
-    # fail on a revert of just the lifter change (see the discrimination
-    # count in the PR description), unlike an equality compare or a splat,
-    # where a byte-swap is either invariant or cancels out.
 
-    # vcmpgtsw: true 256 > 2, but a native (unswapped) 32-bit read sees BE
-    # bytes 00 00 01 00 / 00 00 00 02 as 0x00010000 / 0x02000000 -- 65536 >
-    # 33554432 is false. This is the exact audit example. Lanes 1-3 are a
-    # sanity/equal-value check (not part of the discriminating lane). xo=902
-    # with Rc=0 (bit 10 of the 11-bit xo field clear) decodes as "vcmpgtsw"
-    # with no dot -- the case name below must match exactly.
     vcase("vcmpgtsw mixed", vx_form(902, 2, 0, 1),
           1, be_w([2, 10, 1, 7]), 2, be_w([0xFFFFFFFF, 0, 0, 0]),
           va_reg=0, va_bytes=be_w([256, 10, 0, 7]))
 
-    # vcmpgtsh: same 256-vs-2 audit example at halfword width (native 16-bit
-    # read of BE bytes 01 00 / 00 02 sees 0x0001 / 0x0200 -- 1 > 512 is false).
     vcase("vcmpgtsh mixed", vx_form(838, 2, 0, 1),
           1, be_h([2, 10, 1, 7, 5, 5, 5, 5]), 2, be_h([0xFFFF, 0, 0, 0, 0, 0, 0, 0]),
           va_reg=0, va_bytes=be_h([256, 10, 0, 7, 5, 5, 5, 5]))
 
-    # vadduwm: values straddling a byte boundary (0xFF + 0x01 = 0x100). A
-    # native (unswapped) add sees BE bytes 00 00 00 FF / 00 00 00 01 as
-    # 0xFF000000 / 0x01000000; that sum overflows 32 bits and wraps to 0,
-    # not 0x100. (0x100+0x100 alone does NOT discriminate here -- neither
-    # representation carries across a byte boundary for that pair, so it is
-    # included only as a non-discriminating sanity lane; 0xFFFFFFFF+1 is a
-    # second, stronger discriminating lane: true result 0, native-read result
-    # 0xFFFFFF00.)
     vcase("vadduwm canary", vx_form(128, 2, 0, 1),
           1, be_w([0x01, 0x100, 1, 0]), 2, be_w([0x100, 0x200, 0, 0]),
           va_reg=0, va_bytes=be_w([0xFF, 0x100, 0xFFFFFFFF, 0]))
 
-    # vmaddfp: vD = vA*vC + vB with exact 2.0-family values (2.0*3.0+1.0=7.0).
-    # A native float* cast on raw-BE storage reinterprets 2.0's bytes
-    # (40 00 00 00) as a subnormal near zero, so the pre-fix product/sum is
-    # nowhere near 7.0. Raw encoding fields: RA=vA (mult. operand 1, "va"
-    # here), RB=vC (mult. operand 2 -- the mandatory vb_reg/vb_bytes below is
-    # actually the ADD operand vB; RC=vC is the optional vc_reg/vc_bytes),
-    # per ppu_lifter.py's vmaddfp comment ("operand order is vD, vA, vC, vB").
     vcase("vmaddfp canary", va_form(46, 2, 0, 1, 3),
           1, be_f([1.0, 1.0, 1.0, 1.0]), 2, be_f([7.0, 7.0, 7.0, 7.0]),
           va_reg=0, va_bytes=be_f([2.0, 2.0, 2.0, 2.0]),
           vc_reg=3, vc_bytes=be_f([3.0, 3.0, 3.0, 3.0]))
 
-    # vspltw/vsplth of a multi-byte value: included per the audit's requested
-    # coverage, but these do NOT discriminate the bug (see ppu_lifter.py's
-    # comment on vspltw) -- a splat only copies an existing lane's raw bytes
-    # to other lanes with no arithmetic in between, so reading and writing
-    # with the same (even wrong) reinterpretation cancels out and the
-    # transferred bytes are correct either way. Kept green across the
-    # revert-and-recount step as a deliberate non-discriminating control.
     vcase("vspltw w=1 canary", vx_form(652, 2, 1, 5),
           5, be_w([0x12345678, 0x9ABCDEF0, 0x11111111, 0x22222222]),
           2, be_w([0x9ABCDEF0] * 4))
@@ -670,10 +513,6 @@ def build_vcases():
           5, be_h([0x1234, 0x5678, 0x9ABC, 0xDEF0, 0x1111, 0x2222, 0x3333, 0x4444]),
           2, be_h([0xDEF0] * 8))
 
-    # vmaxfp / vminfp read host floats until GH3 needed them (292 sites, every
-    # Havok AABB). 1.0 vs 2.0 discriminates: native reads of the BE bytes are
-    # denormals ordered the other way round. The NaN and +-0 lanes pin the VMX
-    # rules (NaN operand propagates; max prefers +0, min prefers -0).
     NAN = struct.unpack(">f", b"\x7f\xc0\x00\x00")[0]
     vcase("vmaxfp canary", vx_form(1034, 2, 0, 1),
           1, be_f([2.0, -2.0, 5.0, -0.0]), 2, be_f([2.0, -1.0, NAN, 0.0]),
@@ -681,12 +520,10 @@ def build_vcases():
     vcase("vminfp canary", vx_form(1098, 2, 0, 1),
           1, be_f([2.0, -2.0, NAN, -0.0]), 2, be_f([1.0, -2.0, NAN, -0.0]),
           va_reg=0, va_bytes=be_f([1.0, -1.0, 5.0, 0.0]))
-    # vrfin/vrfiz had no lowering (a TODO comment: vD unchanged). Ties to even.
     vcase("vrfin", vx_form(522, 2, 0, 1),
           1, be_f([1.5, 2.5, -1.5, 2.4]), 2, be_f([2.0, 2.0, -2.0, 2.0]))
     vcase("vrfiz", vx_form(586, 2, 0, 1),
           1, be_f([1.5, 2.5, -1.5, -2.7]), 2, be_f([1.0, 2.0, -1.0, -2.0]))
-    # vcmpbfp: lane 0 in bounds, 1 above (+b), 2 below (-b), 3 NaN (both).
     vcase("vcmpbfp", vx_form(966, 2, 0, 1),
           1, be_f([2.0, 2.0, 2.0, 2.0]),
           2, be_w([0, 0x80000000, 0x40000000, 0xC0000000]),
@@ -694,13 +531,6 @@ def build_vcases():
 
 build_vcases()
 
-# ---------------------------------------------------------------------------
-# Decode/lift-only checks: FPSCR bit ops (mtfsb0/mtfsb1/mtfsfi) and the
-# VRSAVE mfspr/mtspr pair, verified directly against ppu_disasm.decode and
-# PPULifter._translate. FPSCR and VRSAVE are modelled in the context: the
-# FPSCR moves go through ppu_mtfsb/ppu_mtfsf, and VRSAVE reads back what was
-# written to it.
-# ---------------------------------------------------------------------------
 
 def check_decode_and_lift():
     lifter = PPULifter()
@@ -742,19 +572,8 @@ def check_decode_and_lift():
     print(f"[fpscr/vrsave] {n_ok} checks passed, {fails[0]} FAILED")
     return fails[0] == 0
 
-# ---------------------------------------------------------------------------
-# Memory barriers: the decode and the fence each one lowers to.
-#
-# The CASES driver runs a barrier and checks it disturbs nothing, which is
-# necessary and nowhere near sufficient -- a barrier lowered back to a no-op
-# passes every one of those checks. What says the ordering is really there is
-# the text: WHICH fence each mnemonic emits, and that the three XO-598 forms
-# are told apart before the lifter ever sees them. sync and lwsync are one bit
-# apart in the encoding and a whole barrier apart in what they cost.
-# ---------------------------------------------------------------------------
 
 BARRIERS = [
-    # word,            mnemonic,  the fence it must lower to
     (sync_form(0),     "sync",    "PPU_FENCE(seq_cst)"),
     (sync_form(1),     "lwsync",  "PPU_FENCE(acq_rel)"),
     (sync_form(2),     "ptesync", "PPU_FENCE(seq_cst)"),
@@ -783,9 +602,6 @@ def check_barrier_lowering():
             continue
         print(f"[barriers] ok {want_mn}: {insn.mnemonic} -> {code}")
 
-    # The macro itself has to reach the lifted code, and it has to carry both
-    # spellings: the split output is C++, --single-file output and the smoke
-    # title are C.
     wanted = ("define PPU_FENCE(o)", "std::atomic_thread_fence",
               "atomic_thread_fence(memory_order_##o)", "<atomic>",
               "<stdatomic.h>")
@@ -798,28 +614,16 @@ def check_barrier_lowering():
     print(f"[barriers] {n - fails} checks passed, {fails} FAILED")
     return fails == 0
 
-# ---------------------------------------------------------------------------
-# C driver generation
-# ---------------------------------------------------------------------------
 
 def emit_c(path):
     lifter = PPULifter()
     dummy = LiftedFunction(name="conf", start_addr=0, end_addr=0x10000)
     pre = lifter._preamble_lines()
-    # Replace the generated-header include with the real (small) context
-    # header. PPU_FENCE goes in behind it, taken from the lifter rather than
-    # written out again: this driver is the one consumer of lifted statements
-    # that does NOT include a generated ppu_recomp.h, so it would otherwise be
-    # the one place where the fence could be spelt differently from the code
-    # under test, which is the same as not testing it.
     pre[0] = pre[0].replace('#include "ppu_recomp.h"',
                             '#include "ppu_context.h"\n#include <stdint.h>\n'
                             + FENCE_PREAMBLE)
     out = ["/* Auto-generated by tools/test_ppu_lift.py -- conformance driver. */"]
     out.append("#define _CRT_SECURE_NO_WARNINGS")
-    # The driver's vm_read*/vm_write* are its own functions on g_vm_stub (below),
-    # and its statements run outside a lifted function, so the preamble must
-    # not route them to the header's inline paths and PPU_MM_SNAP's copy.
     out.append("#define PPU_NO_INLINE_LOADS")
     out.extend(pre)
     out.append("""
@@ -1034,9 +838,6 @@ extern "C" void vm_write64(uint64_t a, uint64_t v) { v = CONF_BSWAP64(v); memcpy
                     f'check_vr("{nm}", (const uint8_t*)&ctx->vr[{c["vd_reg"]}], _want); }}')
         out.append("    }")
 
-    # AltiVec element loads/stores: every byte offset exercises lane selection
-    # and natural alignment, including RA=0 with a deliberately nonzero r0.
-    # Loads leave the other lanes undefined, so compare only the selected bytes.
     n_vector_memory = 0
     for stem, load_xo, store_xo, width in (("b", 7, 135, 1),
                                          ("h", 39, 167, 2),
@@ -1089,11 +890,6 @@ extern "C" void vm_write64(uint64_t a, uint64_t v) { v = CONF_BSWAP64(v); memcpy
     print(f"wrote {path}: {n_total - n_encoding_skipped} cases "
           f"({n_encoding_skipped} skipped at generation)")
 
-    # A case whose lifted code starts with a comment is dropped above with a
-    # note on stdout, which is how a barrier that went back to being a no-op
-    # would leave this suite green: nothing would fail, there would just be
-    # five fewer cases and a line nobody reads. So say out loud how many
-    # fences reached the driver, and make it an error if any is missing.
     n_fences = text.count("PPU_FENCE(seq_cst)") + text.count("PPU_FENCE(acq_rel)") \
              + text.count("PPU_FENCE(release)") + text.count("PPU_FENCE(acquire)")
     want_fences = len(BARRIERS)
@@ -1105,7 +901,6 @@ extern "C" void vm_write64(uint64_t a, uint64_t v) { v = CONF_BSWAP64(v); memcpy
         return False
     return True
 
-# ---------------------------------------------------------------------------
 
 def main():
     ap = argparse.ArgumentParser()
@@ -1116,7 +911,7 @@ def main():
     decode_ok = check_barrier_lowering() and decode_ok
 
     os.makedirs(os.path.join(ROOT, "scratch"), exist_ok=True)
-    cpath = os.path.join(ROOT, "scratch", "ppu_conformance.cpp")   # preamble is C++ (extern "C")
+    cpath = os.path.join(ROOT, "scratch", "ppu_conformance.cpp")
     epath = os.path.join(ROOT, "scratch", "ppu_conformance.exe"
                          if os.name == "nt" else "ppu_conformance")
     decode_ok = emit_c(cpath) and decode_ok
@@ -1125,17 +920,7 @@ def main():
 
     log = os.path.join(ROOT, "scratch", "ppu_conformance.log")
 
-    # The generated driver has to be COMPILED AND RUN to be worth anything:
-    # decoding and lifting alone never executes a single lifted statement, and
-    # for a long time a missing compiler silently reduced this suite to that.
-    # On Windows cl is usually not on PATH, so self-launch vcvars; everywhere
-    # else use the system compiler directly, so CI runs the same 1300+ checks
-    # on macOS and Linux rather than only on a developer's Windows box.
     if os.name == "nt":
-        # Located rather than hardcoded: a literal version here silently reduced
-        # this suite to compiling nothing on any machine with a different Visual
-        # Studio installed, which is exactly the green-tick-meaning-nothing this
-        # file's own comments warn about.
         from msvc_env import find_vcvars
         vcvars = find_vcvars() or ""
         bat = os.path.join(ROOT, "scratch", "ppu_conformance_run.bat")
@@ -1176,12 +961,6 @@ def main():
         if "[ppu-conformance]" in ln or "error C" in ln or "error:" in ln:
             print(ln)
     if rc == 2:
-        # Distinguish "no compiler on PATH" from "the generated code does not
-        # compile". Both used to print the same COMPILE FAILED, so a run without
-        # a developer prompt looked like an environment hiccup -- and it silently
-        # skipped the half of this test that RUNS the lifted code. Fifteen real
-        # VMX conformance failures hid behind that for as long as it took someone
-        # to run it from a vcvars shell.
         no_compiler = ("is not recognized as an internal or external command" in tail
                        or "no C++ compiler found" in tail)
         if no_compiler:
@@ -1189,9 +968,6 @@ def main():
                   "NOT compiled or run, so the conformance checks above did not",
                   "execute. Install a compiler (or run from a Visual Studio",
                   "developer prompt) for real coverage.")
-            # Under CI a skip is a FALSE GREEN: the whole point of the run is to
-            # execute the lifted code, and a tick that means "compiled nothing"
-            # is worse than a red one. Locally, staying quiet is reasonable.
             if os.environ.get("CI"):
                 print("...and this is CI, where skipping the only test that runs",
                       "lifted code is a failure, not a pass.")

@@ -1,38 +1,4 @@
 #!/usr/bin/env py -3
-"""disasm_audit.py - PPU decoder cross-check: tools/ppu_disasm.py vs Capstone.
-
-Purpose: catch the crnand/crnor bug class (decode-table swaps/scrambles --
-the most expensive bug class in project history) EXHAUSTIVELY, in one run,
-by decoding every 4-byte word of the game's executable segments with two
-independent decoders and diffing the mnemonics.
-
-Decoders:
-  (a) ours   -- tools/ppu_disasm.py's decode()
-  (b) oracle -- Capstone, CS_ARCH_PPC + CS_MODE_64 + CS_MODE_BIG_ENDIAN
-
-Capstone is an OPTIONAL, DEV-ONLY dependency (`py -3 -m pip install
-capstone`). It must NEVER be imported by runtime/lifter code -- this script
-is the only place in the repo that touches it, and it degrades to a one-line
-install hint if the import fails (never a crash or a silent skip).
-
-Scope (v1): MNEMONIC comparison only. Operand normalization is a planned v2.
-Known alias classes -- where Capstone's *simplified* PowerPC
-mnemonic legitimately differs from our *canonical* mnemonic for the exact
-same encoding -- are handled via an explicit WHITELIST table below, each
-entry MEASURED against a hand-built encoding + both decoders (see the
-comments next to ALIAS_WHITELIST). Whitelisted pairs are reported separately
-as INFO, never counted as mismatches.
-
-Usage:
-    py -3 tools\\disasm_audit.py game\\EBOOT.elf [--limit N] [--top N]
-                                 [--dump-mismatches FILE]
-    py -3 tools\\disasm_audit.py --self-test        (seeded-bug harness)
-
-Exit code: 0 if residual (non-whitelisted) mismatch count is 0, else 1.
-Always runs to completion and prints the full report either way -- the exit
-code is a machine-checkable summary, not a reason to stop early.
-"""
-
 import argparse
 import os
 import struct
@@ -40,16 +6,11 @@ import sys
 from collections import Counter, defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from elf_parser import ELFFile, PT_LOAD  # noqa: E402
-from ppu_disasm import decode  # noqa: E402
+from elf_parser import ELFFile, PT_LOAD
+from ppu_disasm import decode
 
 
 def _capstone_or_die():
-    """Import capstone or exit with a one-line install hint.
-
-    Capstone is sanctioned as an OPTIONAL dev-only dependency for THIS
-    script only. It must never be added to runtime/lifter requirements.
-    """
     try:
         import capstone
         return capstone
@@ -59,15 +20,6 @@ def _capstone_or_die():
         sys.exit(1)
 
 
-# ---------------------------------------------------------------------------
-# Alias whitelist
-#
-# Each entry: (ours_mnemonic, capstone_mnemonic) -> one-line reason.
-# Every pair here was MEASURED directly: a hand-built encoding was fed to
-# BOTH decode() (tools/ppu_disasm.py) and Capstone (CS_ARCH_PPC, CS_MODE_64
-# + CS_MODE_BIG_ENDIAN, detail=False) and the mnemonics recorded verbatim.
-# This is not a guess list -- extend it only after doing the same probe.
-# ---------------------------------------------------------------------------
 ALIAS_WHITELIST = {
     ("or", "mr"):
         "or rD,rA,rA (Rc=0) -- Capstone simplifies register-move form to "
@@ -152,70 +104,23 @@ ALIAS_WHITELIST = {
         "word in game/EBOOT.elf).",
 }
 
-# ---------------------------------------------------------------------------
-# Alias RULES (pattern-based, not literal pairs)
-#
-# 1. Branch-prediction hint suffix ('+'/'-'): the PowerPC BO field's "at"
-#    hint bits (Book I p.20 Fig.22: at=10 not-taken '-', at=11 taken '+')
-#    are a pure annotation -- tools/ppu_disasm.py never emits them, Capstone
-#    always does when at != 00. MEASURED across many real base mnemonics
-#    (blt/blt+, bdz/bdz-, beq/beq-, bdnz/bdnz+, bsola/bsola+, bdzla/bdzla-,
-#    ...); a literal per-mnemonic whitelist would be an unbounded list, so
-#    this is a suffix RULE instead: capstone_mn in (ours_mn+'+', ours_mn+'-').
-#
-# 2. Friendly condition-name vs raw bit-test name on COMBINED decrement+
-#    condition branches (bdnz/bdz + true/false condition): ours spells the
-#    derived friendly name (bdnzge, bdnzle, bdnzne, bdnzns for the "false"
-#    tests; bdnzlt/bdnzgt/bdnzeq/bdnzso for the "true" tests, and the bdz
-#    analogs), Capstone keeps the raw bdnzt/bdnzf/bdzt/bdzf root + the CR
-#    bit name as an operand (e.g. bdnzf 'lt'). MEASURED at BO=0..3 (dnz+
-#    false) and BO=8..11 (dnz+true), and the bdz (BO=2/3, 10/11) analogs.
-#    Rule: capstone_mn in ('bdnzt','bdnzf','bdzt','bdzf') and
-#          ours_mn startswith the matching 'bdnz'/'bdz' root.
-#
-# 3. tdi/twi TO-field friendly names: ours always prints the raw numeric TO
-#    field (tdi TO,rA,SI); Capstone maps common TO values to friendly names
-#    (tdlgti = TO=1 "logical greater than immediate", tdlti = TO=16
-#    "logical less than immediate", etc. -- the full TO table has ~10
-#    named combinations). MEASURED at 0x0110D834 (TO=1 -> tdlgti) and
-#    0x0110C308 (TO=16 -> tdlti); BOTH sample sites are OUTSIDE any
-#    functions.json range (confirmed via bisect over functions.json), i.e.
-#    these are very likely data-in-.text words being guessed at by both
-#    decoders, not real trap instructions -- flagged as INFO either way
-#    since the mnemonic-alias relationship itself is real and documented
-#    (see PPC_Vers202_Book1_public.pdf's trap extended-mnemonic table).
-#    Rule: ours_mn in ('tdi','twi') and capstone_mn startswith the
-#          corresponding 't'+('d'|'w') root.
-# ---------------------------------------------------------------------------
 
 _BDNZ_BDZ_FRIENDLY = {
     "bdnzt": "bdnz", "bdnzf": "bdnz", "bdzt": "bdz", "bdzf": "bdz",
 }
 
-# LK/AA suffix combinations that can trail the bdnz(t|f)/bdz(t|f) root:
-# '' (plain), 'l' (LK=1), 'a' (AA=1), 'la' (LK=1,AA=1) -- MEASURED across
-# the real mismatch set (e.g. bdnzgela/bdnzfla, bdzsol/bdztl, bdnzlea/
-# bdnzfa all appear in game/EBOOT.elf), same suffix on both sides.
 _BRANCH_LKAA_SUFFIXES = ("", "l", "a", "la")
 
 _TRAP_ROOTS = {"tdi": "td", "twi": "tw"}
 
 
 def is_whitelisted_by_rule(ours_mn: str, cs_mn: str) -> str | None:
-    """Return a reason string if (ours_mn, cs_mn) matches a RULE-based
-    alias class (not a literal-pair lookup); None if no rule matches.
-    """
-    # Rule 1: branch-hint suffix
     if cs_mn == ours_mn + "+" or cs_mn == ours_mn + "-":
         return ("branch-prediction hint suffix ('+'=likely taken, "
                 "'-'=likely not taken, Book I p.20 Fig.22 'at' bits) -- "
                 "ours never emits the hint suffix, Capstone always does "
                 "when at != 0b00; same base mnemonic otherwise.")
 
-    # Rule 2: bdnz/bdz friendly-name vs raw bit-test name, optionally with
-    # a trailing LK/AA suffix ('l'/'a'/'la') on BOTH sides (e.g.
-    # ours='bdnzgela' vs capstone='bdnzfla': strip 'la', roots become
-    # 'bdnzge' vs 'bdnzf', which then matches the bare rule below).
     for suf in _BRANCH_LKAA_SUFFIXES:
         if suf and not (ours_mn.endswith(suf) and cs_mn.endswith(suf)):
             continue
@@ -232,7 +137,6 @@ def is_whitelisted_by_rule(ours_mn: str, cs_mn: str) -> str | None:
                     "CR bit name as an operand -- same instruction, "
                     "naming-convention difference only.")
 
-    # Rule 3: tdi/twi TO-field friendly names
     trap_root = _TRAP_ROOTS.get(ours_mn)
     if trap_root is not None and cs_mn.startswith(trap_root):
         return ("trap TO-field friendly name: ours prints the raw numeric "
@@ -246,20 +150,10 @@ def is_whitelisted_by_rule(ours_mn: str, cs_mn: str) -> str | None:
     return None
 
 
-# Mnemonic PAIRS that are cheap to sanity-check are never expected to
-# mismatch at all (sanity gate in the acceptance section) -- kept as a
-# constant so --self-test and the sanity check share one list.
 SANITY_COMMON_OPS = ("add", "lwz", "bl", "stw")
 
 
 def executable_words(elf_path: str):
-    """Yield (addr, word32) for every 4-byte word of every PF_X PT_LOAD
-    segment in *elf_path*, reusing tools/elf_parser.py.
-
-    Big-endian is asserted (PS3 PPU binaries are always big-endian); if a
-    file somehow parses as little-endian this is surfaced, not silently
-    reinterpreted.
-    """
     elf = ELFFile(elf_path)
     elf.load()
     if not elf.elf_header.big_endian:
@@ -286,13 +180,11 @@ def executable_words(elf_path: str):
 
 
 def decode_ours(word: int, addr: int) -> str:
-    """Return ONLY the mnemonic from tools/ppu_disasm.py's decode()."""
     insn = decode(word, addr)
     return insn.mnemonic
 
 
 def make_capstone_decoder():
-    """Return a callable(word, addr) -> mnemonic-or-None using Capstone."""
     capstone = _capstone_or_die()
     md = capstone.Cs(capstone.CS_ARCH_PPC,
                       capstone.CS_MODE_64 + capstone.CS_MODE_BIG_ENDIAN)
@@ -302,18 +194,13 @@ def make_capstone_decoder():
         data = struct.pack(">I", word)
         insns = list(md.disasm(data, addr))
         if not insns:
-            return None  # capstone refused to decode (illegal/unknown word)
+            return None
         return insns[0].mnemonic
 
     return _decode
 
 
 def classify_pair(ours_mn: str, cs_mn: str):
-    """Return (is_whitelisted, reason_or_None) for a mismatching pair,
-    checking the literal ALIAS_WHITELIST table first, then the pattern
-    RULES (is_whitelisted_by_rule). reason_or_None is only set when
-    is_whitelisted is True.
-    """
     pair = (ours_mn, cs_mn)
     if pair in ALIAS_WHITELIST:
         return True, ALIAS_WHITELIST[pair]
@@ -324,22 +211,6 @@ def classify_pair(ours_mn: str, cs_mn: str):
 
 
 def run_audit(elf_path: str, limit: int = 0):
-    """Decode every word with both decoders; return (total, mismatch_counter,
-    whitelist_counter, mismatch_samples, whitelist_reasons, none_count,
-    none_samples) where:
-      mismatch_counter: Counter[(ours_mn, cs_mn)] for NON-whitelisted pairs
-      whitelist_counter: Counter[(ours_mn, cs_mn)] for whitelisted pairs
-        (literal-table AND rule-based combined; rule-based pairs are the
-        ones not already keys of ALIAS_WHITELIST)
-      mismatch_samples: dict[(ours_mn, cs_mn)] -> list[addr] (up to 3)
-      whitelist_reasons: dict[(ours_mn, cs_mn)] -> reason string (needed
-        because rule-based reasons aren't in the static ALIAS_WHITELIST
-        dict the way literal-pair reasons are)
-      none_count: words Capstone refused to decode at all (reported, not
-                  silently dropped -- these are NOT counted as mismatches
-                  since there is no oracle mnemonic to pair against, but a
-                  large none_count would itself be a red flag worth noting)
-    """
     cs_decode = make_capstone_decoder()
 
     total = 0
@@ -438,16 +309,6 @@ def print_report(total, mismatch_counter, whitelist_counter,
     return residual
 
 
-# ---------------------------------------------------------------------------
-# Seeded self-test (acceptance item: seeded-bug self-test)
-#
-# This NEVER touches the real tools/ppu_disasm.py. It builds a corrupted
-# COPY of decode() in-process (monkeypatching a local copy's dispatch, not
-# the imported module) by wrapping decode_ours() with a mnemonic swap
-# table, exactly emulating "swap two mnemonics" the way the historical
-# crnand/crnor bug did.
-# ---------------------------------------------------------------------------
-
 SELF_TEST_SWAP = {"crnor": "crnand", "crnand": "crnor"}
 
 
@@ -457,10 +318,6 @@ def decode_ours_corrupted(word: int, addr: int) -> str:
 
 
 def run_self_test(elf_path: str, limit: int):
-    """Re-run the audit with a corrupted ours-side decoder (crnor/crnand
-    swapped, mirroring the real historical bug) and confirm the pair
-    surfaces at the top of the mismatch report.
-    """
     print("disasm_audit --self-test: seeding a crnor/crnand mnemonic swap "
           "in an IN-PROCESS COPY of the decode call (tools/ppu_disasm.py "
           "on disk is untouched)")
@@ -495,9 +352,6 @@ def run_self_test(elf_path: str, limit: int):
         print(f"  {count:8d}  ours={pair[0]!r:14s} capstone={pair[1]!r:14s}"
               f"  samples: {addrs}")
 
-    # A swapped crnor/crnand should surface as (crnor, crnand) and/or
-    # (crnand, crnor) pairs (crnand has no simplification alias against
-    # distinct operands -- confirmed above) at or near the top.
     seeded_pairs_present = any(
         pair[0] in SELF_TEST_SWAP for pair, _ in top
     )

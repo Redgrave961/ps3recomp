@@ -1,20 +1,3 @@
-/*
- * The SPU decrementer counts down at the PS3 timebase from the host clock
- * (runtime/spu/spu_channels.c, SPU_WrDec / SPU_RdDec and spu_host_ns).
- *
- * SPU code times its waits with it, so this checks what such code relies on:
- * after a write it reads back the written value less the elapsed time, it
- * never counts up, it tracks a known sleep at 79.8 MHz, and it moves in steps
- * well under a microsecond (80 ticks) -- the host clock behind it is read at
- * nanosecond resolution on every platform this test runs on.
- *
- * spu_channels.c is compiled in rather than linked, as in
- * test_spu_taskset_wake.c, whose build line this test shares (with this file
- * in place of that one); tools/test_spu_decrementer.py runs it.
- *
- * Exit code: 0 if all passed, 1 if any failed.
- */
-
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -49,12 +32,10 @@ int main(void)
 {
     spu_context_init(&g_spu, 0);
 
-    /* Read back just after a write: the written value, less a little. */
     wrdec(0x80000000u);
     uint32_t d = 0x80000000u - rddec();
-    CHECK(d < SPU_DECREMENTER_HZ / 100u);          /* under 10 ms */
+    CHECK(d < SPU_DECREMENTER_HZ / 100u);
 
-    /* Never counts up; and its smallest step is far below 80 ticks. */
     uint32_t prev = rddec(), min_step = ~0u;
     for (int i = 0; i < 2000000 && min_step > 1u; i++) {
         uint32_t cur = rddec();
@@ -65,7 +46,6 @@ int main(void)
     printf("smallest decrementer step: %u ticks\n", min_step);
     CHECK(min_step < 40u);
 
-    /* Tracks a sleep: 50 ms is 3.99 M ticks. Allow for an oversleep. */
     wrdec(0xFFFFFFFFu);
     const uint32_t a = rddec();
     struct timespec ts = { 0, 50 * 1000000L };
@@ -81,11 +61,6 @@ int main(void)
     return g_fail ? 1 : 0;
 }
 
-/* ---------------------------------------------------------------------------
- * The runtime beyond the SPU channel layer, stubbed as in
- * test_spu_lockline_peer.c. None of it is on the path this test drives; the
- * clock only feeds the WAIT_SIGNAL log line.
- * -----------------------------------------------------------------------*/
 void ps3_ww_report_inline(uint32_t a, uint64_t v, int w)
 {
     (void)a; (void)v; (void)w;

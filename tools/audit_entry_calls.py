@@ -1,16 +1,3 @@
-"""Find HLE entry points that call ANOTHER HLE entry point.
-
-An entry point translates its pointer arguments as guest EAs. Calling one from
-inside the library hands it host pointers -- a local buffer, the address of a
-stack variable -- and it translates them a second time, writing somewhere else
-entirely. cellHttpUtilFormUrlEncode did exactly this to cellHttpUtilEscapeUri.
-
-Not every hit is a bug: a forwarding wrapper that passes its OWN untranslated
-guest arguments straight through is fine. The ones to look at are calls that mix
-in a local address (&x) or a buffer the caller made.
-
-    python tools/audit_entry_calls.py libs/
-"""
 import os
 import re
 import sys
@@ -29,7 +16,6 @@ def main():
         for dirpath, _d, fs in os.walk(root):
             files += [os.path.join(dirpath, f) for f in sorted(fs) if f.endswith('.c')]
 
-    # every entry point defined anywhere in the tree
     entries = set()
     bodies = {}
     for path in files:
@@ -52,11 +38,8 @@ def main():
                 if callee == name or callee not in entries:
                     continue
                 why = []
-                # A host address the caller made: the callee will translate it.
                 if re.search(r'(?<![\w])&\w', args):
                     why.append('passes a local address')
-                # A parameter the caller ALREADY translated, handed to a callee
-                # that translates again -- vm_base gets added twice.
                 for p in mine:
                     if re.search(r'(?<![\w.>])' + re.escape(p) + r'(?![\w])', args) \
                        and A.param_is_translated(body, p):

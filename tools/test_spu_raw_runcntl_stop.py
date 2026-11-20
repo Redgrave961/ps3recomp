@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""SPU_RunCntl = 0 stops a raw SPU parked in a channel wait; the next start runs the new program."""
 import os
 import subprocess
 import tempfile

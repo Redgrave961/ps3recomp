@@ -1,7 +1,3 @@
-/*
- * ps3recomp - Semaphore syscalls
- */
-
 #ifndef SYS_SEMAPHORE_H
 #define SYS_SEMAPHORE_H
 
@@ -44,4 +40,4 @@ void sys_semaphore_init(lv2_syscall_table* tbl);
 }
 #endif
 
-#endif /* SYS_SEMAPHORE_H */
+#endif

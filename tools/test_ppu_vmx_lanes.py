@@ -1,18 +1,4 @@
 #!/usr/bin/env python3
-"""Regression test: ten VMX integer ops use big-endian lane order.
-
-ctx->vr holds each register byte-reversed (host byte j = guest byte 15 - j), so
-an op that reads halfword or word VALUES must take each lane in mirrored order. vmulouh,
-vmsumshm, vadduws, vadduhs and vpkuwum read lanes through int16_t*/uint32_t*
-casts (byte-reversed lanes on a little-endian host); vmsumuhm, vsubuws,
-vpkswss, vsrb and vsrab had no lowering and were emitted as "/* TODO */".
-
-For each op this test lifts one instruction, compiles the emitted C with the
-lifter's own preamble, runs it on random inputs (plus edge values) and
-compares vD with an independent Python model of the instruction as the
-AltiVec PEM defines it. It needs a host C compiler (under CI=1 a missing one
-fails instead of skipping).
-"""
 from __future__ import annotations
 
 import importlib.util
@@ -42,9 +28,6 @@ def _load(name, rel_path):
 L = _load("ppu_lifter", "tools/ppu_lifter.py")
 
 
-# The instruction words, for the fixed operands check_op uses (vD=4, vA=1,
-# vB=2, vC=3): the lifter routes VMX by raw XO (#286), so the test must hand
-# it the same word the disassembler would.
 XO = {"vmulouh": 72, "vadduws": 640, "vsubuws": 1664, "vadduhs": 576,
       "vpkuwum": 78, "vpkswss": 462, "vsrb": 516, "vsrab": 772,
       "vmsumuhm": (3 << 6) | 38, "vmsumshm": (3 << 6) | 40}
@@ -58,7 +41,6 @@ def _lift_one(mnemonic, operands):
     return "\n".join(ln for ln in func.body_lines if "return" not in ln)
 
 
-# ---- reference model (AltiVec PEM), on big-endian byte strings -------------
 def h(v, signed=False):
     return list(struct.unpack(">8h" if signed else ">8H", v))
 
@@ -129,7 +111,7 @@ def check_op(cc, mn, rng):
     vecs = _vectors(rng)
     src = "\n".join([
         "#include <stdint.h>", "#include <string.h>", "#include <stdio.h>",
-        "#include \"ppu_vmx.h\"",   # the helpers #286 lowers VMX to
+        "#include \"ppu_vmx.h\"",
         "typedef struct { uint8_t vr[32][16]; uint32_t vscr; } ctx_t;",
         f"static const unsigned char IN[{len(vecs)}][3][16] = {{" +
         ",".join("{" + ",".join(_carr(v) for v in t) + "}" for t in vecs) + "};",

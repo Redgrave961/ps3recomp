@@ -1,59 +1,22 @@
-/*
- * Unit tests for PPU <-> SPU lock-line coherence (runtime/spu/spu_coherency.c).
- *
- * The mechanism only pays off when three things line up: an SPU marks the line
- * it reserved, a PPU store notices the mark, and the reserving SPU gets
- * SPU_EVENT_LR and loses its reservation. Any one of them silently missing
- * leaves the SPU parked forever, and nothing else in the tree fails, so this
- * asserts all three -- through the REAL PPU store path (ppu_memory.h's
- * vm_write*), not a copy of it, since the whole bug class here is
- * a hook that is not where the stores actually go.
- *
- * The two paths that must NOT fire are tested as carefully as the one that
- * must: a store to a line nobody reserved, and a store to a line other than the
- * reserved one, both have to leave the SPU's event bit alone. A notify that
- * fires too eagerly is a livelock (the SPURS kernel re-enters selection on
- * every unrelated PPU store), not a safe over-approximation.
- *
- * Build:
- *   clang -std=gnu17 -I include -I runtime/spu \
- *         -o /tmp/test_spu_coherency runtime/spu/tests/test_spu_coherency.c
- *
- * Exit code: 0 if all passed, 1 if any failed. Final line prints summary.
- */
-
-/* The unit under test, compiled straight in: it is one small file whose only
- * dependency on the rest of the runtime is spu_ch_wake, stubbed below. */
 #include "../spu_coherency.c"
 
-/* The real PPU store path the hook lives in. */
 #include "../../ppu/ppu_memory.h"
 
 #include <stdio.h>
 #include <string.h>
 
-/* ---------------------------------------------------------------------------
- * The runtime pieces a real build supplies, stubbed.
- * -----------------------------------------------------------------------*/
 static uint8_t g_guest_mem[1u << 20];
 uint8_t* vm_base = g_guest_mem;
 
-/* ppu_memory.h's inline stores reference these. Nothing here watches writes. */
 uint32_t g_ww_lo = 0xFFFFFFFFu, g_ww_hi = 0;
 void ps3_ww_report_inline(uint32_t addr, uint64_t val, int width)
 {
     (void)addr; (void)val; (void)width;
 }
 
-/* spu_channels.c's channel-stall wake. Counted, because "the event bit is set"
- * and "the parked host thread was told" are separate failures: the bit alone
- * wakes the SPU only on its next 10 ms re-poll. */
 static int g_wakes;
 void spu_ch_wake(spu_context* ctx) { (void)ctx; g_wakes++; }
 
-/* ---------------------------------------------------------------------------
- * Harness
- * -----------------------------------------------------------------------*/
 static int g_pass = 0;
 static int g_fail = 0;
 static const char* g_current = "(none)";
@@ -80,17 +43,13 @@ static const char* g_current = "(none)";
     }                                                             \
 } while (0)
 
-/* Two 128-byte lines well apart, plus an address inside each. */
 #define LINE_A   0x00040000u
 #define LINE_B   0x00040180u
 #define LINE_C   0x00040300u
 
-static spu_context g_spu_a;   /* 256 KB of local store each: not on the stack */
+static spu_context g_spu_a;
 static spu_context g_spu_b;
 
-/* What the SPU's GETLLAR does, minus the local-store copy: take the lock-line
- * lock, mark the line, record the reservation. Mirrors spu_channels.c's
- * MFC_GETLLAR_CMD case. */
 static void spu_getllar(spu_context* ctx, uint32_t ea)
 {
     ea &= ~127u;
@@ -106,9 +65,6 @@ static void spu_reset(spu_context* ctx, uint32_t spu_id)
     ctx->spu_id = spu_id;
 }
 
-/* ===========================================================================
- * The bitmap: what a reservation marks, and what it leaves alone
- * ===========================================================================*/
 static void test_bitmap(void)
 {
     spu_reset(&g_spu_a, 0);
@@ -130,9 +86,6 @@ static void test_bitmap(void)
     CHECK(spu_coh_is_reserved(LINE_B) == 0);
 }
 
-/* ===========================================================================
- * A PPU store into a reserved line
- * ===========================================================================*/
 static void test_ppu_store_raises_lr(void)
 {
     spu_reset(&g_spu_a, 0);
@@ -174,9 +127,6 @@ static void test_ppu_store_raises_lr(void)
     CHECK(g_wakes == 2);
 }
 
-/* ===========================================================================
- * The two cases that must NOT raise
- * ===========================================================================*/
 static void test_no_false_raise(void)
 {
     spu_reset(&g_spu_a, 0);
@@ -199,16 +149,13 @@ static void test_no_false_raise(void)
     CHECK((g_spu_a.resv & 1u) == 1);
 
     TEST("an SPU that holds NO reservation is never notified");
-    spu_reset(&g_spu_b, 1);            /* registered, but no live reservation */
+    spu_reset(&g_spu_b, 1);
     g_wakes = 0;
     vm_write32(LINE_B + 8, 0x55555555u);
     CHECK_EQ_U32(g_spu_b.event_status, 0);
     CHECK(g_wakes == 0);
 }
 
-/* ===========================================================================
- * Every store width, and the store-conditional commit
- * ===========================================================================*/
 static void test_all_store_widths(void)
 {
     static const char* names[4] = { "vm_write8", "vm_write16",
@@ -229,8 +176,6 @@ static void test_all_store_widths(void)
     }
 }
 
-/* More live virtual contexts than physical SPUs, including persistent
- * policy contexts which are idle while another workload runs. */
 static void test_many_contexts(void)
 {
     enum { N = 20 };
@@ -306,9 +251,6 @@ static void test_many_contexts(void)
     spu_coh_unregister(&g_spu_a);
 }
 
-/* ===========================================================================
- * main: run all and report
- * ===========================================================================*/
 int main(void)
 {
     test_bitmap();

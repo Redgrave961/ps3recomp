@@ -1,13 +1,4 @@
 #!/usr/bin/env python3
-"""Lifted guest loads on a protected page are emulated exactly.
-
-Compiles the lifter's load helpers (HEADER_PREAMBLE) with the fault decoder
-(runtime/memory/vm_fault_x86.h) at -O0 and -O2, with and without MOVBE, and
-reads a guest page that is mapped no-access through every helper, at aligned,
-unaligned and page-crossing offsets and through every register the allocator
-picks. Each value must equal what the reader says the bytes are, and a 4-byte
-load of the side-effect word must call the reader exactly once per load.
-"""
 from __future__ import annotations
 
 import importlib.util

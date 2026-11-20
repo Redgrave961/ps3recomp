@@ -1,15 +1,4 @@
 #!/usr/bin/env python3
-"""
-PRX module dependency analyser for PS3.
-
-Parses a set of PRX / SPRX files, builds a dependency graph showing which
-modules import from which, resolves NID references against the NID database,
-and generates a report of required HLE stubs.
-
-Usage:
-    python prx_analyzer.py <prx_files...> [--nid-db FILE] [--json] [--graph]
-"""
-
 import argparse
 import json
 import os
@@ -21,34 +10,24 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from elf_parser import ELFFile, ET_SCE_PPURELEXEC
 from nid_database import NIDDatabase, get_default_db
 
-# ---------------------------------------------------------------------------
-# Data structures
-# ---------------------------------------------------------------------------
 
 @dataclass
 class ModuleInfo:
-    """Parsed information for a single PRX module."""
     path: str = ""
     name: str = ""
-    exports: list[dict] = field(default_factory=list)  # [{module, nids, names}]
-    imports: list[dict] = field(default_factory=list)   # [{module, nids, names}]
+    exports: list[dict] = field(default_factory=list)
+    imports: list[dict] = field(default_factory=list)
 
 
 @dataclass
 class DependencyEdge:
-    """An import dependency from one module to another."""
     importer: str = ""
     exporter: str = ""
     nids: list[int] = field(default_factory=list)
-    names: list[str] = field(default_factory=list)  # resolved names
+    names: list[str] = field(default_factory=list)
 
-# ---------------------------------------------------------------------------
-# Analyser
-# ---------------------------------------------------------------------------
 
 class PRXAnalyzer:
-    """Analyse a set of PRX files for dependencies and NID usage."""
-
     def __init__(self, nid_db: NIDDatabase | None = None):
         self.nid_db = nid_db or get_default_db()
         self.modules: list[ModuleInfo] = []
@@ -57,7 +36,6 @@ class PRXAnalyzer:
         self.unresolved_nids: set[int] = set()
 
     def add_file(self, path: str) -> ModuleInfo | None:
-        """Parse a PRX/SPRX file and add it to the analysis."""
         try:
             elf = ELFFile(path)
             elf.load()
@@ -67,13 +45,11 @@ class PRXAnalyzer:
 
         mi = ModuleInfo(path=path)
 
-        # Module name from PRX module info or filename
         if elf.module_info:
             mi.name = elf.module_info.name or os.path.splitext(os.path.basename(path))[0]
         else:
             mi.name = os.path.splitext(os.path.basename(path))[0]
 
-        # Exports
         for exp in elf.exports:
             entry = {
                 "module": exp.name_str or mi.name,
@@ -85,7 +61,6 @@ class PRXAnalyzer:
                 entry["names"].append(result[1] if result else f"nid_0x{nid:08X}")
             mi.exports.append(entry)
 
-        # Imports
         for imp in elf.imports:
             entry = {
                 "module": imp.name_str or "unknown",
@@ -106,14 +81,11 @@ class PRXAnalyzer:
         return mi
 
     def build_dependency_graph(self) -> None:
-        """Build edges between modules based on import/export matching."""
-        # Build export index: module_name -> set of nids
         export_index: dict[str, set[int]] = {}
         for mod in self.modules:
             for exp in mod.exports:
                 export_index.setdefault(exp["module"], set()).update(exp["nids"])
 
-        # Match imports to exports
         self.edges.clear()
         for mod in self.modules:
             for imp in mod.imports:
@@ -127,9 +99,6 @@ class PRXAnalyzer:
                 self.edges.append(edge)
 
     def get_required_stubs(self) -> dict[str, list[dict]]:
-        """Return a dict of module -> [{nid, name}] for all imported NIDs
-        that are not satisfied by any analysed PRX's exports."""
-
         exported_nids: set[int] = set()
         for mod in self.modules:
             for exp in mod.exports:
@@ -146,7 +115,6 @@ class PRXAnalyzer:
                             "name": name,
                         })
 
-        # Deduplicate within each module
         for module in stubs:
             seen: set[int] = set()
             unique = []
@@ -158,10 +126,8 @@ class PRXAnalyzer:
 
         return stubs
 
-    # ---- Reporting ----
 
     def report_text(self) -> str:
-        """Generate a human-readable text report."""
         lines: list[str] = []
 
         lines.append(f"=== PRX Dependency Analysis ===")
@@ -186,14 +152,12 @@ class PRXAnalyzer:
                         lines.append(f"      0x{nid:08X}  {name}")
             lines.append("")
 
-        # Dependency graph
         self.build_dependency_graph()
         lines.append("=== Dependency Graph ===")
         for edge in self.edges:
             lines.append(f"  {edge.importer} -> {edge.exporter}  ({len(edge.nids)} NIDs)")
         lines.append("")
 
-        # Required stubs
         stubs = self.get_required_stubs()
         if stubs:
             lines.append("=== Required HLE Stubs ===")
@@ -206,7 +170,6 @@ class PRXAnalyzer:
         return "\n".join(lines)
 
     def report_json(self) -> dict:
-        """Generate a JSON-serialisable report."""
         self.build_dependency_graph()
         stubs = self.get_required_stubs()
 
@@ -241,9 +204,6 @@ class PRXAnalyzer:
             },
         }
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 def main() -> None:
     parser = argparse.ArgumentParser(

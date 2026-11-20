@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""SPU_DIRECT: lifted known-target branches tail-call when the drain has nothing to do."""
 import os
 import subprocess
 import tempfile

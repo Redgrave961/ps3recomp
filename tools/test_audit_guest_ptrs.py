@@ -1,13 +1,4 @@
 #!/usr/bin/env python3
-"""Self-check for audit_guest_ptrs.py.
-
-The audit is only worth anything if a clean report means the bug is gone rather
-than that the heuristic stopped matching -- which happened three times while the
-sweep was running. This pins both directions: the shapes it must report, and the
-correct forms it must stay quiet about.
-
-    python tools/test_audit_guest_ptrs.py
-"""
 import os
 import sys
 import tempfile

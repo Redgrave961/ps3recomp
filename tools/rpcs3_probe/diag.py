@@ -1,8 +1,3 @@
-"""diag.py - learn RPCS3's GDB stub behavior step-by-step (defensive).
-
-RPCS3's GDB stub HALTS the target when a client connects (?, returns S05). So we
-read state directly (no interrupt needed), then cont()+sleep()+interrupt() to grab
-a running-state snapshot (e.g. during render)."""
 import argparse, os, subprocess, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rsp import RSPClient
@@ -48,8 +43,6 @@ try:
           [n for n, _, _ in r.reg_layout][64:])
     r._send_packet("?"); print("[diag] state:", r._recv_packet()[:40])
 
-    # Connecting halts the running game at its current PC. Walk that stack —
-    # if we connected during the steady loop, the stack reveals the loop.
     regs = r.read_registers()
     pc = pcof(regs)
     print(f"\n[diag] *** HALT-ON-CONNECT SNAPSHOT ***  PC=0x{(pc or 0):08X} "
@@ -58,7 +51,6 @@ try:
     for i, (via, f) in enumerate(walk(r, regs)):
         print(f"    #{i:2d} 0x{(f or 0):08X}  ({via})")
 
-    # clean detach so RPCS3's GDB server thread doesn't fault on socket close
     try:
         r._send_packet("D")
         r._recv_packet()

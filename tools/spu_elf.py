@@ -1,8 +1,3 @@
-"""Bounded ELF32 big-endian SPU validation and embedded-image discovery.
-
-The file extent and FNV offset basis intentionally match spu_workload.c,
-including non-LOAD segments, non-NOBITS sections, and section headers.
-"""
 import struct
 
 MAGIC = b'\x7fELF'
@@ -81,11 +76,6 @@ def validate_spu_elf(buf, offset=0):
 
 
 def scan_spu_candidates(buf):
-    """Yield valid and invalid EM_SPU candidates, retaining every occurrence.
-
-    Search every magic occurrence (even inside another image) so dedup never
-    hides nested occurrences. Other ELF machines are not SPU candidates.
-    """
     pos = 0
     while True:
         offset = buf.find(MAGIC, pos)
@@ -103,7 +93,6 @@ def scan_spu_candidates(buf):
 
 
 def fnv1a64(buf):
-    # This is the existing runtime's offset basis (not the standard FNV value).
     value = 1469598103934665603
     for byte in buf:
         value = ((value ^ byte) * 1099511628211) & 0xffffffffffffffff

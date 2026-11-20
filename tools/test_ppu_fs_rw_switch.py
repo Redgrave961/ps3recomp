@@ -1,25 +1,4 @@
 #!/usr/bin/env python3
-"""cellFs read after write, and write after read, on one fd (runtime/ppu/ppu_fs.cpp).
-
-ppu_fs.cpp keeps files as stdio streams, and C leaves a read straight after a
-write (or a write straight after a read) undefined unless the stream is
-flushed or repositioned in between; cellFs has no such rule. FIOS writes a
-header into its new HDD cache index and reads on: on the MSVC CRT the read
-returned stale buffer bytes and the header never reached the file, so the
-cache never validated. This builds runtime/ppu/tests/test_fs_rw_switch.cpp
-(which includes ppu_fs.cpp) against a ppu_recomp.h made from the lifter's own
-HEADER_PREAMBLE and runs it.
-
-The undefined case shows on the MSVC CRT (clang++ or clang-cl on Windows);
-other C libraries may pass on both sides.
-
-It needs a host C++ compiler (under CI=1 a missing one fails instead of
-skipping).
-
-Usage:
-    python3 tools/test_ppu_fs_rw_switch.py [--exe-out PATH] [--build-only]
-"""
-
 import argparse
 import importlib.util
 import os

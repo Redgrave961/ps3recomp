@@ -1,16 +1,4 @@
 #!/usr/bin/env python3
-"""--merge-chunks must deliver pending SPU interrupts at merged chunk entries.
-
-Without merging, every transfer between chunks returns to the drain loop, which
-takes a pending enabled interrupt before calling the next chunk. --merge-chunks
-turns those transfers into gotos, so a loop that waits for its interrupt
-handler (DMA-list stall-and-notify) would spin forever. The fixture is such a
-loop: it counts r3 up until the handler sets r5, or 100 iterations pass.
-
-Usage:
-    python3 tools/test_spu_lifter_merge_chunks.py
-"""
-
 import os
 import shutil
 import struct
@@ -24,8 +12,8 @@ TOOLS = Path(__file__).resolve().parent
 RUNTIME = TOOLS.parent / 'runtime' / 'spu'
 sys.path.insert(0, str(TOOLS))
 
-from spu_disasm import disassemble_spu  # noqa: E402
-from spu_lifter import SPULifter, merge_chunk_groups  # noqa: E402
+from spu_disasm import disassemble_spu
+from spu_lifter import SPULifter, merge_chunk_groups
 
 
 def ri16(op9, i16, rt):
@@ -41,14 +29,13 @@ def rr(op11, rb, ra, rt):
 
 
 PROGRAM = [
-    ri16(0x081, 0, 3),                    # 0x00 il   $3, 0
-    ri10(0x1C, 1, 3, 3),                  # 0x04 ai   $3, $3, 1      <- loop
-    ri10(0x7C, 100, 3, 6),                # 0x08 ceqi $6, $3, 100
-    rr(0x041, 6, 5, 7),                   # 0x0C or   $7, $5, $6
-    ri16(0x040, (0x04 - 0x10) >> 2, 7),   # 0x10 brz  $7, 0x04
-    rr(0x1A8, 0, 0, 0),                   # 0x14 bi   $0
+    ri16(0x081, 0, 3),
+    ri10(0x1C, 1, 3, 3),
+    ri10(0x7C, 100, 3, 6),
+    rr(0x041, 6, 5, 7),
+    ri16(0x040, (0x04 - 0x10) >> 2, 7),
+    rr(0x1A8, 0, 0, 0),
 ]
-# One chunk per branch target, as find_spu_functions splits them.
 BOUNDS = [(0x00, 0x04), (0x04, 0x18)]
 
 DRIVER = r'''

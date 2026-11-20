@@ -1,20 +1,3 @@
-"""nid_harvest.py - name unresolved firmware NIDs using debug-build symbol tables.
-
-A NID is SHA-1(name + suffix)[:4]; you cannot invert it, so an import NID is only
-resolvable if you already have a candidate *name* to hash. Debug/prototype builds
-(see unfself.py) hand us tens of thousands of real SDK function names in their
-.symtab. Hashing every firmware-shaped name gives a NID->name gazetteer; intersecting
-it with the NIDs those same builds actually *import* (their proc_prx_param -> libstub
-tables, via ppu_loader.parse_imports) yields definitive (library, name, NID) triples:
-compute_nid(name) == the imported NID, and the library string comes from the import
-table. No guessing.
-
-    python nid_harvest.py <ELF-or-dir> [more...] -o tools/nid_from_protos.json
-
-Feed it the ELFs produced by unfself.py. Only matches whose NID is both imported and
-named are written; the gazetteer names that are never imported are reported but not
-emitted (probably-correct, but unvalidated here).
-"""
 from __future__ import annotations
 
 import argparse
@@ -32,10 +15,6 @@ from ppu_loader import parse_imports
 from nid_database import compute_nid, get_default_db
 import elf_symbols
 
-# Names in .symtab that plausibly denote a firmware export. Game-internal symbols
-# also start "cell"/"sce" occasionally, but a false name is harmless unless its NID
-# collides with a real import NID for a different function -- a 1-in-2^32 event we
-# additionally gate away by only emitting NIDs that are actually imported.
 FW_PREFIXES = ("cell", "sce", "sys_", "sysPrx", "_cell", "_sys")
 
 
@@ -48,14 +27,13 @@ def iter_elfs(paths):
 
 
 def build_gazetteer(elfs) -> dict[int, set[str]]:
-    """NID -> {names} for every firmware-shaped symbol across the ELFs."""
     gaz: dict[int, set[str]] = {}
     for p in elfs:
         try:
             with contextlib.redirect_stderr(io.StringIO()):
                 syms = elf_symbols.load_symbols(p)
         except SystemExit:
-            continue                       # stripped ELF: no symbols to harvest
+            continue
         for s in syms:
             nm = s["name"]
             if nm.startswith(FW_PREFIXES):
@@ -64,7 +42,6 @@ def build_gazetteer(elfs) -> dict[int, set[str]]:
 
 
 def collect_imports(elfs) -> dict[int, set[str]]:
-    """NID -> {library names} across every import table found."""
     imports: dict[int, set[str]] = {}
     for p in elfs:
         try:
@@ -82,19 +59,17 @@ def harvest(paths):
     gaz = build_gazetteer(elfs)
     imports = collect_imports(elfs)
 
-    # Collisions would make a name non-definitive; report if any ever appear.
     collisions = {n: v for n, v in gaz.items() if len(v) > 1}
 
     db = get_default_db()
     already = sum(1 for n in imports if db.lookup_nid(n))
 
-    # (library, name, nid) for every imported NID we can now name and the DB can't.
     out: dict[str, dict[str, str]] = {}
     named = 0
     for nid, libs in sorted(imports.items()):
         if db.lookup_nid(nid) or nid not in gaz:
             continue
-        name = sorted(gaz[nid])[0]         # unique unless collisions (reported above)
+        name = sorted(gaz[nid])[0]
         lib = sorted(libs)[0]
         out.setdefault(lib, {})[name] = f"0x{nid:08X}"
         named += 1

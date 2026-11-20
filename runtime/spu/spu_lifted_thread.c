@@ -1,9 +1,7 @@
-/* spu_lifted_thread.c -- see spu_lifted_thread.h for what this is for. */
-
 #include "spu_lifted_thread.h"
 #include "spu_coherency.h"
 #include "spu_context.h"
-#include "ps3emu/ps3_tprof.h"   /* PS3_TPROF: in-process thread samples */
+#include "ps3emu/ps3_tprof.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,16 +9,11 @@
 
 extern uint8_t* vm_base;
 
-/* The lifted-code registry, the dispatcher and the per-context MFC engine
- * table, all in spu_channels.c. */
 int  spu_have_function(uint32_t addr);
 int  spu_image_of_function(uint32_t addr);
 void spu_indirect_branch(struct spu_context* ctx);
 int  spu_run_with_halt(void (*entry)(struct spu_context*), struct spu_context* ctx);
 
-/* Guest memory is big-endian and this file reads descriptors out of it. lv2 has
- * its own copy of this helper; duplicating four lines is cheaper than exporting
- * one from a translation unit full of syscall handlers. */
 static uint32_t rd_be32(uint32_t ea)
 {
     if (!vm_base) return 0;
@@ -29,19 +22,6 @@ static uint32_t rd_be32(uint32_t ea)
            ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
 }
 
-/* Lay a sys_spu_image's segments into a local store.
- *
- *   sys_spu_image   { u32 type; u32 entry_point; sys_spu_segment* segs; s32 nsegs; }
- *   sys_spu_segment { s32 type; u32 ls_start; s32 size; u64 src; }   (0x18 bytes)
- *
- * COPY (type 1) reads from the segment's source EA; FILL (type 2) writes the
- * value in the same field, which the SDK counts as a segment of its own for an
- * ELF's bss tail. INFO (type 4) is metadata and is not loaded.
- *
- * _sys_spu_image_import writes the source EA at both +0x10 and +0x14 (the
- * comment there explains why: readers disagree about whether the field is a u32
- * or the low half of a big-endian u64). Reading +0x10 first and falling back
- * keeps this working for images built by either convention. */
 static void spu_deploy_image(spu_context* ctx, uint32_t img_ea)
 {
     if (!img_ea || !vm_base) return;
@@ -79,31 +59,15 @@ void spu_lifted_thread_setup(spu_context* ctx, const spu_lifted_thread_desc* d)
     ctx->spu_group_id = d->group_id;
     ctx->pc           = d->entry & SPU_LS_MASK;
 
-    /* Start the thread in the image its entry point belongs to, rather than in
-     * image 0. Zero is the registry's wildcard, so a context that keeps it will
-     * happily resolve a later branch into whatever other image registered that
-     * LS address -- SPURS loads its kernel, policy modules and job binaries at
-     * overlapping addresses, so that is not a rare collision but the normal
-     * case. Asking the registry which image owns the entry point gets the same
-     * answer the title's own registration order implies, without the lv2 layer
-     * having to know any image ids. */
     { int img = d->image_id > 0 ? d->image_id : spu_image_of_function(ctx->pc);
       ctx->image_id = (img >= 0) ? img : 0; }
 
     if (d->img_ea) spu_deploy_image(ctx, d->img_ea);
 
-    /* sys_spu_thread_argument is four u64s and lv2 puts each in the preferred
-     * doubleword of r3..r6 (RPCS3 sys_spu.cpp: gpr[3+i] = from64(0, arg[i])).
-     * Lane 0 is the preferred word here, so the u64 occupies lanes 0 and 1 and
-     * the rest of the register is zero, which memset already did. */
     for (int a = 0; a < 4; a++) {
         ctx->gpr[3 + a]._u32[0] = (uint32_t)(d->args[a] >> 32);
         ctx->gpr[3 + a]._u32[1] = (uint32_t)d->args[a];
     }
-
-    /* r1 is deliberately left at 0: an SPU image's own crt sets its stack up,
-     * and lv2 does not. The job helpers in spu_lifted_job.h do seed it, because
-     * they enter a lifted function directly rather than starting a thread. */
 }
 
 void spu_lifted_thread_run(spu_context* ctx, spu_lifted_thread_result* out)
@@ -118,16 +82,8 @@ void spu_lifted_thread_run(spu_context* ctx, spu_lifted_thread_result* out)
 
     ctx->status = SPU_STATUS_RUNNING;
     ps3_tprof_thread('S', ctx->spu_id);
-    /* The dispatcher resolves ctx->pc in ctx->image_id and runs it; the halt
-     * landing pad catches an SPU that stops from inside a nested call, and
-     * drains the tail-transfer chain when it returns normally. */
     spu_run_with_halt(spu_indirect_branch, ctx);
 
-    /* What the SPU meant by stopping. The SPU-side sys_spu_thread_exit ABI
-     * writes the status to SPU_WrOutMbox and then executes stop 0x102; lv2 pops
-     * that mailbox value as the thread's exit status. The 14-bit stop code is
-     * the selector, not the status (CBEA p97, SPU_Status.StopCode): 0x102
-     * THREAD_EXIT carries this thread's status, 0x101 GROUP_EXIT the group's. */
     if (ctx->status == SPU_STATUS_STOPPED_BY_STOP &&
         ctx->stop_code == 0x102u && ctx->ch_out_mbox.count) {
         r.exit_status = (int32_t)ctx->ch_out_mbox.value;
@@ -138,10 +94,6 @@ void spu_lifted_thread_run(spu_context* ctx, spu_lifted_thread_result* out)
         r.group_status = (int32_t)ctx->ch_out_mbox.value;
         ctx->ch_out_mbox.count = 0;
     } else {
-        /* Anything else -- a halt from the dispatcher's unresolved-branch
-         * unwind, or a stop code outside the exit protocol -- is a fault. The
-         * thread still exits with 0, as it does on the fallback path, but the
-         * caller is told so it can report or raise an exception event. */
         r.faulted = 1;
     }
 
@@ -151,8 +103,6 @@ void spu_lifted_thread_run(spu_context* ctx, spu_lifted_thread_result* out)
             r.group_exit ? " group-exit" : "", r.faulted ? " FAULT" : "");
     fflush(stderr);
 
-    /* This thread run has ended; remove observer references and release its
-     * private engine before restart can reset the context or destroy frees it. */
     spu_coh_unregister(ctx);
     spu_mfc_release(ctx);
     ps3_tprof_thread_exit();

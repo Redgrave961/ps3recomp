@@ -1,5 +1,3 @@
-/* ILH must replicate the immediate in every 16-bit lane. Real interpreter
- * bytes plus literal full-vector expectations; no title assets are included. */
 #include "../spu_helpers.h"
 #include "../spu_interp.h"
 #include <assert.h>
@@ -7,7 +5,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* CPU-only instructions never reach these external channel/diagnostic hooks. */
 u128 spu_rdch(spu_context* c, uint32_t ch) { (void)c; (void)ch; abort(); }
 void spu_wrch(spu_context* c, uint32_t ch, u128 v) { (void)c; (void)ch; (void)v; abort(); }
 uint32_t spu_rchcnt(spu_context* c, uint32_t ch) { (void)c; (void)ch; abort(); }
@@ -20,16 +17,14 @@ static spu_context ctx;
 static int run(const char* name, uint32_t opcode, uint32_t want, u128 lifted) {
     memset(&ctx, 0, sizeof(ctx));
     spu_context_init(&ctx, 0);
-    ctx.image_id = -1; /* actual pure interpretation, no registry shortcut */
+    ctx.image_id = -1;
     memset(&ctx.gpr[80], 0xA5, sizeof(u128));
     memset(&ctx.gpr[79], 0x5A, sizeof(u128));
     be32(ctx.ls + 0x100, opcode);
-    be32(ctx.ls + 0x104, 0); /* stop 0 */
+    be32(ctx.ls + 0x104, 0);
     spu_interp_run(&ctx, 0x100);
     assert(ctx.status == SPU_STATUS_STOPPED_BY_STOP && ctx.pc == 0x108);
     const u128 expected = { ._u32 = {want, want, want, want} };
-    /* Check all 16 bytes against literal independently derived expectations,
-     * then against the existing helper used by lifted instruction emission. */
     int ok = !memcmp(&ctx.gpr[80], &expected, 16) && !memcmp(&ctx.gpr[80], &lifted, 16);
     for (unsigned i = 0; i < 16; ++i) assert(ctx.gpr[79]._u8[i] == 0x5A);
     printf("%s opcode=%08X got=%08X:%08X:%08X:%08X expected=%08X %s\n", name, opcode,
@@ -46,7 +41,6 @@ int main(void) {
         {0xBEEF, 0xBEEFBEEF, 0xFFFFBEEF, 0xBEEF0000},
         {0xFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFF0000},
     };
-    /* Exact observed retail instruction: ilh $80,0xBEEF. */
     int failed = run("ILH/native-cookie", 0x41DF77D0u, 0xBEEFBEEFu, spu_ilh(0xBEEF));
     for (unsigned i = 0; i < sizeof(cases)/sizeof(cases[0]); ++i) {
         uint16_t imm = cases[i].imm;

@@ -1,9 +1,3 @@
-/*
- * ps3recomp - Filesystem syscalls
- *
- * Kernel-level filesystem with PS3 path -> host path translation.
- */
-
 #ifndef SYS_FS_H
 #define SYS_FS_H
 
@@ -27,50 +21,17 @@
 extern "C" {
 #endif
 
-/* Maximum open file descriptors / directory descriptors */
 #define SYS_FS_FD_MAX   256
 #define SYS_FS_DIR_MAX  64
 
-/* CellFsStat structure layout (as written to guest memory, all big-endian):
- *   u32 mode        @ 0
- *   s32 uid         @ 4
- *   s32 gid         @ 8
- *   u64 atime       @ 12  (actually at 16 with padding)
- *   u64 mtime       @ 20  (at 24)
- *   u64 ctime       @ 28  (at 32)
- *   u64 size        @ 36  (at 40)
- *   u64 blksize     @ 44  (at 48)
- * Total: 52 bytes (but padded to 56 for alignment)
- *
- * We use a simpler layout matching RPCS3:
- *   u32 mode        @ 0
- *   s32 uid         @ 4
- *   s32 gid         @ 8
- *   u32 pad         @ 12
- *   u64 atime       @ 16
- *   u64 mtime       @ 24
- *   u64 ctime       @ 32
- *   u64 size        @ 40
- *   u64 blksize     @ 48
- * Total: 56 bytes
- */
-
-/* CellFsMode flags */
 #define CELL_FS_S_IFDIR   0040000
 #define CELL_FS_S_IFREG   0100000
-#define CELL_FS_S_IFLNK   0120000
 #define CELL_FS_S_IRUSR   0000400
 #define CELL_FS_S_IWUSR   0000200
 #define CELL_FS_S_IXUSR   0000100
 #define CELL_FS_S_IRGRP   0000040
 #define CELL_FS_S_IROTH   0000004
 
-/* Open flags. The SDK values are OCTAL: O_CREAT 0100, O_EXCL 0200, O_TRUNC 01000, O_APPEND 02000. They used to
- * be spelt 0x100/0x400/0x2000 here, which are different bits: a guest libc's
- * open(O_WRONLY|O_CREAT) of a new file (0x41) never saw O_CREAT and failed
- * ENOENT, and fopen("a") (O_APPEND = 0x400) was read as O_EXCL and overwrote
- * from offset 0. */
-#define CELL_FS_O_RDONLY   0000000
 #define CELL_FS_O_WRONLY   0000001
 #define CELL_FS_O_RDWR     0000002
 #define CELL_FS_O_ACCMODE  0000003
@@ -79,20 +40,17 @@ extern "C" {
 #define CELL_FS_O_TRUNC    0001000
 #define CELL_FS_O_APPEND   0002000
 
-/* Seek modes */
 #define CELL_FS_SEEK_SET   0
 #define CELL_FS_SEEK_CUR   1
 #define CELL_FS_SEEK_END   2
 
-/* File descriptor entry */
 typedef struct sys_fs_fd_info {
     int    active;
     ps3_vfile* fp;
-    char   path[512];  /* host path */
+    char   path[512];
     int    flags;
 } sys_fs_fd_info;
 
-/* Directory descriptor entry */
 typedef struct sys_fs_dir_info {
     int    active;
     ps3_vdir* dir;
@@ -101,13 +59,10 @@ typedef struct sys_fs_dir_info {
 extern sys_fs_fd_info  g_sys_fs_fds[SYS_FS_FD_MAX];
 extern sys_fs_dir_info g_sys_fs_dirs[SYS_FS_DIR_MAX];
 
-/* Host directory the PS3 mount points map into */
 extern const char* ppu_vfs_root;
 
-/* Path translation: convert PS3 path to host path */
 void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size);
 
-/* Syscall handlers */
 int64_t sys_fs_open(ppu_context* ctx);
 int64_t sys_fs_read(ppu_context* ctx);
 int64_t sys_fs_write(ppu_context* ctx);
@@ -124,11 +79,10 @@ int64_t sys_fs_unlink(ppu_context* ctx);
 int64_t sys_fs_rmdir(ppu_context* ctx);
 int64_t sys_fs_ftruncate(ppu_context* ctx);
 
-/* Registration */
 void sys_fs_init(lv2_syscall_table* tbl);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* SYS_FS_H */
+#endif

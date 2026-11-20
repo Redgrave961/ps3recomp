@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""SPU event_status updates (SPU_EVENT_SET/CLEAR) keep every bit when two host threads update it at once."""
 import os
 import subprocess
 import tempfile

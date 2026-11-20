@@ -1,13 +1,4 @@
 #!/usr/bin/env python3
-"""Tail calls, drain elision and the inline exec-table dispatch.
-
-Lifts a small multi-function program, compiles it with a driver and runs it:
-cross-fragment branches are real tail calls (a three-million-step fragment
-loop must not grow the host stack), calls into lifted functions carry no
-trampoline drain, a call into a port-defined (wrapped) function keeps it, and
-an indirect call goes through the exec table for lifted targets and through
-ps3_indirect_call for everything else (wrapped, unaligned, out of range).
-"""
 from __future__ import annotations
 
 import importlib.util

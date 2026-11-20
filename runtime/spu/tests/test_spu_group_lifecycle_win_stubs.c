@@ -1,15 +1,3 @@
-/* Link stubs for test_spu_group_lifecycle.c.
- *
- * The fixture includes lv2_register.c whole and relies on the linker dropping what it does not use (-dead_strip /
- * --gc-sections). The COFF linker resolves every reference first, so on Windows the symbols the rest of the runtime
- * would supply are defined here. None of them is reached by the checks in the fixture: the functions answer 0 and the
- * data is zero. Build it as
- *   clang -std=gnu17 -I include -I runtime -I runtime/syscalls -I runtime/spu -I libs/video
- *     runtime/spu/tests/test_spu_group_lifecycle.c runtime/spu/tests/test_spu_group_lifecycle_win_stubs.c
- *     runtime/spu/spu_lifted_thread.c runtime/platform/ps3_sync.c
- *     runtime/spu/tests/spu_fixture_ppu.c -o test_spu_group_lifecycle.exe
- * (no declarations are visible here, so the definitions carry no types: x64 does not mangle them.) */
-/* data */
 char function_table[64];
 char function_table_count[64];
 char g_ps3_sdk_version[64];
@@ -18,13 +6,9 @@ char g_spu_interp_steps[64];
 char g_spu_out_mbox_hook[64];
 char g_spu_user_event_hook[64];
 char g_spurs_kernel_hook[64];
-char ppu_guard_page[64];
 
-/* functions */
 long long ppu_dump_guest_stack() { return 0; }
 long long ppu_guest_caller() { return 0; }
-long long ppu_guest_callstack() { return 0; }
-long long ppu_log_host_chain() { return 0; }
 long long ps3_hle_register_ctx() { return 0; }
 long long ps3_spu_image_source_ea() { return 0; }
 long long spu_ch_wake() { return 0; }

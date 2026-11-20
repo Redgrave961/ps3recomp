@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-"""Test #1: sum loop -- reads N values from inbound mailbox, sums them,
-writes the result to outbound mailbox."""
 import struct, os, sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "..", "..", "tools"))
@@ -15,14 +13,14 @@ def ch(op11, channel, rt): return w(((op11 & 0x7FF) << 21) | ((channel & 0x1F) <
 N = 4
 LOOP = 0x08
 b = b""
-b += ri16(0x81, 0, 3)                         # 0x00 il   r3, 0
-b += ri16(0x81, N, 4)                         # 0x04 il   r4, N
-b += ch(0x00D, 29, 6)                         # 0x08 rdch r6, SPU_RdInMbox
-b += rr(0x0C0, 6, 3, 3)                       # 0x0C a    r3, r3, r6
-b += ri10(0x1C, -1 & 0x3FF, 4, 4)             # 0x10 ai   r4, r4, -1
-b += ri16(0x42, (LOOP - 0x14)//4 & 0xFFFF, 4) # 0x14 brnz r4, loop
-b += ch(0x10D, 28, 3)                         # 0x18 wrch SPU_WrOutMbox, r3
-b += rr(0x000, 0, 0, 0)                       # 0x1C stop
+b += ri16(0x81, 0, 3)
+b += ri16(0x81, N, 4)
+b += ch(0x00D, 29, 6)
+b += rr(0x0C0, 6, 3, 3)
+b += ri10(0x1C, -1 & 0x3FF, 4, 4)
+b += ri16(0x42, (LOOP - 0x14)//4 & 0xFFFF, 4)
+b += ch(0x10D, 28, 3)
+b += rr(0x000, 0, 0, 0)
 
 elf = wrap(b, base=0, entry=0,
            symbols=[{"name":"main","addr":0,"size":len(b)}])

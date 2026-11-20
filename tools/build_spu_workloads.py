@@ -28,14 +28,11 @@ Example:
 """
 import argparse, glob, os, re, subprocess, sys
 
-# ---- SPU ELF sizing + fingerprint (must match runtime/spu/spu_workload.c) ----
 
 def be16(b, o): return (b[o] << 8) | b[o + 1]
 def be32(b, o): return (b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]
 
 def img_size(b):
-    """On-disk extent spanning the section-header table and all PT_LOAD /
-    non-NOBITS section content -- matches spu_elf_image_size()."""
     e_phoff = be32(b, 0x1C); e_shoff = be32(b, 0x20)
     e_phentsize = be16(b, 0x2A); e_phnum = be16(b, 0x2C)
     e_shentsize = be16(b, 0x2E); e_shnum = be16(b, 0x30)
@@ -47,7 +44,7 @@ def img_size(b):
     for k in range(e_shnum):
         so = e_shoff + k * e_shentsize
         if so + 0x18 > len(b): break
-        if be32(b, so + 0x04) != 8:  # not SHT_NOBITS
+        if be32(b, so + 0x04) != 8:
             end = max(end, be32(b, so + 0x10) + be32(b, so + 0x14))
     return min(end, len(b))
 
@@ -58,9 +55,6 @@ def fnv1a64(b):
     return h
 
 def text_fp(b):
-    """Fingerprint of the executable PT_LOAD's file bytes -- what lands in local
-    store. A raw SPU whose program the PPU streams in by proxy DMA never hands
-    the runtime the ELF, only these bytes (runtime/spu/spu_raw.c)."""
     phoff, phes, phn = be32(b, 0x1C), be16(b, 0x2A), be16(b, 0x2C)
     for i in range(phn):
         o = phoff + i * phes
@@ -72,8 +66,8 @@ def text_fp(b):
 
 def is_spu_elf(b):
     return (len(b) >= 0x34 and b[0:4] == b"\x7fELF"
-            and b[4] == 1 and b[5] == 2  # ELFCLASS32, ELFDATA2MSB
-            and be16(b, 0x12) == 0x17)   # EM_SPU
+            and b[4] == 1 and b[5] == 2
+            and be16(b, 0x12) == 0x17)
 
 def sanitize(name):
     s = re.sub(r"[^0-9A-Za-z_]", "_", name)
@@ -81,7 +75,6 @@ def sanitize(name):
         s = "img_" + s
     return s
 
-# ---- include rewrite: make the lifted tree location-independent --------------
 
 _INC_RE = re.compile(r'#include\s+"(?:\.\./)+runtime/spu/([A-Za-z0-9_]+\.h)"')
 
@@ -94,7 +87,6 @@ def debase_includes(path):
     if new != txt:
         open(path, "w", encoding="utf-8", newline="\n").write(new)
 
-# ---- main --------------------------------------------------------------------
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
@@ -161,8 +153,8 @@ def main():
         k, v = spec.split("=", 1)
         extra_funcs[k.strip()] = v.strip()
 
-    imgs = []  # (img, prefix, fingerprint, e_entry)
-    text_fps = {}  # img -> executable-segment fingerprint
+    imgs = []
+    text_fps = {}
     for e in elfs:
         b = open(e, "rb").read()
         if not is_spu_elf(b):
@@ -186,7 +178,6 @@ def main():
             if subprocess.run(cmd).returncode != 0:
                 sys.exit(f"[build_spu_workloads] lift FAILED for {img}")
 
-        # Make the lifted headers/sources location-independent.
         debase_includes(os.path.join(outdir, "spu_recomp.h"))
         debase_includes(srcc)
 
@@ -198,7 +189,6 @@ def main():
     if not imgs:
         sys.exit("[build_spu_workloads] no SPU images lifted")
 
-    # Verify each registered entry symbol actually exists in the lifted header.
     for img, prefix, fp, ent in imgs:
         hdr = os.path.join(args.lifted, img, "spu_recomp.h")
         sym = f"{prefix}spu_func_{ent:08X}"
@@ -236,7 +226,7 @@ def write_registry(args, imgs, text_fps, image_ids=None, regions=None):
         i = image_ids[img] if image_ids else index
         L.append(f"    spu_begin_image({i}); {prefix}spu_recomp_register();")
         L.append(f"    spu_workload_register_img(0x{fp:016X}ULL, {prefix}spu_func_{ent:08X}, {i}, \"{img}\");")
-        if text_fps.get(img):  # same entry, keyed by the text segment (raw SPU proxy-DMA load)
+        if text_fps.get(img):
             L.append(f"    spu_workload_register_img(0x{text_fps[img]:016X}ULL, {prefix}spu_func_{ent:08X}, {i}, \"{img}.text\");")
         for ea, lsa, span in (regions or {}).get(img, []):
             L.append(f"    spu_overlay_register_region_at(0x{ea:08X}u, 0x{lsa:X}u, 0x{span:X}u, {i});")

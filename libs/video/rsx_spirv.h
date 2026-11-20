@@ -32,7 +32,6 @@ enum rsx_spv_binding {
 
 enum rsx_spv_varying {
     RSX_SPV_VAR_COL0 = 0,
-    RSX_SPV_VAR_COL1 = 1,
     RSX_SPV_VAR_BFC0 = 2,
     RSX_SPV_VAR_BFC1 = 3,
     RSX_SPV_VAR_FOG  = 4,
@@ -48,16 +47,7 @@ enum rsx_spv_tex_dim {
 };
 
 enum rsx_spv_vertex_format {
-    RSX_SPV_VFMT_S1          = 1,
-    RSX_SPV_VFMT_F           = 2,
-    RSX_SPV_VFMT_SF          = 3,
-    RSX_SPV_VFMT_UB          = 4,
-    RSX_SPV_VFMT_S32K        = 5,
-    RSX_SPV_VFMT_CMP         = 6,
-    RSX_SPV_VFMT_UB256       = 7,
-    RSX_SPV_VFMT_TYPE_MASK   = 0x0Fu,
     RSX_SPV_VFMT_SIZE_SHIFT  = 4,
-    RSX_SPV_VFMT_SIZE_MASK   = 0xF0u,
     RSX_SPV_VFMT_MODULO      = 0x100u
 };
 
@@ -65,7 +55,6 @@ enum rsx_spv_clip_plane_op {
     RSX_SPV_CLIP_LT       = 0,
     RSX_SPV_CLIP_DISABLED = 1,
     RSX_SPV_CLIP_GE       = 2,
-    RSX_SPV_CLIP_ALL_DISABLED = 0x555u
 };
 
 enum rsx_spv_vp_output_bit {
@@ -107,10 +96,8 @@ enum rsx_spv_texture_control_bit {
     RSX_SPV_TEXC_EXPAND_SHIFT = 4,
     RSX_SPV_TEXC_SEXT_SHIFT   = 8,
     RSX_SPV_TEXC_ALPHAKILL    = 1u << 12,
-    RSX_SPV_TEXC_RENORMALIZE  = 1u << 13,
     RSX_SPV_TEXC_DEPTH_FLOAT  = 1u << 14,
     RSX_SPV_TEXC_UNNORMALIZED = 1u << 15,
-    RSX_SPV_TEXC_BX2_CAPABLE  = 1u << 16,
     RSX_SPV_TEXC_CHANNELS16   = 1u << 17,
     RSX_SPV_TEXREMAP_BX2_SHIFT = 16
 };

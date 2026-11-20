@@ -11,10 +11,6 @@ DWORD GetFileAttributesA(const char*p){(void)p;abort();}
 DWORD GetLastError(void){return 0;}
 void SetLastError(DWORD e){(void)e;}
 
-/* Zero times an SPU extended-range finite number is zero, even though the
- * same bits encode an IEEE NaN/Infinity. FNMS then preserves its addend.
- * IBM SPU ISA v1.2 sections 9.1 and FNMS (pages 195/196/210).
- * This deliberately does not claim general extended multiplication support. */
 #include "fnms_test_lifted.h"
 static spu_context ctx;
 static unsigned failures, checks;
@@ -35,7 +31,6 @@ static void run_case(u128 a,u128 b,u128 c,u128 want) {
     const unsigned dests[]={12,3,5,7};
     for(unsigned k=0;k<4;k++) {
         unsigned d=dests[k];
-        /* Synthetic RRR FNMS: destination 12 or alias of each input. */
         unsigned op=(13u<<28)|(d<<21)|(5u<<14)|(3u<<7)|7u;
         spu_context_init(&ctx,0);ctx.image_id=0;put32(0x100,op);
         ctx.gpr[3]=a;ctx.gpr[5]=b;ctx.gpr[7]=c;
@@ -54,7 +49,6 @@ static void run_case(u128 a,u128 b,u128 c,u128 want) {
 }
 int main(void) {
     const unsigned ext[]={0x7f800000,0x7f800001,0x7fc00000,0x7fffffff,0xff800000,0xff800001,0xffc00000,0xffffffff};
-    /* Literal zero-product results, independently derived from the ISA. */
     const struct { unsigned bits, want; } add[]={
         {0,0},{0x80000000,0},{1,0},{0x807fffff,0},
         {0x00800000,0x00800000},{0x80800000,0x80800000},
@@ -73,7 +67,6 @@ int main(void) {
         }
         run_case(a,b,z,w);
     }
-    /* Ordinary exact finite results, plus distinct lanes and signs. */
     u128 a={0},b={0},c={0},w={0};
     const float finite_want[]={3,7,9,9};
     for(int i=0;i<4;i++) {

@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Run SPU MFC ownership and reservation regressions with >8 live contexts."""
 import os
 import signal
 import subprocess

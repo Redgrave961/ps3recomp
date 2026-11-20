@@ -1,52 +1,24 @@
-/*
- * ps3recomp - cellAvconfExt HLE implementation
- *
- * Reports standard LPCM stereo 48kHz as available audio output.
- * Games query this to decide audio format before opening cellAudio ports.
- */
-
 #include "cellAvconfExt.h"
-#include "../../runtime/ppu/ppu_memory.h"   /* vm_write32: translate + byte-swap */
+#include "../../runtime/ppu/ppu_memory.h"
 #include <stdlib.h>
 
-/* The HLE ABI adapter passes pointer parameters as raw guest addresses, so a
- * bare deref here writes to whatever host address shares that number. These
- * three out-params were dereferenced directly, and cellAudioOutGetDeviceInfo
- * memset()s through one -- an access violation the moment a title reaches audio
- * device setup, which is exactly where Tokyo Jungle crashed. Both device structs
- * are all-u8, so translation alone is correct for them; the float needs a
- * byte-swapped store. */
-extern u8* vm_base;
 #include <stdio.h>
 #include <string.h>
-
-/* ---------------------------------------------------------------------------
- * API implementations
- * -----------------------------------------------------------------------*/
 
 s32 cellAudioOutGetSoundAvailability(u32 audioOut, u32 type, u32 fs, u32 option)
 {
     (void)audioOut;
     (void)option;
 
-    /* Report the SAME capability set a real PS3/RPCS3 reports, not just stereo.
-     * Golden trace (RPCS3.log, real YDKJ boot) shows:
-     *   cellAudioOut: found support for Linear PCM 2 Ch. / 5.1 Ch. / 7.1 Ch.
-     *   cellAudioOut: found support for Dolby Digital 5.1 Ch. / DTS 5.1 Ch.
-     * This call returns the MAX channel count available for (type, fs). Under-reporting
-     * stereo (the old behaviour) makes FMOD's init probe fail its 8/6-channel checks and
-     * then fall through to DTS/AC3 probes that also returned 0 -- YDKJ ends up with no
-     * FMOD threads at all. Returning the real 7.1 for LPCM matches the console. */
     if (type == CELL_AUDIO_OUT_CODING_TYPE_LPCM) {
-        if (fs & CELL_AUDIO_OUT_FS_48KHZ) return CELL_AUDIO_OUT_CHNUM_6;  /* 5.1 (A/B: was 8) */
+        if (fs & CELL_AUDIO_OUT_FS_48KHZ) return CELL_AUDIO_OUT_CHNUM_6;
         return CELL_AUDIO_OUT_CHNUM_2;
     }
 
-    /* Dolby Digital / DTS: real hardware reports 5.1 for these. */
     if (type == CELL_AUDIO_OUT_CODING_TYPE_AC3 || type == CELL_AUDIO_OUT_CODING_TYPE_DTS)
         return CELL_AUDIO_OUT_CHNUM_6;
 
-    return 0; /* not available */
+    return 0;
 }
 
 s32 cellAudioOutGetDeviceInfo(u32 audioOut, u32 deviceIndex,
@@ -64,13 +36,8 @@ s32 cellAudioOutGetDeviceInfo(u32 audioOut, u32 deviceIndex,
 
     memset(info, 0, sizeof(CellAudioOutDeviceInfo));
 
-    /* Report the mode set a real PS3 reports. Golden trace (RPCS3.log, real YDKJ boot):
-     *   "found support for Linear PCM 2 Ch. / 5.1 Ch. / 7.1 Ch."
-     *   "found support for Dolby Digital 5.1 Ch. / DTS 5.1 Ch."
-     * Advertising a single stereo mode here while GetSoundAvailability reports 5.1/7.1 is
-     * self-inconsistent, and middleware (FMOD) validates these against each other. */
-    info->portType = 0; /* HDMI */
-    info->state = 2;    /* connected */
+    info->portType = 0;
+    info->state = 2;
     info->availableModeCount = 3;
     info->availableModes[0].type    = CELL_AUDIO_OUT_CODING_TYPE_LPCM;
     info->availableModes[0].channel = CELL_AUDIO_OUT_CHNUM_2;
@@ -106,15 +73,6 @@ s32 cellAudioOutGetConfiguration(u32 audioOut,
     return CELL_OK;
 }
 
-/* cellAudioOutGetState(audioOut, deviceIndex, state) -- the audio sibling of
- * cellVideoOutGetState. A title checks it before configuring output; Virtua
- * Fighter 5 calls it once during boot and it was the last unresolved import in
- * the whole title. The device is always present and enabled here: there is no
- * "no audio device" case a recompiled port can be in.
- *
- * CellAudioOutState { u8 state; u8 encoder; u8 reserved[2]; u32 downMixer;
- *                     CellAudioOutSoundMode soundMode; } -- written big-endian
- * a byte at a time, which needs no struct definition to get right. */
 s32 cellAudioOutGetState(u32 audioOut, u32 deviceIndex, void* state)
 {
     (void)deviceIndex;
@@ -123,12 +81,12 @@ s32 cellAudioOutGetState(u32 audioOut, u32 deviceIndex, void* state)
     if (!ea)
         return CELL_EINVAL;
 
-    vm_write8(ea + 0, 0);                                   /* ENABLED        */
+    vm_write8(ea + 0, 0);
     vm_write8(ea + 1, CELL_AUDIO_OUT_CODING_TYPE_LPCM);
     vm_write8(ea + 2, 0);
     vm_write8(ea + 3, 0);
-    vm_write32(ea + 4, 0);                                  /* no down-mixer  */
-    vm_write8(ea + 8, CELL_AUDIO_OUT_CODING_TYPE_LPCM);     /* soundMode      */
+    vm_write32(ea + 4, 0);
+    vm_write8(ea + 8, CELL_AUDIO_OUT_CODING_TYPE_LPCM);
     vm_write8(ea + 9, CELL_AUDIO_OUT_CHNUM_2);
     vm_write8(ea + 10, CELL_AUDIO_OUT_FS_48KHZ);
     vm_write8(ea + 11, 0);
@@ -139,12 +97,9 @@ s32 cellAudioOutGetState(u32 audioOut, u32 deviceIndex, void* state)
 s32 cellAudioOutGetNumberOfDevice(u32 audioOut)
 {
     (void)audioOut;
-    return 1; /* one audio output device */
+    return 1;
 }
 
-/* cellAudioOutConfigure(audioOut, config, option, waitForEvent) -- set the
- * audio output mode. We accept any config and report success (request id 0);
- * the title queries availability separately. NID 0x4692AB35. */
 s32 cellAudioOutConfigure(u32 audioOut, void* config, void* option, u32 waitForEvent)
 {
     (void)config; (void)option; (void)waitForEvent;

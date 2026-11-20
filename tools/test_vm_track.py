@@ -1,19 +1,4 @@
 #!/usr/bin/env python3
-"""Guest write tracking through slow-page bits (runtime/memory/vm_track.c).
-
-vm_track arms pages in ppu_slow_page; a write to an armed page reports it once
-(vm_track_write disarms and marks it dirty) and vm_track_drain re-arms every
-dirty page before reporting it. Checked against a renderer-style reader that
-re-reads a page whenever it is reported:
-  - first tracking reports every page once, and an untouched page is never
-    reported again;
-  - a pinned range (vm_io_begin/vm_io_end) is reported on every drain until
-    unpinned, then once more;
-  - racing a writer against back-to-back drains, the reader always ends up
-    with the writer's last value: a host writer that marks after its copy, and
-    a lifted guest store that takes the inline page check and the re-check
-    after the store (the path the PPU uses).
-"""
 from __future__ import annotations
 
 import importlib.util

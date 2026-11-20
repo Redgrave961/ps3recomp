@@ -1,8 +1,3 @@
-/* The vector spu_fi/frest/frsqest/cflts/cfltu/csflt/cuflt (AVX2 on x86) must be bit-identical
- * to the scalar references (spu_*_ref) for every input: random words, ordinary floats, the
- * normal/extended-range boundaries, zeros and denormals, integers of every magnitude, and every
- * scale immediate. Prints a rough speed comparison too. Build on x86 with AVX2:
- *   cc -O2 -mavx2 -mfma -I../../../include -I.. test_spu_float_est.c -o t && ./t */
 #include "../spu_helpers.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,12 +14,12 @@ static uint32_t rnd_float(void)
 {
     uint32_t sign = (rnd32() & 1u) << 31, man = rnd32() & 0x7FFFFFu, e;
     switch (rnd32() % 10) {
-    case 0: e = 0; break;                              /* zero / denormal */
-    case 1: e = 1 + rnd32() % 4; break;                /* bottom of normal range */
-    case 2: e = 248 + rnd32() % 8; break;              /* top, into extended range */
-    case 3: return rnd32();                            /* anything */
-    case 4: return sign;                               /* +-0 */
-    default: e = 110 + rnd32() % 36; break;            /* ordinary */
+    case 0: e = 0; break;
+    case 1: e = 1 + rnd32() % 4; break;
+    case 2: e = 248 + rnd32() % 8; break;
+    case 3: return rnd32();
+    case 4: return sign;
+    default: e = 110 + rnd32() % 36; break;
     }
     return sign | (e << 23) | man;
 }
@@ -33,10 +28,10 @@ static uint32_t rnd_int(void)
 {
     switch (rnd32() % 6) {
     case 0: return 0;
-    case 1: return 0x80000000u >> (rnd32() % 32);      /* powers of two */
-    case 2: return 0xFFFFFFFFu >> (rnd32() % 32);      /* all-ones runs */
+    case 1: return 0x80000000u >> (rnd32() % 32);
+    case 2: return 0xFFFFFFFFu >> (rnd32() % 32);
     case 3: return (uint32_t)-(int32_t)(rnd32() >> (rnd32() % 32));
-    default: return rnd32() >> (rnd32() % 32);         /* every magnitude */
+    default: return rnd32() >> (rnd32() % 32);
     }
 }
 
@@ -73,7 +68,7 @@ int main(void)
         CHECK1(frest, f);
         CHECK1(frsqest, f);
         CHECK2(fi, g, f);
-        CHECK2(fi, g, spu_frest_ref(f));               /* the frest -> fi pair as code uses it */
+        CHECK2(fi, g, spu_frest_ref(f));
         CHECK2(fi, g, spu_frsqest_ref(f));
         const int imm = (int)(rnd32() & 0xFF);
         CHECKI(cflts, f, imm);
@@ -81,7 +76,6 @@ int main(void)
         CHECKI(csflt, n, imm);
         CHECKI(cuflt, n, imm);
     }
-    /* every immediate on a fixed spread of operands */
     for (int imm = 0; imm < 256; imm++)
         for (int it = 0; it < 2000; it++) {
             u128 f, n;
@@ -90,7 +84,6 @@ int main(void)
         }
     printf("test_spu_float_est: %ld mismatches\n", s_bad);
 
-    /* speed: the frest/fi reciprocal pair, vector vs scalar */
     u128 x, y; for (int k = 0; k < 4; k++) { x._u32[k] = 0x3F800000u + rnd32() % 0x800000u; y = x; }
     volatile uint32_t sink = 0;
     const long R = 20000000;

@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""PS3_PRIO_START through the real sys_ppu_thread.c: run once with the option and once without."""
 import os
 from pathlib import Path
 import subprocess

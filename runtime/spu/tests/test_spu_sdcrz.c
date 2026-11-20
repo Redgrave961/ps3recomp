@@ -1,4 +1,3 @@
-/* Synthetic storage-control commands, real channels/interpreter and reservations. */
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -18,7 +17,7 @@ static void prepare(uint32_t ea, uint32_t n) {
     memset(guest+ea-128,0x77,n+256);
     memset(writer.ls,0xA5,SPU_LS_SIZE);
     memcpy(expected_ls,writer.ls,SPU_LS_SIZE);
-    writer.mfc_lsa=SPU_LS_SIZE-1; /* No valid DMA span; SDCRZ does not use LSA. */
+    writer.mfc_lsa=SPU_LS_SIZE-1;
     writer.mfc_eah=0;writer.mfc_eal=ea;writer.mfc_size=n;writer.mfc_tag=11;
     mfc_for(&writer)->tag_completed &= ~(1u<<11);
 }
@@ -47,9 +46,7 @@ int main(void) {
     spu_wrch(&writer,MFC_Cmd,spu_splat_u32(0x89));
     cleared(ea,2048);
     prepare(ea,2048);
-    /* Upper halfword is replacement/transfer class; lower16 is opcode. */
     spu_wrch(&writer,MFC_Cmd,spu_splat_u32(0x01020089u));cleared(ea,2048);
-    /* Independently encode synthetic wrch instructions with preloaded registers. */
     prepare(ea,16384);
     const unsigned channels[]={MFC_EAL,MFC_Size,MFC_TagID,MFC_Cmd};
     const uint32_t values[]={ea,16384,11,0x89};
@@ -60,8 +57,6 @@ int main(void) {
     be32(writer.ls+0x1010,0);memcpy(expected_ls,writer.ls,SPU_LS_SIZE);
     spu_interp_run(&writer,0x1000);
     cleared(ea,16384);
-    /* Zero-to-zero writes must notify peers on every touched line. Master
-     * tracks SPU reservations; it does not expose PPU reservation epochs. */
     prepare(ea,2048);memset(guest+ea,0,2048);reserve(ea+1920);
     first_peer.mfc_eal=ea;first_peer.mfc_eah=0;first_peer.mfc_lsa=0x2000;
     assert(spu_mfc_atomic(&first_peer,MFC_GETLLAR_CMD));
@@ -93,8 +88,6 @@ int main(void) {
             assert(pid>0&&waitpid(pid,&status,0)==pid);
             assert(WIFEXITED(status)&&WEXITSTATUS(status)==3);
         }
-    /* An earlier stall in the same tag must prevent zeroing/completion. An
-     * unrelated stalled tag must not block this tag's synchronous command. */
     prepare(ea,2048);writer.list_stall_mask=(1u<<11);
     assert(mfc_submit(mfc_for(&writer),&writer,0x89)==-1);
     assert(guest[ea]==0x77 && !(mfc_for(&writer)->tag_completed&(1u<<11)));
@@ -117,6 +110,5 @@ uint32_t g_ww_lo = 0xFFFFFFFFu, g_ww_hi = 0;
 void (*g_spurs_kernel_hook)(uint32_t) = 0;
 void spurs_ef_set_from_spu(uint32_t ea, uint16_t bits) { (void)ea; (void)bits; }
 
-/* Loader diagnostics and worker publication are outside this fixture. */
 uint32_t g_spu_image_src_ea, g_spu_image_ls_start, g_spu_image_span;
 void spu_thread_publish_ctx(uint32_t tid, void* ctx) { (void)tid; (void)ctx; }

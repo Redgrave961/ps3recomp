@@ -1,31 +1,12 @@
-/*
- * ps3recomp - cellUserInfo HLE implementation
- *
- * Reports a single default user (ID=00000001, name="User").
- */
-
 #include "cellUserInfo.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
-#include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
-/* HLE args arrive as guest effective addresses; translate before deref. */
-/* The guest is big-endian; u32 fields we write into guest structs must be stored
- * byte-swapped or the guest reads them mangled (e.g. a count of 1 read as
- * 0x01000000 = 16.7M, blowing up the caller's enumeration loop). */
+#include "../../runtime/ppu/ppu_memory.h"
 #define BE32(v) ( (((uint32_t)(v) & 0x000000FFu) << 24) | (((uint32_t)(v) & 0x0000FF00u) << 8) | \
                   (((uint32_t)(v) & 0x00FF0000u) >> 8) | (((uint32_t)(v) & 0xFF000000u) >> 24) )
 
-/* ---------------------------------------------------------------------------
- * Internal state
- * -----------------------------------------------------------------------*/
-
-/* The emulated PS3 has one user */
 #define EMU_USER_ID     CELL_USERINFO_DEFAULT_USER_ID
-
-/* ---------------------------------------------------------------------------
- * API implementations
- * -----------------------------------------------------------------------*/
 
 s32 cellUserInfoGetList(u32* listNum, CellUserInfoUserList* list, u32* currentUser)
 {
@@ -47,4 +28,3 @@ s32 cellUserInfoGetList(u32* listNum, CellUserInfoUserList* list, u32* currentUs
 
     return CELL_OK;
 }
-

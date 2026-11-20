@@ -1,6 +1,3 @@
-/* mfc_for runs on every MFC channel read and write. It must not look an environment variable up each time: with
- * SPU_PCSAMPLE unset it used to, and getenv walks the whole environment, so an SPU program that talks to its MFC in a
- * tight loop (an audio DSP thread) ran at half speed. spu_channels.c's getenv calls are counted by name. */
 #include <stdlib.h>
 #include <string.h>
 

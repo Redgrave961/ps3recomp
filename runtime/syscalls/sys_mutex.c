@@ -1,7 +1,3 @@
-/*
- * ps3recomp - Kernel mutex syscalls (implementation)
- */
-
 #include "sys_mutex.h"
 #include "sys_ppu_thread.h"
 #include "../memory/vm.h"

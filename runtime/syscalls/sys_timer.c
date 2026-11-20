@@ -1,16 +1,12 @@
-/*
- * ps3recomp - Timer and time syscalls (implementation)
- */
-
 #ifndef _DEFAULT_SOURCE
-#define _DEFAULT_SOURCE /* tm_gmtoff on glibc */
+#define _DEFAULT_SOURCE
 #endif
 #include "sys_timer.h"
-#include "sys_ppu_thread.h"   /* ppu_thread_note_block */
+#include "sys_ppu_thread.h"
 #include <time.h>
 #include "sys_event.h"
 #include "../memory/vm.h"
-#include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
+#include <stdlib.h>
 #include <string.h>
 #include <stdlib.h>
 #include "ps3emu/log_first.h"
@@ -20,9 +16,6 @@
 #endif
 #include "ps3emu/thread_name.h"
 
-/* ---------------------------------------------------------------------------
- * Globals
- * -----------------------------------------------------------------------*/
 sys_timer_info g_sys_timers[SYS_TIMER_MAX];
 
 #ifdef _WIN32
@@ -38,17 +31,6 @@ static void ensure_qpc_init(void)
 }
 #endif
 
-/* ---------------------------------------------------------------------------
- * PPU timebase (mftb/mftbu) -- THE guest clock.
- *
- * One global monotonic counter scaled to the PS3 timebase (79.8 MHz),
- * anchored at first use. The old lifter emission was a per-call-site
- * static that advanced 16667 ticks PER READ -- not a clock at all: every
- * guest timing loop (media pacers, throttles, profilers) computed garbage
- * from it, and each call site had a PRIVATE counter that only moved when
- * polled. Overflow-safe split multiply (rem < qpf, so
- * rem * 79.8e6 < ~8e14 << 2^63).
- * -----------------------------------------------------------------------*/
 uint64_t ppu_timebase_now(void)
 {
 #ifdef _WIN32
@@ -56,7 +38,7 @@ uint64_t ppu_timebase_now(void)
     ensure_qpc_init();
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
-    if (!t0) t0 = now.QuadPart;   /* benign race: same anchor either way */
+    if (!t0) t0 = now.QuadPart;
     uint64_t d = (uint64_t)(now.QuadPart - t0);
     uint64_t q = (uint64_t)s_qpc_freq.QuadPart;
     return (d / q) * PS3_TIMEBASE_FREQ + (d % q) * PS3_TIMEBASE_FREQ / q;
@@ -83,13 +65,12 @@ uint64_t host_monotonic_ns(void)
 {
 #ifdef __APPLE__
     static uint32_t numer, denom;
-    if (!denom) {                       /* benign race: same values either way */
+    if (!denom) {
         mach_timebase_info_data_t tb;
         mach_timebase_info(&tb);
         numer = tb.numer; denom = tb.denom;
     }
     const uint64_t t = mach_absolute_time();
-    /* Split so t * numer cannot overflow (numer is 125 on Apple silicon). */
     return (t / denom) * numer + (t % denom) * numer / denom;
 #else
     struct timespec ts;
@@ -125,11 +106,6 @@ static void write_be64(uint32_t addr, uint64_t val)
     *p = val;
 }
 
-/* ---------------------------------------------------------------------------
- * sys_timer_usleep
- *
- * r3 = microseconds
- * -----------------------------------------------------------------------*/
 int64_t sys_timer_usleep(ppu_context* ctx)
 {
     uint64_t usec = LV2_ARG_U64(ctx, 0);
@@ -138,15 +114,10 @@ int64_t sys_timer_usleep(ppu_context* ctx)
     return CELL_OK;
 }
 
-/* ---------------------------------------------------------------------------
- * sys_timer_sleep
- *
- * r3 = seconds
- * -----------------------------------------------------------------------*/
 int64_t sys_timer_sleep(ppu_context* ctx)
 {
     uint32_t sec = LV2_ARG_U32(ctx, 0);
-    ppu_thread_note_block(ctx->thread_id);   /* PS3_PRIO_START */
+    ppu_thread_note_block(ctx->thread_id);
 
 #ifdef _WIN32
     Sleep(sec * 1000);
@@ -157,15 +128,6 @@ int64_t sys_timer_sleep(ppu_context* ctx)
     return CELL_OK;
 }
 
-/* ---------------------------------------------------------------------------
- * sys_time_get_current_time
- *
- * r3 = pointer to receive seconds (u64*)
- * r4 = pointer to receive nanoseconds (u64*)
- * -----------------------------------------------------------------------*/
-/* LV2 144: r3/r4 point to signed BE32 minute offsets. The first is the
- * standard UTC offset; the second is the current seasonal adjustment.
- * Derive the adjustment instead of assuming every DST shift is 60 minutes. */
 int64_t sys_time_get_timezone(ppu_context* ctx)
 {
     uint32_t zone_addr = LV2_ARG_PTR(ctx, 0);
@@ -175,8 +137,6 @@ int64_t sys_time_get_timezone(ppu_context* ctx)
 
     int32_t standard_minutes, daylight_minutes;
 #ifdef _WIN32
-    /* Ask the system, not the C runtime: _get_timezone and _get_dstbias do not exist in the msvcrt.dll that a
-     * MinGW-w64 toolchain with the msvcrt runtime links against. Bias is minutes west of UTC. */
     TIME_ZONE_INFORMATION tz;
     DWORD zone_id = GetTimeZoneInformation(&tz);
     if (zone_id == TIME_ZONE_ID_INVALID)
@@ -214,7 +174,6 @@ int64_t sys_time_get_current_time(ppu_context* ctx)
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
 
-    /* Convert QPC to seconds + nanoseconds */
     sec  = (uint64_t)(now.QuadPart / s_qpc_freq.QuadPart);
     uint64_t remainder = (uint64_t)(now.QuadPart % s_qpc_freq.QuadPart);
     nsec = (remainder * 1000000000ULL) / (uint64_t)s_qpc_freq.QuadPart;
@@ -235,25 +194,14 @@ int64_t sys_time_get_current_time(ppu_context* ctx)
     return CELL_OK;
 }
 
-/* ---------------------------------------------------------------------------
- * sys_time_get_timebase_frequency
- *
- * Returns the PS3 timebase frequency in r3.
- * -----------------------------------------------------------------------*/
 int64_t sys_time_get_timebase_frequency(ppu_context* ctx)
 {
     (void)ctx;
     return (int64_t)PS3_TIMEBASE_FREQ;
 }
 
-/* ---------------------------------------------------------------------------
- * Periodic timer thread
- * -----------------------------------------------------------------------*/
-
-/* Forward declaration */
 static void timer_send_event(sys_timer_info* t);
 
-/* Microseconds on a monotonic host clock: the timer's expiration times. */
 static uint64_t timer_now_us(void)
 {
 #ifdef _WIN32
@@ -279,7 +227,7 @@ static DWORD WINAPI timer_thread_proc(LPVOID param)
 
         DWORD result = WaitForSingleObject(t->stop_event, ms);
         if (result == WAIT_OBJECT_0) {
-            break; /* stop signaled */
+            break;
         }
 
         if (t->running) {
@@ -327,12 +275,6 @@ static void timer_send_event(sys_timer_info* t)
 
     sys_event_t evt;
     evt.source = t->source;
-    /* lv2 (and RPCS3) deliver the connect's data1/data2 and, in data3, the
-     * EXPIRATION TIME -- which advances every period. It was 0 here, so a
-     * consumer that paces itself by the delta between ticks saw no time pass:
-     * Twisted Metal's BoomRangBuss audio driver wakes on this timer, derives
-     * how many blocks to service from data3, and serviced none, ever -- so
-     * brb_StartSession timed out and every later BRB request hung. */
     evt.data1  = t->data1;
     evt.data2  = t->data2;
     evt.data3  = t->next_expire;
@@ -341,11 +283,6 @@ static void timer_send_event(sys_timer_info* t)
     sys_event_queue_push_by_id((uint32_t)t->event_queue_id, evt.source, evt.data1, evt.data2, evt.data3);
 }
 
-/* ---------------------------------------------------------------------------
- * sys_timer_create
- *
- * r3 = pointer to receive timer ID (u32*)
- * -----------------------------------------------------------------------*/
 int64_t sys_timer_create(ppu_context* ctx)
 {
     uint32_t id_out_addr = LV2_ARG_PTR(ctx, 0);
@@ -381,11 +318,6 @@ int64_t sys_timer_create(ppu_context* ctx)
     return CELL_OK;
 }
 
-/* ---------------------------------------------------------------------------
- * sys_timer_destroy
- *
- * r3 = timer_id
- * -----------------------------------------------------------------------*/
 int64_t sys_timer_destroy(ppu_context* ctx)
 {
     uint32_t timer_id = LV2_ARG_U32(ctx, 0);
@@ -397,7 +329,6 @@ int64_t sys_timer_destroy(ppu_context* ctx)
     if (!t->active)
         return (int64_t)(int32_t)CELL_ESRCH;
 
-    /* Stop if running */
     if (t->running) {
         t->running = 0;
 #ifdef _WIN32
@@ -422,14 +353,6 @@ int64_t sys_timer_destroy(ppu_context* ctx)
     return CELL_OK;
 }
 
-/* ---------------------------------------------------------------------------
- * sys_timer_connect_event_queue
- *
- * r3 = timer_id
- * r4 = queue_id
- * r5 = source
- * r6 = data1
- * -----------------------------------------------------------------------*/
 int64_t sys_timer_connect_event_queue(ppu_context* ctx)
 {
     uint32_t timer_id = LV2_ARG_U32(ctx, 0);
@@ -456,11 +379,6 @@ int64_t sys_timer_connect_event_queue(ppu_context* ctx)
     return CELL_OK;
 }
 
-/* ---------------------------------------------------------------------------
- * sys_timer_disconnect_event_queue
- *
- * r3 = timer_id
- * -----------------------------------------------------------------------*/
 int64_t sys_timer_disconnect_event_queue(ppu_context* ctx)
 {
     uint32_t timer_id = LV2_ARG_U32(ctx, 0);
@@ -476,17 +394,9 @@ int64_t sys_timer_disconnect_event_queue(ppu_context* ctx)
     return CELL_OK;
 }
 
-/* ---------------------------------------------------------------------------
- * sys_timer_start
- *
- * r3 = timer_id
- * r4 = base_time (absolute start time, 0 = now)
- * r5 = period_usec
- * -----------------------------------------------------------------------*/
 int64_t sys_timer_start(ppu_context* ctx)
 {
     uint32_t timer_id    = LV2_ARG_U32(ctx, 0);
-    /* uint64_t base_time = LV2_ARG_U64(ctx, 1); -- ignored for now */
     uint64_t period      = LV2_ARG_U64(ctx, 2);
 
     if (timer_id == 0 || timer_id > SYS_TIMER_MAX)
@@ -517,11 +427,6 @@ int64_t sys_timer_start(ppu_context* ctx)
     return CELL_OK;
 }
 
-/* ---------------------------------------------------------------------------
- * sys_timer_stop
- *
- * r3 = timer_id
- * -----------------------------------------------------------------------*/
 int64_t sys_timer_stop(ppu_context* ctx)
 {
     uint32_t timer_id = LV2_ARG_U32(ctx, 0);
@@ -560,18 +465,6 @@ int64_t sys_timer_stop(ppu_context* ctx)
     return CELL_OK;
 }
 
-/* ---------------------------------------------------------------------------
- * Registration
- *
- * NOTE: There are syscall number collisions in the existing table:
- *   SYS_TIMER_USLEEP (141) == SYS_EVENT_FLAG_WAIT (141)
- *   SYS_TIMER_SLEEP  (142) == SYS_EVENT_FLAG_TRYWAIT (142)
- *   SYS_TIME_GET_CURRENT_TIME (145) == SYS_EVENT_FLAG_CANCEL (145)
- * The event flag handlers are registered separately and will win.
- * Timer sleep/time functions should be called via wrapper functions
- * or fixed syscall numbers should be assigned.
- * For now, we register the timer-specific syscalls that don't collide.
- * -----------------------------------------------------------------------*/
 void sys_timer_init(lv2_syscall_table* tbl)
 {
     memset(g_sys_timers, 0, sizeof(g_sys_timers));
@@ -587,15 +480,9 @@ void sys_timer_init(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, SYS_TIMER_CONNECT_EVENT_QUEUE,      sys_timer_connect_event_queue);
     lv2_syscall_register(tbl, SYS_TIMER_DISCONNECT_EVENT_QUEUE,   sys_timer_disconnect_event_queue);
 
-    /* These have conflicting numbers with event flag syscalls.
-     * Register them here -- last registration wins. If events are
-     * registered after timers, the event handlers will override.
-     * The runtime should dispatch timer_usleep/sleep/get_current_time
-     * via direct function calls instead. */
     lv2_syscall_register(tbl, SYS_TIME_GET_TIMEBASE_FREQUENCY, sys_time_get_timebase_frequency);
     lv2_syscall_register(tbl, SYS_TIME_GET_TIMEZONE, sys_time_get_timezone);
 
-    /* Register these but be aware of collisions */
     lv2_syscall_register(tbl, SYS_TIMER_USLEEP,            sys_timer_usleep);
     lv2_syscall_register(tbl, SYS_TIMER_SLEEP,             sys_timer_sleep);
     lv2_syscall_register(tbl, SYS_TIME_GET_CURRENT_TIME,   sys_time_get_current_time);

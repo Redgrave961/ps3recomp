@@ -85,8 +85,8 @@ ROOT = os.path.abspath(os.path.join(HERE, ".."))
 
 sys.path.insert(0, HERE)
 try:
-    from ppu_disasm import decode, disassemble_bytes  # noqa: E402
-    from elf_parser import ELFFile, PT_LOAD  # noqa: E402
+    from ppu_disasm import decode, disassemble_bytes
+    from elf_parser import ELFFile, PT_LOAD
 except ImportError as exc:
     print(f"Error: could not import ppu_disasm/elf_parser from {HERE}: {exc}",
           file=sys.stderr)
@@ -98,20 +98,7 @@ TODO_RE = re.compile(r"/\* TODO: (\S+)")
 UNRESOLVED_RE = re.compile(r"/\* unresolved target 0x([0-9A-Fa-f]+) \*/")
 
 
-# ---------------------------------------------------------------------------
-# Pass 1: marker census (reads the generated chunk .cpp files as-shipped)
-# ---------------------------------------------------------------------------
-
 def marker_census(recomp_dir: str):
-    """Scan <recomp_dir>/ppu_recomp_*.cpp for the two marker emit sites.
-
-    Grouping: /* TODO: <mn> ... */ by mnemonic (mn is the first whitespace
-    token after "TODO: ", matching ppu_lifter.py line 2176's f-string
-    exactly: "{mn} {insn.operands}"). /* unresolved target 0x... */ has no
-    sub-grouping in the source (ppu_lifter.py line 2568 emits one per
-    address) -- reported as a single reason bucket "unresolved-call-or-
-    branch-target" with the total count and sample addresses.
-    """
     chunk_paths = sorted(glob.glob(os.path.join(recomp_dir, "ppu_recomp_*.cpp")))
     if not chunk_paths:
         print(f"ERROR: no {recomp_dir}/ppu_recomp_*.cpp chunk files found -- "
@@ -139,10 +126,6 @@ def marker_census(recomp_dir: str):
     return chunk_paths, todo_by_mnemonic, unresolved_addrs
 
 
-# ---------------------------------------------------------------------------
-# Pass 2: fall-through census (absorbs scratch/fallthrough_sweep.py in-place)
-# ---------------------------------------------------------------------------
-
 def _load_functions_json(functions_path: str):
     import json
     with open(functions_path) as f:
@@ -151,11 +134,6 @@ def _load_functions_json(functions_path: str):
 
 
 def _is_terminator_word(w: int) -> bool:
-    """Same terminator test as scratch/fallthrough_sweep.py's is_terminator():
-    unconditional b/ba (opcode 18, LK=0) or unconditional blr/bctr (opcode 19,
-    XO 16/528, LK=0, BO unconditional bits bo&0x14==0x14). sc (opcode 17)
-    returns control to the caller via the syscall path, so it is NOT treated
-    as a terminator (matches the sweep script: falls through)."""
     op = w >> 26
     if op == 18 and not (w & 1):
         return True
@@ -189,16 +167,7 @@ def fallthrough_census(elf_data: bytes, functions_path: str):
     return entries, gap_followed, hazards
 
 
-# ---------------------------------------------------------------------------
-# Pass 3: target coverage (decode all executable words, bucket b/bl targets)
-# ---------------------------------------------------------------------------
-
 def _executable_instructions(elf_path: str):
-    """Same PT_LOAD/PF_X segment walk as ppu_lifter.py main() (~line 2840-
-    2857): decode every executable segment's words via disassemble_bytes.
-    Falls back to the first non-empty PT_LOAD segment if none are marked
-    executable (mirrors the lifter's own fallback), matching its behavior
-    exactly rather than reimplementing a heuristic."""
     elf = ELFFile(elf_path)
     elf.load()
     big_endian = elf.elf_header.big_endian
@@ -217,16 +186,6 @@ def _executable_instructions(elf_path: str):
 
 
 def target_coverage_census(elf_path: str, entries: list[tuple[int, int]]):
-    """Decode all executable words; collect unconditional-transfer (b/bl/
-    ba/bla) targets; bucket vs functions.json coverage.
-
-    Unconditional transfer = PPC opcode 18 forms (mnemonic starts with 'b',
-    produced only by the opcd==18 branch in ppu_disasm.py decode() ~line
-    151: mnemonics "b"/"bl"/"ba"/"bla"). Conditional branches (opcode 16) and
-    CTR/LR-indirect forms are excluded -- their targets are either runtime-
-    resolved (not statically knowable) or already covered as conditional
-    in-function gotos by the lifter.
-    """
     starts = sorted(s for s, _ in entries)
     import bisect
 
@@ -241,8 +200,6 @@ def target_coverage_census(elf_path: str, entries: list[tuple[int, int]]):
 
     entries_by_start = {}
     for s, e in entries:
-        # keep the widest/last end if duplicate starts exist (shouldn't, but
-        # be defensive rather than silently dropping data)
         if s not in entries_by_start or e > entries_by_start[s][1]:
             entries_by_start[s] = (s, e)
     starts = sorted(entries_by_start.keys())
@@ -270,10 +227,6 @@ def target_coverage_census(elf_path: str, entries: list[tuple[int, int]]):
 
     return total_words, len(targets), gap_targets, midfunc_targets
 
-
-# ---------------------------------------------------------------------------
-# Report formatting + baseline diff
-# ---------------------------------------------------------------------------
 
 def build_report(chunk_paths, todo_by_mnemonic, unresolved_addrs,
                   fn_entries, gap_followed, ft_hazards,
@@ -330,11 +283,6 @@ def build_report(chunk_paths, todo_by_mnemonic, unresolved_addrs,
 
 def build_baseline_dict(todo_by_mnemonic, unresolved_addrs, ft_hazards,
                          gap_targets, midfunc_targets):
-    """Flat key->count dict used for baseline persistence + diffing. Only
-    SUMMARY counts are diffed (not full address lists) -- new counts higher
-    than baseline are FAIL; the full lists are for human triage in the
-    printed report, not baseline-tracked line by line (address sets shift
-    harmlessly with unrelated relifts; count regressions are the signal)."""
     d = {}
     for mn, cnt in todo_by_mnemonic.items():
         d[f"todo_mnemonic:{mn}"] = cnt
@@ -358,9 +306,6 @@ def read_baseline(path):
     if not os.path.exists(path):
         return None
     d = {}
-    # utf-8-sig: tolerate a BOM if the file was ever touched by a BOM-adding
-    # editor/tool (this tool's own writer never adds one, but baseline files
-    # are plain text and easy to corrupt by hand on Windows).
     with open(path, "r", encoding="utf-8-sig") as f:
         for line in f:
             line = line.rstrip("\r\n")
@@ -375,9 +320,6 @@ def read_baseline(path):
 
 
 def diff_against_baseline(current: dict, baseline: dict) -> tuple[list[str], bool]:
-    """Returns (report_lines, has_new_anomaly). A NEW anomaly = a key whose
-    count increased vs baseline, or a key with nonzero count that is absent
-    from baseline entirely. Decreases and unchanged counts are fine."""
     lines = []
     fail = False
     all_keys = sorted(set(current) | set(baseline))

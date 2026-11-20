@@ -1,24 +1,4 @@
 #!/usr/bin/env python3
-"""End-to-end: a switch whose case blocks lie past the function's first blr.
-
-A function inventory that ends functions at their first `blr` (or an export
-that truncates them) cuts a switch function in two: the dispatch stays in the
-declared range and the case blocks, which sit after an early-return `blr` and
-share a later epilogue, are outside it. Once the dispatcher is resolved,
-ppu_lifter.main() extends the enclosing function over its cases and the bctr
-becomes a computed goto to internal labels. If the dispatcher is NOT resolved,
-nothing extends the function, the bctr lifts to ps3_indirect_call and the case
-blocks only exist as unrelated fragments.
-
-The vector here combines that shape with a table base that was TOC-loaded,
-spilled to the stack and reloaded at the dispatch (the base register then
-reused for the case address), which discover_jump_tables used to drop. It
-builds a tiny big-endian ELF64, passes a --functions list that ends the switch
-function at its first blr, runs the real lifter, and checks the emitted C.
-
-Run: python tools/test_ppu_jumptable_extent.py
-"""
-
 import glob
 import json
 import os
@@ -30,13 +10,13 @@ import tempfile
 TOOLS = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, TOOLS)
 
-import ppu_disasm                                   # noqa: E402
-import ppu_lifter                                   # noqa: E402
-from test_ppu_jumptables import (w_add, w_b, w_bc, w_blr, w_bctr, w_cmplwi,  # noqa: E402
+import ppu_disasm
+import ppu_lifter
+from test_ppu_jumptables import (w_add, w_b, w_bc, w_blr, w_bctr, w_cmplwi,
                                  w_ld, w_li, w_lwz, w_lwzx, w_mtctr, w_slwi,
                                  w_std, w_stdu)
 
-DATA = 0x10000          # TOC, OPD entry descriptor, jump table
+DATA = 0x10000
 TEXT = 0x20000
 TOC = DATA + 0x8000
 TABLE = DATA + 0x100
@@ -49,17 +29,6 @@ def w_mtlr(rs):            return (31 << 26) | (rs << 21) | (_spr(8) << 11) | (4
 
 
 def build():
-    """Return (text words, label addresses). Layout of the switch function:
-
-        mflr r0 ; stdu r1,-0x300(r1) ; std r0,0x310(r1)
-        lwz r10,16(r2) ; std r10,0x2D0(r1)          TOC-load, spill
-        li r0,1 (the index) ; cmplwi r0,2 ; bgt early
-        ld r11,0x2D0(r1) ; slwi r9,r0,2 ; lwzx r0,r9,r11
-        add r11,r0,r11 ; mtctr r11 ; bctr
-      early:  li r3,-1 ; addi r1,r1,0x300 ; blr     FIRST blr
-      case0/1/2: li r3,N ; b done
-      done:   ld r0,0x310(r1) ; mtlr r0 ; addi r1,r1,0x300 ; blr
-    followed by an unrelated function (its own prologue)."""
     w, at = [], {}
 
     def here(name):
@@ -69,7 +38,7 @@ def build():
     w += [w_mflr(0), w_stdu(1, 1, -0x300), w_std(0, 1, 0x310),
           w_lwz(10, 2, 16), w_std(10, 1, 0x2D0),
           w_li(0, 1), w_cmplwi(0, 0, 2)]
-    bgt_at = len(w); w.append(0)                     # patched below
+    bgt_at = len(w); w.append(0)
     w += [w_ld(11, 1, 0x2D0), w_slwi(9, 0, 2), w_lwzx(0, 9, 11),
           w_add(11, 0, 11), w_mtctr(11)]
     here("bctr"); w.append(w_bctr())
@@ -89,8 +58,6 @@ def build():
 
 
 def elf64(text, data):
-    """Minimal ET_EXEC, big-endian, two PT_LOADs (RX text, RW data), entry =
-    the OPD descriptor {code, toc} at the start of data."""
     ehsz, phsz = 64, 56
     off_text = 0x1000
     off_data = off_text + ((len(text) + 0xFFF) & ~0xFFF)
@@ -110,9 +77,9 @@ def elf64(text, data):
 def lift(td, words, at, bounds):
     text = b"".join(struct.pack(">I", x) for x in words)
     data = bytearray(0x8000 + 0x100)
-    struct.pack_into(">II", data, 0, at["func"], TOC)               # entry OPD
-    struct.pack_into(">I", data, TOC + 16 - DATA, TABLE)            # TOC slot -> table
-    for n in range(3):                                              # offset table
+    struct.pack_into(">II", data, 0, at["func"], TOC)
+    struct.pack_into(">I", data, TOC + 16 - DATA, TABLE)
+    for n in range(3):
         struct.pack_into(">I", data, TABLE - DATA + 4 * n, at[f"case{n}"] - TABLE)
     elf = os.path.join(td, "switch.elf")
     with open(elf, "wb") as f:
@@ -151,11 +118,10 @@ def check(name, ok, detail=""):
 
 def main():
     words, at = build()
-    for i, x in enumerate(words):                    # encoding sanity
+    for i, x in enumerate(words):
         if ppu_disasm.decode(x, TEXT + 4 * i).mnemonic.startswith((".", "unk")):
             print(f"ENCODING word {i}: 0x{x:08X}")
             return 1
-    # The inventory ends the switch function at its first blr.
     bounds = [(at["func"], at["first_end"]), (at["next"], at["end"])]
     with tempfile.TemporaryDirectory() as td:
         src = lift(td, words, at, bounds)

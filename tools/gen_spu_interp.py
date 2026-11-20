@@ -1,25 +1,11 @@
 #!/usr/bin/env python3
-"""Generate the SPU interpreter's decode table (C) from the validated Python
-decoder (spu_disasm.py). The interpreter is the correctness floor for the SPU
-static recompiler: computed/indirect branches (`bi $reg`) and DMA'd or
-self-modified code (LBP overlays, spu_0004's `sync; bi $3` trampoline) can't be
-statically lifted, so on a lifted-function-table miss we interpret from live
-local store. Emitting the opcode->mnemonic tables from spu_disasm keeps the
-interpreter's decode bit-identical to the decoder we already proved 100% vs
-spu-lv2-objdump; the execute half (spu_interp.c) calls the SAME spu_<mnemonic>
-helpers the lifter emits, so lifted and interpreted code share exact semantics.
-
-    python gen_spu_interp.py > ../runtime/spu/spu_interp_tables.inc
-"""
 import os
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-import spu_disasm as D  # RRR_TABLE, RI18_TABLE, RI16_TABLE, RI10_TABLE, SPU_RR, ...
+import spu_disasm as D
 
-# The RI7 / RI8 / LSX tables live inside spu_decode() as locals; mirror them here
-# (kept in sync by this generator; a drift shows immediately in the selftest).
 RI7 = {
     0x078: "roti", 0x079: "rotmi", 0x07a: "rotmai", 0x07b: "shli",
     0x07c: "rothi", 0x07d: "rothmi", 0x07e: "rotmahi", 0x07f: "shlhi",
@@ -28,11 +14,10 @@ RI7 = {
     0x1fc: "rotqbyi", 0x1fd: "rotqmbyi", 0x1ff: "shlqbyi",
 }
 RI7_UNSIGNED = {"cbd", "chd", "cwd", "cdd"}
-RI8 = {0x1d8: "cflts", 0x1d9: "cfltu", 0x1da: "csflt", 0x1db: "cuflt"}  # op10
+RI8 = {0x1d8: "cflts", 0x1d9: "cfltu", 0x1da: "csflt", 0x1db: "cuflt"}
 LSX = {0x1c4: "lqx", 0x144: "stqx"}
-CHANNEL = {0x00D: "rdch", 0x10D: "wrch", 0x00F: "rchcnt"}  # op11
+CHANNEL = {0x00D: "rdch", 0x10D: "wrch", 0x00F: "rchcnt"}
 
-# Every mnemonic the decoder can emit -> a stable enum. `.word` is the trap.
 all_mn = set()
 for t in (D.RRR_TABLE, D.RI18_TABLE, D.RI16_TABLE, D.RI10_TABLE, D.SPU_RR,
           RI7, RI8, LSX, CHANNEL):
@@ -45,22 +30,6 @@ def enum_name(m):
     return "SPU_" + ("word" if m == ".word" else m)
 
 
-# Every opcode field of the SPU ISA (RRR 4 bits, RI18 7, RI16 9, RI10 8, RI8 10,
-# RI7/RR/LSX/channel 11) is a prefix of instruction bits 31..21, so the matched
-# mnemonic is a pure function of p = insn >> 21 and the whole decode collapses
-# into one 2048-entry table. The immediate form is a function of the matched
-# mnemonic and of the table it came from; the position-fixed operand fields
-# (rt/ra/rb/rc/ch) stay in spu_decode1.
-#
-# Prefixes may match more than one table, and the first stage to match wins, so
-# this order IS the decoder's precedence and mirrors spu_disasm.spu_decode:
-# RI16 before RI10 (an RI10 opcode equal to the top 8 bits of an RI16 opcode
-# must not shadow it), channel ops before RI10, RR before RI7, LSX last, else
-# `.word`. With the current tables the only prefixes matched twice are
-# rdch/rchcnt/wrch (channel and RR) and lqx/stqx (RR and LSX), where both
-# stages agree; the order is kept so a table entry added later resolves
-# exactly as the old cascade did instead of silently changing which
-# instruction executes.
 STAGES = (
     ("rrr", 4, D.RRR_TABLE),
     ("ri18", 7, D.RI18_TABLE),
@@ -73,7 +42,6 @@ STAGES = (
     ("lsx", 11, LSX),
 )
 
-# How spu_decode1 derives `imm` / `tgt` for a decoded instruction.
 FORMS = (
     ("NONE", "no immediate: RRR, RR (except stop), LSX, channel ops, .word"),
     ("I18", "ila: full 18-bit immediate"),
@@ -117,7 +85,6 @@ def form_of(stage, mn):
 
 
 def decode_prefix(p):
-    """(mnemonic, form) for the 11-bit prefix p = insn >> 21."""
     for stage, bits, table in STAGES:
         mn = table.get(p >> (11 - bits))
         if mn is not None:

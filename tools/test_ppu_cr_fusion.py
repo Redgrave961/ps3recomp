@@ -1,12 +1,4 @@
 #!/usr/bin/env python3
-"""Compare+branch fusion and the XER.SO proof.
-
-A compare followed by a branch on one of its bits lifts to a direct C
-condition; the CR field store stays whenever any path can still read the
-field. Every fused function is compiled next to its unfused lift and both are
-run over the same inputs, which must leave identical r3 and CR. The SO proof
-must find every instruction that can set XER.SO and nothing else.
-"""
 from __future__ import annotations
 
 import importlib.util

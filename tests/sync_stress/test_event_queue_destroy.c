@@ -1,16 +1,3 @@
-/* sys_event_queue_destroy and timed receive.
- *
- *   - mode is honoured: an unknown mode is EINVAL; a plain destroy while a
- *     receiver is blocked is EBUSY and leaves that receiver blocked; a FORCE
- *     destroy returns every blocked receiver CELL_ECANCELED. The lock was
- *     deleted under a receiver parked with no timeout, which then never woke.
- *   - ports connected to a destroyed queue are disconnected (send is ENOTCONN),
- *     so a send cannot land in whatever queue next reuses the slot.
- *   - a timed receive runs to an absolute deadline: wake-ups that find the queue
- *     empty do not restart the timeout.
- *
- * Win32 host threads, through the shim off Windows. Links sys_event.c and
- * test_shims.c only. */
 #include "runtime/platform/win32_compat.h"
 #include "runtime/syscalls/sys_event.h"
 #include <stdio.h>
@@ -19,7 +6,6 @@
 
 uint8_t* vm_base;
 
-/* sys_event.c's title-diagnostic side paths reach for these; none can run here. */
 size_t spu_elf_image_size(const uint8_t* image, size_t max_avail) { (void)image; (void)max_avail; return 0; }
 int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size, uint32_t args_ea)
 { (void)image; (void)image_size; (void)args_ea; return 0; }
@@ -82,7 +68,6 @@ static uint32_t make_queue(void)
     CHECK_RC(call(sys_event_queue_create, 1, 0x200, 0, 0x1234, 8), CELL_OK);
     return be_read(0x200);
 }
-/* Wait until `n` receivers are inside the queue. */
 static int waiters(uint32_t q)
 {
     sys_event_queue_info* e = &g_sys_event_queues[q - 1];
@@ -104,13 +89,11 @@ static void test_destroy_modes(void)
     CHECK_RC(call(sys_event_queue_destroy, 1, q, 7, 0, 0), CELL_EINVAL);
     CHECK(g_sys_event_queues[q - 1].active);
 
-    /* A port wired to the queue. */
     CHECK_RC(call(sys_event_port_create, 1, 0x210, SYS_EVENT_PORT_LOCAL, 0, 0), CELL_OK);
     const uint32_t port = be_read(0x210);
     CHECK_RC(call(sys_event_port_connect_local, 1, port, q, 0, 0), CELL_OK);
-    CHECK_RC(call(sys_event_port_send, 1, port, 1, 2, 3), CELL_OK);          /* queued */
+    CHECK_RC(call(sys_event_port_send, 1, port, 1, 2, 3), CELL_OK);
 
-    /* Two receivers: the first takes the queued event, then both block. */
     recv_t r1, r2;
     recv_start(&r1, q, 0, 0x300);
     recv_join(&r1);
@@ -119,35 +102,29 @@ static void test_destroy_modes(void)
     recv_start(&r2, q, 0, 0x340);
     wait_waiters(q, 2);
 
-    /* A plain destroy refuses and leaves them blocked. */
     CHECK_RC(call(sys_event_queue_destroy, 1, q, 0, 0, 0), CELL_EBUSY);
     CHECK(g_sys_event_queues[q - 1].active);
     Sleep(50);
     CHECK(r1.rc == -1 && r2.rc == -1);
 
-    /* FORCE wakes both with ECANCELED. */
     CHECK_RC(call(sys_event_queue_destroy, 1, q, SYS_EVENT_QUEUE_DESTROY_FORCE, 0, 0), CELL_OK);
     recv_join(&r1); recv_join(&r2);
     CHECK(r1.rc == (int32_t)CELL_ECANCELED);
     CHECK(r2.rc == (int32_t)CELL_ECANCELED);
     CHECK(!g_sys_event_queues[q - 1].active);
 
-    /* The port no longer points at the dead queue, and a new queue in that slot
-     * does not receive from it. */
     CHECK_RC(call(sys_event_port_send, 1, port, 1, 2, 3), CELL_ENOTCONN);
     const uint32_t q2 = make_queue();
-    CHECK(q2 == q);                                  /* the slot is reused */
+    CHECK(q2 == q);
     CHECK_RC(call(sys_event_port_send, 1, port, 1, 2, 3), CELL_ENOTCONN);
     CHECK(g_sys_event_queues[q2 - 1].count == 0);
     CHECK_RC(call(sys_event_queue_receive, 1, q2, 0x300, 1000, 0), CELL_ETIMEDOUT);
 
-    /* Idle: a plain destroy works, and a second one is ESRCH. */
     CHECK_RC(call(sys_event_queue_destroy, 1, q2, 0, 0, 0), CELL_OK);
     CHECK_RC(call(sys_event_queue_destroy, 1, q2, 0, 0, 0), CELL_ESRCH);
     CHECK_RC(call(sys_event_port_destroy, 1, port, 0, 0, 0), CELL_OK);
 }
 
-/* Spurious wake-ups (a broadcast that finds the queue empty) every 25 ms. */
 static volatile int s_stop_wakes;
 static uint32_t s_wake_q;
 static DWORD WINAPI waker(void* unused)
@@ -167,16 +144,12 @@ static void test_timed_receive(void)
 {
     const uint32_t q = make_queue();
 
-    /* Plain timeout: not early, not wildly late. */
     recv_t r;
     recv_start(&r, q, 60000, 0x300);
     recv_join(&r);
     CHECK(r.rc == (int32_t)CELL_ETIMEDOUT);
     CHECK(r.ms >= 55.0 && r.ms < 500.0);
 
-    /* A wake-up that finds nothing must not restart the timeout: with one every
-     * 25 ms, a 120 ms receive still ends at about 120 ms (it used to start its
-     * full wait over after each wake, and so never ended). */
     s_wake_q = q; s_stop_wakes = 0;
     HANDLE w = CreateThread(NULL, 0, waker, NULL, 0, NULL);
     recv_start(&r, q, 120000, 0x300);

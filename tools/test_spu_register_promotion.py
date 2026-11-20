@@ -22,7 +22,6 @@ RESERVED = {0, 1, 60, 70}
 POOL = [r for r in range(2, 128) if r not in RESERVED and not 60 <= r < 80]
 RRR = {"selb", "shufb", "mpya", "fnms", "fma", "fms"}
 WIDE = {"il", "ila", "ilh", "ilhu", "iohl", "fsmbi", "lqa", "stqa", "lqr", "stqr"}
-STORES = {"stqd", "stqa", "stqx", "stqr"}
 SKIP = {"hbr", "hbra", "hbrr", "nop", "lnop", "sync", "dsync", "syncc", "fscrwr", "mtspr",
         "heq", "heqi", "hgt", "hgti", "hlgt", "hlgti"}
 REJECT = ("TODO", "return", "goto", "SPU_", "spu_func_", "spu_rdch", "spu_wrch", "spu_rchcnt", "spu_stop",

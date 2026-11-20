@@ -1,19 +1,3 @@
-/*
- * Unit tests for SPU instruction-semantics helpers (runtime/spu/spu_helpers.h).
- *
- * Each test fixes a known input and asserts the bit-exact output. Vectors
- * are taken from the IBM Cell BE Architecture / SPU ISA reference; tricky
- * cases (selector specials in shufb, boundary shifts at 0 and >=width,
- * negative-direction rotates in rotmi/rotmai, insertion-mask generation)
- * have multiple vectors.
- *
- * Build:
- *   gcc -std=c11 -I../.. test_spu_helpers.c -o test_spu_helpers
- *   (add -mssse3 on x86 to cover the SPU_LS_VEC quadword path of spu_context.h)
- *
- * Exit code: 0 if all passed, 1 if any failed. Final line prints summary.
- */
-
 #include "../spu_helpers.h"
 #include <stdio.h>
 #include <string.h>
@@ -26,28 +10,12 @@ static u128 make128(uint64_t hi, uint64_t lo) {
     u128 r; r._u64[0] = hi; r._u64[1] = lo; return r;
 }
 
-/* Construct from four SPU words: w0 is SPU word 0 (most significant).
- * Use this rather than make128 whenever the lanes differ, because make128
- * writes _u64[] and the union is host-native -- on a little-endian host
- * _u64[0]'s low half is _u32[0], i.e. SPU word 0, so the word order comes out
- * reversed within each dword. */
 static u128 make128_words(uint32_t w0, uint32_t w1, uint32_t w2, uint32_t w3) {
     u128 r; r._u32[0] = w0; r._u32[1] = w1; r._u32[2] = w2; r._u32[3] = w3;
     return r;
 }
 
-/* Construct from 16 explicit bytes — endianness-neutral (writes _u8[i]=b[i]).
- * Use this for any test that cares about specific byte layout (shufb, cwd,
- * fsmbi, byte permutations). make128 above interprets values according to
- * host endianness, which is fine only for lane-symmetric vectors. */
 static u128 from_bytes(const uint8_t b[16]) {
-    /* Adapted to THIS runtime's u128 convention. Our u128 is host-native
-     * little-endian (_u32[i] = SPU word i as a value), so SPU byte i lives at
-     * _u8[SPU_W(i)], not _u8[i]. Upstream's u128 is a big-endian byte array
-     * (_u8[i] = SPU byte i), which is what these ISA vectors were written for.
-     * Routing the byte vector through SPU_W is the only change needed to make
-     * the byte-layout tests (shufb, cwd/cbd/chd/cdd, byte shifts) evaluate in
-     * our representation; every byte-position op already maps through SPU_W. */
     u128 r;
     for (int i = 0; i < 16; i++) r._u8[SPU_W(i)] = b[i];
     return r;
@@ -76,9 +44,6 @@ static void print_u128(const char* label, u128 v) {
 
 #define TEST(name) g_current = name
 
-/* ===========================================================================
- * Immediate loaders: broadcast semantics
- * ===========================================================================*/
 static void test_immediate_loaders(void) {
     TEST("il splats sign-extended 16-bit to 4 words");
     EXPECT_EQ(spu_il(5),    make128(0x0000000500000005ULL, 0x0000000500000005ULL));
@@ -96,9 +61,6 @@ static void test_immediate_loaders(void) {
               make128(0x1234567812345678ULL, 0x1234567812345678ULL));
 }
 
-/* ===========================================================================
- * Per-lane SIMD arithmetic
- * ===========================================================================*/
 static void test_simd_arith(void) {
     TEST("a (add word) per-lane");
     u128 a4 = make128(0x0000000100000002ULL, 0x0000000300000004ULL);
@@ -107,7 +69,7 @@ static void test_simd_arith(void) {
               make128(0x0000001100000022ULL, 0x0000003300000044ULL));
 
     TEST("sf (subtract from word) does rb-ra, not ra-rb");
-    EXPECT_EQ(spu_sf(spu_il(3), spu_il(7)), spu_il(4));   /* 7-3 = 4 */
+    EXPECT_EQ(spu_sf(spu_il(3), spu_il(7)), spu_il(4));
 
     TEST("ah (add halfword) per-lane");
     EXPECT_EQ(spu_ah(spu_ilh(10), spu_ilh(20)), spu_ilh(30));
@@ -124,39 +86,28 @@ static void test_simd_arith(void) {
     EXPECT_EQ(spu_cg(spu_il(1), spu_il(2)), spu_il(0));
 
     TEST("addx (add extended w/ carry-in from rt LSB)");
-    u128 carry_one = spu_il(1);   /* rt._u32[i] & 1 = 1 */
+    u128 carry_one = spu_il(1);
     EXPECT_EQ(spu_addx(spu_il(10), spu_il(20), carry_one), spu_il(31));
-    u128 carry_zero = spu_il(2);  /* LSB = 0 */
+    u128 carry_zero = spu_il(2);
     EXPECT_EQ(spu_addx(spu_il(10), spu_il(20), carry_zero), spu_il(30));
 }
 
-/* ===========================================================================
- * Multiply family — these mix lanes; common to get wrong
- * ===========================================================================*/
 static void test_multiply(void) {
-    /* mpy: low halfword of each word × low halfword → 32-bit word. */
     TEST("mpy multiplies low halfwords of each word");
-    /* word i = 0x00030007 -> low half = 7, high half = 3.
-       For mpy: low * low = 7*5 = 35 per word. */
     u128 a = make128(0x0003000700030007ULL, 0x0003000700030007ULL);
     u128 b = make128(0x0002000500020005ULL, 0x0002000500020005ULL);
     EXPECT_EQ(spu_mpy(a, b), spu_il(35));
 
     TEST("mpyh multiplies high half of ra by low half of rb, then <<16");
-    /* per word: (high_a * low_b) << 16 = (3 * 5) << 16 = 15 << 16 = 0xF0000 */
     EXPECT_EQ(spu_mpyh(a, b), spu_il(0xF0000));
 
     TEST("mpyhh multiplies high halves of both");
-    /* high_a * high_b = 3 * 2 = 6 per word */
     EXPECT_EQ(spu_mpyhh(a, b), spu_il(6));
 
     TEST("mpyu unsigned matches mpy for positive small values");
     EXPECT_EQ(spu_mpyu(a, b), spu_il(35));
 }
 
-/* ===========================================================================
- * Compares — produce all-ones or all-zeros per lane
- * ===========================================================================*/
 static void test_compares(void) {
     TEST("ceq word equal");
     u128 x = make128(0x0000000A0000000BULL, 0x0000000C0000000BULL);
@@ -165,18 +116,16 @@ static void test_compares(void) {
               make128(0x00000000FFFFFFFFULL, 0x00000000FFFFFFFFULL));
 
     TEST("cgt signed greater (negative is less)");
-    EXPECT_EQ(spu_cgt(spu_il(1), spu_il(-1)), spu_il(-1));   /* 1 > -1 */
-    EXPECT_EQ(spu_cgt(spu_il(-1), spu_il(1)), spu_il(0));    /* -1 not > 1 */
+    EXPECT_EQ(spu_cgt(spu_il(1), spu_il(-1)), spu_il(-1));
+    EXPECT_EQ(spu_cgt(spu_il(-1), spu_il(1)), spu_il(0));
 
     TEST("clgt unsigned greater");
-    /* 0xFFFFFFFF > 1 unsigned */
     EXPECT_EQ(spu_clgt(spu_il(-1), spu_il(1)), spu_il(-1));
 
     TEST("ceqb byte-wise equal produces 0xFF per matching byte");
     {
         uint8_t zb_bytes[16] = {1,2,3,4,5,6,7,8, 1,2,3,4,5,6,7,8};
         uint8_t wb_bytes[16] = {1,0,3,0,4,6,5,8, 1,0,3,0,4,6,5,8};
-        /* per byte: ==FF / !=00; expected mask: FF,00,FF,00,00,FF,00,FF (x2) */
         uint8_t exp_bytes[16] = {0xFF,0,0xFF,0,0,0xFF,0,0xFF,
                                  0xFF,0,0xFF,0,0,0xFF,0,0xFF};
         EXPECT_EQ(spu_ceqb(from_bytes(zb_bytes), from_bytes(wb_bytes)),
@@ -184,9 +133,6 @@ static void test_compares(void) {
     }
 }
 
-/* ===========================================================================
- * Shift / rotate: boundary cases at 0 and >= width
- * ===========================================================================*/
 static void test_shift_rotate_boundaries(void) {
     TEST("shli with sh=0 is identity (no UB)");
     EXPECT_EQ(spu_shli(spu_il(0xAB), 0), spu_il(0xAB));
@@ -234,9 +180,6 @@ static void test_shift_rotate_boundaries(void) {
     }
 }
 
-/* ===========================================================================
- * shufb: special selector values and byte permutation
- * ===========================================================================*/
 static void test_shufb(void) {
     uint8_t a_bytes[16] = {0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,
                            0x08,0x09,0x0A,0x0B,0x0C,0x0D,0x0E,0x0F};
@@ -273,9 +216,6 @@ static void test_shufb(void) {
     }
 }
 
-/* ===========================================================================
- * selb: bitwise select (c-bit ? b : a)
- * ===========================================================================*/
 static void test_selb(void) {
     TEST("selb with c=all-zeros returns a");
     u128 a = make128(0xAAAAAAAAAAAAAAAAULL, 0xAAAAAAAAAAAAAAAAULL);
@@ -286,17 +226,12 @@ static void test_selb(void) {
     EXPECT_EQ(spu_selb(a, b, spu_splat_u8(0xFF)), b);
 
     TEST("selb per-bit mix");
-    /* c = 0x0F repeating -> low nibble picks b, high nibble picks a */
     u128 c = spu_splat_u8(0x0F);
-    u128 expected = spu_splat_u8(0xAB);   /* high nibble A from a, low nibble B from b */
+    u128 expected = spu_splat_u8(0xAB);
     EXPECT_EQ(spu_selb(a, b, c), expected);
 }
 
-/* ===========================================================================
- * Constant generators: insertion mask shape
- * ===========================================================================*/
 static void test_constant_generators(void) {
-    /* Default selector pattern = identity-from-B: 0x10, 0x11, ..., 0x1F. */
     uint8_t identity_b[16] = {0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,
                               0x18,0x19,0x1A,0x1B,0x1C,0x1D,0x1E,0x1F};
 
@@ -341,9 +276,6 @@ static void test_constant_generators(void) {
     }
 }
 
-/* ===========================================================================
- * fsmbi: bit-mask to byte-mask
- * ===========================================================================*/
 static void test_fsmbi(void) {
     TEST("fsmbi 0x0000 -> all zeros");
     EXPECT_EQ(spu_fsmbi(0x0000), spu_zero());
@@ -363,12 +295,8 @@ static void test_fsmbi(void) {
     }
 }
 
-/* ===========================================================================
- * Sign extension
- * ===========================================================================*/
 static void test_sign_extend(void) {
     TEST("xsbh: sign-extend low byte of each halfword");
-    /* halfword 0xFF80 -> low byte = 0x80 = -128 -> sign-extend to 0xFF80 */
     u128 in_xsbh = spu_ilh(0xFF80);
     EXPECT_EQ(spu_xsbh(in_xsbh), spu_ilh(0xFF80));
 
@@ -379,10 +307,6 @@ static void test_sign_extend(void) {
     EXPECT_EQ(spu_xshw(spu_il(0x0000FFFE)), spu_il((int32_t)0xFFFFFFFE));
 
     TEST("xswd: sign-extend low word of each dword to 64-bit");
-    /* dword 0: low word 0xFFFFFFFF -> sign-extends to all ones.
-     * dword 1: low word 0x7FFFFFFF -> stays positive, high word cleared.
-     * Built by word lane: make128 would reverse the words within each dword
-     * (see make128_words), which is why this case read as all zeros. */
     u128 in_xswd       = make128_words(0x00000000u, 0xFFFFFFFFu,
                                        0x00000000u, 0x7FFFFFFFu);
     u128 expected_xswd = make128_words(0xFFFFFFFFu, 0xFFFFFFFFu,
@@ -390,9 +314,6 @@ static void test_sign_extend(void) {
     EXPECT_EQ(spu_xswd(in_xswd), expected_xswd);
 }
 
-/* ===========================================================================
- * Floating-point fused multiply / negative variants
- * ===========================================================================*/
 static void float_splat(u128* r, float v) {
     for (int i = 0; i < 4; i++) r->_f32[i] = v;
 }
@@ -419,10 +340,6 @@ static void test_float_fused(void) {
     else { g_fail++; fprintf(stderr, "FAIL: %s\n", g_current); }
 }
 
-/* ===========================================================================
- * Float compares: extended range, any two zeros equal, and the vector forms
- * bit for bit against the _ref loops
- * ===========================================================================*/
 static uint32_t cmp_rand(uint32_t* s) { *s = *s * 1664525u + 1013904223u; return *s; }
 static void test_float_compares(void) {
     TEST("fceq: +0, -0 and denormals are all zero");
@@ -469,7 +386,6 @@ static void test_float_compares(void) {
         u128 a, b;
         for (int k = 0; k < 4; k++) {
             a._u32[k] = cmp_rand(&seed);
-            /* Often the same exponent, or a near value, or its negation. */
             switch (cmp_rand(&seed) >> 30) {
             case 0:  b._u32[k] = a._u32[k] ^ (cmp_rand(&seed) & 0x807FFFFFu); break;
             case 1:  b._u32[k] = a._u32[k] + (cmp_rand(&seed) & 3u) - 1u; break;
@@ -485,9 +401,6 @@ static void test_float_compares(void) {
     if (!bad) g_pass++; else { g_fail++; fprintf(stderr, "FAIL: %s (%d)\n", g_current, bad); }
 }
 
-/* ===========================================================================
- * main: run all and report
- * ===========================================================================*/
 static void test_ls_quadwords(void) {
     static spu_context ctx;
     ctx.ls = ctx.ls_store;

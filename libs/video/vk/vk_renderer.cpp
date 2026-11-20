@@ -15,7 +15,7 @@ namespace {
 enum fb_context : u32 { FB_DRAW = 0, FB_CLEAR_COLOR = 1, FB_CLEAR_DEPTH = 2 };
 
 enum : u32 {
-    CLEAR_Z = 0x01u, CLEAR_S = 0x02u, CLEAR_R = 0x10u, CLEAR_G = 0x20u, CLEAR_B = 0x40u, CLEAR_A = 0x80u,
+    CLEAR_Z = 0x01u, CLEAR_S = 0x02u,
     CLEAR_RGBA = 0xF0u, CLEAR_ANY = 0xF3u,
 };
 

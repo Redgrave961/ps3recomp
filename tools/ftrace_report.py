@@ -1,22 +1,4 @@
 #!/usr/bin/env python3
-"""Frame-by-frame report of a PS3_FTRACE timeline.
-
-  tools/ftrace_report.py <trace.txt> [--frames N] [--ms-per-col F] [--threads a,b]
-
-PS3_FTRACE=<start s>:<seconds>:<path> (toolkit, include/ps3emu/ps3_ftrace.h)
-records spans: PPU syscalls that blocked and merged usleep poll runs (with the
-guest call site), SPU busy/wait spans (busy tagged with the lifted image and the
-SPURS workload id), the RSX walker blocked on a semaphore ACQUIRE, FIFO drains,
-flips, presents and HLE import calls. A frame here is the time between two
-guest flip requests.
-
-The report says, for the median frame, how each thread spent it, and draws a
-few frames as a timeline (one column per --ms-per-col ms):
-  PPU   '#' running   '.' usleep poll   's' other blocking syscall
-  SPU   '#' busy      ' ' waiting on a channel
-  RSX   'S' blocked on ACQUIRE   'D' FIFO drain   'P' present   '|' flip reached
-        inside D/P: 'E' GPU encode   'G' waiting for the GPU   'R' render-target readback
-"""
 import argparse
 import collections
 import statistics
@@ -26,7 +8,7 @@ import sys
  GPU_ENCODE, GPU_WAIT, READBACK, GPU_EXEC, HLE) = range(1, 16)
 GPU_WAIT_KIND = {0: "gpu wait (flush)", 1: "gpu wait (present)", 2: "gpu wait (in-flight)"}
 
-SYSCALL_NAMES = {   # runtime/syscalls/lv2_syscall_table.h
+SYSCALL_NAMES = {
     43: "thread_yield", 44: "thread_join", 85: "event_flag_wait", 92: "semaphore_wait",
     97: "lwmutex_lock", 102: "mutex_lock", 107: "cond_wait", 113: "lwcond_wait",
     122: "rwlock_rlock", 125: "rwlock_wlock", 130: "event_queue_receive", 138: "event_port_send",
@@ -77,10 +59,9 @@ def main():
     print(f"{len(frames)} frames, median {statistics.median(durs):.1f} ms "
           f"({1000 / statistics.median(durs):.1f} fps), min {min(durs):.1f}, max {max(durs):.1f}")
 
-    # Per-frame totals, then the median of each.
-    ppu = collections.defaultdict(lambda: collections.defaultdict(list))   # tid -> (kind, site) -> [ms per frame]
-    spu_busy = collections.defaultdict(list)                                # spu -> [ms per frame]
-    spu_wid = collections.defaultdict(float)                                # (wid) -> ms total
+    ppu = collections.defaultdict(lambda: collections.defaultdict(list))
+    spu_busy = collections.defaultdict(list)
+    spu_wid = collections.defaultdict(float)
     spu_img = collections.defaultdict(float)
     rsx = collections.defaultdict(list)
     tids = sorted({s[1] for s in spans if s[0] in (SYSCALL, USLEEP)})
@@ -132,7 +113,7 @@ def main():
     med = statistics.median(durs)
 
     def mean(xs):
-        return sum(xs) / n   # frames where it never happened count as 0
+        return sum(xs) / n
 
     print(f"\nPer frame (mean over {n} frames, ms; frame median {med:.1f}):")
     print("  PPU threads (time blocked, by kind and guest call site):")
@@ -156,7 +137,6 @@ def main():
     for what in RSX_ROWS:
         print(f"    {what:20s} {mean(rsx[what]):5.1f}")
 
-    # GPU execution per command buffer (headless commits wait for each one).
     ex = [s for s in spans if s[0] == GPU_EXEC and flips[0] <= s[5] <= flips[-1]]
     if ex:
         print("  GPU command buffers (GPU's own execution time):")
@@ -170,9 +150,6 @@ def main():
                   f"  depth resolves {statistics.median([s[2] & 0xFFFF for s in xs]):.0f}"
                   f"  colour copies {statistics.median([s[2] >> 16 for s in xs]):.0f}")
 
-    # Time inside HLE import calls, which includes waits that no syscall span
-    # shows (an lwcond wait, a file read). Names come from the NIDs of the
-    # functions the toolkit implements.
     hle = collections.defaultdict(float)
     for s in spans:
         if s[0] == HLE:
@@ -189,11 +166,10 @@ def main():
             e = db.lookup_nid(nid) if db else None
             print(f"    tid {t:3d} {names.get(t, '?')[:28]:28s} {ms / n:5.1f}  {e[1] if e else f'nid {nid:08X}'}")
 
-    # Timelines.
     if args.threads:
         draw = [int(x) for x in args.threads.split(",")]
     else:
-        draw = [t for _, t in sorted(rows)[:6]]   # the threads that work, not the idle ones
+        draw = [t for _, t in sorted(rows)[:6]]
     pick = [frames[len(frames) // 2 + i] for i in range(args.frames) if len(frames) // 2 + i < len(frames)]
     for f0, f1 in pick:
         cols = int((f1 - f0) / args.ms_per_col) + 1
@@ -229,7 +205,7 @@ def main():
                 paint(lines[("rsx",)], t0, t1, "P", True)
             elif k == FLIP_FIFO:
                 paint(lines[("rsx",)], t0, t0, "|", True)
-        for k, who, a, b, t0, t1 in spans:   # second pass: what the drain/present was doing
+        for k, who, a, b, t0, t1 in spans:
             if t1 < f0 or t0 > f1:
                 continue
             if k == GPU_ENCODE:

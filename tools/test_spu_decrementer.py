@@ -1,9 +1,4 @@
 #!/usr/bin/env python3
-"""SPU decrementer: counts down from the host clock at 79.8 MHz, at fine resolution.
-
-Builds runtime/spu/tests/test_spu_decrementer.c against the SPU channel layer
-(the build line of test_spu_taskset_wake.c) and runs it.
-"""
 import os
 from pathlib import Path
 import subprocess

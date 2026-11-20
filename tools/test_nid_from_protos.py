@@ -1,12 +1,3 @@
-"""Self-check for tools/nid_from_protos.json (produced by nid_harvest.py).
-
-Every entry must satisfy the definition compute_nid(name) == nid. That is exactly what
-made each entry admissible (a symbol name whose hash equals a real imported NID), so this
-re-verifies the whole file with no game binary -- and trips if compute_nid ever regresses
-or the JSON is hand-edited wrong.
-
-Run: python tools/test_nid_from_protos.py
-"""
 import json
 import os
 import sys
@@ -32,7 +23,6 @@ def main() -> int:
 
     assert total >= 300, f"expected the harvested set, got only {total} entries"
 
-    # And the database actually surfaces them.
     ndb = NIDDatabase()
     ndb.load_builtins()
     sample_lib = next(iter(db))

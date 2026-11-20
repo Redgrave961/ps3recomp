@@ -1,5 +1,3 @@
-/* Existing engines are directory reads; only publication/removal need a writer.
- * Real production lookup and real platform locks are used. Every wait is bounded. */
 #include "../../platform/win32_compat.h"
 #include <stdatomic.h>
 #include <pthread.h>
@@ -70,8 +68,6 @@ static void read_lock_case(spu_context* ctx, int operation)
     CHECK(pthread_create(&worker, NULL, lookup_worker, &req) == 0);
     CHECK(wait_flag(&req.started, 3000));
     if (operation == 0) {
-        /* On the parent the worker needs a writer, so this reports RED before
-         * the root releases its read lock and joins the worker normally. */
         CHECK(wait_flag(&req.done, 1000));
         CHECK(atomic_load(&fixture_exclusive_attempts) == 0);
     } else {
@@ -85,8 +81,6 @@ static void read_lock_case(spu_context* ctx, int operation)
 }
 int main(void)
 {
-    /* Retain the pre-existing ownership, 48 live allocation lifetimes, real
-     * stalled-list DMA, same-address reset and range cleanup regressions. */
     if (registry_previous_main()) return 1;
     CHECK(s_mfc_slots == NULL);
     fixture_lock = &s_mfc_claim_lock;
@@ -101,8 +95,6 @@ int main(void)
     CHECK(s_mfc_slots == NULL);
     free(ctx);
 
-    /* All misses reach exclusive admission before any can publish. The
-     * exclusive path must recheck or duplicate nodes appear for each owner. */
     struct lookup_request req[16] = {0};
     pthread_t threads[16];
     spu_context* pair[2] = {calloc(1, sizeof(*ctx)), calloc(1, sizeof(*ctx))};

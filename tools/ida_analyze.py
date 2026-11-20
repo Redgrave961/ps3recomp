@@ -1,30 +1,10 @@
 #!/usr/bin/env python3
-"""ida_analyze.py -- headless IDA Pro function export for ps3recomp.
-
-The IDA-side sibling of ghidra_analyze.py: opens a (decrypted) PS3 PPU ELF in
-IDA via idalib (no GUI), runs auto-analysis, and writes a functions.json in the
-*same* schema Ghidra's exporter uses:
-
-    functions.json   [{addr, size, name, thunk}]
-
-so the harness cross-check (tier 6) and `find_functions --seed-json` consume an
-IDA export and a Ghidra export interchangeably -- two independent oracles for
-the same question ("which function starts did our detector miss?").
-
-MUST run under the Python that idalib is installed in (IDA Pro 9.1 -> Python
-3.11). The harness invokes it with that interpreter; if you run it by hand:
-
-    py -3.11 tools/ida_analyze.py game/EBOOT.elf -o ida_out
-
-idalib locks the input's .idb while open, so don't point two analyses at the
-same file at once.
-"""
 import argparse
 import json
 import os
 import sys
 
-import idapro  # MUST be imported before any ida_* module
+import idapro
 
 import ida_funcs
 import ida_auto
@@ -49,7 +29,7 @@ def main():
         print("ERROR: idapro.open_database failed", file=sys.stderr)
         sys.exit(2)
     try:
-        ida_auto.auto_wait()  # ensure analysis settled
+        ida_auto.auto_wait()
         funcs = []
         for ea in idautils.Functions():
             f = ida_funcs.get_func(ea)

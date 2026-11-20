@@ -60,8 +60,6 @@ endif()
             consumers=[row for row in commands if Path(row['file']).parent==out]
             assert len(consumers)==2
             for row in consumers:
-                # Build only the real generated object rules. The semantic
-                # fixture is header-only and needs no SDK duplicate archive.
                 cmd=row['command']
                 obj=row.get('output')
                 if not obj:

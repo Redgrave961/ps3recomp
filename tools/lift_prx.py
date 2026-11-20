@@ -1,29 +1,4 @@
 #!/usr/bin/env python3
-"""Relocate a decrypted PS3 PRX module for static lifting (firmware LLE).
-
-Takes a decrypted .prx (ELF64 BE, type 0xFFA4), places its LOAD segments at a
-chosen guest base, applies the SCE_PPURELA relocations, and emits:
-
-  <name>_image.bin       relocated flat image (load at --base in the runner)
-  <name>_functions.json  function seeds for ppu_lifter (--raw --base mode):
-                         every exported function's code address, region-bounded;
-                         the lifter's discovery pass finds interior functions
-  <name>_exports.json    {library: {fnid_hex: opd_ea_hex}} for import binding
-  <name>_imports.json    the module's own imports: {library: {fnid_hex:
-                         stub_slot_ea_hex}} — slots the runner patches to its
-                         HLE bridge descriptors
-
-Relocation semantics follow the PS3 PRX format as documented by RPCS3's
-ppu_loader (PPUModule.cpp): 24-byte entries {offset u64, pad u16,
-index_value u8, index_addr u8, type u32, ptr u64}; target =
-seg[index_addr].base + offset; value = (index_value == 0xFF ? 0 :
-seg[index_value].base) + ptr. Types: 1 = ADDR32, 4 = ADDR16_LO, 5 = ADDR16_HI,
-6 = ADDR16_HA, 10 = REL24, 44 = REL64, 57 = ADDR16_LO_DS.
-
-Usage:
-    py -3 tools/lift_prx.py libsre.prx --base 0x02000000 --output recomp_prx/
-"""
-
 import argparse
 import json
 import os
@@ -56,8 +31,8 @@ class Prx:
             raise SystemExit("not a PPC64 module")
         e_phoff = be64(d, 0x20)
         phnum = be16(d, 0x38)
-        self.loads = []        # (p_offset, p_vaddr, p_filesz, p_memsz)
-        self.rela = None       # (p_offset, p_filesz)
+        self.loads = []
+        self.rela = None
         for i in range(phnum):
             o = e_phoff + i * 0x38
             p_type = be32(d, o)
@@ -71,11 +46,9 @@ class Prx:
             elif p_type == 0x700000A4:
                 self.rela = (p_offset, p_filesz)
             if p_type == 1 and not hasattr(self, "modinfo_off"):
-                # module info: paddr of the first LOAD segment = file offset
                 self.modinfo_off = p_paddr
 
     def build_image(self, base):
-        """Place LOAD segments at base+vaddr, zero-fill bss, relocate."""
         top = max(v + m for _, v, _, m in self.loads)
         img = bytearray(top)
         seg_bases = []
@@ -93,20 +66,20 @@ class Prx:
             rtype = be32(self.data, o + 12)
             ptr = be64(self.data, o + 16)
 
-            target = (seg_bases[index_addr] - base) + offset   # image-relative
+            target = (seg_bases[index_addr] - base) + offset
             value = (0 if index_value == 0xFF else seg_bases[index_value]) + ptr
             counts[rtype] = counts.get(rtype, 0) + 1
 
-            if rtype == 1:        # ADDR32
+            if rtype == 1:
                 img[target:target + 4] = struct.pack(">I", value & 0xFFFFFFFF)
-            elif rtype == 4:      # ADDR16_LO
+            elif rtype == 4:
                 img[target:target + 2] = struct.pack(">H", value & 0xFFFF)
-            elif rtype == 5:      # ADDR16_HI
+            elif rtype == 5:
                 img[target:target + 2] = struct.pack(">H", (value >> 16) & 0xFFFF)
-            elif rtype == 6:      # ADDR16_HA
+            elif rtype == 6:
                 img[target:target + 2] = struct.pack(
                     ">H", ((value + 0x8000) >> 16) & 0xFFFF)
-            elif rtype == 44:     # REL64 (rare)
+            elif rtype == 44:
                 img[target:target + 8] = struct.pack(">Q", value & (2**64 - 1))
             else:
                 raise SystemExit(f"unhandled relocation type {rtype} "
@@ -114,7 +87,6 @@ class Prx:
         return bytes(img), counts
 
     def parse_modinfo(self, img, base):
-        """Exports/imports from the RELOCATED image (tables hold real EAs)."""
         d = self.data
         mi = self.modinfo_off
         name = d[mi + 4:mi + 32].split(b"\0")[0].decode("ascii", "replace")
@@ -163,7 +135,6 @@ class Prx:
         return name, toc, exports, imports
 
     def text_extent(self):
-        """(vaddr, size) of the first (text) LOAD segment."""
         off, vaddr, filesz, memsz = self.loads[0]
         return vaddr, filesz
 
@@ -181,10 +152,6 @@ def main():
     stem = os.path.splitext(os.path.basename(args.input))[0]
     os.makedirs(args.output, exist_ok=True)
 
-    # function seeds: every exported function's CODE address (read from its
-    # relocated OPD), region-bounded by the next seed / end of text. Interior
-    # functions are found by the lifter's discovery pass (bl targets, tail
-    # entries); unreachable tail code inside a region lifts harmlessly.
     text_va, text_sz = prx.text_extent()
     code_addrs = set()
     opd_map = {}
@@ -195,12 +162,6 @@ def main():
             code_addrs.add(code)
             opd_map[opd] = f"0x{code:08X}"
 
-    # ALSO seed every internal OPD: scan the image for {code, toc} pairs
-    # with toc == the module TOC and code inside text. Functions referenced
-    # only through data OPDs (e.g. SPURS passes its PPU handler-thread
-    # entries to sys_ppu_thread_create) are invisible to the lifter's
-    # branch discovery — without these seeds they lift as nothing and the
-    # threads exit instantly (observed live with pxd::SpursHdlr0/1).
     text_lo = args.base + text_va
     text_hi = args.base + text_va + text_sz
     toc_ea = toc + args.base

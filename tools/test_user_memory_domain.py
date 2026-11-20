@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Exercise the real LV2 user and mapper allocators with a manufactured VM."""
 import os
 from pathlib import Path
 import subprocess

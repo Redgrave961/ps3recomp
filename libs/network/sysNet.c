@@ -1,20 +1,3 @@
-/*
- * ps3recomp - sys_net module implementation
- *
- * The PS3 BSD socket API (libnet) passed through to host sockets: Winsock2 on
- * Windows, POSIX sockets elsewhere. It is OFF by default. ppu_sysprx.cpp's
- * offline model answers every libnet import unless PS3_NET_ONLINE is set, in
- * which case ps3_net_host_register() puts these handlers in front of it.
- *
- * Every pointer argument is a GUEST address, and everything the guest reads
- * back is big-endian: pollfd events, fd_set words, option values, socklen_t.
- * sockaddr_in needs no swap -- its port and address are already in network
- * order in guest memory, which is exactly what the host struct wants.
- *
- * errno is plain BSD (35 = EWOULDBLOCK). Winsock's WSAE* codes are BSD + 10000,
- * so Windows translates by subtraction; Linux numbers differ and get a table.
- */
-
 #ifdef _WIN32
     #define WIN32_LEAN_AND_MEAN
     #include <winsock2.h>
@@ -61,7 +44,6 @@ extern void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_
 
 #define EA(p) ((uint32_t)(uintptr_t)(p))
 
-/* PS3-only socket types and options */
 #define SYS_NET_SOCK_DGRAM_P2P   6
 #define SYS_NET_SOCK_STREAM_P2P  10
 #define SYS_NET_SO_USECRYPTO     0x1101
@@ -71,33 +53,25 @@ extern void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_
 #define SYS_NET_TCP_NODELAY      1
 #define SYS_NET_HOST_NOT_FOUND   1
 
-/* ---------------------------------------------------------------------------
- * State
- * -----------------------------------------------------------------------*/
-
 typedef struct {
     host_socket_t host_fd;
     int           in_use;
     int           nonblocking;
-    int           p2p;      /* SOCK_DGRAM_P2P / SOCK_STREAM_P2P */
-    int           stream;   /* SOCK_STREAM or SOCK_STREAM_P2P */
-    uint16_t      vport;    /* the P2P vport it was bound to */
+    int           p2p;
+    int           stream;
+    uint16_t      vport;
 } net_socket_slot;
 
 static net_socket_slot s_sockets[SYS_NET_MAX_SOCKETS];
 static int s_net_initialized = 0;
 
-/* Guest scratch, allocated on first use through the allocator the runtime
- * handed ps3_net_host_register. */
 static unsigned int (*s_alloc)(unsigned int, unsigned int) = NULL;
 static uint32_t s_errno_ea = 0, s_h_errno_ea = 0, s_hostent_ea = 0, s_ntoa_ea = 0;
-static int32_t  s_errno = 0;   /* ponytail: one errno for every thread, per-thread cells if a title races on it */
+static int32_t  s_errno = 0;
 
-/* hostent scratch layout: struct at +0, h_aliases[] at +32, h_addr_list[] at
- * +40, the address at +48, the name at +64. */
 #define HOSTENT_SCRATCH 320u
 
-static int net_trace(void);   /* PS3_NET_TRACE; defined with the send/recv paths */
+static int net_trace(void);
 
 static uint32_t scratch(uint32_t* ea, uint32_t size)
 {
@@ -105,11 +79,6 @@ static uint32_t scratch(uint32_t* ea, uint32_t size)
     return *ea;
 }
 
-/* A failing call returns SYS_NET_ERROR_BASE | errno (0x80010223 for
- * EWOULDBLOCK) and also leaves errno in the cell. Titles compare the return
- * value itself: Simpsons Arcade's connect wrapper waits on 0x80010224
- * (EINPROGRESS) and 0x80010238 (EISCONN), and a plain -1 read as a failure it
- * never retried. Anything that only tests for < 0 is unaffected. */
 #define SYS_NET_RET_BASE 0x80010200u
 static int32_t fail(int32_t err)
 {
@@ -122,8 +91,6 @@ static int32_t host_fail(void)
 {
 #ifdef _WIN32
     int e = WSAGetLastError();
-    /* WSAE* is the BSD value + 10000; a nonblocking connect says WOULDBLOCK
-     * where BSD says INPROGRESS, and the caller fixes that one up. */
     if (e >= 10000 && e < 10100) return fail(e - 10000);
     return fail(SYS_NET_EINVAL);
 #else
@@ -166,7 +133,6 @@ static void net_startup(void)
     s_net_initialized = 1;
 }
 
-/* fd 0 is never handed out: titles use 0 as "no socket" in their own tables. */
 static int alloc_slot(host_socket_t fd)
 {
     for (int i = 1; i < SYS_NET_MAX_SOCKETS; i++)
@@ -193,7 +159,7 @@ static int read_sockaddr(uint32_t ea, struct sockaddr_in* out)
     if (!p) return -1;
     memset(out, 0, sizeof(*out));
     out->sin_family = AF_INET;
-    memcpy(&out->sin_port, p + 2, 2);   /* network order in both */
+    memcpy(&out->sin_port, p + 2, 2);
     memcpy(&out->sin_addr, p + 4, 4);
     return 0;
 }
@@ -229,8 +195,6 @@ static void sleep_ms(int ms)
 #endif
 }
 
-/* MSG_DONTWAIT on a blocking socket. Winsock has no such flag, so both
- * platforms ask poll whether the call would block instead of passing it on. */
 static int would_block(int32_t s, int32_t flags, short ev)
 {
     if (!(flags & SYS_NET_MSG_DONTWAIT) || s_sockets[s].nonblocking) return 0;
@@ -252,10 +216,6 @@ static int set_nonblocking(host_socket_t fd, int on)
 #endif
 }
 
-/* ---------------------------------------------------------------------------
- * Init / shutdown
- * -----------------------------------------------------------------------*/
-
 int32_t sys_net_initialize_network_ex(void* param)
 {
     (void)param;
@@ -273,10 +233,6 @@ int32_t sys_net_finalize_network(void)
     return CELL_OK;
 }
 
-/* ---------------------------------------------------------------------------
- * Sockets
- * -----------------------------------------------------------------------*/
-
 int32_t sys_net_bnet_socket(int32_t domain, int32_t type, int32_t protocol)
 {
     net_startup();
@@ -287,10 +243,6 @@ int32_t sys_net_bnet_socket(int32_t domain, int32_t type, int32_t protocol)
         case SYS_NET_SOCK_STREAM:
         case SYS_NET_SOCK_STREAM_P2P: host_type = SOCK_STREAM; break;
         case SYS_NET_SOCK_DGRAM:
-        /* ponytail: a P2P socket is plain UDP/TCP on this instance's P2P port
-         * (see bind), with no vport multiplexing: one DGRAM_P2P and any number
-         * of STREAM_P2P sockets per instance, which is what titles use so far.
-         * Two DGRAM_P2P sockets on different vports would need a demux layer. */
         case SYS_NET_SOCK_DGRAM_P2P:  host_type = SOCK_DGRAM;  break;
         default: return fail(SYS_NET_EINVAL);
     }
@@ -330,21 +282,9 @@ int32_t sys_net_bnet_bind(int32_t s, const sys_net_sockaddr* addr, uint32_t addr
     if (!valid_socket(s)) return fail(SYS_NET_EBADF);
     if (read_sockaddr(EA(addr), &a)) return fail(SYS_NET_EINVAL);
     if (s_sockets[s].p2p) {
-        /* P2P sockets live on this instance's P2P port (PS3_NET_P2P_PORT,
-         * default 3658), whatever port the title names: peers send straight
-         * to it. sockaddr_in_p2p keeps the vport at offset 8. */
         s_sockets[s].vport = vm_read16(EA(addr) + 8);
         a.sin_port = htons(p2p_port());
-        /* ...on every interface. Titles bind the console's own IP (what
-         * cellNetCtl reports), and Windows then refuses to send from that
-         * socket to a peer on 127.0.0.1 (WSAEADDRNOTAVAIL) -- Simpsons
-         * Arcade's every packet failed that way. The port is what peers use. */
         a.sin_addr.s_addr = htonl(INADDR_ANY);
-        /* Every P2P stream socket shares that port, the listener and the ones
-         * that connect out, as on a console. A connection's source port is
-         * then the P2P port, and titles check it: Simpsons Arcade drops the
-         * host's game setup when it arrives from any port but the one
-         * signaling reported for the host. */
         if (s_sockets[s].stream) {
             int on = 1;
             setsockopt(s_sockets[s].host_fd, SOL_SOCKET, SO_REUSEADDR, (const char*)&on, sizeof(on));
@@ -354,9 +294,6 @@ int32_t sys_net_bnet_bind(int32_t s, const sys_net_sockaddr* addr, uint32_t addr
         }
     }
     if (bind(s_sockets[s].host_fd, (struct sockaddr*)&a, sizeof(a)) == HOST_SOCKET_ERROR) {
-        /* Last resort for a P2P stream socket that still can't share the
-         * port: an ephemeral one. It connects, but titles that check the
-         * source port will ignore what it sends. */
         if (!(s_sockets[s].p2p && s_sockets[s].stream)) return host_fail();
         a.sin_port = 0;
         if (bind(s_sockets[s].host_fd, (struct sockaddr*)&a, sizeof(a)) == HOST_SOCKET_ERROR)
@@ -395,10 +332,6 @@ int32_t sys_net_bnet_accept(int32_t s, sys_net_sockaddr* addr, uint32_t* addrlen
     if (net_trace()) printf("[sys_net] accept(%d) -> %d\n", s, slot);
     s_sockets[slot].vport = s_sockets[s].vport;
     write_sockaddr(EA(addr), EA(addrlen), &a);
-    /* The mirror of connect: titles name a stream peer by the P2P port in
-     * sin_vport, and the peer connects from its P2P port (see bind). Simpsons
-     * Arcade keys the host's connection on it; left at 0, the host's game
-     * setup matched no member and was dropped. */
     if (addr && s_sockets[s].p2p) vm_write16(EA(addr) + 8, ntohs(a.sin_port));
     return slot;
 }
@@ -410,11 +343,6 @@ int32_t sys_net_bnet_connect(int32_t s, const sys_net_sockaddr* addr, uint32_t a
     if (!valid_socket(s)) return fail(SYS_NET_EBADF);
     if (read_sockaddr(EA(addr), &a)) return fail(SYS_NET_EINVAL);
     if (s_sockets[s].p2p && s_sockets[s].stream && vm_read16(EA(addr) + 8)) {
-        /* A stream P2P endpoint is (address, vport): titles put their own
-         * constant in sin_port and the peer's P2P port -- what signaling
-         * reported, 3658 on a console -- in sin_vport. The peer's listener is
-         * on that port here (see bind), so that is where to connect. Seen in
-         * Simpsons Arcade: port 4099, vport 3659. */
         a.sin_port = htons(vm_read16(EA(addr) + 8));
     }
 
@@ -438,10 +366,6 @@ int32_t sys_net_bnet_shutdown(int32_t s, int32_t how)
     return 0;
 }
 
-/* ---------------------------------------------------------------------------
- * Data transfer
- * -----------------------------------------------------------------------*/
-
 static int host_recv_flags(int32_t flags)
 {
     int f = 0;
@@ -450,8 +374,6 @@ static int host_recv_flags(int32_t flags)
     return f;
 }
 
-/* PS3_NET_TRACE=1: log every packet sent and every one received (not the
- * empty polls), with its peer. How a title's own session handshake is seen. */
 static int net_trace(void)
 {
     static int t = -1;
@@ -468,7 +390,6 @@ static void trace(const char* op, int32_t s, int n, const struct sockaddr_in* a)
 #endif
     char ip[16] = "-";
     if (a) ip_str(&a->sin_addr, ip);
-    /* Wall-clock milliseconds, to line two machines' traces up. */
     unsigned hh, mm, ss, ms;
 #ifdef _WIN32
     SYSTEMTIME t;
@@ -501,7 +422,7 @@ int32_t sys_net_bnet_sendto(int32_t s, const void* buf, uint32_t len, int32_t fl
     (void)tolen;
     struct sockaddr_in a;
     if (!valid_socket(s)) return fail(SYS_NET_EBADF);
-    if (!to) return sys_net_bnet_send(s, buf, len, flags);   /* connected socket */
+    if (!to) return sys_net_bnet_send(s, buf, len, flags);
     if (read_sockaddr(EA(to), &a)) return fail(SYS_NET_EINVAL);
     if (would_block(s, flags, POLLOUT)) return fail(SYS_NET_EWOULDBLOCK);
     int n = sendto(s_sockets[s].host_fd, GUEST_PTR(EA(buf), const char*), (int)len, PS3_NET_HOST_SEND_FLAGS,
@@ -543,11 +464,6 @@ int32_t sys_net_bnet_recvfrom(int32_t s, void* buf, uint32_t len, int32_t flags,
     return n;
 }
 
-/* ---------------------------------------------------------------------------
- * Socket options
- * -----------------------------------------------------------------------*/
-
-/* Timeouts arrive as a PS3 timeval {s64 sec, s64 usec}. */
 static int set_timeout(host_socket_t fd, int name, uint32_t val_ea, uint32_t len)
 {
     uint64_t us = (len >= 16) ? vm_read64(val_ea) * 1000000ull + vm_read64(val_ea + 8)
@@ -596,7 +512,6 @@ int32_t sys_net_bnet_setsockopt(int32_t s, int32_t level, int32_t optname,
                 ret = setsockopt(fd, SOL_SOCKET, SO_LINGER, (const char*)&l, sizeof(l));
                 break;
             }
-            /* NP signaling's packet crypto/signature: meaningless off-console. */
             case SYS_NET_SO_USECRYPTO:
             case SYS_NET_SO_USESIGNATURE:
                 break;
@@ -607,8 +522,6 @@ int32_t sys_net_bnet_setsockopt(int32_t s, int32_t level, int32_t optname,
     } else if (level == SYS_NET_IPPROTO_TCP && optname == SYS_NET_TCP_NODELAY) {
         ret = setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char*)&val, sizeof(val));
     } else {
-        /* ponytail: IP-level options (TTL, TOS, multicast) are accepted and
-         * dropped; map them when a title's traffic depends on one. */
         printf("[sys_net] setsockopt(%d, level %d, 0x%X) ignored\n", s, level, (unsigned)optname);
     }
     return ret == HOST_SOCKET_ERROR ? host_fail() : 0;
@@ -649,7 +562,7 @@ int32_t sys_net_bnet_getsockopt(int32_t s, int32_t level, int32_t optname,
                                (char*)&val, &hl) == HOST_SOCKET_ERROR)
                     return host_fail();
                 break;
-            default: break;   /* everything else reads as 0 */
+            default: break;
         }
     }
     if (v_ea) vm_write32(v_ea, (uint32_t)val);
@@ -679,18 +592,8 @@ int32_t sys_net_bnet_getpeername(int32_t s, sys_net_sockaddr* addr, uint32_t* ad
     return 0;
 }
 
-/* ---------------------------------------------------------------------------
- * poll / select
- *
- * Both go through one host poll. Guest pollfd is {s32 fd, s16 events,
- * s16 revents}; guest fd_set is 1024 bits in big-endian u32 words, fd n at
- * bit (n % 32) of word (n / 32) -- the BSD fd_mask layout.
- * -----------------------------------------------------------------------*/
-
 #define NET_POLL_MAX 64
 
-/* Run host poll over n guest fds. Invalid fds come back POLLNVAL without
- * reaching the host (WSAPoll rejects the whole call over one bad handle). */
 static int run_poll(const int32_t* gfd, const short* gev, short* grev, int n, int timeout_ms)
 {
     host_pollfd hp[NET_POLL_MAX];
@@ -763,7 +666,7 @@ int32_t sys_net_bnet_select(int32_t nfds, void* readfds, void* writefds,
         gfd[n] = fd; gev[n] = ev; n++;
     }
 
-    int timeout_ms = -1;   /* NULL timeval = wait forever */
+    int timeout_ms = -1;
     if (tv) {
         uint64_t us = vm_read64(tv) * 1000000ull + vm_read64(tv + 8);
         timeout_ms = (int)((us + 999) / 1000);
@@ -771,7 +674,6 @@ int32_t sys_net_bnet_select(int32_t nfds, void* readfds, void* writefds,
     int r = run_poll(gfd, gev, grev, n, timeout_ms);
     if (r < 0) return r;
 
-    /* Rewrite the sets to hold only what is ready; the except set never is. */
     for (uint32_t i = 0; i < 128; i += 4) {
         if (rd) vm_write32(rd + i, 0);
         if (wr) vm_write32(wr + i, 0);
@@ -790,7 +692,7 @@ int32_t sys_net_bnet_select(int32_t nfds, void* readfds, void* writefds,
     }
     if (net_trace()) {
         static int last = -1;
-        if (count != last || count) {   /* changes and every ready answer, not every empty poll */
+        if (count != last || count) {
             printf("[sys_net] socketselect(nfds %d, %d fds asked) -> %d ready\n", nfds, n, count);
             last = count;
         }
@@ -798,15 +700,8 @@ int32_t sys_net_bnet_select(int32_t nfds, void* readfds, void* writefds,
     return count;
 }
 
-/* ---------------------------------------------------------------------------
- * Addresses and DNS
- * -----------------------------------------------------------------------*/
-
 int32_t sys_net_bnet_inet_pton(int32_t family, const char* src, void* dst)
 {
-    /* PS3's current host-socket backend supports AF_INET. Do not pass guest
-     * family numbers directly to the host: unsupported families are explicit.
-     * Unlike socket errors, inet_pton's failure return is -1, with errno. */
     if (family != SYS_NET_AF_INET) {
         (void)fail(SYS_NET_EAFNOSUPPORT);
         return -1;
@@ -819,8 +714,6 @@ int32_t sys_net_bnet_inet_pton(int32_t family, const char* src, void* dst)
     }
     struct in_addr address;
     int result = inet_pton(AF_INET, text, &address);
-    /* Parse into a temporary so invalid text never changes guest output.
-     * Copy bytes verbatim: the guest needs network order, not host integers. */
     if (result == 1) memcpy(output, &address, sizeof(address));
     return result;
 }
@@ -838,7 +731,7 @@ uint32_t sys_net_bnet_inet_addr(const char* cp)
 {
     struct in_addr a;
     const char* s = GUEST_PTR(EA(cp), const char*);
-    if (!s || inet_pton(AF_INET, s, &a) != 1) return 0xFFFFFFFFu;   /* INADDR_NONE */
+    if (!s || inet_pton(AF_INET, s, &a) != 1) return 0xFFFFFFFFu;
     return ntohl(a.s_addr);
 }
 
@@ -868,11 +761,11 @@ uint32_t sys_net_bnet_gethostbyname(const char* name)
     const struct sockaddr_in* sa = (const struct sockaddr_in*)res->ai_addr;
 
     memset(vm_ptr8(h), 0, HOSTENT_SCRATCH);
-    vm_write32(h + 0,  h + 64);           /* h_name */
-    vm_write32(h + 4,  h + 32);           /* h_aliases -> { NULL } */
-    vm_write32(h + 8,  SYS_NET_AF_INET);  /* h_addrtype */
-    vm_write32(h + 12, 4);                /* h_length */
-    vm_write32(h + 16, h + 40);           /* h_addr_list -> { &addr, NULL } */
+    vm_write32(h + 0,  h + 64);
+    vm_write32(h + 4,  h + 32);
+    vm_write32(h + 8,  SYS_NET_AF_INET);
+    vm_write32(h + 12, 4);
+    vm_write32(h + 16, h + 40);
     vm_write32(h + 40, h + 48);
     memcpy(vm_ptr8(h + 48), &sa->sin_addr, 4);
     strncpy((char*)vm_ptr8(h + 64), host, HOSTENT_SCRATCH - 65);
@@ -888,10 +781,6 @@ uint32_t sys_net_errno_loc(void)
     if (scratch(&s_errno_ea, 4)) vm_write32(s_errno_ea, (uint32_t)s_errno);
     return s_errno_ea;
 }
-
-/* ---------------------------------------------------------------------------
- * Registration: libnet export names -> ctx handlers
- * -----------------------------------------------------------------------*/
 
 #define R32(n)  ((uint32_t)ctx->gpr[n])
 #define S32(n)  ((int32_t)(uint32_t)ctx->gpr[n])

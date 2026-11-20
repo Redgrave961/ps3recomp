@@ -1,17 +1,3 @@
-/* rsx_tiling.h / rsx_tiling.c: where the RSX keeps a byte of a tiled main-memory region, and the range copies
- * every RSX client goes through.
- *
- * The vectors come from envytools' tile_translate_addr (nvhw/tile.c) itself, built unmodified with the RSX's memory
- * configuration, with the four in-block bits rsx_tiling.h names set the RSX's way; one per pitch class the function
- * distinguishes: a power of two (factor 32, 8 and 2) and a prime multiple (5120 = 5 x 4 x 256). The first is
- * a retail title's tile 4 (main 0x30000, 0x580000 bytes, pitch 8192, bank 2). Then, for that tile: every 32-byte block
- * lands on a distinct block inside the tile. Then the range copies: a row into the tiling and back, a range that
- * starts before a tile and runs on through a second one, IO pages scattered in host memory, unreachable pages,
- * a local tile, and the footprint a change detector hashes.
- *
- * python3 tools/test_rsx_tiling.py, or
- * clang -std=gnu17 -I include -I libs/video libs/video/tests/test_rsx_tiling.c libs/video/rsx_tiling.c -o /tmp/t
- */
 #include "rsx_tiling.h"
 #include "rsx_core.h"
 #include <stdio.h>
@@ -34,8 +20,6 @@ static void vectors(const char* what, rsx_tile t, const u32 (*v)[2], u32 n)
     CHECK(!wrong, "%s: %u of %u addresses differ", what, wrong, n);
 }
 
-/* Guest main memory for the range copies: GUEST bytes, IO page p at host page p ^ g_scatter, and g_hole (when not
- * ~0) an IO page nothing backs. */
 #define GUEST (8u << 20)
 #define PAGE  0x100000u
 static u8* g_mem;
@@ -45,14 +29,13 @@ static u8* guest_ptr(void* user, u32 location, u32 offset, u32 len)
 {
     (void)user;
     if (location != RSX_LOCATION_MAIN || (u64)offset + len > GUEST) return NULL;
-    if ((offset & ~(PAGE - 1u)) != ((offset + len - 1u) & ~(PAGE - 1u))) return NULL;   /* one page at a time */
+    if ((offset & ~(PAGE - 1u)) != ((offset + len - 1u) & ~(PAGE - 1u))) return NULL;
     if (offset / PAGE == g_hole) return NULL;
     return g_mem + ((offset / PAGE) ^ g_scatter) * PAGE + offset % PAGE;
 }
 
 static const rsx_tiled_mem g_view = { guest_ptr, NULL, NULL };
 
-/* The host byte the RSX keeps location offset `lin` at. */
 static u8* rsx_byte(u32 lin)
 {
     rsx_tile t;
@@ -68,7 +51,6 @@ static void ranges(rsx_tile tile4)
     u8* back = malloc(0x70000u);
     rsx_tiling_set(4, RSX_LOCATION_MAIN, tile4.offset, tile4.size, tile4.pitch, tile4.bank);
 
-    /* a 480-pixel row, not block aligned, into the tiling and back */
     for (u32 i = 0; i < 1920u; i++) buf[i] = (u8)(i * 7u + 3u);
     const u32 at = tile4.offset + 17u * 8192u + 2048u + 4u;
     int all = rsx_tiled_write(&g_view, RSX_LOCATION_MAIN, at, buf, 1920u);
@@ -76,8 +58,6 @@ static void ranges(rsx_tile tile4)
     CHECK(all && !memcmp(buf, back, 1920u) && g_mem[rsx_tile_address(&tile4, at)] == buf[0] &&
           rsx_tile_address(&tile4, at) != at, "a row written through the tiling reads back the same, at its tiled address");
 
-    /* a range from before a tile through it and a second tile right after it, to past both; each tile whole
-     * 64-row bands (a partial band's tiled addresses run past the tile, and those bytes are skipped) */
     const rsx_tile a = { 0x600000u, 0x10000u, 512u, 3u }, b = { 0x610000u, 0x50000u, 5120u, 1u };
     rsx_tiling_set(0, RSX_LOCATION_MAIN, a.offset, a.size, a.pitch, a.bank);
     rsx_tiling_set(1, RSX_LOCATION_MAIN, b.offset, b.size, b.pitch, b.bank);
@@ -91,9 +71,8 @@ static void ranges(rsx_tile tile4)
     CHECK(all && !misplaced && !memcmp(buf, back, len) && g_mem[from] == buf[0] && g_mem[from + len - 1u] == buf[len - 1u],
           "a range across two tiles goes through each tiling, linear outside them (%u bytes misplaced)", misplaced);
 
-    /* IO pages scattered in host memory: each tiled byte still lands on its own page */
     g_scatter = 1u;
-    const u32 wide = 0x1F0000u;                       /* rows spanning IO pages 1 and 2 */
+    const u32 wide = 0x1F0000u;
     for (u32 i = 0; i < 0x30000u; i++) buf[i] = (u8)(i * 5u + 1u);
     all = rsx_tiled_write(&g_view, RSX_LOCATION_MAIN, wide, buf, 0x30000u);
     misplaced = 0;
@@ -101,7 +80,6 @@ static void ranges(rsx_tile tile4)
     CHECK(all && !misplaced, "IO pages scattered in host memory are reached page by page (%u bytes misplaced)", misplaced);
     g_scatter = 0;
 
-    /* an IO page nothing backs: the read zero-fills its bytes and says so, the rest arrive */
     g_hole = 2u;
     memset(back, 0xEE, 0x30000u);
     all = rsx_tiled_read(&g_view, RSX_LOCATION_MAIN, wide, back, 0x30000u);
@@ -115,7 +93,6 @@ static void ranges(rsx_tile tile4)
     CHECK(!all && zeros + kept == 0x30000u && zeros, "an unbacked page reads as zero and fails the read (%u zero)", zeros);
     g_hole = ~0u;
 
-    /* a local tile is transparent; unbound, main memory is linear again */
     rsx_tile t;
     rsx_tiling_set(2, RSX_LOCATION_LOCAL, 0x700000u, 0x10000u, 1024u, 0u);
     CHECK(!rsx_tiling_find(RSX_LOCATION_MAIN, 0x700000u, 0x10000u, &t) &&

@@ -1,25 +1,8 @@
-/*
- * ps3recomp - NID (Name ID) system
- *
- * PS3 uses a SHA-1 hash of (function_name + suffix) truncated to 32 bits as
- * the "NID" (Name IDentifier) that links imports to exports across PRX modules.
- *
- * The standard suffix appended before hashing is the empty string for most
- * firmware versions, but some libraries use a library-specific salt.  The
- * default suffix used in early firmware and for homebrew is "\x67\x59\x65\x99"
- * (the first 4 bytes of SHA-1("") with a twist).  In practice the NID database
- * is precomputed and shipped as a lookup table.
- */
-
 #ifndef PS3EMU_NID_H
 #define PS3EMU_NID_H
 
 #include <stdint.h>
 #include <string.h>
-
-/* ---------------------------------------------------------------------------
- * Minimal SHA-1 (RFC 3174) -- only used for NID computation; not for crypto.
- * -----------------------------------------------------------------------*/
 
 #ifdef __cplusplus
 extern "C" {
@@ -110,23 +93,9 @@ static inline void ps3_sha1_final(ps3_sha1_ctx* ctx, uint8_t digest[20])
     }
 }
 
-/* ---------------------------------------------------------------------------
- * NID computation
- * -----------------------------------------------------------------------*/
-
-/* Default NID suffix (used by most firmware libraries).
- * This is the standard 16-byte suffix used in PS3 firmware NID computation.
- * Earlier documentation incorrectly listed only the first 4 bytes. */
 #define PS3_NID_SUFFIX      "\x67\x59\x65\x99\x04\x25\x04\x90\x56\x64\x27\x49\x94\x89\x74\x1A"
 #define PS3_NID_SUFFIX_LEN  16
 
-/*
- * Compute the 32-bit NID for a function or variable name.
- * NID = first 4 bytes of SHA-1(name + suffix), interpreted little-endian.
- *
- * This matches the NID values found in PS3 ELF import/export tables as
- * used by the Cell OS Lv-2 linker and RPCS3.
- */
 static inline uint32_t ps3_compute_nid(const char* name)
 {
     ps3_sha1_ctx ctx;
@@ -137,21 +106,16 @@ static inline uint32_t ps3_compute_nid(const char* name)
     ps3_sha1_update(&ctx, PS3_NID_SUFFIX, PS3_NID_SUFFIX_LEN);
     ps3_sha1_final(&ctx, digest);
 
-    /* Little-endian interpretation of first 4 bytes */
     return ((uint32_t)digest[0])       |
            ((uint32_t)digest[1] << 8)  |
            ((uint32_t)digest[2] << 16) |
            ((uint32_t)digest[3] << 24);
 }
 
-/* ---------------------------------------------------------------------------
- * NID lookup table
- * -----------------------------------------------------------------------*/
-
 typedef struct ps3_nid_entry {
     uint32_t    nid;
-    const char* name;       /* original function/variable name (may be NULL) */
-    void*       handler;    /* HLE function pointer or stub */
+    const char* name;
+    void*       handler;
 } ps3_nid_entry;
 
 typedef struct ps3_nid_table {
@@ -187,7 +151,7 @@ static inline ps3_nid_entry* ps3_nid_table_find(const ps3_nid_table* t, uint32_t
 }
 
 #ifdef __cplusplus
-} /* extern "C" */
+}
 #endif
 
-#endif /* PS3EMU_NID_H */
+#endif

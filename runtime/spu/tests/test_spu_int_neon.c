@@ -1,6 +1,3 @@
-/* The NEON integer/permute helpers must be bit-identical to their scalar
- * references (spu_*_ref) for random operands and every shift amount. Build on
- * arm64:  cc -O2 -I.. -I../.. -I../../.. test_spu_int_neon.c -o t && ./t */
 #include "../spu_helpers.h"
 #include <stdio.h>
 
@@ -31,9 +28,9 @@ int main(void)
     const long N = 200000;
     for (long it = 0; it < N; it++) {
         u128 a = rnd128(), b = rnd128(), c = rnd128();
-        if (it & 1) b._u32[0] = rnd32() & 0xFF;          /* small shift counts */
-        if (it % 5 == 0) b = a;                           /* equal operands for compares */
-        int imm = (int)(rnd32() & 0x3FF) - 0x200;         /* 10-bit signed immediate */
+        if (it & 1) b._u32[0] = rnd32() & 0xFF;
+        if (it % 5 == 0) b = a;
+        int imm = (int)(rnd32() & 0x3FF) - 0x200;
         if (it % 3 == 0) imm = (int32_t)a._u32[rnd32() & 3];
         int sh = (int)(it % 64) - 16;
 #define C2(op) check(#op, spu_##op(a, b), spu_##op##_ref(a, b), a, b, 0)
@@ -48,15 +45,11 @@ int main(void)
     if (s_bad) { printf("test_spu_int_neon: %ld mismatches\n", s_bad); return 1; }
     printf("test_spu_int_neon: ok (%ld random cases x 27 ops)\n", N);
 
-    /* The per-lane ops vectorised for tests/bench/spu. Shift and rotate counts come per lane,
-     * so b is drawn three ways: random bits, a small count (0..80, past every lane width) in
-     * every lane, and equal to a (the compares' equality edge). Immediates sweep all 10-bit
-     * values and the 7-bit shift range including negatives. */
     for (long it = 0; it < 4 * N; it++) {
         u128 a = rnd128(), b = rnd128(), t = rnd128();
         const int kind = (int)(it % 4);
         if (kind == 1) for (int i = 0; i < 16; i++) b._u8[i] = (uint8_t)(rnd32() % 81);
-        if (kind == 2) for (int i = 0; i < 8; i++) b._u16[i] = (uint16_t)(0u - rnd32() % 81);   /* rotm-style negated */
+        if (kind == 2) for (int i = 0; i < 8; i++) b._u16[i] = (uint16_t)(0u - rnd32() % 81);
         if (kind == 3) b = a;
         if (it % 7 == 0) for (int i = 0; i < 16; i++) a._u8[i] = (uint8_t)(rnd32() % 3 ? a._u8[i] : 0x80 + (rnd32() & 1) - 1);
         const int imm = (int)(it % 1024) - 512;

@@ -1,19 +1,4 @@
 #!/usr/bin/env python3
-"""Stores to a page that is slow only because of vm_watch (rsx_park's watched
-jump word) are done inside ppu_st_thunk without the runtime slow store.
-
-Lifted-style functions run with the real thunk against a runtime stub whose
-ppu_store_slow mirrors the runtime: the store, then the RSX notify when the
-written range covers vm_watch_ea (16 bytes for the re-check after a store).
-Checked:
-  - every store form landing on the watched page but not on the watched word
-    writes the same bytes as with no watch, and the forms the thunk handles
-    itself (1, 2, 4, 8 and 16 bytes) neither call the runtime nor notify;
-  - a store covering the watched word notifies;
-  - racing an RSX that arms the watch, flushes, re-reads the word and only then
-    waits, against a guest store to that word (plus stores to its neighbours),
-    the RSX always either reads the new word or gets a notify.
-"""
 from __future__ import annotations
 
 import importlib.util

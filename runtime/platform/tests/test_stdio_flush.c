@@ -1,28 +1,3 @@
-/*
- * ps3recomp - test for runtime/platform/ps3_stdio.c (buffered stdout/stderr
- * with a timed flush)
- *
- * Each case runs in a forked child whose stdout and stderr are pipes the
- * parent reads, because what is being checked is when bytes reach the file
- * descriptor, which only an outside reader can see:
- *
- *   - buffered by default: right after a printf, nothing has reached the pipe
- *     (the interval is 5 s here, so the timer cannot have fired yet);
- *   - flushed within the interval: with PS3_STDIO_FLUSH_MS=50 a line arrives
- *     while the child is still alive and blocked, so it came from the timer,
- *     not from exit;
- *   - flushed at exit, on abort() and on a crash (a SIGSEGV that reaches the
- *     unhandled-exception filter through win32_compat's dispatcher), each
- *     with the 5 s interval, so the timer is not what delivered it;
- *   - PS3_STDIO_UNBUFFERED=1: a line is in the pipe as soon as printf returns.
- *
- * Build (any POSIX host):
- *   cc -std=gnu17 -Wall -Wextra -I runtime/platform -o test_stdio_flush \
- *      runtime/platform/tests/test_stdio_flush.c runtime/platform/ps3_stdio.c \
- *      runtime/platform/win32_compat.c -lpthread
- *
- * Exit status is the number of failed checks, so it works as a CI step.
- */
 #if defined(__linux__) && !defined(_GNU_SOURCE)
 #  define _GNU_SOURCE
 #endif
@@ -46,14 +21,13 @@ static int g_pass, g_fail;
 
 enum { END_EXIT, END_ABORT, END_CRASH, END_WAIT };
 
-/* Volatile so the compiler cannot see the store is to a fixed bad address. */
 static volatile uintptr_t g_bad_addr = 8;
 
 typedef struct {
     pid_t pid;
-    int   out, err;   /* read ends of the child's stdout and stderr */
-    int   ctl_in;     /* child -> parent: one byte after it printed */
-    int   ctl_out;    /* parent -> child: one byte to let it finish */
+    int   out, err;
+    int   ctl_in;
+    int   ctl_out;
 } child_t;
 
 static double now_ms(void)
@@ -63,15 +37,11 @@ static double now_ms(void)
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
 }
 
-/* The child: set the environment, init, print one line to each stream, tell
- * the parent, then end the way the case asks. */
 static void child_main(int ctl_w, int ctl_r, const char* flush_ms, int unbuffered, int end)
 {
     if (flush_ms) setenv("PS3_STDIO_FLUSH_MS", flush_ms, 1); else unsetenv("PS3_STDIO_FLUSH_MS");
     if (unbuffered) setenv("PS3_STDIO_UNBUFFERED", "1", 1); else unsetenv("PS3_STDIO_UNBUFFERED");
     ps3_stdio_init();
-    /* The init banner goes to stderr; get it out of the way so the parent's
-     * "nothing yet" check is about the line printed below. */
     fflush(stderr);
     if (write(ctl_w, "i", 1) != 1) _exit(90);
     { char c; if (read(ctl_r, &c, 1) != 1) _exit(91); }
@@ -115,7 +85,6 @@ static void wait_byte(int fd)
     CHECK(read(fd, &c, 1) == 1);
 }
 
-/* Append whatever is in fd now to buf (no waiting). Returns 1 on EOF. */
 static int drain(int fd, char* buf, size_t cap)
 {
     size_t len = strlen(buf);
@@ -124,11 +93,10 @@ static int drain(int fd, char* buf, size_t cap)
         ssize_t n = read(fd, buf + len, cap - 1 - len);
         if (n > 0) { len += (size_t)n; buf[len] = 0; continue; }
         if (n == 0) return 1;
-        return 0;   /* EAGAIN */
+        return 0;
     }
 }
 
-/* Wait up to ms for needle to show up in fd. */
 static int wait_for(int fd, char* buf, size_t cap, const char* needle, double ms)
 {
     double end = now_ms() + ms;
@@ -146,20 +114,19 @@ static int wait_for(int fd, char* buf, size_t cap, const char* needle, double ms
 static int finish(child_t* c)
 {
     int st = 0;
-    if (write(c->ctl_out, "x", 1) != 1) { /* the child may be gone already */ }
+    if (write(c->ctl_out, "x", 1) != 1) { }
     waitpid(c->pid, &st, 0);
     close(c->out); close(c->err); close(c->ctl_in); close(c->ctl_out);
     return st;
 }
 
-/* Start a child, let it init and print, and return with the line printed. */
 static child_t start(const char* flush_ms, int unbuffered, int end)
 {
     child_t c = spawn(flush_ms, unbuffered, end);
-    wait_byte(c.ctl_in);                         /* initialised */
-    { char junk[512] = ""; drain(c.err, junk, sizeof junk); }   /* the banner */
+    wait_byte(c.ctl_in);
+    { char junk[512] = ""; drain(c.err, junk, sizeof junk); }
     CHECK(write(c.ctl_out, "g", 1) == 1);
-    wait_byte(c.ctl_in);                         /* printed */
+    wait_byte(c.ctl_in);
     return c;
 }
 
@@ -169,8 +136,8 @@ static void test_buffered_by_default(void)
     char out[256] = "", err[256] = "";
     drain(c.out, out, sizeof out);
     drain(c.err, err, sizeof err);
-    CHECK(strstr(out, "out-line") == NULL);      /* still in the stdout buffer */
-    CHECK(strstr(err, "err-line") == NULL);      /* still in the stderr buffer */
+    CHECK(strstr(out, "out-line") == NULL);
+    CHECK(strstr(err, "err-line") == NULL);
     int st = finish(&c);
     CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
 }
@@ -180,12 +147,10 @@ static void test_flushed_within_interval(void)
     child_t c = start("50", 0, END_WAIT);
     double t0 = now_ms();
     char out[256] = "", err[256] = "";
-    /* 50 ms interval; 2 s allows for a loaded CI runner. The child is blocked
-     * on its control pipe the whole time, so only the timer can deliver. */
     CHECK(wait_for(c.out, out, sizeof out, "out-line\n", 2000));
     CHECK(wait_for(c.err, err, sizeof err, "err-line\n", 2000));
     double took = now_ms() - t0;
-    CHECK(kill(c.pid, 0) == 0);                  /* still alive: not an exit flush */
+    CHECK(kill(c.pid, 0) == 0);
     int st = finish(&c);
     CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
     printf("  timed flush: both lines arrived %.0f ms after printing (interval 50 ms)\n", took);
@@ -205,9 +170,7 @@ static void test_end(int end, const char* what, int want_sig)
     if (!ok) fprintf(stderr, "  %s: stdout=\"%s\" stderr=\"%s\"\n", what, out, err);
     CHECK(strstr(out, "out-line\n") != NULL);
     CHECK(strstr(err, "err-line\n") != NULL);
-    CHECK(took < 4000);                          /* not the 5 s timer */
-    /* A crash may end in SIGSEGV or SIGBUS depending on the host (see
-     * test_guest_ptr_trap.c); either is the fault, not some other death. */
+    CHECK(took < 4000);
     if (want_sig == SIGSEGV)
         CHECK(WIFSIGNALED(st) && (WTERMSIG(st) == SIGSEGV || WTERMSIG(st) == SIGBUS));
     else if (want_sig) CHECK(WIFSIGNALED(st) && WTERMSIG(st) == want_sig);
@@ -222,8 +185,8 @@ static void test_unbuffered_env(void)
     char out[256] = "", err[256] = "";
     drain(c.out, out, sizeof out);
     drain(c.err, err, sizeof err);
-    CHECK(strstr(out, "out-line\n") != NULL);    /* there as soon as printf returned */
-    CHECK(strstr(err, "err-line\n") != NULL);    /* stderr stays unbuffered too */
+    CHECK(strstr(out, "out-line\n") != NULL);
+    CHECK(strstr(err, "err-line\n") != NULL);
     int st = finish(&c);
     CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
 }

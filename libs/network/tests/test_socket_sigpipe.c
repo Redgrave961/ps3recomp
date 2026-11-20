@@ -1,4 +1,3 @@
-/* Real broken-stream writes through the production sys_net send paths. */
 #define main existing_sys_net_test_main
 #include "test_sys_net.c"
 #undef main
@@ -23,8 +22,6 @@ int main(int argc, char** argv)
     sigset_t before, after;
     assert(sigprocmask(SIG_SETMASK, NULL, &before) == 0);
     int pair[2];
-    /* An AF_INET stream makes explicit sendto's destination valid on every
-     * host, rather than passing an IPv4 address to an AF_UNIX socket. */
     struct sockaddr_in peer;
     memset(&peer, 0, sizeof(peer));
     peer.sin_family = AF_INET; peer.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -37,10 +34,10 @@ int main(int argc, char** argv)
     assert(connect(pair[0], (struct sockaddr*)&peer, sizeof(peer)) == 0);
     pair[1] = accept(listener, NULL, NULL); assert(pair[1] >= 0);
     close(listener);
-    if (!healthy) assert(shutdown(pair[0], SHUT_WR) == 0); /* Deterministic EPIPE. */
+    if (!healthy) assert(shutdown(pair[0], SHUT_WR) == 0);
     if (!strcmp(argv[1], "raw")) {
         send(pair[0], "x", 1, 0);
-        return 99; /* Default SIGPIPE must terminate this negative control. */
+        return 99;
     }
     vm_base = (uint8_t*)calloc(1, 1u << 20); assert(vm_base);
     ps3_net_host_register(bump_alloc);

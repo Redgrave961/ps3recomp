@@ -1,9 +1,3 @@
-/*
- * ps3recomp - cellRtc HLE
- *
- * Real-time clock: ticks, date/time conversion, formatting.
- */
-
 #ifndef PS3RECOMP_CELL_RTC_H
 #define PS3RECOMP_CELL_RTC_H
 
@@ -14,41 +8,19 @@
 extern "C" {
 #endif
 
-/* ---------------------------------------------------------------------------
- * Constants
- * -----------------------------------------------------------------------*/
-
-/*
- * PS3 epoch: Jan 1, 0001 00:00:00.000000 UTC
- * Offset from Unix epoch (Jan 1, 1970) = 62135596800 seconds
- * Ticks are in microseconds.
- */
-#define CELL_RTC_UNIX_EPOCH_OFFSET  62135596800ULL
-
-/* ---------------------------------------------------------------------------
- * Structures
- * -----------------------------------------------------------------------*/
-
 typedef struct CellRtcTick {
-    u64 tick;  /* microseconds since PS3 epoch (Jan 1, 0001) */
+    u64 tick;
 } CellRtcTick;
 
 typedef struct CellRtcDateTime {
     u16 year;
-    u16 month;     /* 1-12 */
-    u16 day;       /* 1-31 */
-    u16 hour;      /* 0-23 */
-    u16 minute;    /* 0-59 */
-    u16 second;    /* 0-59 */
-    u32 microsecond; /* 0-999999 */
+    u16 month;
+    u16 day;
+    u16 hour;
+    u16 minute;
+    u16 second;
+    u32 microsecond;
 } CellRtcDateTime;
-
-/* Alias used by some SDK headers */
-typedef CellRtcDateTime CellRtcTime;
-
-/* ---------------------------------------------------------------------------
- * Functions
- * -----------------------------------------------------------------------*/
 
 s32 cellRtcGetCurrentTick(CellRtcTick* pTick);
 
@@ -68,4 +40,4 @@ s32 cellRtcGetTick(const CellRtcDateTime* pDateTime, CellRtcTick* pTick);
 }
 #endif
 
-#endif /* PS3RECOMP_CELL_RTC_H */
+#endif

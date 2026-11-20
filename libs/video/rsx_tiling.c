@@ -1,7 +1,3 @@
-/*
- * RSX tiled main memory: the bound tiles and the range copies every RSX
- * client goes through (rsx_tiling.h).
- */
 #include "rsx_tiling.h"
 #include "rsx_core.h"
 #include "../../runtime/platform/win32_compat.h"
@@ -9,13 +5,8 @@
 #include <stdio.h>
 #include <string.h>
 
-/* The ranges below ask `ptr` for at most one IO page at a time: main memory
- * is IO-mapped in 1 MB pages, and each page is contiguous in guest memory. */
 #define RSX_TILING_PAGE 0x100000u
 
-/* Written from the PPU thread (cellGcmSetTile), read by the FIFO walker and
- * the draw engine. s_rsx_tiles_bound has a bit per bound tile, so a client checks it
- * without the lock while nothing is bound. */
 static rsx_tile s_rsx_tiles[RSX_TILE_COUNT];
 static SRWLOCK s_rsx_tiles_lock = SRWLOCK_INIT;
 static volatile LONG s_rsx_tiles_bound;
@@ -60,7 +51,6 @@ static void rsx_tiling_put(const rsx_tiled_mem* mem, u8* dst, const u8* src, u32
     else            memcpy(dst, src, n);
 }
 
-/* [pos, stop) as the bytes lie, an IO page at a time. */
 static int rsx_tiling_linear(const rsx_tiled_mem* mem, u32 location, u64 pos, u64 stop,
                              u8* linear, int write)
 {
@@ -77,8 +67,6 @@ static int rsx_tiling_linear(const rsx_tiled_mem* mem, u32 location, u64 pos, u6
     return all;
 }
 
-/* [pos, stop) inside tile t, 32 bytes at a time through its tiling. The host
- * bytes of the IO page the last run landed in are kept for the next. */
 static int rsx_tiling_tiled(const rsx_tiled_mem* mem, u32 location, const rsx_tile* t,
                             u64 pos, u64 stop, u8* linear, int write)
 {

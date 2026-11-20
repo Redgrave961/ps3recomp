@@ -1,21 +1,3 @@
-"""objdump_audit.py - cross-check our PPU/SPU decoders against the GNU objdump oracle.
-
-The PS3 SDK ships the authoritative GNU disassemblers (ppu-lv2-objdump / spu-lv2-objdump).
-This runs one over a binary and diffs its mnemonic-per-address against ours (ppu_disasm.decode
-/ spu_disasm.spu_decode), so any decode-table bug shows up as a mismatch.
-
-Clean-room posture (matches spu_disasm_audit.py): the SDK is proprietary and NOT part of
-this repo. This script only *invokes* an objdump binary you already have and diffs its
-plain-text stdout -- no SDK code, headers, or output are copied in. Point --objdump at your
-toolchain's disassembler (or set OBJDUMP_PPU / OBJDUMP_SPU).
-
-    python objdump_audit.py t.spu.elf --objdump .../spu-lv2-objdump.exe
-    python objdump_audit.py EBOOT.elf --objdump .../ppu-lv2-objdump.exe --show 40
-
-objdump gives (address, raw bytes, mnemonic) per line; we re-decode its bytes with our own
-decoder and compare, so no ELF parsing or section-finding is needed -- objdump is the single
-source of truth for what is code.
-"""
 from __future__ import annotations
 
 import argparse
@@ -35,28 +17,20 @@ from spu_disasm import spu_decode
 EM_PPC64 = 21
 EM_SPU = 23
 
-# objdump -d line: "   c0:\t04 00 01 d0 \tori\t$80,$3,0". The mnemonic starts with a
-# letter (skips ".word"/".long" data directives) and may carry a trailing "." (the PPC
-# record forms: addic., or., ...), which must be captured or every dot-form mis-diffs.
 _LINE = re.compile(r"^\s*([0-9a-fA-F]+):\s+((?:[0-9a-fA-F]{2} )+)\s+([a-zA-Z][a-zA-Z0-9_]*\.?)")
 
-# (ours, objdump) mnemonic pairs that decode to the SAME instruction but display under a
-# different name. These are the PowerPC "simplified/extended mnemonics" (Power ISA Book I
-# Appendix C): objdump prints the friendly alias, our decoder prints the architected base
-# form the lifter operates on. Confirmed against this corpus + the ISA manual; not decode
-# bugs. Keep evidence-based -- an unconfirmed entry here could mask a real table swap.
 ALIAS = {
-    ("or", "mr"),          # mr rA,rS      = or rA,rS,rS
-    ("nor", "not"),        # not rA,rS     = nor rA,rS,rS
-    ("tw", "trap"),        # trap          = tw 31,r0,r0
-    ("rldicl", "clrldi"),  # clrldi rA,rS,n = rldicl rA,rS,0,n
-    ("rldicl", "rotldi"),  # rotldi rA,rS,n = rldicl rA,rS,n,0
-    ("rlwinm", "clrlwi"),  # clrlwi rA,rS,n = rlwinm rA,rS,0,n,31
-    ("rlwinm", "rotlwi"),  # rotlwi rA,rS,n = rlwinm rA,rS,n,0,31
-    ("rlwnm", "rotlw"),    # rotlw  rA,rS,rB= rlwnm rA,rS,rB,0,31
-    ("mtcrf", "mtocrf"),   # one-CR-field form (bit 11 set); same effect for lifting
-    ("addi", "li"), ("addi", "la"), ("addis", "lis"),  # li/la/lis: addi/addis with rA=0
-    ("ori", "nop"),        # nop           = ori r0,r0,0
+    ("or", "mr"),
+    ("nor", "not"),
+    ("tw", "trap"),
+    ("rldicl", "clrldi"),
+    ("rldicl", "rotldi"),
+    ("rlwinm", "clrlwi"),
+    ("rlwinm", "rotlwi"),
+    ("rlwnm", "rotlw"),
+    ("mtcrf", "mtocrf"),
+    ("addi", "li"), ("addi", "la"), ("addis", "lis"),
+    ("ori", "nop"),
 }
 
 
@@ -66,16 +40,15 @@ def machine(elf_path: str) -> int:
 
 
 def parse_objdump_text(text: str) -> list[tuple[int, int, str]]:
-    """(address, word, objdump_mnemonic) for every 4-byte instruction line."""
     rows = []
     for line in text.splitlines():
         m = _LINE.match(line)
         if not m:
             continue
         raw = bytes(int(b, 16) for b in m.group(2).split())
-        if len(raw) != 4:                    # PPU/SPU are fixed 4-byte; skip data lines
+        if len(raw) != 4:
             continue
-        word = struct.unpack(">I", raw)[0]   # both ISAs are big-endian
+        word = struct.unpack(">I", raw)[0]
         rows.append((int(m.group(1), 16), word, m.group(3).lower()))
     return rows
 

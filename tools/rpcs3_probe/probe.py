@@ -1,22 +1,3 @@
-"""probe.py - RPCS3 oracle introspection rig (title-agnostic).
-
-Boots a title in RPCS3 with the GDB stub, runs a "recipe" of captures, and dumps
-structured JSON: call stacks (PPC64 ELFv1 unwind), registers, memory. Use it to
-observe the *correct* execution of a PS3 title and compare against a recompiled
-build.
-
-Recipe steps (JSON list):
-  {"op":"snapshot", "after_s": 12, "label":"render"}      # run, pause @T, capture
-  {"op":"breakpoint","addr":"0x000CBAD0","label":"ret",
-   "continue_first": true, "max_hits":1}                   # bp, run, capture on hit
-  {"op":"mem","addr":"0x10163364","len":64,"label":"subsys-list"}  # raw dump
-
-Usage:
-  python probe.py --rpcs3 <rpcs3.exe> --title <EBOOT.BIN> --recipe r.json --out o.json
-  python probe.py ... --boot-only-snapshot 12   # shorthand: one render snapshot @12s
-
-Nothing here is game-specific; point --title / --recipe at any title.
-"""
 import argparse
 import json
 import os
@@ -33,7 +14,6 @@ def launch_rpcs3(rpcs3, title, headless=True, extra=None):
     args.append("--headless" if headless else "--no-gui")
     if extra:
         args += extra
-    # detach; RPCS3 keeps running until we kill it
     creation = 0
     if os.name == "nt":
         creation = subprocess.CREATE_NEW_PROCESS_GROUP
@@ -53,11 +33,6 @@ def _pc(regs):
 
 
 def walk_stack(rsp, regs, max_frames=64):
-    """PPC64 ELFv1 unwind. Return list of {pc, sp} frames, innermost first.
-
-    Innermost PC is the instruction pointer; each caller's return address is the
-    LR-save slot (offset 16) in the *next* (caller) frame found via the back chain
-    at *(sp). EAs are 32-bit (low word of the 64-bit slot)."""
     frames = []
     pc = _pc(regs)
     sp = regs.get("r1", regs.get("gpr1", 0)) & 0xFFFFFFFF
@@ -83,7 +58,6 @@ def walk_stack(rsp, regs, max_frames=64):
             continue
         frames.append({"pc": ret, "sp": next_sp, "via": "lr-save"})
         sp = next_sp
-    # LR often holds the true innermost return when frame 0 hasn't saved it yet
     if lr and len(frames) >= 1 and (len(frames) < 2 or frames[1]["pc"] != lr):
         frames.insert(1, {"pc": lr, "sp": frames[0]["sp"], "via": "lr-reg"})
     return frames
@@ -193,7 +167,6 @@ def main():
 
     json.dump(result, open(args.out, "w"), indent=2)
     print(f"[probe] wrote {args.out}")
-    # echo the headline
     for c in result.get("captures", []):
         if "stack" in c:
             print(f"\n=== {c['label']} pc={c.get('pc') and hex(c['pc'])} ===")

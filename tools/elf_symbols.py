@@ -1,27 +1,3 @@
-"""elf_symbols.py - pull the function symbol table out of an unstripped PS3 ELF.
-
-Debug / prototype builds (see unfself.py) keep their .symtab. That gives the exact
-start address, byte size and name of every function in the build -- ground truth the
-recomp pipeline otherwise has to *guess* at with .opd seeding and prologue scanning.
-
-Two uses:
-
-  1. Seed the lifter. The emitted JSON is the same shape find_functions.py already
-     accepts, so it drops straight in:
-
-         python elf_symbols.py EBOOT.elf -o syms.json
-         python find_functions.py EBOOT.elf --seed-json syms.json -o funcs.json
-
-  2. Score the detector. On a title where symbols exist, the symtab tells us how good
-     .opd + prologue scanning actually is -- and the answer carries to the stripped
-     retail titles where we have no symbols at all:
-
-         python elf_symbols.py EBOOT.elf --score funcs.json
-
-On PPC64 a function has two symbols: `foo` is the OPD descriptor (in .opd) and `.foo`
-is the entry point (in .text). We want the code addresses, so a leading '.' is stripped
-from the name and descriptor-only symbols are dropped.
-"""
 from __future__ import annotations
 
 import argparse
@@ -32,14 +8,13 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from elf_parser import ELFFile  # noqa: E402
+from elf_parser import ELFFile
 
 SHT_SYMTAB = 2
 STT_FUNC = 2
 
 
 def load_symbols(path: str) -> list[dict]:
-    """Every STT_FUNC symbol with a real code address, as {start,end,size,name}."""
     elf = ELFFile(path)
     elf.load()
     if elf.self_header is not None:
@@ -61,7 +36,6 @@ def load_symbols(path: str) -> list[dict]:
         end = strdata.find(b"\0", off)
         return strdata[off:end if end != -1 else None].decode("utf-8", "replace")
 
-    # Executable ranges, so we keep code symbols and drop the .opd descriptors.
     exec_ranges = [(ph.p_vaddr, ph.p_vaddr + ph.p_filesz)
                    for ph in elf.program_headers
                    if ph.p_type == 1 and (ph.p_flags & 1)]
@@ -76,11 +50,10 @@ def load_symbols(path: str) -> list[dict]:
         if (st_info & 0xF) != STT_FUNC or not st_value:
             continue
         if exec_ranges and not in_text(st_value):
-            continue                      # OPD descriptor, not the entry point
+            continue
         nm = name_at(st_name).lstrip(".")
         if not nm:
             continue
-        # Same address twice: keep the one that carries a size.
         prev = out.get(st_value)
         if prev and prev["size"] >= st_size:
             continue
@@ -95,7 +68,6 @@ def load_symbols(path: str) -> list[dict]:
 
 
 def _starts(items) -> set[int]:
-    """Function start addresses from either tool's JSON (bare list or {functions:[]})."""
     if isinstance(items, dict):
         items = items.get("functions", [])
     got = set()
@@ -109,8 +81,6 @@ def _starts(items) -> set[int]:
 
 def score(truth: list[dict], detected_path: str) -> None:
     detected = _starts(json.load(open(detected_path, encoding="utf-8")))
-    # Only score inside the range the symbols actually cover; a detector finding
-    # functions outside it is not necessarily wrong.
     truth_by_start = {int(f["start"], 16): f for f in truth}
     real = set(truth_by_start)
     lo, hi = min(real), max(real)
@@ -130,8 +100,6 @@ def score(truth: list[dict], detected_path: str) -> None:
         print(f"  precision : {len(hit)}/{len(det)} = {100 * len(hit) / len(det):.1f}%  "
               f"(spurious {len(spurious)})")
 
-    # A start that is real but got swallowed into a preceding function is the
-    # failure mode that silently corrupts a lift, so call it out separately.
     if missed:
         print("\n  sample of missed functions (these lift as part of a neighbour):")
         for a in sorted(missed)[:12]:

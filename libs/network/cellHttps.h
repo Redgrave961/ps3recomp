@@ -1,9 +1,3 @@
-/*
- * ps3recomp - cellHttps HLE
- *
- * HTTPS (HTTP over TLS) client.
- */
-
 #ifndef PS3RECOMP_CELL_HTTPS_H
 #define PS3RECOMP_CELL_HTTPS_H
 
@@ -17,7 +11,6 @@ extern "C" {
 #define CELL_HTTPS_ERROR_NOT_INITIALIZED       0x80711101
 #define CELL_HTTPS_ERROR_ALREADY_INITIALIZED   0x80711102
 
-/* Mirrors RPCS3's CellHttpsData: one CA-cert blob {ptr, size} in a caList array. */
 typedef struct CellHttpsData {
     char* ptr;
     u32   size;
@@ -30,4 +23,4 @@ s32 cellHttpsEnd(void);
 }
 #endif
 
-#endif /* PS3RECOMP_CELL_HTTPS_H */
+#endif

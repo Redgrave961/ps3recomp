@@ -1,29 +1,16 @@
-/*
- * ps3recomp - Memory management syscalls (implementation)
- */
-
 #include "sys_memory.h"
 #include <stdio.h>
 #include <string.h>
-#include "../../include/ps3emu/log_first.h"   /* relative: tools/test_*memory*.py compile this file alone */
+#include "../../include/ps3emu/log_first.h"
 
-/* ---------------------------------------------------------------------------
- * Globals
- * -----------------------------------------------------------------------*/
 sys_mem_alloc_info       g_sys_mem_allocs[SYS_MEMORY_ALLOC_MAX];
 sys_mem_container_info   g_sys_mem_containers[SYS_MEMORY_CONTAINER_MAX];
 sys_mmapper_shared_info  g_sys_mmapper_shared[SYS_MMAPPER_SHARED_MAX];
 
-/* Bump allocator for main memory pool.
- * Starts after a reasonable offset to avoid the low addresses used by ELF. */
 uint32_t g_sys_mem_bump_ptr = 0;
 
-/* Total user memory size (default 213 MB, after kernel reservation) */
-#define SYS_MEMORY_CONTAINER_DEFAULT 0xFFFFFFFFu   /* SYS_MEMORY_CONTAINER_ID_INVALID: the default container */
+#define SYS_MEMORY_CONTAINER_DEFAULT 0xFFFFFFFFu
 
-/* LV2 user memory and mapper reservations occupy separate address domains.
- * User allocations start above the executable region. Mapper addresses may
- * carry high address bits; ordinary user allocations must not inherit them. */
 #define SYS_MEM_ALLOC_BASE  0x10000000u
 #define SYS_MEM_ALLOC_END   0x20000000u
 #define SYS_MAPPER_BASE     0x40000000u
@@ -55,7 +42,6 @@ void sys_memory_set_image_query(uint64_t (*query)(uint64_t addr, uint64_t end))
     s_image_query = query;
 }
 
-/* Guest threads are real host threads; serialize the bump allocator. */
 #ifdef _WIN32
 static SRWLOCK s_bump_lock = SRWLOCK_INIT;
 static void bump_lock(void)   { AcquireSRWLockExclusive(&s_bump_lock); }
@@ -77,17 +63,6 @@ static void write_be32(uint32_t addr, uint32_t val)
     *p = val;
 }
 
-/* ---------------------------------------------------------------------------
- * sys_memory_allocate
- *
- * r3 = size
- * r4 = flags (page size)
- * r5 = pointer to receive allocated address (u32*)
- * -----------------------------------------------------------------------*/
-/* Find an aligned gap among live user allocations. Freed blocks are reusable.
- * The small runtime-injected window is reserved even when a port relocates it
- * into this domain, and loaded ELF data/BSS remain owned by the image.
- * Use 64-bit arithmetic for every exclusive range end. */
 static uint32_t user_address(uint32_t size, uint32_t alignment)
 {
     uint64_t candidate = SYS_MEM_ALLOC_BASE;
@@ -133,9 +108,6 @@ static void log_guest_chain(const ppu_context* ctx)
     fprintf(stderr, "\n");
 }
 
-/* sys_memory_allocate and sys_memory_allocate_from_container share this. cid 0
- * is the process's main pool; a container's allocations are also charged to
- * that container (its used_size), checked against its total. */
 static int64_t memory_allocate(const ppu_context* ctx, uint64_t requested, uint32_t flags, uint32_t cid, uint32_t addr_out)
 {
     uint32_t alignment = (flags & SYS_MEMORY_PAGE_SIZE_1M) ? 0x100000u : 0x10000u;
@@ -188,16 +160,6 @@ int64_t sys_memory_allocate(ppu_context* ctx)
     return memory_allocate(ctx, LV2_ARG_U64(ctx, 0), LV2_ARG_U32(ctx, 1), 0, LV2_ARG_PTR(ctx, 2));
 }
 
-/* ---------------------------------------------------------------------------
- * sys_memory_allocate_from_container (syscall 350)
- *
- * r3 = size, r4 = container id, r5 = flags, r6 = pointer to receive the address
- *
- * Was unregistered. MLB The Show 16 builds its animation and movie buffer pools
- * ("SharedMemContAnim", "SharedMemContMovie") in containers carved from the
- * default one; with no allocation the pool stayed empty and loading a match
- * called a method on a NULL buffer.
- * -----------------------------------------------------------------------*/
 int64_t sys_memory_allocate_from_container(ppu_context* ctx)
 {
     uint32_t cid = LV2_ARG_U32(ctx, 1);
@@ -208,11 +170,6 @@ int64_t sys_memory_allocate_from_container(ppu_context* ctx)
     return memory_allocate(ctx, LV2_ARG_U64(ctx, 0), LV2_ARG_U32(ctx, 2), cid, LV2_ARG_PTR(ctx, 3));
 }
 
-/* ---------------------------------------------------------------------------
- * sys_memory_free
- *
- * r3 = address
- * -----------------------------------------------------------------------*/
 int64_t sys_memory_free(ppu_context* ctx)
 {
     uint32_t addr = LV2_ARG_U32(ctx, 0);
@@ -231,11 +188,6 @@ int64_t sys_memory_free(ppu_context* ctx)
     return (int64_t)(int32_t)CELL_EINVAL;
 }
 
-/* ---------------------------------------------------------------------------
- * sys_memory_get_user_memory_size
- *
- * r3 = pointer to output struct: { u32 total, u32 available }
- * -----------------------------------------------------------------------*/
 int64_t sys_memory_get_user_memory_size(ppu_context* ctx)
 {
     uint32_t out_addr = LV2_ARG_PTR(ctx, 0);
@@ -251,29 +203,12 @@ int64_t sys_memory_get_user_memory_size(ppu_context* ctx)
     return CELL_OK;
 }
 
-/* ---------------------------------------------------------------------------
- * sys_memory_get_page_attribute (syscall 351 / 0x15F)
- *
- * r3 = address to query
- * r4 = pointer to sys_page_attribute_t:
- *        +0x00 attribute   (u64)
- *        +0x08 access_right(u64)
- *        +0x10 page_size   (u32)   <- the field titles actually check
- *        +0x14 pad         (u32)
- *
- * Was unimplemented (fell through to the return-0 stub), so the output struct
- * was never filled -> callers reading page_size got stack garbage. Dantelion2's
- * graphics init (func_009F6D40) queries a 1MB-page buffer and only proceeds to
- * construct a sub-object when page_size == 0x100000; the stub made it take the
- * failure path, leaving that sub-object NULL -> later null-deref crash.
- * -----------------------------------------------------------------------*/
 int64_t sys_memory_get_page_attribute(ppu_context* ctx)
 {
     uint32_t addr     = LV2_ARG_U32(ctx, 0);
     uint32_t attr_out = LV2_ARG_PTR(ctx, 1);
 
-    /* Report the page size of the allocation containing addr. */
-    uint32_t page_size = 0x10000;  /* default 64K */
+    uint32_t page_size = 0x10000;
     bump_lock();
     const int i = alloc_after(addr);
     if (i < s_alloc_count && addr >= g_sys_mem_allocs[i].addr && g_sys_mem_allocs[i].page_size)
@@ -281,22 +216,16 @@ int64_t sys_memory_get_page_attribute(ppu_context* ctx)
     bump_unlock();
 
     if (attr_out != 0) {
-        write_be32(attr_out + 0x00, 0);          /* attribute    (hi) */
-        write_be32(attr_out + 0x04, 0x00040000); /* attribute    (lo) PROT_READ_WRITE-ish */
-        write_be32(attr_out + 0x08, 0);          /* access_right (hi) */
-        write_be32(attr_out + 0x0C, 0x00000008); /* access_right (lo) PPU_THREAD-ish */
-        write_be32(attr_out + 0x10, page_size);  /* page_size */
-        write_be32(attr_out + 0x14, 0);          /* pad */
+        write_be32(attr_out + 0x00, 0);
+        write_be32(attr_out + 0x04, 0x00040000);
+        write_be32(attr_out + 0x08, 0);
+        write_be32(attr_out + 0x0C, 0x00000008);
+        write_be32(attr_out + 0x10, page_size);
+        write_be32(attr_out + 0x14, 0);
     }
     return CELL_OK;
 }
 
-/* ---------------------------------------------------------------------------
- * sys_memory_container_create
- *
- * r3 = pointer to receive container ID (u32*)
- * r4 = size
- * -----------------------------------------------------------------------*/
 int64_t sys_memory_container_create(ppu_context* ctx)
 {
     uint32_t id_out_addr = LV2_ARG_PTR(ctx, 0);
@@ -322,11 +251,6 @@ int64_t sys_memory_container_create(ppu_context* ctx)
     return CELL_OK;
 }
 
-/* ---------------------------------------------------------------------------
- * sys_memory_container_destroy
- *
- * r3 = container_id
- * -----------------------------------------------------------------------*/
 int64_t sys_memory_container_destroy(ppu_context* ctx)
 {
     uint32_t container_id = LV2_ARG_U32(ctx, 0);
@@ -342,18 +266,6 @@ int64_t sys_memory_container_destroy(ppu_context* ctx)
     return CELL_OK;
 }
 
-/* ---------------------------------------------------------------------------
- * sys_memory_container_get_size
- *
- * r3 = pointer to output struct: sys_memory_info_t { u32 total, u32 available }
- * r4 = container_id; SYS_MEMORY_CONTAINER_ID_INVALID (0xFFFFFFFF) means the
- *      process's default container, i.e. the title's own user memory.
- *
- * The argument order and the second field were both wrong: the game passes the
- * struct first, and the second word is what is still free, not what is used. A
- * title carving a container out of the default one ("get the size, destroy,
- * recreate smaller, create mine") got ESRCH, then a container id of 0.
- * -----------------------------------------------------------------------*/
 int64_t sys_memory_container_get_size(ppu_context* ctx)
 {
     uint32_t out_addr     = LV2_ARG_PTR(ctx, 0);
@@ -384,24 +296,12 @@ int64_t sys_memory_container_get_size(ppu_context* ctx)
     return CELL_OK;
 }
 
-/* ---------------------------------------------------------------------------
- * sys_mmapper_allocate_address
- *
- * r3 = size
- * r4 = flags
- * r5 = alignment
- * r6 = pointer to receive address (u32*)
- * -----------------------------------------------------------------------*/
-/* Mapper reservation and legacy direct mapping share their own cursor.
- * Called with the allocator lock held. */
 static uint32_t mapper_address(uint64_t requested, uint64_t alignment)
 {
     if (!requested || requested > UINT32_MAX || !alignment ||
         alignment > UINT32_MAX || (alignment & (alignment - 1u))) return 0;
     uint64_t addr = ((uint64_t)s_mapper_bump_ptr + alignment - 1u) & ~(alignment - 1u);
     uint64_t size = (requested + alignment - 1u) & ~(alignment - 1u);
-    /* A reservation owns its entire aligned span. Recheck after every skip:
-     * an alignment adjustment can move it into another runtime-owned window. */
     const uint64_t reserved[][2] = {
         { VM_HLE_HEAP_BASE, (uint64_t)VM_HLE_HEAP_BASE + VM_HLE_HEAP_SIZE },
         { VM_AUDIO_BASE, (uint64_t)VM_AUDIO_BASE + VM_AUDIO_SIZE },
@@ -452,9 +352,6 @@ int64_t sys_mmapper_allocate_address(ppu_context* ctx)
     return CELL_OK;
 }
 
-/* Claim a mapped block inside the caller's existing reservation. The loader's
- * search-and-map bridge and the allocator share this ownership bookkeeping,
- * so an unsuccessful request leaves all reservation cursors unchanged. */
 int64_t sys_mmapper_search_map_address(uint32_t start, uint32_t size, uint32_t* out)
 {
     if (!out || !size) return (int64_t)(int32_t)CELL_EINVAL;
@@ -486,32 +383,16 @@ int64_t sys_mmapper_search_map_address(uint32_t start, uint32_t size, uint32_t* 
     bump_unlock(); return CELL_OK;
 }
 
-/* ---------------------------------------------------------------------------
- * sys_mmapper_free_address
- *
- * r3 = address
- * -----------------------------------------------------------------------*/
 int64_t sys_mmapper_free_address(ppu_context* ctx)
 {
-    /* uint32_t addr = LV2_ARG_U32(ctx, 0); */
     (void)ctx;
-    /* In our bump allocator we don't actually free, just acknowledge */
     return CELL_OK;
 }
 
-/* ---------------------------------------------------------------------------
- * sys_mmapper_allocate_shared_memory
- *
- * r3 = key
- * r4 = size
- * r5 = flags
- * r6 = pointer to receive shared mem ID (u32*)
- * -----------------------------------------------------------------------*/
 int64_t sys_mmapper_allocate_shared_memory(ppu_context* ctx)
 {
     uint64_t key      = LV2_ARG_U64(ctx, 0);
     uint32_t size     = LV2_ARG_U32(ctx, 1);
-    /* uint32_t flags = LV2_ARG_U32(ctx, 2); */
     uint32_t id_out   = LV2_ARG_PTR(ctx, 3);
 
     int slot = -1;
@@ -541,28 +422,6 @@ int64_t sys_mmapper_allocate_shared_memory(ppu_context* ctx)
     return CELL_OK;
 }
 
-/* ---------------------------------------------------------------------------
- * sys_mmapper_allocate_memory (lv2 341)
- *
- * r3 = pointer to receive the allocated address (u32*)
- * r4 = size
- *
- * The ABI here was read off the caller rather than a header. GT5P's PDI device
- * worker calls this the moment it starts -- func_00941808 loads r3 with a
- * pointer and r4 with 0x300000, issues the syscall, retries on any non-zero
- * result, and on success immediately does `lwz r29, 0(r29)`, reading back
- * through the pointer it passed in r3.
- *
- * Answering CELL_OK without writing anything is the worst of both worlds: the
- * worker believes it has three megabytes, reads a null buffer back, and exits
- * on the spot -- which leaves the packed-filesystem device with no worker at
- * all and stalls asset loading. Answering an error is worse still, because the
- * caller retries forever.
- *
- * The flat VM has no distinction between reserving and mapping, so this hands
- * back committed guest memory directly and sys_mmapper_allocate_memory_from_
- * container below accepts it as already mapped.
- * -----------------------------------------------------------------------*/
 int64_t sys_mmapper_allocate_memory(ppu_context* ctx)
 {
     uint32_t addr_out = LV2_ARG_PTR(ctx, 0);
@@ -586,31 +445,16 @@ int64_t sys_mmapper_allocate_memory(ppu_context* ctx)
     return CELL_OK;
 }
 
-/* ---------------------------------------------------------------------------
- * sys_mmapper_allocate_memory_from_container (lv2 342)
- *
- * The same allocation charged to a container. GT5P calls it straight after 341
- * with the address 341 handed back, so with a flat VM there is nothing further
- * to do -- the memory is already committed and addressable.
- * -----------------------------------------------------------------------*/
 int64_t sys_mmapper_allocate_memory_from_container(ppu_context* ctx)
 {
     (void)ctx;
     return CELL_OK;
 }
 
-/* ---------------------------------------------------------------------------
- * sys_mmapper_map_shared_memory
- *
- * r3 = address (where to map)
- * r4 = shared mem ID
- * r5 = flags
- * -----------------------------------------------------------------------*/
 int64_t sys_mmapper_map_shared_memory(ppu_context* ctx)
 {
     uint32_t addr   = LV2_ARG_U32(ctx, 0);
     uint32_t shm_id = LV2_ARG_U32(ctx, 1);
-    /* uint32_t flags = LV2_ARG_U32(ctx, 2); */
 
     if (shm_id == 0 || shm_id > SYS_MMAPPER_SHARED_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
@@ -619,7 +463,6 @@ int64_t sys_mmapper_map_shared_memory(ppu_context* ctx)
     if (!s->active)
         return (int64_t)(int32_t)CELL_ESRCH;
 
-    /* Commit the memory at the specified address */
     int32_t rc = vm_commit(addr, s->size);
     if (rc != CELL_OK) {
         fprintf(stderr, "[sys_mmapper] map_shared_memory(addr=0x%08X, id=%u) -> 0x%08X\n", addr, shm_id, (unsigned)rc);
@@ -635,9 +478,6 @@ int64_t sys_mmapper_map_shared_memory(ppu_context* ctx)
     return CELL_OK;
 }
 
-/* ---------------------------------------------------------------------------
- * Registration
- * -----------------------------------------------------------------------*/
 void sys_memory_init(lv2_syscall_table* tbl)
 {
     bump_lock();

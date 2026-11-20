@@ -1,16 +1,4 @@
 #!/usr/bin/env python3
-"""SMC micro-interpreter: lqa/stqa address the local store at I16 << 2.
-
-Builds the real ``spu_smc_microstep`` (pulled verbatim out of
-runtime/spu/spu_channels.c) into a small host program with the real SPU
-headers. The program writes a register save/restore stub into the local store
-the way a job manager writes its interrupt stub at runtime: 76 ``stqa`` of
-r0..r75 to 0x3F9C0.., a ``bi``, then 76 ``lqa`` back from the same addresses
-and a second ``bi``. It runs both halves through the micro-interpreter and
-checks that every register lands at its own 16 bytes, that the restore brings
-every register back, and that no local-store byte outside the save area and
-the stub itself changes.
-"""
 import os
 import re
 import shutil

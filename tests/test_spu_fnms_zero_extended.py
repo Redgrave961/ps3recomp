@@ -1,8 +1,4 @@
 #!/usr/bin/env python3
-"""Compile production helper/interpreter and actual generated lifted FNMS.
-No original program bytes, runtime captures, DMA, channels or guest calls.
-Run: python3 tests/test_spu_fnms_zero_extended.py
-"""
 import os
 from pathlib import Path
 import subprocess

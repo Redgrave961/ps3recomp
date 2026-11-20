@@ -1,23 +1,3 @@
-"""unfself.py - rebuild the original ELF from a debug/"fake" SELF (fSELF).
-
-Debug and prototype builds ship EBOOT.BIN as an fSELF: key_revision 0x8000, which
-means the payload is *not encrypted* -- segments are stored plain or zlib-deflated.
-No keys are needed, only an inflate.
-
-Two things make these worth unwrapping:
-
-  * The PT_LOAD segments give the real .text/.data, so the whole recomp pipeline
-    (find_functions -> ppu_disasm -> ppu_lifter) runs on them directly.
-  * SDK debug builds are *unstripped*: the ELF keeps .symtab/.strtab and the DWARF
-    .debug_* sections. Those live outside any PT_LOAD, so the SELF stores them
-    verbatim after the (possibly compressed) segments -- at a constant offset delta
-    from where the section headers say they belong. Recovering them yields exact
-    address+size+name for every function in the build.
-
-Usage:
-    python unfself.py EBOOT.BIN -o EBOOT.elf
-    python unfself.py EBOOT.BIN --info        # inspect, write nothing
-"""
 from __future__ import annotations
 
 import argparse
@@ -25,14 +5,14 @@ import struct
 import sys
 import zlib
 
-SELF_MAGIC = 0x53434500          # "SCE\0"
-KEY_REV_DEBUG = 0x8000           # fSELF marker: payload is not encrypted
+SELF_MAGIC = 0x53434500
+KEY_REV_DEBUG = 0x8000
 HDR_TYPE_SELF = 1
 
 SHT_NOBITS = 8
 SHF_ALLOC = 0x2
 
-COMPRESSED = 2                   # segment_info.compressed: 1 = plain, 2 = zlib
+COMPRESSED = 2
 
 
 class NotADebugSelf(Exception):
@@ -62,7 +42,6 @@ class FSelf:
         if data[self.elf_off:self.elf_off + 4] != b"\x7fELF":
             raise NotADebugSelf("no ELF header at the offset the SELF advertises")
 
-        # ELF header fields we need (ELF64 big-endian).
         self.e_phoff, self.e_shoff = _u("QQ", data, self.elf_off + 0x20)
         (self.e_phentsize, self.e_phnum, self.e_shentsize,
          self.e_shnum, self.e_shstrndx) = _u("5H", data, self.elf_off + 0x36)
@@ -72,7 +51,6 @@ class FSelf:
         return self.key_rev == KEY_REV_DEBUG
 
     def segments(self):
-        """(index, file_off, file_size, compressed, p_offset, p_filesz) per phdr."""
         for i in range(self.e_phnum):
             o = self.seginfo_off + i * 0x20
             f_off, f_size, comp, _u1, _u2, _enc = _u("QQIIII", self.d, o)
@@ -81,8 +59,6 @@ class FSelf:
             yield i, f_off, f_size, comp, p_offset, p_filesz
 
     def sections(self):
-        """(index, name_off, type, flags, addr, off, size) per shdr, read from the
-        SELF's copy of the section header table."""
         for i in range(self.e_shnum):
             o = self.shdr_off + i * self.e_shentsize
             nameo, typ, flags, addr, off, size = _u("IIQQQQ", self.d, o)
@@ -90,13 +66,6 @@ class FSelf:
 
     @property
     def tail_delta(self) -> int:
-        """Offset delta between the original ELF's file layout and this SELF's.
-
-        The SELF carries its own copy of the section header table, so the shift
-        between "where the ELF says its shdrs live" and "where they actually are
-        in this file" gives the delta for every other non-alloc byte too -- the
-        tail (symtab/strtab/DWARF) is stored verbatim, just moved.
-        """
         return self.shdr_off - self.e_shoff
 
     def to_elf(self) -> bytes:
@@ -110,16 +79,12 @@ class FSelf:
         d = self.d
         out = bytearray(self.elf_filesize)
 
-        # ELF header + program headers, from the SELF's own copies.
         out[0:64] = d[self.elf_off:self.elf_off + 64]
         phsz = self.e_phnum * self.e_phentsize
         out[self.e_phoff:self.e_phoff + phsz] = d[self.phdr_off:self.phdr_off + phsz]
 
-        # PT_LOAD (and friends) payloads.
         for i, f_off, f_size, comp, p_offset, p_filesz in self.segments():
             if not f_off or not f_size:
-                # Not separately stored -- it lives inside a segment already written
-                # (PT_TLS and the SCE PPU segments overlap a PT_LOAD).
                 continue
             blob = d[f_off:f_off + f_size]
             if comp == COMPRESSED:
@@ -136,8 +101,6 @@ class FSelf:
                 )
             out[p_offset:p_offset + p_filesz] = blob
 
-        # Non-alloc sections (.symtab/.strtab/.shstrtab/.debug_*) are not in any
-        # segment; they sit in the tail at a constant delta.
         delta = self.tail_delta
         recovered = 0
         for i, _nameo, typ, flags, _addr, off, size in self.sections():
@@ -152,7 +115,6 @@ class FSelf:
             out[off:off + size] = d[src:src + size]
             recovered += 1
 
-        # Finally the section header table itself.
         if self.e_shnum:
             shsz = self.e_shnum * self.e_shentsize
             out[self.e_shoff:self.e_shoff + shsz] = d[self.shdr_off:self.shdr_off + shsz]

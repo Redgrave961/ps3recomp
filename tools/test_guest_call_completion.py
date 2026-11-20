@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Compile the actual resolved guest-call body with an isolated function registry."""
 import os,subprocess,tempfile
 from pathlib import Path
 root=Path(__file__).resolve().parents[1]

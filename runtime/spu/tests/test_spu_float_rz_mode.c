@@ -1,8 +1,3 @@
-/* SPU_FLOAT_RZ: spu_run_with_halt runs SPU code with FPCR at round toward zero with
- * flush-to-zero and puts the caller's FPCR back on the way out -- after a normal return, after a
- * halt (longjmp), and around a nested run. A run can happen synchronously on a PPU thread, whose
- * floating point must keep round to nearest with denormals. Without SPU_FLOAT_RZ=1 FPCR is never
- * touched. arm64 only. */
 #include "../spu_helpers.h"
 #include "../spu_interp.h"
 #include <assert.h>
@@ -56,7 +51,7 @@ int main(void)
 {
     const char* e = getenv("SPU_FLOAT_RZ");
     rz = e && !strcmp(e, "1");
-    const uint64_t callers[] = { 0, 0x00400000ull /* round toward +inf */, SPU_FPCR_RZFZ };
+    const uint64_t callers[] = { 0, 0x00400000ull, SPU_FPCR_RZFZ };
     for (unsigned i = 0; i < sizeof callers / sizeof callers[0]; i++) {
         run(leaf_return, callers[i], "return");
         run(leaf_halt, callers[i], "halt");
@@ -69,7 +64,6 @@ int main(void)
 int main(void) { puts("SKIP: SPU_FLOAT_RZ is arm64 only"); return 0; }
 #endif
 
-/* Link-only boundaries outside this CPU-only fixture. Fail if any is reached. */
 void spu_thread_publish_ctx(uint32_t tid, void* c) { (void)tid; (void)c; abort(); }
 void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; abort(); }
 unsigned long long ps3_ms_now(void) { abort(); }

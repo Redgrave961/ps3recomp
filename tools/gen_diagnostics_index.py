@@ -4,7 +4,7 @@ ROOTS = ['runtime', 'libs', 'tools']
 PAT = re.compile(r'(?:getenv|ps3_env_once)\(\s*"([A-Za-z_][A-Za-z_0-9]*)"\s*\)')
 COMMENT = re.compile(r'^\s*(?:/\*|\*|//)\s?(.*)$')
 
-hits = collections.defaultdict(list)   # name -> [(file, line, desc)]
+hits = collections.defaultdict(list)
 for root in ROOTS:
     for dp, _dn, fn in os.walk(root):
         if '.git' in dp: continue
@@ -16,7 +16,6 @@ for root in ROOTS:
             for i, l in enumerate(lines):
                 for m in PAT.finditer(l):
                     name = m.group(1)
-                    # nearest preceding comment block, up to 6 lines back
                     desc = ''
                     for j in range(i - 1, max(-1, i - 7), -1):
                         c = COMMENT.match(lines[j])
@@ -28,7 +27,6 @@ for root in ROOTS:
                             break
                         elif lines[j].strip():
                             break
-                    # a same-line trailing comment wins
                     tc = re.search(r'/\*\s*(.*?)\s*\*/|//\s*(.*)$', l)
                     if tc and (tc.group(1) or tc.group(2)):
                         desc = (tc.group(1) or tc.group(2)).strip()

@@ -6,4 +6,4 @@
 
 #define GUEST_EA(p) ((uint32_t)(uintptr_t)(p))
 
-#endif /* PS3RECOMP_GUEST_STRUCT_H */
+#endif

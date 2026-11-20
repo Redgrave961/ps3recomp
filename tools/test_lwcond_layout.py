@@ -1,16 +1,4 @@
 #!/usr/bin/env python3
-"""sys_lwcond_t layout in the context-style HLE (runtime/ppu/ppu_sysprx.cpp).
-
-sys_lwcond_t is 8 bytes: +0x00 u32 lwmutex EA, +0x04 u32 lwcond queue id (the
-same layout libs/system/sysPrxForUser.h declares as sys_lwcond_t_hle). Builds
-the real lwmutex/lwcond handlers (the block pulled verbatim out of
-ppu_sysprx.cpp) with the real park/wait layer (runtime/platform/ps3_sync.c)
-into a small host program over guest memory, creates an lwcond, and checks:
-  - +0x00 holds the lwmutex EA, +0x04 a nonzero id;
-  - nothing is written past the 8-byte structure;
-  - a timed sys_lwcond_wait releases and retakes the lwmutex the lwcond was
-    created with: CELL_ETIMEDOUT, the caller owns it again, recursion restored.
-"""
 import os
 import re
 import shutil

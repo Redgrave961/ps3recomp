@@ -1,16 +1,8 @@
-/*
- * ps3recomp - cellRtc HLE implementation
- *
- * Real-time clock using host system time.
- * PS3 epoch: Jan 1, 0001 00:00:00.000000 UTC
- * Tick unit: microseconds
- */
-
 #include "cellRtc.h"
-#include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_read/write (guest mem) */
+#include "../../runtime/ppu/ppu_memory.h"
 #include <stdio.h>
 #include <string.h>
-#include <stdlib.h>   /* abs */
+#include <stdlib.h>
 #include <time.h>
 
 #ifdef _WIN32
@@ -20,17 +12,10 @@
 #  include <sys/time.h>
 #endif
 
-/* Seconds between PS3 epoch (0001-01-01) and Unix epoch (1970-01-01) */
 #define PS3_UNIX_EPOCH_DIFF  62135596800ULL
 
-/* Microseconds per second */
 #define USEC_PER_SEC  1000000ULL
 
-/* ---------------------------------------------------------------------------
- * Internal helpers
- * -----------------------------------------------------------------------*/
-
-/* Get current Unix time in microseconds */
 static u64 get_host_time_usec(void)
 {
 #ifdef _WIN32
@@ -44,19 +29,16 @@ static u64 get_host_time_usec(void)
 #endif
 }
 
-/* Convert Unix time_t to PS3 tick */
 static u64 time_t_to_tick(s64 t)
 {
     return ((u64)t + PS3_UNIX_EPOCH_DIFF) * USEC_PER_SEC;
 }
 
-/* Convert PS3 tick to Unix time_t */
 static s64 tick_to_time_t(u64 tick)
 {
     return (s64)(tick / USEC_PER_SEC) - (s64)PS3_UNIX_EPOCH_DIFF;
 }
 
-/* Fill CellRtcDateTime from struct tm + microseconds */
 static void tm_to_datetime(const struct tm* t, u32 usec, CellRtcDateTime* dt)
 {
     dt->year        = (u16)(t->tm_year + 1900);
@@ -68,7 +50,6 @@ static void tm_to_datetime(const struct tm* t, u32 usec, CellRtcDateTime* dt)
     dt->microsecond = usec;
 }
 
-/* Convert CellRtcDateTime to struct tm */
 static struct tm datetime_to_tm(const CellRtcDateTime* dt)
 {
     struct tm t;
@@ -83,15 +64,6 @@ static struct tm datetime_to_tm(const CellRtcDateTime* dt)
     return t;
 }
 
-/* ---------------------------------------------------------------------------
- * Guest/host dual-mode accessors.
- *
- * Public entry points receive GUEST addresses (the generic HLE adapter passes
- * PPC registers raw), but internal helpers call the same functions
- * with HOST stack locals. Values in guest memory are BIG-ENDIAN, so a plain
- * pointer translation is not enough — each field store must byte-swap.
- * Discriminate by value: guest EAs are < 4GB, host pointers are not.
- * -----------------------------------------------------------------------*/
 static int rtc_is_guest(const void* p)
 {
     uintptr_t v = (uintptr_t)p;
@@ -137,10 +109,6 @@ static void rtc_dt_read(const CellRtcDateTime* p, CellRtcDateTime* v)
     }
 }
 
-/* ---------------------------------------------------------------------------
- * API implementations
- * -----------------------------------------------------------------------*/
-
 s32 cellRtcGetCurrentTick(CellRtcTick* pTick)
 {
     if (!pTick)
@@ -152,8 +120,6 @@ s32 cellRtcGetCurrentTick(CellRtcTick* pTick)
     return CELL_OK;
 }
 
-/* cellRtcGetCurrentClock(CellRtcDateTime* pClock, s32 iTimeZone) — UTC shifted
- * by iTimeZone minutes. LBP's boot path imports this (was missing entirely). */
 s32 cellRtcGetCurrentClock(CellRtcDateTime* pClock, s32 iTimeZone)
 {
     if (!pClock)
@@ -245,7 +211,6 @@ s32 cellRtcConvertUtcToLocalTime(const CellRtcTick* pUtc, CellRtcTick* pLocalTim
 
 s32 cellRtcGetDayOfWeek(s32 year, s32 month, s32 day)
 {
-    /* Tomohiko Sakamoto's algorithm */
     static const int t[] = { 0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4 };
     int y = year;
     if (month < 3) y -= 1;

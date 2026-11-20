@@ -53,36 +53,13 @@ from collections import Counter, defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from elf_parser import ELFFile, PT_LOAD  # noqa: E402
-from spu_disasm import spu_decode  # noqa: E402
+from elf_parser import ELFFile, PT_LOAD
+from spu_disasm import spu_decode
 
-# ---------------------------------------------------------------------------
-# Oracle harness location: never shipped in this repo (built against your own
-# RPCS3 clone -- see tools/spu_dump_tool.vcxproj). Point --oracle-exe at your
-# build, or set the SPU_DUMP_TOOL_EXE environment variable.
-# ---------------------------------------------------------------------------
 DEFAULT_ORACLE_EXE = os.environ.get("SPU_DUMP_TOOL_EXE")
 
-PF_X = 0x1  # ELF program header "executable" flag bit
+PF_X = 0x1
 
-# ---------------------------------------------------------------------------
-# Alias whitelist: (ours_mnemonic, oracle_mnemonic) pairs known to be the
-# SAME instruction under a different display name, confirmed by reading the
-# RPCS3 source (GPLv2, cited by file:line only -- no code copied):
-#   - SPUDisAsm.h ORI():      "if (!op.si10) DisAsm(\"mr\", ...)"       (~line 897)
-#   - SPUDisAsm.h SHLQBYI():  "if (!op.si7)  DisAsm(\"mr\", ...)"       (~line 553)
-#     Both are RPCS3's own "made-up mnemonic: as MR on PPU" comment --
-#     value-conditional (immediate == 0) aliasing our decoder does not do.
-#     v1 whitelists the mnemonic PAIR unconditionally (does not re-check the
-#     immediate); this is a deliberate v1 simplification, matching the
-#     "mnemonic-only in v1" scope used elsewhere in this audit family.
-#   - SPUDisAsm.h SYNC():     "DisAsm(op.c ? \"syncc\" : \"sync\")"      (~line 240)
-#   - SPUDisAsm.h HBR():      "DisAsm(op.c ? \"hbrp\" : \"hbr\", ...)"   (~line 419)
-#     Our decoder (tools/spu_disasm.py) always emits the C=0 name; these
-#     pairs are a REAL, reportable gap (not a bug -- SYNC/HBR are 1-bit
-#     variants we don't currently distinguish), whitelisted here so they
-#     don't drown out true decode-table-swap mismatches in the top-N report.
-# ---------------------------------------------------------------------------
 ALIAS_WHITELIST = {
     ("ori", "mr"),
     ("shlqbyi", "mr"),
@@ -114,7 +91,6 @@ def find_oracle_exe(explicit: str | None) -> str:
 
 
 def extract_code_segment(elf_path: str) -> tuple[bytes, int]:
-    """Return (code_bytes, vaddr) for the executable PT_LOAD segment."""
     ef = ELFFile(elf_path)
     ef.load()
 
@@ -137,7 +113,6 @@ def extract_code_segment(elf_path: str) -> tuple[bytes, int]:
 
 
 def decode_ours(code: bytes, vaddr: int) -> dict[int, str]:
-    """offset -> mnemonic, decoding every 4-byte-aligned word."""
     out = {}
     n = len(code) - (len(code) % 4)
     for off in range(0, n, 4):
@@ -148,11 +123,6 @@ def decode_ours(code: bytes, vaddr: int) -> dict[int, str]:
 
 
 def decode_oracle(oracle_exe: str, code: bytes, vaddr: int) -> dict[int, str]:
-    """offset -> mnemonic, by shelling out to the rpcs3clone harness."""
-    # SPU local store is 256 KiB (SPU_LS_SIZE); the harness requires
-    # base + len(code) <= 0x40000. Our lifted images' vaddrs (e.g. gs_task's
-    # 0x3000) already satisfy this -- if a future image doesn't, mask to the
-    # low 18 bits (LS-relative) the way real SPU addressing does.
     base = vaddr
     if base + len(code) > 0x40000:
         base = vaddr & 0x3FFFF
@@ -181,9 +151,8 @@ def decode_oracle(oracle_exe: str, code: bytes, vaddr: int) -> dict[int, str]:
         )
 
     out = {}
-    delta = vaddr - base  # map harness-local offsets back to the real vaddr
+    delta = vaddr - base
     for line in proc.stdout.splitlines():
-        # "00003000: ila r2,0x15ba4" (or "<disasm-out-of-range>")
         colon = line.find(":")
         if colon < 0:
             continue
@@ -200,7 +169,6 @@ def decode_oracle(oracle_exe: str, code: bytes, vaddr: int) -> dict[int, str]:
 
 
 def audit_one(image_path: str, oracle_exe: str, samples: int) -> tuple[Counter, dict, int]:
-    """Returns (mismatch_pair_counts, sample_addrs_by_pair, total_words)."""
     code, vaddr = extract_code_segment(image_path)
     ours = decode_ours(code, vaddr)
     oracle = decode_oracle(oracle_exe, code, vaddr)
@@ -213,7 +181,7 @@ def audit_one(image_path: str, oracle_exe: str, samples: int) -> tuple[Counter, 
         total += 1
         oracle_mn = oracle.get(addr)
         if oracle_mn is None:
-            continue  # oracle didn't cover this offset (shouldn't happen for aligned code)
+            continue
         if our_mn == oracle_mn:
             continue
         pair = (our_mn, oracle_mn)
@@ -280,7 +248,6 @@ def main() -> None:
     if not whitelisted_pairs:
         print("  (none)")
 
-    # Sanity gate: core ops must show zero NON-whitelisted mismatches.
     core_ops = {"il", "ai", "lqd", "brsl", "shufb"}
     core_residual = {p: c for p, c in residual_pairs.items() if p[0] in core_ops}
     print()

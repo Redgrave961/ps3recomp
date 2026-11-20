@@ -1,7 +1,3 @@
-/* Real runtime transition regression. Hand-encoded guest bytes force the full
- * interpreter (ori is outside the SMC microstep subset), then call lifted code.
- * The lifted functions below use the same call/drain/return ABI as generated C.
- * No game data, DMA, service, GPU, or runtime dispatcher mocks are involved. */
 #include "../spu_helpers.h"
 #include "../spu_interp.h"
 #include <assert.h>
@@ -29,8 +25,6 @@ static void helper(spu_context* c) {
     c->gpr[10] = spu_ai(c->gpr[10], 1);
     SPU_RET(c);
 }
-/* This is a valid registered entry which a nested call's return boundary must
- * NOT execute: the corresponding host frame owns its continuation. */
 static void wrong_continuation(spu_context* c) {
     c->gpr[21]._u32[0]++;
     finish(c);
@@ -62,53 +56,51 @@ int main(int argc, char** argv) {
         spu_register_function(0x204, wrong_continuation);
     spu_register_function(0x240, finish);
     if (!strcmp(mode, "job-ls0")) spu_register_function(0, finish);
-    word(0x4000, 0x04000082); /* ori $2,$1,0: force full interpreter */
+    word(0x4000, 0x04000082);
     void (*entry)(spu_context*) = tail_entry;
     if (!strcmp(mode, "job-ls0")) {
-        word(0x4004, 0x30000000); /* bra 0: registered, valid lifted entry */
+        word(0x4004, 0x30000000);
     } else if (!strcmp(mode, "top")) {
-        word(0x4004, 0x30004800); /* bra 0x240 */
+        word(0x4004, 0x30004800);
     } else if (!strncmp(mode, "nested-return", 13)) {
         entry = nested_entry; queued_call = 1;
-        word(0x204, 0x1C004A95); /* ai $21,$21,1: must NOT be interpreted */
-        word(0x208, 0x30004800); /* bra 0x240 */
-        word(0x4004, 0x35000000); /* bi $0 -> 0x204 */
+        word(0x204, 0x1C004A95);
+        word(0x208, 0x30004800);
+        word(0x4004, 0x35000000);
     } else if (!strcmp(mode, "nested-calls")) {
         entry = nested_entry;
-        word(0x4004, 0x31004000); /* brasl $0,0x200 */
-        word(0x4008, 0x04000082); /* ori $2,$1,0 */
-        word(0x400C, 0x31004000); /* brasl $0,0x200 */
-        word(0x4010, 0x04000082); /* ori $2,$1,0 */
-        word(0x4014, 0x30004800); /* bra 0x240 */
+        word(0x4004, 0x31004000);
+        word(0x4008, 0x04000082);
+        word(0x400C, 0x31004000);
+        word(0x4010, 0x04000082);
+        word(0x4014, 0x30004800);
     } else if (!strcmp(mode, "stop-zero") || !strcmp(mode, "nested-stop")) {
         if (!strcmp(mode, "nested-stop")) entry = nested_entry;
-        word(0x4004, 0x00000000); /* stop 0 */
+        word(0x4004, 0x00000000);
     } else if (!strcmp(mode, "stop-code")) {
-        word(0x4004, 0x00002123); /* stop 0x2123 */
+        word(0x4004, 0x00002123);
     } else if (!strcmp(mode, "halt")) {
-        word(0x4004, 0x7F000102); /* heqi $2,0: ori copied initial zero */
+        word(0x4004, 0x7F000102);
     } else if (!strcmp(mode, "smc")) {
-        word(0x4000, 0x40812003); /* il $3,0x240 (microstep supported) */
-        word(0x4004, 0x35000180); /* bi $3 */
+        word(0x4000, 0x40812003);
+        word(0x4004, 0x35000180);
     } else if (!strncmp(mode, "smc-ldst", 8)) {
-        /* A generated save/restore stub's shape: quadword stores and loads,
-         * then a branch, run on the microstep's load/store fast loop. */
         for (int k = 0; k < 4; k++) {
             ctx.gpr[5]._u32[k] = 0x11223344u * (uint32_t)(k + 1);
             ctx.gpr[6]._u32[k] = 0xA0B0C0D0u ^ (uint32_t)k;
         }
         ctx.gpr[1]._u32[0] = 0x3000;
-        word(0x4000, 0x40812003); /* il   $3,0x240 */
-        word(0x4004, 0x20FE0005); /* stqa $5,0x3F000 */
-        word(0x4008, 0x24008086); /* stqd $6,0x20($1) */
-        word(0x400C, 0x30FE0007); /* lqa  $7,0x3F000 */
-        word(0x4010, 0x34008088); /* lqd  $8,0x20($1) */
-        word(0x4014, 0x35000180); /* bi   $3 */
+        word(0x4000, 0x40812003);
+        word(0x4004, 0x20FE0005);
+        word(0x4008, 0x24008086);
+        word(0x400C, 0x30FE0007);
+        word(0x4010, 0x34008088);
+        word(0x4014, 0x35000180);
     } else if (!strcmp(mode, "pure-interpreter")) {
         word(0x4004, 0x30004800);
         uint32_t pc = spu_interp_run_until(&ctx, 0x4000, 0);
         assert(pc == 0x240 && ctx.status == SPU_STATUS_RUNNING);
-        assert(g_spu_trampoline_fn == NULL); /* adapter owns scheduling */
+        assert(g_spu_trampoline_fn == NULL);
         puts("pure-interpreter PASS"); return 0;
     } else { fprintf(stderr, "unknown mode\n"); return 2; }
     int halted = spu_run_with_halt(entry, &ctx);
@@ -128,15 +120,12 @@ int main(int argc, char** argv) {
             const uint8_t* a = &ctx.ls[0x3F000 + 4 * k];
             const uint8_t* b = &ctx.ls[0x3020 + 4 * k];
             assert(a[0] == (uint8_t)(v5 >> 24) && a[1] == (uint8_t)(v5 >> 16) &&
-                   a[2] == (uint8_t)(v5 >> 8) && a[3] == (uint8_t)v5);   /* big-endian in LS */
+                   a[2] == (uint8_t)(v5 >> 8) && a[3] == (uint8_t)v5);
             assert(b[0] == (uint8_t)(v6 >> 24) && b[3] == (uint8_t)v6);
             assert(ctx.gpr[7]._u32[k] == v5 && ctx.gpr[8]._u32[k] == v6);
         }
     }
     if (!strncmp(mode, "stop", 4) || !strcmp(mode, "nested-stop") || !strcmp(mode, "halt")) {
-        /* Baseline-equivalence controls, not assertions of architectural stop
-         * correctness. The adapter's inherited numeric-stop-code behavior is
-         * deliberately outside this narrowly scoped rejoin fix. */
         assert(ctx.gpr[11]._u32[0] == 0 && ctx.gpr[20]._u32[0] == 0);
         assert(halted == (!strcmp(mode, "nested-stop") ? 1 : 0));
         assert(ctx.status == (!strcmp(mode, "stop-code") ?
@@ -152,9 +141,6 @@ int main(int argc, char** argv) {
     puts("PASS"); return 0;
 }
 
-/* Link-only boundaries outside this CPU-only fixture. Fail if any is reached. */
-/* spu_workload.c can retain the LV2 runner's publication calls at link time;
- * this fixture runs its own context directly, without an LV2 SPU thread. */
 void spu_thread_publish_ctx(uint32_t tid, void* c) { (void)tid; (void)c; abort(); }
 void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; abort(); }
 unsigned long long ps3_ms_now(void) { abort(); }

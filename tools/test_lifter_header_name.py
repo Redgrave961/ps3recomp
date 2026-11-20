@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Custom module headers must be used in both split and single-file output."""
 import json
 from pathlib import Path
 import subprocess
@@ -10,7 +9,7 @@ import tempfile
 def main():
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
-        (root / 'code.bin').write_bytes(bytes.fromhex('4e800020'))  # blr
+        (root / 'code.bin').write_bytes(bytes.fromhex('4e800020'))
         (root / 'functions.json').write_text(json.dumps([{'start': '0x10000', 'end': '0x10004'}]))
         for single in (False, True):
             output = root / ('single' if single else 'split')

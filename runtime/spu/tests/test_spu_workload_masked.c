@@ -1,16 +1,3 @@
-/* A raw-SPU program whose loader fills a parameter area in before every load is
- * found whatever that area holds. Resistance's second raw SPU program carries
- * 0x50 bytes of heap pointers, per-level values and its own MMIO window at the
- * end of its image; one run loaded it as 47C9CB480016D493, a Continue from a
- * later checkpoint as 5771C48D28664765, and with a plain fingerprint the second
- * found no lifted entry and the game hung. Registered masked, both resolve to
- * the image's fingerprint with the area zero.
- *
- * tools/test_spu_workload_masked.py builds and runs it:
- *   cc -std=gnu17 -I include -I runtime -I runtime/spu
- *     runtime/spu/tests/test_spu_workload_masked.c -pthread
- *     -o /tmp/test_spu_workload_masked && /tmp/test_spu_workload_masked
- */
 #include "../spu_workload.c"
 #include <assert.h>
 
@@ -22,13 +9,11 @@ int main(void)
     enum { SIZE = 0x57D0, VAR = 0x5780, VLEN = 0x50 };
     static uint8_t img[SIZE], loaded[SIZE];
     for (unsigned i = 0; i < VAR; i++) img[i] = (uint8_t)(i * 7 + 3);
-    const uint64_t fp = spu_workload_fingerprint(img, SIZE);     /* area zero */
+    const uint64_t fp = spu_workload_fingerprint(img, SIZE);
 
     spu_workload_register_img(0x1111ULL, prog_a, 2, "a");
     spu_workload_register_img_masked(fp, prog_b, 3, "b", SIZE, VAR, VLEN);
 
-    /* Two loads with different parameters: neither fingerprints as the image,
-     * both resolve to it. */
     for (int run = 0; run < 2; run++) {
         memcpy(loaded, img, SIZE);
         for (unsigned i = 0; i < VLEN; i++) loaded[VAR + i] = (uint8_t)(0x47 + run * 13 + i);
@@ -40,16 +25,12 @@ int main(void)
         assert(got == fp && id == 3);
     }
 
-    /* A change outside the area is a different program. */
     memcpy(loaded, img, SIZE);
     loaded[0x100] ^= 1;
     int id = -1;
     assert(spu_workload_find_img_masked(loaded, SIZE, NULL, &id) == NULL && id == 0);
-    /* So is the same bytes at another length. */
     assert(spu_workload_find_img_masked(img, SIZE - 0x10, NULL, &id) == NULL);
-    /* The plain lookup still finds the image loaded as it is in the ELF. */
     assert(spu_workload_find_img(fp, &id) == prog_b && id == 3);
-    /* A masked registration that does not fit its size is refused. */
     spu_workload_register_img_masked(0x2222ULL, prog_a, 4, "bad", 0x100, 0xF0, 0x20);
     assert(spu_workload_find(0x2222ULL) == NULL);
 

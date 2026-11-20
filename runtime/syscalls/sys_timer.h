@@ -1,7 +1,3 @@
-/*
- * ps3recomp - Timer and time syscalls
- */
-
 #ifndef SYS_TIMER_H
 #define SYS_TIMER_H
 
@@ -25,21 +21,13 @@
 extern "C" {
 #endif
 
-/* PS3 timebase frequency */
 #define PS3_TIMEBASE_FREQ  79800000ULL
 
-/* The guest mftb/mftbu clock: one global monotonic counter, host time scaled
- * to the PS3 timebase. Called from every lifted mftb site (ppu_lifter.py). */
 uint64_t ppu_timebase_now(void);
 unsigned long long ps3_qpc_us(void);
 unsigned long long ps3_ms_now(void);
 
 #ifndef _WIN32
-/* Nanoseconds on the host monotonic clock that every guest clock derives from
- * (the timebase above, sys_time_get_system_time, timer expirations), so they
- * stay consistent with each other. On macOS this is mach_absolute_time: the
- * mftb site is hot in game loops, and clock_gettime(CLOCK_MONOTONIC) there
- * goes through _mach_boottime_usec + gettimeofday on every read. */
 uint64_t host_monotonic_ns(void);
 #endif
 
@@ -49,11 +37,11 @@ typedef struct sys_timer_info {
     int      active;
     int      running;
     uint64_t period_usec;
-    int32_t  event_queue_id;   /* connected event queue */
-    uint64_t source;           /* event source value */
-    uint64_t data1;            /* event data1 */
-    uint64_t data2;            /* event data2 (connect's fifth argument) */
-    uint64_t next_expire;      /* next expiration, us on the timer clock */
+    int32_t  event_queue_id;
+    uint64_t source;
+    uint64_t data1;
+    uint64_t data2;
+    uint64_t next_expire;
 
 #ifdef _WIN32
     HANDLE   timer_handle;
@@ -70,7 +58,6 @@ typedef struct sys_timer_info {
 
 extern sys_timer_info g_sys_timers[SYS_TIMER_MAX];
 
-/* Syscall handlers */
 int64_t sys_timer_usleep(ppu_context* ctx);
 int64_t sys_timer_sleep(ppu_context* ctx);
 int64_t sys_time_get_current_time(ppu_context* ctx);
@@ -83,11 +70,10 @@ int64_t sys_timer_stop(ppu_context* ctx);
 int64_t sys_timer_connect_event_queue(ppu_context* ctx);
 int64_t sys_timer_disconnect_event_queue(ppu_context* ctx);
 
-/* Registration */
 void sys_timer_init(lv2_syscall_table* tbl);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* SYS_TIMER_H */
+#endif

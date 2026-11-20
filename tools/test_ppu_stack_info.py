@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""sys_ppu_thread_get_stack_information through the real sys_ppu_thread.c: the main thread is told a real stack."""
 import os
 from pathlib import Path
 import subprocess

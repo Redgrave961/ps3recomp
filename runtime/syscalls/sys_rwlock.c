@@ -1,7 +1,3 @@
-/*
- * ps3recomp - Reader-writer lock syscalls (implementation)
- */
-
 #include "sys_rwlock.h"
 #include "sys_ppu_thread.h"
 #include "../memory/vm.h"

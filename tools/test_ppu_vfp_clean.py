@@ -1,8 +1,4 @@
 #!/usr/bin/env python3
-"""VMX float inputs produced by an earlier float op in the same block skip the
-denormal screen (_vfp_clean): the hint appears only on such inputs, and the
-hinted code computes the same vector registers as the unhinted code for
-denormal, NaN, infinite and ordinary inputs with VSCR[NJ] on and off."""
 from __future__ import annotations
 
 import importlib.util

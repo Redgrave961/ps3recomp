@@ -1,15 +1,4 @@
 #!/usr/bin/env python3
-"""Regression test: the record form of every AltiVec compare sets CR6.
-
-AltiVec PEM (vcmp*.): CR6 = 0b1000 when the compare is true in every lane,
-0b0010 when it is false in every lane; vcmpbfp.: CR6 = 0b0010 when every lane
-is within bounds. vcmpequb. and vcmpequh. computed vD and left CR6 untouched,
-so the `b[n]e cr6` after them followed whatever compare wrote CR6 last. The
-other forms are covered as controls.
-
-This test lifts each form, compiles the emitted C with the VMX helpers, runs it and checks vD's CR6 effect and that no other CR field moved.
-It needs a host C compiler (under CI=1 a missing one fails instead of skipping).
-"""
 from __future__ import annotations
 
 import importlib.util
@@ -54,7 +43,6 @@ def _be(kind, vals):
     return struct.pack(">4I", *vals)
 
 
-# (mnemonic, lane kind of vA/vB, vA, vB, expected CR6 field)
 CASES = [
     ("vcmpequw.", "w", [1, 2, 3, 4], [1, 2, 3, 4], 0x8),
     ("vcmpequw.", "w", [1, 2, 3, 4], [5, 6, 7, 8], 0x2),
@@ -66,19 +54,15 @@ CASES = [
     ("vcmpgtfp.", "f", [2.0, 0.0, 2.0, 0.0], [1.0, 1.0, 1.0, 1.0], 0x0),
     ("vcmpgefp.", "f", [1.0, 1.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0], 0x8),
     ("vcmpgefp.", "f", [0.0, 0.0, 0.0, 0.0], [1.0, 1.0, 1.0, 1.0], 0x2),
-    # vcmpequh./vcmpequb. left CR6 stale before the fix
     ("vcmpequh.", "w", [0x00010002, 3, 4, 5], [0x00010002, 3, 4, 5], 0x8),
     ("vcmpequh.", "w", [0x00010002] * 4, [0x00030004] * 4, 0x2),
     ("vcmpequh.", "w", [0x00010002] * 4, [0x00010004] * 4, 0x0),
     ("vcmpequb.", "w", [0x01020304] * 4, [0x01020304] * 4, 0x8),
     ("vcmpequb.", "w", [0, 0, 0, 0], [0x01010101] * 4, 0x2),
     ("vcmpequb.", "w", [0x01020304] * 4, [0x01020305] * 4, 0x0),
-    # vcmpbfp. with a NaN lane: NaN is out of bounds on both sides
     ("vcmpbfp.", "f", [0.5, float("nan"), 1.0, 0.0], [1.0, 1.0, 1.0, 1.0], 0x0),
-    # vcmpbfp.: |a| <= b in every lane -> all in bounds -> 0b0010; one out -> 0
     ("vcmpbfp.", "f", [0.5, -0.5, 1.0, 0.0], [1.0, 1.0, 1.0, 1.0], 0x2),
     ("vcmpbfp.", "f", [0.5, -2.0, 1.0, 0.0], [1.0, 1.0, 1.0, 1.0], 0x0),
-    # already correct (the integer vcmpgt* handlers set CR6 themselves)
     ("vcmpgtsw.", "w", [5, 5, 5, 5], [1, 1, 1, 1], 0x8),
 ]
 
@@ -117,7 +101,6 @@ def check_vcmp_record_sets_cr6(cc, mn, kind, a, b, cr6):
 def test_vcmp_record_sets_cr6():
     cc = _cc()
     if cc is None:
-        # same rule as the conformance suite: a skipped run must not pass in CI
         if os.environ.get("CI"):
             raise SystemExit("FAIL: no C compiler found")
         print("skip test_vcmp_record_sets_cr6: no C compiler")

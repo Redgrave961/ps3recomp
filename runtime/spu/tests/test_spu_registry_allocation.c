@@ -23,7 +23,7 @@ int main(int argc, char** argv)
         spu_coh_reserve(ctx, 0x10000);
         spu_lockline_unlock(0x10000u);
     }
-    return 0; /* surviving allocation failure would fabricate working state */
+    return 0;
 }
 void ps3_ww_report_inline(uint32_t a, uint64_t v, int w)
 {
@@ -35,6 +35,5 @@ uint32_t g_ww_lo = 0xFFFFFFFFu, g_ww_hi = 0;
 void (*g_spurs_kernel_hook)(uint32_t) = 0;
 void spurs_ef_set_from_spu(uint32_t ea, uint16_t bits) { (void)ea; (void)bits; }
 
-/* Loader diagnostics and worker publication are outside this fixture. */
 uint32_t g_spu_image_src_ea, g_spu_image_ls_start, g_spu_image_span;
 void spu_thread_publish_ctx(uint32_t tid, void* ctx) { (void)tid; (void)ctx; }

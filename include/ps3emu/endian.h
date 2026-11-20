@@ -1,22 +1,11 @@
-/*
- * ps3recomp - Big-endian conversion utilities
- *
- * Platform-aware byte swap intrinsics and templated conversion functions
- * for translating between PS3 (big-endian) and host (little-endian) byte order.
- */
-
 #ifndef PS3EMU_ENDIAN_H
 #define PS3EMU_ENDIAN_H
 
 #include <stdint.h>
 #include <string.h>
 
-/* ---------------------------------------------------------------------------
- * Platform intrinsics
- * -----------------------------------------------------------------------*/
-
 #if defined(_MSC_VER)
-  #include <stdlib.h>   /* _byteswap_* */
+  #include <stdlib.h>
 
   static inline uint16_t ps3_bswap16(uint16_t v) { return _byteswap_ushort(v); }
   static inline uint32_t ps3_bswap32(uint32_t v) { return _byteswap_ulong(v);  }
@@ -29,7 +18,6 @@
   static inline uint64_t ps3_bswap64(uint64_t v) { return __builtin_bswap64(v); }
 
 #else
-  /* Portable fallbacks */
   static inline uint16_t ps3_bswap16(uint16_t v)
   {
       return (uint16_t)((v >> 8) | (v << 8));
@@ -49,9 +37,6 @@
   }
 #endif
 
-/* ---------------------------------------------------------------------------
- * C++ template helpers
- * -----------------------------------------------------------------------*/
 #ifdef __cplusplus
 
 namespace ps3 {
@@ -86,18 +71,14 @@ template <> inline double byte_swap<double>(double v)
     return result;
 }
 
-/*
- * be_to_host / host_to_be  --  identical operations (swap is its own inverse),
- * but the two names make intent clear at call sites.
- */
 template <typename T>
 inline T be_to_host(T v) { return byte_swap<T>(v); }
 
 template <typename T>
 inline T host_to_be(T v) { return byte_swap<T>(v); }
 
-} /* namespace endian */
-} /* namespace ps3 */
+}
+}
 
-#endif /* __cplusplus */
-#endif /* PS3EMU_ENDIAN_H */
+#endif
+#endif

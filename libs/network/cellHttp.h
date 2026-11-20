@@ -1,7 +1,3 @@
-/*
- * ps3recomp - cellHttp HLE
- */
-
 #ifndef PS3RECOMP_CELL_HTTP_H
 #define PS3RECOMP_CELL_HTTP_H
 
@@ -23,4 +19,4 @@ s32 cellHttpEnd(void);
 }
 #endif
 
-#endif /* PS3RECOMP_CELL_HTTP_H */
+#endif

@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Loaded ELF data and BSS must survive user and mapper allocations."""
 import os
 from pathlib import Path
 import struct

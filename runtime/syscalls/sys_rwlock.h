@@ -1,7 +1,3 @@
-/*
- * ps3recomp - Reader-writer lock syscalls
- */
-
 #ifndef SYS_RWLOCK_H
 #define SYS_RWLOCK_H
 
@@ -46,4 +42,4 @@ void sys_rwlock_init(lv2_syscall_table* tbl);
 }
 #endif
 
-#endif /* SYS_RWLOCK_H */
+#endif

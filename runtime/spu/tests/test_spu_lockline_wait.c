@@ -1,5 +1,3 @@
-/* Real coherence lock: a descheduled owner must not make waiters burn a core.
- * Also exercise exclusion and publication with concurrent synthetic writers. */
 #include <assert.h>
 #include <pthread.h>
 #include <stdatomic.h>

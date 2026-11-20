@@ -1,9 +1,3 @@
-/*
- * ps3recomp - cellVideoOut HLE
- *
- * Video output configuration: resolution, display mode, device info.
- */
-
 #ifndef PS3RECOMP_CELL_VIDEOOUT_H
 #define PS3RECOMP_CELL_VIDEOOUT_H
 
@@ -14,14 +8,8 @@
 extern "C" {
 #endif
 
-/* ---------------------------------------------------------------------------
- * Constants
- * -----------------------------------------------------------------------*/
 #define CELL_VIDEO_OUT_PRIMARY      0
-#define CELL_VIDEO_OUT_SECONDARY    1
 
-/* Resolution IDs */
-#define CELL_VIDEO_OUT_RESOLUTION_UNDEFINED  0
 #define CELL_VIDEO_OUT_RESOLUTION_1080       1
 #define CELL_VIDEO_OUT_RESOLUTION_720        2
 #define CELL_VIDEO_OUT_RESOLUTION_480        4
@@ -31,13 +19,9 @@ extern "C" {
 #define CELL_VIDEO_OUT_RESOLUTION_1280x1080  12
 #define CELL_VIDEO_OUT_RESOLUTION_960x1080   13
 
-/* Scan mode */
-#define CELL_VIDEO_OUT_SCAN_MODE_INTERLACE   0
 #define CELL_VIDEO_OUT_SCAN_MODE_PROGRESSIVE 1
 
-/* Aspect ratio */
 #define CELL_VIDEO_OUT_ASPECT_AUTO   0
-#define CELL_VIDEO_OUT_ASPECT_4_3    1
 #define CELL_VIDEO_OUT_ASPECT_16_9   2
 
 #define CELL_VIDEO_OUT_PORT_HDMI     0x01
@@ -46,38 +30,12 @@ extern "C" {
 #define CELL_VIDEO_OUT_REFRESH_RATE_59_94HZ    0x0001
 #define CELL_VIDEO_OUT_REFRESH_RATE_60HZ       0x0004
 
-/* Color space */
 #define CELL_VIDEO_OUT_COLOR_SPACE_RGB   0x01
-#define CELL_VIDEO_OUT_COLOR_SPACE_YUV   0x02
 
-/* Buffer color format */
 #define CELL_VIDEO_OUT_BUFFER_COLOR_FORMAT_X8R8G8B8  1
-#define CELL_VIDEO_OUT_BUFFER_COLOR_FORMAT_X8B8G8R8  2
-#define CELL_VIDEO_OUT_BUFFER_COLOR_FORMAT_R16G16B16X16_FLOAT  10
 
-/* Display mode */
-#define CELL_VIDEO_OUT_DISPLAY_MODE_720_480_59_94HZ    0x00000001
-#define CELL_VIDEO_OUT_DISPLAY_MODE_720_576_50HZ       0x00000002
-#define CELL_VIDEO_OUT_DISPLAY_MODE_1280_720_59_94HZ   0x00000004
-#define CELL_VIDEO_OUT_DISPLAY_MODE_1920_1080_59_94HZ  0x00000008
-#define CELL_VIDEO_OUT_DISPLAY_MODE_1280_720_50HZ      0x00000040
-#define CELL_VIDEO_OUT_DISPLAY_MODE_1920_1080_50HZ     0x00000080
-
-/* ---------------------------------------------------------------------------
- * Error codes
- * -----------------------------------------------------------------------*/
-#define CELL_VIDEO_OUT_ERROR_NOT_IMPLEMENTED  (s32)(CELL_ERROR_BASE_VIDEO | 0x01)
-#define CELL_VIDEO_OUT_ERROR_ILLEGAL_CONFIGURATION (s32)(CELL_ERROR_BASE_VIDEO | 0x02)
 #define CELL_VIDEO_OUT_ERROR_ILLEGAL_PARAMETER (s32)(CELL_ERROR_BASE_VIDEO | 0x03)
-#define CELL_VIDEO_OUT_ERROR_PARAMETER_OUT_OF_RANGE (s32)(CELL_ERROR_BASE_VIDEO | 0x04)
-#define CELL_VIDEO_OUT_ERROR_DEVICE_NOT_FOUND (s32)(CELL_ERROR_BASE_VIDEO | 0x05)
 #define CELL_VIDEO_OUT_ERROR_UNSUPPORTED_VIDEO_OUT (s32)(CELL_ERROR_BASE_VIDEO | 0x06)
-#define CELL_VIDEO_OUT_ERROR_UNSUPPORTED_DISPLAY_MODE (s32)(CELL_ERROR_BASE_VIDEO | 0x07)
-#define CELL_VIDEO_OUT_ERROR_CONDITION_BUSY (s32)(CELL_ERROR_BASE_VIDEO | 0x08)
-
-/* ---------------------------------------------------------------------------
- * Structures
- * -----------------------------------------------------------------------*/
 
 typedef struct CellVideoOutResolution {
     u16 width;
@@ -128,14 +86,6 @@ typedef struct CellVideoOutDeviceInfo {
 _Static_assert(sizeof(CellVideoOutColorInfo) == 20, "CellVideoOutColorInfo layout");
 _Static_assert(sizeof(CellVideoOutDeviceInfo) == 456, "CellVideoOutDeviceInfo layout");
 
-/* ---------------------------------------------------------------------------
- * Configuration
- * -----------------------------------------------------------------------*/
-
-/* ---------------------------------------------------------------------------
- * Functions
- * -----------------------------------------------------------------------*/
-
 s32 cellVideoOutGetResolution(u32 resolutionId, CellVideoOutResolution* resolution);
 
 s32 cellVideoOutConfigure(u32 videoOut, CellVideoOutConfiguration* config,
@@ -150,4 +100,4 @@ s32 cellVideoOutGetNumberOfDevice(u32 videoOut);
 }
 #endif
 
-#endif /* PS3RECOMP_CELL_VIDEOOUT_H */
+#endif

@@ -1,11 +1,3 @@
-/* sys_mutex_destroy refuses a mutex that is held or has a thread blocked
- * acquiring it, with EBUSY, as lv2 does. It used to destroy the host mutex
- * under the blocked thread; the next sys_mutex_create in that slot then
- * initialised a new mutex over it, and the blocked thread waited on the dead
- * one for good.
- *
- * The blocked acquires are queued on sys_mutex_info.q: sys_mutex_lock
- * (both timeouts give the count back) and sys_cond_wait's re-lock. */
 #include "runtime/platform/win32_compat.h"
 #include "runtime/syscalls/sys_cond.h"
 #include <stdio.h>
@@ -36,7 +28,6 @@ static int wait_waiters(int want) {
     for (int i=0;i<2000 && waiters()!=want;i++) Sleep(1);
     return waiters()==want;
 }
-/* Thread 2: lock (blocking, or with the timeout in raw), record, unlock. */
 static volatile int32_t s_rc=-1;
 static DWORD WINAPI locker(void* raw) {
     ppu_context c={0}; c.thread_id=2;
@@ -49,7 +40,6 @@ static DWORD WINAPI signaler(void* raw) {
     ppu_context c={0}; c.thread_id=3;
     while (call(sys_mutex_lock,&c,mid,0,0)!=CELL_OK) Sleep(1);
     call(sys_cond_signal,&c,cid,0,0);
-    /* Hold it: the waiter is now blocked re-acquiring. */
     CHECK(wait_waiters(1));
     CHECK(call(sys_mutex_destroy,&c,mid,0,0)==(int32_t)CELL_EBUSY);
     call(sys_mutex_unlock,&c,mid,0,0);
@@ -58,16 +48,13 @@ static DWORD WINAPI signaler(void* raw) {
 int main(void) {
     vm_base=calloc(1,65536);
     ppu_context c={0}; c.thread_id=1;
-    vm_base[0x103]=1; vm_base[0x107]=0x20;     /* FIFO, not recursive */
+    vm_base[0x103]=1; vm_base[0x107]=0x20;
     CHECK(call(sys_mutex_create,&c,0x200,0x100,0)==CELL_OK);
     mid=be_read(0x200);
 
-    /* 1. Held: EBUSY. */
     CHECK(call(sys_mutex_lock,&c,mid,0,0)==CELL_OK);
     CHECK(call(sys_mutex_destroy,&c,mid,0,0)==(int32_t)CELL_EBUSY);
 
-    /* 2. Held, with a thread blocked on it: EBUSY, and the blocked thread
-     *    gets the mutex once it is released. */
     HANDLE h=CreateThread(NULL,0,locker,NULL,0,NULL);
     CHECK(wait_waiters(1));
     CHECK(call(sys_mutex_destroy,&c,mid,0,0)==(int32_t)CELL_EBUSY);
@@ -75,7 +62,6 @@ int main(void) {
     CHECK(WaitForSingleObject(h,2000)==WAIT_OBJECT_0); CloseHandle(h);
     CHECK(s_rc==CELL_OK && waiters()==0);
 
-    /* 3. A timed lock that times out gives its count back. */
     CHECK(call(sys_mutex_lock,&c,mid,0,0)==CELL_OK);
     s_rc=-1;
     h=CreateThread(NULL,0,locker,(void*)(uintptr_t)20000,0,NULL);
@@ -83,7 +69,6 @@ int main(void) {
     CHECK(s_rc==(int32_t)CELL_ETIMEDOUT && waiters()==0);
     CHECK(call(sys_mutex_unlock,&c,mid,0,0)==CELL_OK);
 
-    /* 4. sys_cond_wait's re-lock counts as a waiter. */
     CHECK(call(sys_cond_create,&c,0x204,mid,0)==CELL_OK);
     cid=be_read(0x204);
     CHECK(call(sys_mutex_lock,&c,mid,0,0)==CELL_OK);
@@ -93,7 +78,6 @@ int main(void) {
     CHECK(call(sys_mutex_unlock,&c,mid,0,0)==CELL_OK);
     CHECK(call(sys_cond_destroy,&c,cid,0,0)==CELL_OK);
 
-    /* 5. Free and uncontended: destroyed. */
     CHECK(waiters()==0);
     CHECK(call(sys_mutex_destroy,&c,mid,0,0)==CELL_OK);
     CHECK(call(sys_mutex_destroy,&c,mid,0,0)==(int32_t)CELL_ESRCH);

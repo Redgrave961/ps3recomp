@@ -1,21 +1,4 @@
 #!/usr/bin/env python3
-"""sys_lwmutex_trylock on a mutex another thread holds returns CELL_EBUSY.
-
-lv2 answers a contended trylock with CELL_EBUSY (0x8001000A). The context-style
-HLE in runtime/ppu/ppu_sysprx.cpp returned 0x8001000B, CELL_ETIMEDOUT, which a
-real kernel only gives a lock whose timeout expired. Titles that poll with
-trylock and test for EBUSY then treat the busy case as a hard failure; FIOS in
-PlayStation All-Stars Battle Royale (BCUS98472) logs
-"sys_lwmutex_trylock failed on mutex 'dearchiver_opticalFunnel'" on every
-contended poll.
-
-Builds the real lwmutex handlers (the block pulled verbatim out of
-ppu_sysprx.cpp) with the real park/wait layer (runtime/platform/ps3_sync.c)
-into a small host program over guest memory, and checks:
-  - a trylock on a free mutex succeeds and stamps the owner, recursion 0;
-  - a trylock by a second thread while it is held returns CELL_EBUSY, not
-    CELL_ETIMEDOUT, and leaves the holder's owner/recursion untouched.
-"""
 import os
 import re
 import shutil

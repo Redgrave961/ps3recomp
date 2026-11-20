@@ -1,17 +1,3 @@
-/*
- * ps3recomp - NV40 vertex-program decode layout validation
- *
- * Confirms the VP instruction bitfield layout (from RPCS3 RSXVertexProgram.h)
- * against a corpus of real vertex programs (RPCS3 shader cache raw/ *.vp).
- *
- * VP words are stored little-endian (RPCS3 native order), 4 words = 16 bytes
- * per instruction, NO inline constants (VP constants live in a separate bank),
- * program ends at the D3.end bit. If the layout is right, every program
- * terminates within its file and every vec/sca opcode is known.
- *
- * Build: gcc -std=c11 -O2 validate_vp_decode.c -o vvp.exe
- * Run:   ./vvp.exe "<.../shaders_cache/raw>"
- */
 #include <dirent.h>
 #include <stdint.h>
 #include <stdio.h>

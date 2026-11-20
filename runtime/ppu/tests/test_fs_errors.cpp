@@ -1,22 +1,3 @@
-/*
- * ps3recomp - cellFs error codes, seek errors, file times and directory dots
- * (ppu_fs.cpp).
- *
- * Drives cellFsOpen / cellFsRead / cellFsWrite / cellFsLseek / cellFsFstat /
- * cellFsStat / cellFsOpendir / cellFsReaddir on real files and checks what the
- * guest sees:
- *   - the codes: an fd that is not open is CELL_EBADF (0x8001002A), a full fd
- *     table is CELL_EMFILE (0x8001002C), and CELL_FS_EIO is 0x8001002B -- it
- *     used to be 0x80010001, which is CELL_EAGAIN;
- *   - cellFsLseek: an unknown whence and a seek before the start of the file
- *     are CELL_EINVAL, the offset is left where it was, and offsets are 64-bit;
- *   - cellFsStat / cellFsFstat: the host file's atime / mtime / ctime, not 0;
- *   - cellFsReaddir: "." and ".." come back as directories.
- *
- *   tools/test_ppu_fs_errors.py [--exe-out PATH]
- *   test_fs_errors [DIR]      (DIR: scratch directory; default the system temp dir)
- */
-/* ps3_dev_flash_path (runtime/platform), which host_path calls for /dev_flash. */
 #include "../../platform/ps3_dev_flash.c"
 #include "../../../libs/filesystem/ps3_vfs.c"
 #include "ppu_fs.cpp"
@@ -24,7 +5,6 @@
 #  include <windows.h>
 #endif
 
-/* ---- link stubs: nothing on the paths this test drives calls them ---- */
 extern "C" {
 uint8_t* vm_base = nullptr;
 uint32_t ppu_vm_size = 0;
@@ -99,7 +79,6 @@ int main(int argc, char** argv)
     remove(host);
     ppu_vfs_root = dir;
 
-    /* ---- the codes ---- */
     CHECK((uint32_t)CELL_FS_EIO == 0x8001002Bu, "CELL_FS_EIO is 0x8001002B (CELL_EIO), not EAGAIN");
     CHECK((uint32_t)CELL_FS_EBADF == 0x8001002Au, "CELL_FS_EBADF is 0x8001002A");
     CHECK((uint32_t)CELL_FS_EMFILE == 0x8001002Cu, "CELL_FS_EMFILE is 0x8001002C");
@@ -118,15 +97,13 @@ int main(int argc, char** argv)
         CHECK(call_rc(ctx) == 0x8001002Au, "cellFsReaddir on a dir fd that is not open: 0x%08X (want EBADF)", call_rc(ctx));
     }
 
-    /* ---- a file to seek and stat ---- */
     uint32_t fd = 0;
-    uint32_t rc = open_guest("/dev_hdd1/ps3recomp_fs_errors.bin", 0x42 /* O_RDWR|O_CREAT */, &fd);
+    uint32_t rc = open_guest("/dev_hdd1/ps3recomp_fs_errors.bin", 0x42, &fd);
     CHECK(rc == 0, "cellFsOpen(O_RDWR|O_CREAT) creates the file (rc 0x%08X, fd %u)", rc, fd);
     if (rc != 0) { printf("FAIL (could not create %s)\n", host); return 1; }
     memcpy(mem + BUF, "0123456789", 10);
     { ppu_context ctx = mk(fd, BUF, 10, NP); cellFsWrite(&ctx); }
 
-    /* ---- cellFsLseek ---- */
     uint64_t pos = 99;
     CHECK(lseek_rc(fd, 4, CELL_FS_SEEK_SET, &pos) == 0 && pos == 4, "seek SET 4 -> %llu", (unsigned long long)pos);
     CHECK(lseek_rc(fd, 2, CELL_FS_SEEK_CUR, &pos) == 0 && pos == 6, "seek CUR +2 -> %llu", (unsigned long long)pos);
@@ -147,7 +124,6 @@ int main(int argc, char** argv)
     CHECK(rc == 0 && pos == 0x140000000ull, "seek past 4 GiB keeps 64 bits (pos 0x%llX)", (unsigned long long)pos);
     lseek_rc(fd, 0, CELL_FS_SEEK_SET, NULL);
 
-    /* ---- file times ---- */
     { ppu_context ctx = mk(fd); cellFsClose(&ctx); }
     strcpy((char*)mem + PATH, "/dev_hdd1/ps3recomp_fs_errors.bin");
     { ppu_context ctx = mk(PATH, STATB); cellFsStat(&ctx);
@@ -165,7 +141,6 @@ int main(int argc, char** argv)
       CHECK(rd64(STATB + 0x14) != 0 && rd64(STATB + 0x1C) != 0, "cellFsFstat mtime / ctime are set");
       ctx = mk(fd2); cellFsClose(&ctx); }
 
-    /* ---- readdir: "." and ".." are directories ---- */
     {
 #ifdef _WIN32
         _mkdir(hostdir);
@@ -201,7 +176,6 @@ int main(int argc, char** argv)
 #endif
     }
 
-    /* ---- the fd table: full is EMFILE, not EIO, and a close makes room ---- */
     {
         uint32_t fds[FS_MAX]; int n = 0;
         for (int i = 0; i < FS_MAX; i++) {

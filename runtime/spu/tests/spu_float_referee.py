@@ -1,26 +1,4 @@
 #!/usr/bin/env python3
-"""Adjudicate SPU float mismatches between ps3recomp and the RPCS3 oracle.
-
-RPCS3's SPU float model is not exact in places (its precise path computes
-extended-range single precision through host floats and doubles), so for the
-single-precision arithmetic and the int<->float conversions the authority is
-the SPU ISA v1.2 itself, evaluated here with exact rational arithmetic:
-
-  - extended range: biased exponent 255 is an ordinary binade, Smax = 0x7FFFFFFF;
-    exponent 0 reads as zero; every zero result is +0;
-  - one truncation (toward zero) of the exact result; overflow saturates to
-    +-Smax, results below Smin = 2^-126 become +0;
-  - fma/fms/fnms: the product is exact and unbounded, then one truncation;
-  - cflts/cfltu: value * 2^(173-i8), truncated, saturated; csflt/cuflt:
-    integer / 2^(155-i8). A scale outside 0..127 is undefined by the ISA.
-
-usage: spu_float_referee.py LOG   (LOG: spu_interp_diff_test output run with
-SPU_DIFF_SHOW large enough to print every mismatch)
-
-Exit 0 when every mismatching lane of these ops is one where ps3recomp gives
-the ISA's exact answer, or where the ISA leaves the result undefined; any
-other mismatch (or a mismatch in another op) fails.
-"""
 import re
 import sys
 from fractions import Fraction as F
@@ -55,19 +33,16 @@ def to_single(v):
 
 
 def spec(op, insn, a, b, c):
-    """The ISA result for one lane, or None when the ISA leaves it undefined."""
     if op in ("fa", "fs", "fm", "fma", "fms", "fnms"):
         x, y, z = value(a), value(b), value(c)
         return to_single({"fa": x + y, "fs": x - y, "fm": x * y,
                           "fma": x * y + z, "fms": x * y - z, "fnms": z - x * y}[op])
     if op in ("fceq", "fcgt", "fcmeq", "fcmgt"):
-        # extended range: exponent 255 is a number, any two zeros are equal
         x, y = value(a), value(b)
         if op in ("fcmeq", "fcmgt"):
             x, y = abs(x), abs(y)
         return 0xFFFFFFFF if (x == y if op in ("fceq", "fcmeq") else x > y) else 0
     if op == "rotmai":
-        # not a float op: RPCS3's arm64 build gets it wrong (sse2neon _mm_srai_epi32 macro)
         n = (0 - ((insn >> 14) & 0x7F)) & 0x3F
         sv = a - (1 << 32) if a >> 31 else a
         return (sv >> min(n, 31)) & 0xFFFFFFFF
@@ -76,7 +51,7 @@ def spec(op, insn, a, b, c):
         scale = 173 - i8
         if not 0 <= scale <= 127:
             return None
-        t = int(value(a) * F(2) ** scale)          # int() truncates toward zero
+        t = int(value(a) * F(2) ** scale)
         if op == "cflts":
             return 0x7FFFFFFF if t > 2 ** 31 - 1 else 0x80000000 if t < -2 ** 31 else t & 0xFFFFFFFF
         return 0 if t < 0 else 0xFFFFFFFF if t > 2 ** 32 - 1 else t

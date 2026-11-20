@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Run the real interpreter's immediate-load vector semantics and existing self-test."""
 import os
 import subprocess
 import tempfile

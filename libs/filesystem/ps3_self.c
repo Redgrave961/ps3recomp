@@ -20,35 +20,31 @@ static const struct {
 
 enum { SELF_TYPE_NPDRM = 8, LICENSE_FREE = 3, CTRL_NPDRM = 3, PT_SEGMENT = 2, ENC_AES_CTR = 3, COMP_NONE = 1 };
 
-static uint16_t be16(const uint8_t* p) { return (uint16_t)(p[0] << 8 | p[1]); }
-static uint32_t be32(const uint8_t* p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
-static uint64_t be64(const uint8_t* p) { return (uint64_t)be32(p) << 32 | be32(p + 4); }
-
 static int in_range(uint64_t off, uint64_t len, uint64_t size) { return off <= size && len <= size - off; }
 
 PS3_AES_TARGET int ps3_self_decrypt(const uint8_t* s, size_t size, uint8_t** elf, size_t* elf_size)
 {
     *elf = NULL;
     *elf_size = 0;
-    if (size < 0x70 || memcmp(s, "SCE", 4) || be16(s + 0x0A) != 1) return PS3_SELF_EFORMAT;
-    const uint16_t revision = be16(s + 0x08);
-    const uint64_t meta = 0x20 + (uint64_t)be32(s + 0x0C), header_len = be64(s + 0x10);
-    const uint64_t app_off = be64(s + 0x28), elf_off = be64(s + 0x30), phdr_off = be64(s + 0x38);
-    const uint64_t shdr_off = be64(s + 0x40), ctrl_off = be64(s + 0x58), ctrl_size = be64(s + 0x60);
+    if (size < 0x70 || memcmp(s, "SCE", 4) || ps3_be16(s + 0x0A) != 1) return PS3_SELF_EFORMAT;
+    const uint16_t revision = ps3_be16(s + 0x08);
+    const uint64_t meta = 0x20 + (uint64_t)ps3_be32(s + 0x0C), header_len = ps3_be64(s + 0x10);
+    const uint64_t app_off = ps3_be64(s + 0x28), elf_off = ps3_be64(s + 0x30), phdr_off = ps3_be64(s + 0x38);
+    const uint64_t shdr_off = ps3_be64(s + 0x40), ctrl_off = ps3_be64(s + 0x58), ctrl_size = ps3_be64(s + 0x60);
     if (!in_range(app_off, 0x20, size) || !in_range(elf_off, 0x40, size) || !in_range(ctrl_off, ctrl_size, size) ||
         header_len > size || meta + 0x40 > header_len)
         return PS3_SELF_EFORMAT;
-    if (be32(s + app_off + 0x0C) != SELF_TYPE_NPDRM) return PS3_SELF_EKEY;
+    if (ps3_be32(s + app_off + 0x0C) != SELF_TYPE_NPDRM) return PS3_SELF_EKEY;
 
     const uint8_t* npd = NULL;
     for (uint64_t pos = ctrl_off; pos + 8 <= ctrl_off + ctrl_size;) {
-        const uint32_t type = be32(s + pos), len = be32(s + pos + 4);
+        const uint32_t type = ps3_be32(s + pos), len = ps3_be32(s + pos + 4);
         if (len < 8 || pos + len > ctrl_off + ctrl_size) return PS3_SELF_EFORMAT;
         if (type == CTRL_NPDRM && len >= 0x10 + 0x10) npd = s + pos + 0x10;
         pos += len;
     }
     if (!npd || memcmp(npd, "NPD", 4)) return PS3_SELF_EFORMAT;
-    if ((be32(npd + 8) & 3) != LICENSE_FREE) return PS3_SELF_ELICENSE;
+    if ((ps3_be32(npd + 8) & 3) != LICENSE_FREE) return PS3_SELF_ELICENSE;
 
     int k = -1;
     for (int i = 0; i < (int)(sizeof NPDRM_KEYS / sizeof NPDRM_KEYS[0]); i++)
@@ -71,18 +67,18 @@ PS3_AES_TARGET int ps3_self_decrypt(const uint8_t* s, size_t size, uint8_t** elf
     if (!h) return PS3_SELF_EFORMAT;
     ps3_aes128_init(&key, info);
     ps3_aes_ctr(&key, info + 0x20, 0, s + meta + 0x40, h, hlen);
-    const uint32_t sections = hlen >= 0x20 ? be32(h + 0x0C) : 0, keys = hlen >= 0x20 ? be32(h + 0x10) : 0;
+    const uint32_t sections = hlen >= 0x20 ? ps3_be32(h + 0x0C) : 0, keys = hlen >= 0x20 ? ps3_be32(h + 0x10) : 0;
     const uint64_t key_base = 0x20 + (uint64_t)sections * 0x30;
     const uint8_t* ehdr = s + elf_off;
-    const uint64_t e_phoff = be64(ehdr + 0x20), e_shoff = be64(ehdr + 0x28);
-    const uint16_t e_phnum = be16(ehdr + 0x38), e_shentsize = be16(ehdr + 0x3A), e_shnum = be16(ehdr + 0x3C);
+    const uint64_t e_phoff = ps3_be64(ehdr + 0x20), e_shoff = ps3_be64(ehdr + 0x28);
+    const uint16_t e_phnum = ps3_be16(ehdr + 0x38), e_shentsize = ps3_be16(ehdr + 0x3A), e_shnum = ps3_be16(ehdr + 0x3C);
     int rc = !sections || !in_range(key_base, (uint64_t)keys * 16, hlen) || !in_range(phdr_off, (uint64_t)e_phnum * 0x38, size) ||
              (e_shnum && !in_range(shdr_off, (uint64_t)e_shnum * e_shentsize, size)) ? PS3_SELF_EFORMAT : PS3_SELF_OK;
     uint64_t out_size = e_shnum ? e_shoff + (uint64_t)e_shnum * e_shentsize : 0;
     if (e_phoff + (uint64_t)e_phnum * 0x38 > out_size) out_size = e_phoff + (uint64_t)e_phnum * 0x38;
     for (uint16_t i = 0; !rc && i < e_phnum; i++) {
         const uint8_t* ph = s + phdr_off + (uint64_t)i * 0x38;
-        if (be64(ph + 8) + be64(ph + 32) > out_size) out_size = be64(ph + 8) + be64(ph + 32);
+        if (ps3_be64(ph + 8) + ps3_be64(ph + 32) > out_size) out_size = ps3_be64(ph + 8) + ps3_be64(ph + 32);
     }
     uint8_t* out = !rc && out_size <= ((uint64_t)1 << 32) ? (uint8_t*)calloc(1, (size_t)out_size) : NULL;
     if (!out) rc = PS3_SELF_EFORMAT;
@@ -93,14 +89,14 @@ PS3_AES_TARGET int ps3_self_decrypt(const uint8_t* s, size_t size, uint8_t** elf
     }
     for (uint32_t i = 0; !rc && i < sections; i++) {
         const uint8_t* sec = h + 0x20 + (uint64_t)i * 0x30;
-        const uint64_t off = be64(sec), len = be64(sec + 8);
-        const uint32_t type = be32(sec + 0x10), prog = be32(sec + 0x14), enc = be32(sec + 0x20);
-        const uint32_t key_idx = be32(sec + 0x24), iv_idx = be32(sec + 0x28), comp = be32(sec + 0x2C);
+        const uint64_t off = ps3_be64(sec), len = ps3_be64(sec + 8);
+        const uint32_t type = ps3_be32(sec + 0x10), prog = ps3_be32(sec + 0x14), enc = ps3_be32(sec + 0x20);
+        const uint32_t key_idx = ps3_be32(sec + 0x24), iv_idx = ps3_be32(sec + 0x28), comp = ps3_be32(sec + 0x2C);
         if (type != PT_SEGMENT) continue;
         if (prog >= e_phnum || comp != COMP_NONE || !in_range(off, len, size)) { rc = PS3_SELF_EFORMAT; break; }
         const uint8_t* ph = s + phdr_off + (uint64_t)prog * 0x38;
-        const uint64_t dst = be64(ph + 8);
-        if (len > be64(ph + 32) || !in_range(dst, len, out_size)) { rc = PS3_SELF_EFORMAT; break; }
+        const uint64_t dst = ps3_be64(ph + 8);
+        if (len > ps3_be64(ph + 32) || !in_range(dst, len, out_size)) { rc = PS3_SELF_EFORMAT; break; }
         if (enc != ENC_AES_CTR) {
             memcpy(out + dst, s + off, (size_t)len);
             continue;

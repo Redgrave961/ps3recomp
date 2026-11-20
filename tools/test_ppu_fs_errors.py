@@ -1,21 +1,4 @@
 #!/usr/bin/env python3
-"""cellFs error codes, seek errors, file times and directory dots (runtime/ppu/ppu_fs.cpp).
-
-An fd that is not open is CELL_EBADF and a full fd table CELL_EMFILE (CELL_FS_EIO
-used to be 0x80010001, which is CELL_EAGAIN); cellFsLseek answers CELL_EINVAL for
-an unknown whence or a seek before the start and leaves the offset alone;
-cellFsStat / cellFsFstat report the host file's times; "." and ".." are listed as
-directories. This builds runtime/ppu/tests/test_fs_errors.cpp (which includes
-ppu_fs.cpp) against a ppu_recomp.h made from the lifter's own HEADER_PREAMBLE and
-runs it.
-
-It needs a host C++ compiler (under CI=1 a missing one fails instead of
-skipping).
-
-Usage:
-    python3 tools/test_ppu_fs_errors.py [--exe-out PATH] [--build-only]
-"""
-
 import argparse
 import importlib.util
 import os

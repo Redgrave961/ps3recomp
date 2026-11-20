@@ -1,7 +1,3 @@
-/*
- * ps3recomp - cellHttp HLE implementation
- */
-
 #include "cellHttp.h"
 #include <stdio.h>
 
@@ -10,18 +6,10 @@
 #pragma comment(lib, "ws2_32.lib")
 #endif
 
-/* ---------------------------------------------------------------------------
- * Internal state
- * -----------------------------------------------------------------------*/
-
 static int s_http_initialized = 0;
 #ifdef _WIN32
 static int s_wsa_initialized = 0;
 #endif
-
-/* ---------------------------------------------------------------------------
- * API implementations
- * -----------------------------------------------------------------------*/
 
 s32 cellHttpInit(void* pool, u32 poolSize)
 {

@@ -1,5 +1,3 @@
-/* macOS: clang -std=gnu17 -I include libs/system/tests/test_dialog_callbacks.c
- * libs/system/cellSysutil.c -Wl,-dead_strip -pthread -o /tmp/test_dialog_callbacks && /tmp/test_dialog_callbacks */
 #include "../cellMsgDialog.c"
 #include <assert.h>
 #include <stdlib.h>
@@ -48,16 +46,9 @@ int main(void)
     cellSysutilCheckCallback(); assert(calls == 2);
     g_ps3_guest_caller = callback;
     cellSysutilCheckCallback(); assert(calls == 3 && last_result == CELL_MSGDIALOG_BUTTON_NONE);
-    /* The values themselves, which a title compares against: a dialog the title closed reports -1. */
     assert(last_result == -1 && CELL_MSGDIALOG_BUTTON_INVALID == 0);
     cellSysutilCheckCallback(); assert(calls == 3);
 
-    /* The yes/no auto-answer. DEFAULT is a blanket YES, including for a prompt
-     * that offers to abort something -- see cellMsgDialog.c for why the
-     * semantically better answer is opt-in (`MSGDIALOG_ANSWER=auto`): Virtua
-     * Fighter 5 boots further on the blanket YES, and correctness about the
-     * button is worth less than the title booting. Assert the default, so that
-     * if it is ever flipped it is flipped deliberately. */
     memcpy(vm_base + 0x300, "Do you want to cancel the load operation?", 42);
     assert(cellMsgDialogOpen2(CELL_MSGDIALOG_TYPE_SE_TYPE_NORMAL |
                               CELL_MSGDIALOG_TYPE_BUTTON_TYPE_YESNO,
@@ -65,9 +56,6 @@ int main(void)
     cellSysutilCheckCallback();
     assert(calls == 4 && last_result == CELL_MSGDIALOG_BUTTON_YES);
 
-    /* The heuristic =auto would use, tested directly: the decision is cached on
-     * first use so the env cannot be flipped mid-run, but the predicate is the
-     * whole of the logic and it is right here in this translation unit. */
     assert(msg_offers_to_abort("Are you sure you want to cancel checking the game data?"));
     assert(msg_offers_to_abort("Do you want to cancel the load operation?"));
     assert(msg_offers_to_abort("CANCEL?"));
@@ -77,7 +65,6 @@ int main(void)
     assert(!msg_offers_to_abort("Save complete."));
     assert(!msg_offers_to_abort(""));
     assert(!msg_offers_to_abort(NULL));
-
 
     free(vm_base);
     puts("Deferred dialog and button-mask checks passed");

@@ -1,9 +1,3 @@
-/* SPU_WrEventAck through the real spu_channels.c: acknowledging Sn (0x2) while
- * a DMA list is still parked on a stall-and-notify (list_stall_stat non-zero)
- * leaves Sn pending. A resumed list runs inline, inside the MFC_WrListStallAck
- * that resumes it, so its next stall can land before the handler acknowledges
- * the event it was taken for; on hardware the MFC gets there after the ack.
- * Other bits, and Sn with no list parked, are acknowledged as before. */
 #include "../spu_helpers.h"
 #include "../spu_interp.h"
 #include <stdio.h>
@@ -25,18 +19,15 @@ int main(void)
     spu_context_init(&ctx, 0);
     ctx.ls = ls;
 
-    /* A list parked on tag 4: Sn stays pending through its ack, Lr is acked. */
     ctx.list_stall_mask = ctx.list_stall_stat = 1u << 4;
     ctx.event_status = 0x2u | 0x400u;
     ack(0x2u | 0x400u);
     CHECK(ctx.event_status == 0x2u);
 
-    /* Nothing parked: Sn is acked like any other event. */
     ctx.list_stall_mask = ctx.list_stall_stat = 0;
     ack(0x2u);
     CHECK(ctx.event_status == 0);
 
-    /* An ack without Sn does not raise it, parked list or not. */
     ctx.list_stall_stat = 1u << 4;
     ctx.event_status = 0x1u;
     ack(0x1u);

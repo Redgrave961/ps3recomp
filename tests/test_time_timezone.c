@@ -21,9 +21,9 @@ static void check(const char* zone,time_t now,int32_t standard,int32_t dst) {
 }
 int main(void) {
     vm_base=calloc(1,64);
-    check("UTC0",1705320000,0,0); // 2024-01-15 12:00 UTC
+    check("UTC0",1705320000,0,0);
     check("PST8PDT,M3.2.0,M11.1.0",1705320000,-480,0);
-    check("PST8PDT,M3.2.0,M11.1.0",1721044800,-480,60); // July
+    check("PST8PDT,M3.2.0,M11.1.0",1721044800,-480,60);
     check("NPT-5:45",1705320000,345,0);
     check("LHST-10:30LHDT-11,M10.1.0,M4.1.0",1705320000,630,30);
     check("LHST-10:30LHDT-11,M10.1.0,M4.1.0",1721044800,630,0);

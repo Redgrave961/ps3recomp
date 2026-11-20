@@ -1,32 +1,16 @@
-/*
- * Integration test #1: sum loop.
- *
- * Drives test_sum.elf's lifted output. The SPU program reads N values from
- * the inbound mailbox, sums them, writes the result to the outbound mailbox.
- *
- * We provide our own spu_rdch / spu_wrch (overriding spu_channels.c) so we
- * can serve a queue of inbound values without modelling real PPU/SPU
- * scheduling. The lifter only knows about the externs declared in
- * spu_recomp.h, so linking these definitions instead of spu_channels.c is
- * how we plug in the test harness.
- */
-
 #include "spu_recomp.h"
-#include "spu_helpers.h"   /* for spu_zero() */
+#include "spu_helpers.h"
 #include <stdio.h>
 #include <stdint.h>
 
-/* Required by spu_dma.h (referenced via spu_helpers.h chain). Unused here. */
 uint8_t* vm_base = 0;
 
-/* ---- harness state ---- */
 static const uint32_t kInputs[] = { 10, 20, 30, 40 };
 static const int      kNumInputs = (int)(sizeof(kInputs) / sizeof(kInputs[0]));
 static int            g_in_idx = 0;
 static uint32_t       g_out = 0;
 static int            g_wrote = 0;
 
-/* ---- channel overrides ---- */
 u128 spu_rdch(spu_context* ctx, uint32_t channel) {
     (void)ctx;
     uint32_t v = 0;
@@ -44,18 +28,14 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value) {
     if (channel == SPU_WrOutMbox) { g_out = value._u32[0]; g_wrote = 1; }
 }
 
-/* The lifter emits these as externs; this test has no indirect branches
- * so the bodies are unreachable, but the symbols must exist. */
 void spu_indirect_branch(spu_context* ctx) {
     (void)ctx;
     fprintf(stderr, "FAIL: unexpected spu_indirect_branch\n");
 }
 void spu_register_function(uint32_t addr, void (*fn)(spu_context*)) {
-    (void)addr; (void)fn;   /* not used in this test */
+    (void)addr; (void)fn;
 }
 
-/* diagnostics externs referenced from spu_dma.h in the full runtime */
-/* stop/halt hooks required by current lifter output */
 void spu_stop(spu_context* ctx) { (void)ctx; }
 void spu_halt(spu_context* ctx) { (void)ctx; }
 

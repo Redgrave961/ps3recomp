@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-"""Verify that raw PRX metadata reaches jump-table discovery."""
-
 import json
 import os
 import sys

@@ -25,11 +25,10 @@ import argparse
 import struct
 import sys
 
-# ELF constants
 EM_SPU         = 23
 ET_EXEC        = 2
 PT_LOAD        = 1
-PF_X, PF_W, PF_R = 1, 2, 4
+PF_X, PF_R = 1, 4
 SHT_NULL       = 0
 SHT_PROGBITS   = 1
 SHT_SYMTAB     = 2
@@ -46,11 +45,11 @@ SYM_SIZE       = 16
 
 
 def _pack_ehdr(e_entry, e_phoff, e_shoff, e_phnum, e_shnum, e_shstrndx):
-    ident  = b"\x7FELF"            # magic
-    ident += b"\x01"                # EI_CLASS = 32-bit
-    ident += b"\x02"                # EI_DATA  = big-endian
-    ident += b"\x01"                # EI_VERSION
-    ident += b"\x00" * 9            # OSABI + padding (9 bytes to reach 16)
+    ident  = b"\x7FELF"
+    ident += b"\x01"
+    ident += b"\x02"
+    ident += b"\x01"
+    ident += b"\x00" * 9
     assert len(ident) == 16
     return ident + struct.pack(
         ">HHIIIIIHHHHHH",
@@ -76,8 +75,7 @@ def _pack_sym(name_off, value, size, info, shndx):
 
 
 def _strtab(strings):
-    """Build a strtab. Returns (bytes, {name: offset})."""
-    buf = bytearray(b"\x00")     # index 0 is always the empty string
+    buf = bytearray(b"\x00")
     offs = {"": 0}
     for s in strings:
         if s in offs:
@@ -90,37 +88,27 @@ def _strtab(strings):
 
 def wrap(code: bytes, *, base: int = 0, entry: int = 0,
          symbols: list[dict] | None = None) -> bytes:
-    """Produce an SPU ELF wrapping `code` at virtual address `base`,
-    starting execution at `entry` (default: same as base).
-
-    `symbols` is an optional list of {"name": str, "addr": int, "size": int}.
-    Addresses are virtual (i.e. include `base`).
-    """
     symbols = symbols or []
     if entry == 0 and base != 0:
         entry = base
 
-    # ---- layout ----
-    # [ EHDR | PHDR | code | symtab? | strtab? | shstrtab | SHDRs ]
     phoff = EHDR_SIZE
     code_off = phoff + PHDR_SIZE
-    code_off = (code_off + 15) & ~15            # align to 16
+    code_off = (code_off + 15) & ~15
     pad_to_code = code_off - (phoff + PHDR_SIZE)
     cursor = code_off + len(code)
 
-    # Symbol + symbol string tables (only if symbols supplied)
     sym_names = [s["name"] for s in symbols]
     strtab_buf, str_offs = _strtab(sym_names)
 
     if symbols:
         symtab_off = cursor
-        # Emit a leading STN_UNDEF entry, then one per symbol.
         sym_bytes = bytearray(_pack_sym(0, 0, 0, 0, 0))
         for s in symbols:
             info = (STB_GLOBAL << 4) | STT_FUNC
             sym_bytes += _pack_sym(str_offs[s["name"]],
                                    s["addr"], s.get("size", 0),
-                                   info, 1)        # shndx=1 (.text)
+                                   info, 1)
         cursor += len(sym_bytes)
         strtab_off = cursor
         cursor += len(strtab_buf)
@@ -128,7 +116,6 @@ def wrap(code: bytes, *, base: int = 0, entry: int = 0,
         symtab_off = strtab_off = 0
         sym_bytes = b""
 
-    # Section name string table
     section_names = [".text", ".shstrtab"]
     if symbols:
         section_names += [".symtab", ".strtab"]
@@ -136,40 +123,30 @@ def wrap(code: bytes, *, base: int = 0, entry: int = 0,
     shstrtab_off = cursor
     cursor += len(shstrtab_buf)
 
-    # Section headers
-    cursor = (cursor + 3) & ~3                  # mild alignment for SHDRs
+    cursor = (cursor + 3) & ~3
     shdr_off = cursor
 
-    # ---- build section header table ----
     shdrs = bytearray()
-    # [0] SHT_NULL
     shdrs += _pack_shdr(0, SHT_NULL, 0, 0, 0, 0)
-    # [1] .text
     shdrs += _pack_shdr(shstr_offs[".text"], SHT_PROGBITS,
                         SHF_ALLOC | SHF_EXECINSTR,
                         base, code_off, len(code), sh_addralign=16)
     next_idx = 2
     shstrtab_idx = next_idx
-    # [N] .shstrtab
     shdrs += _pack_shdr(shstr_offs[".shstrtab"], SHT_STRTAB, 0,
                         0, shstrtab_off, len(shstrtab_buf))
     next_idx += 1
     if symbols:
         symtab_idx = next_idx
         strtab_idx = next_idx + 1
-        # [N] .symtab    sh_link -> strtab idx;  sh_info -> 1 + index of last
-        #                local symbol (we emit only globals after STN_UNDEF,
-        #                so sh_info=1 is correct).
         shdrs += _pack_shdr(shstr_offs[".symtab"], SHT_SYMTAB, 0,
                             0, symtab_off, len(sym_bytes),
                             sh_link=strtab_idx, sh_info=1,
                             sh_addralign=4, sh_entsize=SYM_SIZE)
-        # [N+1] .strtab
         shdrs += _pack_shdr(shstr_offs[".strtab"], SHT_STRTAB, 0,
                             0, strtab_off, len(strtab_buf))
     e_shnum = 2 + (3 if symbols else 1)
 
-    # ---- assemble file ----
     out = bytearray()
     out += _pack_ehdr(entry, phoff, shdr_off, 1, e_shnum, shstrtab_idx)
     out += _pack_phdr(code_off, base, len(code), PF_X | PF_R)
@@ -179,7 +156,6 @@ def wrap(code: bytes, *, base: int = 0, entry: int = 0,
         out += sym_bytes
         out += strtab_buf
     out += shstrtab_buf
-    # pad to shdr alignment
     pad = shdr_off - len(out)
     if pad > 0:
         out += b"\x00" * pad
@@ -188,7 +164,6 @@ def wrap(code: bytes, *, base: int = 0, entry: int = 0,
 
 
 def _parse_symbols_arg(text: str) -> list[dict]:
-    """`name:addr:size,name:addr:size` -> list of symbol dicts."""
     out = []
     if not text:
         return out

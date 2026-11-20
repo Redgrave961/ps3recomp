@@ -1,33 +1,4 @@
 #!/usr/bin/env python3
-"""
-PS3 PPU loader (stage 1: image + OPD + TOC + function table).
-
-Turns a decrypted PS3 PPU ELF (ET_EXEC EBOOT, or an ET_DYN PRX) into the data
-a static recompilation needs to actually run:
-
-  * the guest memory image  -- which PT_LOAD segments go where in `vm_base`,
-    including zero-filled BSS (memsz > filesz);
-  * the OPD function table   -- PS3 uses 8-byte function descriptors
-    {u32 func, u32 toc}; a function POINTER in the binary is an OPD address,
-    so every indirect call must resolve OPD -> code entry. The OPD also gives
-    us the authoritative list of function entry points (far better than
-    heuristic scanning) and the module TOC (r2);
-  * the entry point          -- e_entry is itself an OPD address; we resolve it
-    to (code entry, toc).
-
-Outputs (to --output dir):
-  * <name>.functions.json  -- [{start,end,toc,opd}] for ppu_lifter.py --functions
-  * <name>.image.json      -- segment manifest {vaddr,filesz,memsz,flags,file_offset}
-  * <name>.loader.json     -- {entry, toc, opd_base, opd_count, ...}
-
-This stage is game-agnostic. Relocations (PRX/ET_DYN) and import-stub
-resolution (NID -> HLE) are the next stages; ET_EXEC EBOOTs have no
-relocations (fixed load address) so the image is loaded verbatim.
-
-Usage:
-    python ppu_loader.py <elf> [--output dir]
-"""
-
 import argparse
 import json
 import os
@@ -61,7 +32,6 @@ def in_ranges(addr, rs):
 
 
 def read_vaddr(elf, vaddr, size):
-    """Read `size` bytes at guest vaddr out of the loaded segments."""
     for i, ph in enumerate(elf.program_headers):
         if ph.p_type == PT_LOAD and ph.p_filesz and ph.p_vaddr <= vaddr < ph.p_vaddr + ph.p_filesz:
             data = elf.get_segment_data(i)
@@ -72,22 +42,16 @@ def read_vaddr(elf, vaddr, size):
 
 
 def find_opd(elf, entry):
-    """Locate the OPD section: the one section that contains e_entry.
-    Section names are usually stripped on retail EBOOTs, so we go by address.
-    Returns (opd_vaddr, opd_size) or (None, None)."""
     best = None
     for s in getattr(elf, "section_headers", []) or []:
         a, sz = getattr(s, "sh_addr", 0), getattr(s, "sh_size", 0)
         if sz and a <= entry < a + sz:
-            # prefer the tightest section containing entry
             if best is None or sz < best[1]:
                 best = (a, sz)
     return best if best else (None, None)
 
 
 def parse_opd(elf, opd_va, opd_size, crange):
-    """Walk 8-byte {func,toc} descriptors. Stop when an entry stops looking
-    like a valid descriptor (func not in code, or toc inconsistent)."""
     blob = read_vaddr(elf, opd_va, opd_size)
     if blob is None:
         return [], 0
@@ -122,9 +86,6 @@ def _cstr(elf, va, maxlen=64):
 
 
 def parse_imports(elf):
-    """Parse ET_EXEC firmware imports via the proc_prx_param (PT 0x60000002) ->
-    libstub table. Returns [{library, nid, stub}]. PRX (ET_DYN) modules use the
-    module-info import table instead (handled by elf_parser); not covered here."""
     pp = None
     for ph in elf.program_headers:
         if getattr(ph, "p_type", 0) == 0x60000002:
@@ -150,13 +111,6 @@ def parse_imports(elf):
         entries.append([modname, nfunc, nid_tbl, stub_tbl])
         va += s_size
 
-    # PSL1GHT's toolchain emits s_imports (nfunc) = 0 with populated NID/stub
-    # tables. The per-library counts are still fully determined by the table
-    # layout: each library's NID (and stub) table runs to the start of the next
-    # library's table. Derive the count as the tightest span available from
-    # either table (the two tables are laid out in different library orders, so
-    # every library is bounded in at least one), falling back to the libstub
-    # table start for the highest NID table.
     if any(e[1] == 0 and e[2] and e[3] for e in entries):
         nid_starts = sorted(e[2] for e in entries if e[2])
         stub_starts = sorted(e[3] for e in entries if e[3])
@@ -196,7 +150,6 @@ def main():
     entry = h.e_entry
     crange = code_ranges(elf)
 
-    # Resolve the entry OPD -> (code entry, toc).
     entry_code, entry_toc = entry, 0
     od = read_vaddr(elf, entry, 8)
     if od and in_ranges(struct.unpack(">I", od[:4])[0], crange):
@@ -209,8 +162,6 @@ def main():
     if not entry_toc:
         entry_toc = module_toc
 
-    # Function boundaries from OPD: unique func addrs, end = next start in the
-    # same code segment (the lifter refines via blr).
     func_addrs = sorted({e["func"] for e in opd_entries})
     func_toc = {e["func"]: e["toc"] for e in opd_entries}
     opd_of = {e["func"]: e["opd"] for e in opd_entries}
