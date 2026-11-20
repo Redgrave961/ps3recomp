@@ -1,6 +1,9 @@
 #ifndef PPU_STORE_THUNK_H
 #define PPU_STORE_THUNK_H
 
+#include "../memory/vm_page_map.h"
+#include "../spu/spu_coh_bitmap.h"
+
 #define PPU_ST_V(op) ".irp r,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15\n    " op "\n.endr\n"
 #if defined(__AVX512F__)
 #define PPU_ST_VSAVE PPU_ST_V("vmovdqu64 %zmm\\r, (128+64*\\r)(%rsp)")
@@ -43,15 +46,21 @@ __asm__(".att_syntax\n.text\n.globl ppu_st_thunk\n" PPU_ST_HEAD
         ".Lppu_st_n:\n    leal -1(%r11), %eax\n    testl %eax, %r11d\n    jnz .Lppu_st_full\n"
         "    testl %r11d, %r11d\n    jz .Lppu_st_full\n    cmpl $16, %r11d\n    ja .Lppu_st_full\n"
         "    movl %ecx, %eax\n    andl $0xFFF, %eax\n    addl %r11d, %eax\n    cmpl $0x1000, %eax\n    ja .Lppu_st_full\n"
-        "    movl %ecx, %eax\n    shrl $12, %eax\n    leaq ppu_slow_page(%rip), %r9\n    cmpb $2, (%r9,%rax)\n    jne .Lppu_st_full\n"
-        "    movl %ecx, %r10d\n    addq vm_base(%rip), %r10\n"
+        "    movl %ecx, %eax\n    shrl $12, %eax\n    leaq ppu_slow_page(%rip), %r9\n    movzbl (%r9,%rax), %r10d\n"
+        "    testl $1, %r10d\n    jnz .Lppu_st_full\n    testl $8, %r10d\n    jz .Lppu_st_go\n"
+        "    movq g_spu_coh_bits(%rip), %rax\n    testq %rax, %rax\n    jz .Lppu_st_go\n"
+        "    movl %ecx, %r10d\n    shrl $7, %r10d\n    btl %r10d, (%rax)\n    jc .Lppu_st_full\n"
+        ".Lppu_st_go:\n    movl %ecx, %r10d\n    addq vm_base(%rip), %r10\n"
         "    cmpl $8, %r11d\n    ja .Lppu_st_16\n    je .Lppu_st_8\n    cmpl $2, %r11d\n    ja .Lppu_st_4\n    je .Lppu_st_2\n"
         "    movb %dl, (%r10)\n    jmp .Lppu_st_check\n"
         ".Lppu_st_2:\n    movw %dx, (%r10)\n    jmp .Lppu_st_check\n"
         ".Lppu_st_4:\n    movl %edx, (%r10)\n    jmp .Lppu_st_check\n"
         ".Lppu_st_8:\n    movq %rdx, (%r10)\n    jmp .Lppu_st_check\n"
         ".Lppu_st_16:\n    movq %rdx, (%r10)\n    movq %r8, 8(%r10)\n"
-        ".Lppu_st_check:\n    cmpb $2, (%r9,%rax)\n    jne .Lppu_st_recheck\n"
+        ".Lppu_st_check:\n    movl %ecx, %eax\n    shrl $12, %eax\n    movzbl (%r9,%rax), %eax\n    testl $5, %eax\n    jnz .Lppu_st_recheck\n"
+        "    testl $8, %eax\n    jz .Lppu_st_watch\n    movq g_spu_coh_bits(%rip), %rax\n    testq %rax, %rax\n    jz .Lppu_st_watch\n"
+        "    movl %ecx, %r10d\n    shrl $7, %r10d\n    btl %r10d, (%rax)\n    jc .Lppu_st_recheck\n"
+        ".Lppu_st_watch:\n"
         "    movl vm_watch_ea(%rip), %eax\n    testl %eax, %eax\n    jz .Lppu_st_done\n"
         "    subl %ecx, %eax\n    cmpl %r11d, %eax\n    jb .Lppu_st_recheck\n"
         ".Lppu_st_done:\n" PPU_ST_SCRATCH_POP PPU_ST_RET

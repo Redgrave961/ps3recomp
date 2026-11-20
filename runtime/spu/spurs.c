@@ -487,27 +487,34 @@ static void ss_exit_if_no_work(spu_context* c)
     spu_exit_stop(c, 0x101, 0);
 }
 
-static int ss_idle_found_in(const uint8_t* l, const uint8_t* ls)
+static uint32_t ss_prio_mask(const uint8_t* ls)
 {
-    const uint32_t sig = g16(l + 0x70), flag = g32(l + 0x6C), recv = l[0x77], run = g16(ls + 0x1EC);
+    uint32_t m = 0;
+    for (uint32_t i = 0; i < 16; i++) m |= (ls[0x1A0 + i] ? 0x8000u : 0u) >> i;
+    return m;
+}
+
+static int ss_idle_found_in(const uint8_t* l, uint32_t run, uint32_t prio)
+{
+    const uint32_t sig = g16(l + 0x70), flag = g32(l + 0x6C), recv = l[0x77];
     const uint32_t fm = flag == 0 && recv < 16 ? 0x8000u >> recv : 0u;
     for (uint32_t i = 0; i < 16; i++) {
         const uint32_t ct = l[0x20 + i], rc = l[i], idle = l[0x10 + i];
         const uint32_t rdy = (rc > 8 ? 8 : rc) + (idle > 8 ? 8 : idle);
         const int ready = ((sig | fm) >> (15 - i)) & 1 || (rc != 0 && rdy > ct);
-        if (((run >> (15 - i)) & 1) && ls[0x1A0 + i] && l[0x50 + i] > ct && ready) return 1;
+        if (((run & prio) >> (15 - i)) & 1 && l[0x50 + i] > ct && ready) return 1;
     }
     return 0;
 }
 
-static int ss_idle_found(spu_context* c) { return ss_idle_found_in(c->ls + 0x100, c->ls); }
+static int ss_idle_found(spu_context* c) { return ss_idle_found_in(c->ls + 0x100, g16(c->ls + 0x1EC), ss_prio_mask(c->ls)); }
 
 static int ss_idle_wake(const spu_context* c, const uint8_t* l)
 {
-    const uint32_t s = g32(c->ls + 0x1C8), b = s < 8 ? 1u << s : 0u;
+    const uint32_t b = c->idle_bit;
     if ((l[0x74] & 0x40) || !(l[0x73] & b) || (l[0x72] & b)) return 2;
     if ((uint32_t)__builtin_popcount(l[0x73]) == l[0x76] && (l[0x74] & 0x80)) return 2;
-    return ss_idle_found_in(l, c->ls);
+    return ss_idle_found_in(l, c->idle_run, c->idle_prio);
 }
 
 static uint32_t ss_idle_slots(const uint8_t* l)
@@ -535,6 +542,9 @@ static void ss_idle_reserve(spu_context* c, uint32_t ea)
     yz_lockstep_tick(c);
     ll_begin(c, ea, 0x100);
     memcpy(c->resv_line, c->ls + 0x100, MFC_ATOMIC_LINE);
+    c->idle_bit = ss_bit(c);
+    c->idle_run = g16(c->ls + 0x1EC);
+    c->idle_prio = ss_prio_mask(c->ls);
     __atomic_store_n(&c->resv, (ea & ~127u) | 1u | SPU_RESV_BY_CONTENT, __ATOMIC_RELAXED);
     c->atomic_stat = 4;
     spu_lockline_unlock(ea & ~127u);

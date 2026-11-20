@@ -274,9 +274,9 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
         uint32_t r = __atomic_load_n(&c->resv, __ATOMIC_RELAXED);
         if ((r & ~SPU_RESV_BY_CONTENT) != (line | 1u)) continue;
         if (r & SPU_RESV_BY_CONTENT) {
-            if (!memcmp(vm_base + line, c->resv_line, MFC_ATOMIC_LINE)) continue;
             const int need = g_spu_idle_wake ? g_spu_idle_wake(c, vm_base + line) : 2;
             if (!need) continue;
+            if (!memcmp(vm_base + line, c->resv_line, MFC_ATOMIC_LINE)) continue;
             if (need == 1) {
                 if (slots == ~0u) slots = g_spu_idle_slots(vm_base + line);
                 if (!slots) continue;

@@ -109,6 +109,13 @@ int      ppu_stwcx32(ppu_context* ctx, uint64_t addr, uint32_t expected, uint32_
 int      ppu_stdcx64(ppu_context* ctx, uint64_t addr, uint64_t expected, uint64_t val);
 #define PPU_RESV_MASK 0x1FFFFFu
 extern uint64_t g_ppu_resv[PPU_RESV_MASK + 1];
+#define PPU_RESV_LIVE (1ull << 63)
+static inline uint64_t ppu_resv_take(uint32_t ea)
+{
+    uint64_t* const p = &g_ppu_resv[(ea >> 7) & PPU_RESV_MASK];
+    const uint64_t t = __atomic_load_n(p, __ATOMIC_ACQUIRE);
+    return (t & PPU_RESV_LIVE) ? t : __atomic_or_fetch(p, PPU_RESV_LIVE, __ATOMIC_SEQ_CST);
+}
 #ifdef __cplusplus
 }
 #endif
@@ -2448,7 +2455,7 @@ class PPULifter:
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             ea = f"ctx->gpr[{ra}] + ctx->gpr[{rb}]" if ra != "0" else f"ctx->gpr[{rb}]"
             return (f"{{ uint64_t ea = {ea}; ctx->reserve_addr = (uint32_t)ea; "
-                    f"ctx->reserve_time = __atomic_load_n(&g_ppu_resv[((uint32_t)ea >> 7) & PPU_RESV_MASK], __ATOMIC_ACQUIRE); "
+                    f"ctx->reserve_time = ppu_resv_take((uint32_t)ea); "
                     f"ctx->gpr[{rd}] = vm_read32(ea); ctx->reserve_value = ctx->gpr[{rd}]; }}")
 
         if mn == "stwcx" or mn == "stwcx.":
@@ -2464,7 +2471,7 @@ class PPULifter:
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             ea = f"ctx->gpr[{ra}] + ctx->gpr[{rb}]" if ra != "0" else f"ctx->gpr[{rb}]"
             return (f"{{ uint64_t ea = {ea}; ctx->reserve_addr = (uint32_t)ea; "
-                    f"ctx->reserve_time = __atomic_load_n(&g_ppu_resv[((uint32_t)ea >> 7) & PPU_RESV_MASK], __ATOMIC_ACQUIRE); "
+                    f"ctx->reserve_time = ppu_resv_take((uint32_t)ea); "
                     f"ctx->gpr[{rd}] = vm_read64(ea); ctx->reserve_value = ctx->gpr[{rd}]; }}")
 
         if mn == "stdcx" or mn == "stdcx.":

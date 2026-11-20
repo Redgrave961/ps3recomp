@@ -80,6 +80,18 @@ static inline uint32_t spu_pref_word(u128 a) {
 #endif
 }
 
+static inline void spu_ls_copy_fwd(uint8_t* ls, uint32_t d, uint32_t s, uint32_t n) {
+    const uint32_t p = d - s;
+    if (p - 1u >= n - 1u) {
+        memmove(ls + d, ls + s, n);
+        return;
+    }
+    for (uint32_t w = 0, c; w < n; w += c) {
+        c = w + p < n - w ? w + p : n - w;
+        memcpy(ls + d + w, ls + s, c);
+    }
+}
+
 
 static inline u128 spu_absdb(u128 a, u128 b);
 static inline u128 spu_avgb(u128 a, u128 b);

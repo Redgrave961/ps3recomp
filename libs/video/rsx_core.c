@@ -765,7 +765,7 @@ void rsx_core_init(u32 local_size, u32 main_size)
         if (s_next_core[i] != i) s_next_core[i] = s_next_core[i + 1u];
     rsx_window_clear();
     rsx_transfer_reset();
-    ppu_slow_pages(VM_HLE_INJECT_BASE, 0x10000u);
+    ppu_special_pages(VM_HLE_INJECT_BASE, 0x10000u);
     g_rsx_window_write = rsx_core_window_written;
 }
 

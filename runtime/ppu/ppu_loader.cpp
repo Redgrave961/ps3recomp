@@ -46,61 +46,11 @@ extern "C" void ppu_guest_caller(char* out, size_t n)
 
 #include "ps3emu/log_first.h"
 
-extern "C" uint8_t* vm_base;
+#include "ppu_resv.h"
 
-extern "C" int  spu_coh_is_reserved(uint32_t addr);
-extern "C" void spu_lockline_lock(uint32_t ea);
-extern "C" void spu_lockline_unlock(uint32_t ea);
-extern "C" void spu_coh_notify_write(uint32_t addr);
-static inline void vm_coh_notify(uint32_t a)
-{
-    spu_lockline_lock(a);
-    spu_coh_notify_write(a);
-    spu_lockline_unlock(a);
-}
-
-extern "C" PPU_THREAD_LOCAL ppu_context* g_active_ctx;
 extern "C" alignas(64) uint64_t g_ppu_resv[PPU_RESV_MASK + 1] = {};
 
-static inline uint64_t* resv_line(uint32_t ea) { return &g_ppu_resv[(ea >> 7) & PPU_RESV_MASK]; }
-
-extern "C" void ppu_resv_break_line(uint32_t ea)
-{
-    const uint64_t old = __atomic_fetch_add(resv_line(ea), 2, __ATOMIC_ACQ_REL);
-    ppu_context* self = g_active_ctx;
-    if (self && (((uint32_t)self->reserve_addr ^ ea) & ~127u) == 0 && self->reserve_time == old)
-        self->reserve_time = old + 2;
-}
-
-template <class T>
-static inline int ppu_store_conditional(ppu_context* self, uint32_t a, T expected, T val)
-{
-    uint64_t* line = resv_line(a);
-    uint64_t t = self->reserve_time;
-    if ((t & 1) || !__atomic_compare_exchange_n(line, &t, t + 1, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return 0;
-    const int coh = spu_coh_is_reserved(a);
-    if (coh) {
-        spu_lockline_lock(a);
-        if (__atomic_load_n(line, __ATOMIC_ACQUIRE) != t + 1) {
-            spu_lockline_unlock(a);
-            __atomic_fetch_sub(line, 1, __ATOMIC_RELEASE);
-            return 0;
-        }
-    }
-    T raw, swapped;
-    if constexpr (sizeof(T) == 4) raw = __builtin_bswap32(expected), swapped = __builtin_bswap32(val);
-    else raw = __builtin_bswap64(expected), swapped = __builtin_bswap64(val);
-    const int ok = __atomic_compare_exchange_n((T*)(vm_base + a), &raw, swapped, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
-    if (coh) {
-        if (ok) spu_coh_notify_write(a);
-        spu_lockline_unlock(a);
-    } else if (ok && spu_coh_is_reserved(a)) {
-        vm_coh_notify(a);
-    }
-    __atomic_fetch_add(line, ok ? 1 : ~0ull, __ATOMIC_RELEASE);
-    if (ok) vm_track_write(a, sizeof(T));
-    return ok;
-}
+extern "C" void ppu_resv_break_line(uint32_t ea) { ppu_resv_break(ea); }
 
 extern "C" int ppu_stwcx32(ppu_context* self, uint64_t ea, uint32_t expected, uint32_t val)
 {
@@ -224,7 +174,7 @@ static inline uint8_t* vm_host(uint32_t a)
     return shadow ? shadow : vm_base + a;
 }
 
-static inline void vm_write_coh(uint32_t a, const void* src, uint32_t n)
+static inline __attribute__((always_inline)) void vm_write_coh(uint32_t a, const void* src, uint32_t n)
 {
     if (spu_coh_line_reserved(a)) {
         spu_lockline_lock(a);
@@ -248,10 +198,10 @@ static struct VmInlineInit {
     VmInlineInit()
     {
         vm_inline_st_ok = !(getenv("PPU_WVAL") || getenv("PPU_WWATCH"));
-        if (!vm_inline_st_ok || getenv("PS3_NULL_SWEEP")) ppu_slow_pages(0, 1ull << 32);
-        ppu_slow_pages(0, 0x1000);
+        if (!vm_inline_st_ok || getenv("PS3_NULL_SWEEP")) ppu_special_pages(0, 1ull << 32);
+        ppu_special_pages(0, 0x1000);
         for (uint32_t n = 0; n < SPU_RAW_COUNT; n++)
-            ppu_slow_pages(SPU_RAW_BASE + n * SPU_RAW_STRIDE + SPU_RAW_PROB_OFF, SPU_RAW_STRIDE - SPU_RAW_PROB_OFF);
+            ppu_special_pages(SPU_RAW_BASE + n * SPU_RAW_STRIDE + SPU_RAW_PROB_OFF, SPU_RAW_STRIDE - SPU_RAW_PROB_OFF);
     }
 } s_vm_inline_init;
 
@@ -546,7 +496,7 @@ extern "C" void ppu_recomp_register(void)
     ppu_exec_tab = tab;
     ppu_exec_lo = lo;
     __atomic_store_n(&ppu_exec_n, tab ? n : 0, __ATOMIC_RELEASE);
-    if (ppu_vm_size) ppu_slow_pages(ppu_vm_size, (1ull << 32) - ppu_vm_size);
+    if (ppu_vm_size) ppu_special_pages(ppu_vm_size, (1ull << 32) - ppu_vm_size);
 }
 
 static uint32_t ppu_code_hi(void)

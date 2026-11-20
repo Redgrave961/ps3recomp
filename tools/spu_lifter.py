@@ -354,6 +354,92 @@ class SPULifter:
     def _spill(regs) -> str:
         return " ".join(f"ctx->gpr[{r}] = sr{r};" for r in sorted(regs))
 
+    def _copy_loops(self, fins, labels) -> dict:
+        idx = {ins.addr: k for k, ins in enumerate(fins)}
+        out = {}
+        for k, br in enumerate(fins):
+            h = idx.get(self._branch_target(br), k) if br.mnemonic in ("brz", "brnz") else k
+            if h < k and not any(fins[j].addr in labels for j in range(h + 1, k + 1)):
+                c = self._copy_loop(fins[h:k + 1])
+                if c:
+                    out[fins[h].addr] = c
+        return out
+
+    def _copy_loop(self, body) -> str:
+        val, heads, store = {}, set(), None
+
+        def rd(r):
+            if r not in val:
+                heads.add(r)
+                return ("a", r, 0)
+            return val[r]
+
+        for ins in body[:-1]:
+            mn, o = ins.mnemonic, _ops(ins.operands)
+            if mn in ("nop", "lnop", "hbr", "hbra", "hbrr"):
+                continue
+            regs = [_reg(x) for x in o]
+            if mn in ("lqd", "stqd"):
+                d, b = _disp_base(o[1])
+                if b is None:
+                    return ""
+                a = rd(b)
+                if a[0] != "a":
+                    return ""
+                a = (a[1], a[2] + int(d, 0))
+                if mn == "lqd":
+                    val[regs[0]] = ("q",) + a
+                    continue
+                v = rd(regs[0])
+                if store or v[0] != "i" or v[3:] != a:
+                    return ""
+                store = v
+                continue
+            arity = {"ai": 1, "cbd": 1, "rotqby": 2, "ceq": 2, "shufb": 3}.get(mn)
+            if arity is None:
+                return ""
+            src = [rd(r) for r in regs[1:1 + arity]]
+            if mn == "ai" and src[0][0] == "a":
+                v = ("a", src[0][1], src[0][2] + int(o[2], 0))
+            elif mn == "cbd" and src[0][0] == "a":
+                v = ("m", src[0][1], src[0][2] + int(o[2], 0))
+            elif mn == "rotqby" and src[0][0] == "q" and src[1][0] == "a" and src[0][1] == src[1][1] \
+                    and (src[1][2] - src[0][2] + 3) % 16 == 0:
+                v = ("b",) + src[0][1:]
+            elif mn == "shufb" and [s[0] for s in src] == ["b", "q", "m"] and src[1][1:] == src[2][1:]:
+                v = ("i",) + src[0][1:] + src[1][1:]
+            elif mn == "ceq" and src[0][0] == src[1][0] == "a":
+                v = ("e",) + src[0][1:] + src[1][1:]
+            else:
+                return ""
+            val[regs[0]] = v
+        cond = rd(_reg(_ops(body[-1].operands)[0]))
+        step = {}
+        for r in heads:
+            v = val.get(r, ("a", r, 0))
+            if v[:2] != ("a", r):
+                return ""
+            step[r] = v[2]
+        if store is None or step[store[1]] != 1 or step[store[3]] != 1:
+            return ""
+        if body[-1].mnemonic == "brnz" and cond[0] == "a":
+            terms, delta = [(cond[1], cond[2], 1)], step[cond[1]]
+        elif body[-1].mnemonic == "brz" and cond[0] == "e":
+            terms, delta = [(cond[1], cond[2], 1), (cond[3], cond[4], -1)], step[cond[1]] - step[cond[3]]
+        else:
+            return ""
+        if delta not in (1, -1):
+            return ""
+        g = self._g
+        e0 = " ".join(f"{'+' if s > 0 else '-'} (spu_pref_word({g(r)}) + 0x{k & 0xFFFFFFFF:X}u)" for r, k, s in terms)
+        bump = " ".join(f"{g(r)} = spu_ai({g(r)}, (int32_t)((_cn - 1u) * 0x{d & 0xFFFFFFFF:X}u));"
+                        for r, d in sorted(step.items(), key=lambda t: int(t[0])) if d)
+        return (f"{{ const uint32_t _cn = 1u {'+' if delta < 0 else '-'} (0u {e0}); "
+                f"const uint32_t _cs = (spu_pref_word({g(store[1])}) + 0x{store[2] & 0xFFFFFFFF:X}u) & 0x3FFFFu; "
+                f"const uint32_t _cd = (spu_pref_word({g(store[3])}) + 0x{store[4] & 0xFFFFFFFF:X}u) & 0x3FFFFu; "
+                f"if (_cn - 2u < 0x3FFFFu && _cs + _cn <= 0x40001u && _cd + _cn <= 0x40001u) {{ "
+                f"spu_ls_copy_fwd(_ls, _cd, _cs, _cn - 1u); {bump} }} }} ")
+
     def lift_function(self, insns: list[SPUInstruction],
                       start: int, end: int) -> LiftedFunction:
         func = LiftedFunction(name=f"{self.prefix}spu_func_{start:08X}",
@@ -374,6 +460,7 @@ class SPULifter:
         self._jt_targets = [] if self.reloc else sorted(merged_starts & {i.addr for i in fins})
         texts = []
         last_insn = None
+        copies = {} if self.trace else self._copy_loops(fins, internal | merged_starts)
         for k, insn in enumerate(fins):
             if insn.addr in internal or insn.addr in merged_starts:
                 func.body_lines.append(f"loc_{insn.addr:08X}:")
@@ -382,7 +469,7 @@ class SPULifter:
                     f"    if (ctx->int_enable && (ctx->event_status & ctx->event_mask)) "
                     f"{{ ctx->pc = {self._pc(insn.addr)}; @I{k}@ g_spu_trampoline_fn = "
                     f"{self.prefix}spu_func_{insn.addr:08X}; return; }}")
-            c = self._translate(insn, func) or ""
+            c = copies.get(insn.addr, "") + (self._translate(insn, func) or "")
             c = c.replace("@SPILL@", f"@S{k}@").replace("@RELOAD@", f"@R{k}@")
             texts.append(c)
             if c:

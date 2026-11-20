@@ -398,7 +398,7 @@ static void spu_ch_park(spu_context* ctx, int (*ready)(void*), void* arg)
 {
     for (;;) {
         const uint32_t seq = __atomic_load_n(&ctx->ch_wake_seq, __ATOMIC_ACQUIRE);
-        __atomic_store_n(&ctx->ch_sleeping, 1, __ATOMIC_SEQ_CST);
+        __atomic_store_n(&ctx->ch_sleeping, 1, __ATOMIC_RELAXED);
         __atomic_thread_fence(__ATOMIC_SEQ_CST);
         if (ready(arg)) break;
         ps3_futex_wait(&ctx->ch_wake_seq, seq, 0);
@@ -423,17 +423,21 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
     case MFC_Size:      ctx->mfc_size = v;        return;
     case MFC_TagID:     ctx->mfc_tag = v & 0x1F;  return;
     case MFC_WrTagMask: ctx->mfc_tag_mask = v;    return;
+    case MFC_Cmd:
+        if (!spu_mfc_atomic(ctx, v)) mfc_submit(mfc_for(ctx), ctx, v);
+        return;
+    case MFC_WrTagUpdate:
+        ctx->mfc_tag_status = mfc_for(ctx)->tag_completed & ctx->mfc_tag_mask;
+        if (v != 0 && (ctx->event_mask & 0x1u)) {
+            SPU_EVENT_SET(ctx, 0x1u);
+            spu_ch_wake(ctx);
+        }
+        return;
     default: break;
     }
 
     if (channel_is_mfc(channel)) {
-        if (channel == MFC_Cmd && spu_mfc_atomic(ctx, v))
-            return;
         mfc_channel_write(mfc_for(ctx), ctx, channel, v);
-        if (channel == MFC_WrTagUpdate && v != 0 && (ctx->event_mask & 0x1u)) {
-            SPU_EVENT_SET(ctx, 0x1u);
-            spu_ch_wake(ctx);
-        }
         return;
     }
 
@@ -550,6 +554,8 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
 u128 spu_rdch(spu_context* ctx, uint32_t channel)
 {
     spu_honour_stop_request(ctx);
+    if (channel == MFC_RdTagStat) return spu_make_preferred_u32(ctx->mfc_tag_status);
+    if (channel == MFC_RdAtomicStat) return spu_make_preferred_u32(ctx->atomic_stat);
     if (channel == SPU_RdInMbox || channel == SPU_RdSigNotify1 || channel == SPU_RdSigNotify2)
         spu_ch_wait(ctx, channel, "rdch");
     else if (channel == SPU_RdEventStat && ctx->event_mask != 0)
@@ -1014,6 +1020,17 @@ void spu_overlay_register_sig(const uint8_t sig[16], int image_id)
     }
 }
 
+static inline int spu_bytes_differ(const uint8_t* a, const uint8_t* b, uint32_t n)
+{
+    if (n >= 8) {
+        uint64_t x, y;
+        memcpy(&x, a, 8);
+        memcpy(&y, b, 8);
+        if (x != y) return 1;
+    }
+    return memcmp(a, b, n) != 0;
+}
+
 void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint32_t size)
 {
     uint32_t lsa = (uint32_t)(ls - ctx->ls);
@@ -1029,7 +1046,7 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
                     const uint8_t* orig = vm_base + ctx->resident_code[slot].source_ea + (lo - base);
                     uint32_t k = 0;
                     while (k < hi - lo && !orig[k]) k++;
-                    if (k == hi - lo || !memcmp(ls + (lo - lsa), orig, hi - lo)) continue;
+                    if (k == hi - lo || !spu_bytes_differ(ls + (lo - lsa), orig, hi - lo)) continue;
                 }
                 ctx->resident_code[slot].image_id = 0;
                 spu_dcache_residency_changed(ctx);
@@ -1064,7 +1081,7 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
         if (lo >= hi || (hi - lo < 128 && hi - lo != size)) continue;
         const uint8_t* q = ls + (lo - lsa);
         const uint32_t src = s_ovl_at[i].ea + (lo - rlo);
-        if (ea + (lo - lsa) != src && memcmp(q, vm_base + src, hi - lo)) continue;
+        if (ea + (lo - lsa) != src && spu_bytes_differ(q, vm_base + src, hi - lo)) continue;
         uint32_t k = 0;
         while (k < hi - lo && !q[k]) k++;
         if (k == hi - lo) continue;

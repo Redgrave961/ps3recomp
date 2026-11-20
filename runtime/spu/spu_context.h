@@ -135,6 +135,7 @@ typedef struct spu_context {
 
     uint32_t resv;
     uint32_t atomic_stat;
+    uint32_t idle_bit, idle_run, idle_prio;
     uint8_t  resv_line[128];
 
     int resident_ovl;
