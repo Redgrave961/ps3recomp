@@ -480,6 +480,16 @@ static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
 }
 #define spu_shufb_ref spu_shufb
 #endif
+#if defined(__SSE4_1__)
+static inline u128 spu_shufb_ins(u128 a, u128 b, u128 c) {
+    __m128i A, B, C; memcpy(&A, &a, 16); memcpy(&B, &b, 16); memcpy(&C, &c, 16);
+    const __m128i out = _mm_blendv_epi8(B, _mm_shuffle_epi8(A, _mm_xor_si128(C, _mm_set1_epi8(3))),
+                                        _mm_cmpgt_epi8(_mm_set1_epi8(0x10), C));
+    u128 o; memcpy(&o, &out, 16); return o;
+}
+#else
+static inline u128 spu_shufb_ins(u128 a, u128 b, u128 c) { return spu_shufb(a, b, c); }
+#endif
 
 static inline u128 spu_shli(u128 a, int sh)  { u128 r; sh&=0x3F; for(int i=0;i<4;i++) r._u32[i]=(sh>31)?0:(a._u32[i]<<sh); return r; }
 static inline u128 spu_shlhi(u128 a, int sh) { u128 r; sh&=0x1F; for(int i=0;i<8;i++) r._u16[i]=(sh>15)?0:(uint16_t)(a._u16[i]<<sh); return r; }
@@ -575,9 +585,8 @@ static inline int spu__sf_split(uint32_t x, uint32_t* sig, int* e2) {
 #if SPU_X86
 #define SPU_MXCSR_RZ 0xFFC0u
 SPU__XI u128 spu__xf_out(__m128 s) {
-    const __m128 c = _mm_max_ps(_mm_min_ps(s, _mm_set1_ps(0x1.fffffep127f)), _mm_set1_ps(-0x1.fffffep127f));
-    const __m128 z = _mm_cmplt_ps(_mm_and_ps(c, _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF))), _mm_set1_ps(0x1p-126f));
-    return spu__xs(_mm_castps_si128(_mm_andnot_ps(z, c)));
+    const __m128 z = _mm_cmplt_ps(_mm_and_ps(s, _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF))), _mm_set1_ps(0x1p-126f));
+    return spu__xs(_mm_castps_si128(_mm_andnot_ps(z, s)));
 }
 SPU__XI __m128 spu__xf(u128 a) {
     const __m128i x = spu__xl(a), m = _mm_set1_epi32(0x7FFFFFFF);
@@ -593,12 +602,13 @@ SPU__XI __m128 spu__xf(u128 a) {
 #define SPU__XFNMS(a, b, c) _mm_sub_ps(c, _mm_mul_ps(a, b))
 #endif
 SPU__XI __m128 spu__xfk(u128 a, int clean) { return clean ? _mm_castsi128_ps(spu__xl(a)) : spu__xf(a); }
-static inline u128 spu_fa_k(u128 a, u128 b, int k) { return spu__xf_out(_mm_add_ps(spu__xfk(a, k & 1), spu__xfk(b, k & 2))); }
-static inline u128 spu_fs_k(u128 a, u128 b, int k) { return spu__xf_out(_mm_sub_ps(spu__xfk(a, k & 1), spu__xfk(b, k & 2))); }
-static inline u128 spu_fm_k(u128 a, u128 b, int k) { return spu__xf_out(_mm_mul_ps(spu__xfk(a, k & 1), spu__xfk(b, k & 2))); }
-static inline u128 spu_fma_k(u128 a, u128 b, u128 c, int k)  { return spu__xf_out(SPU__XFMA(spu__xfk(a, k & 1), spu__xfk(b, k & 2), spu__xfk(c, k & 4))); }
-static inline u128 spu_fms_k(u128 a, u128 b, u128 c, int k)  { return spu__xf_out(SPU__XFMS(spu__xfk(a, k & 1), spu__xfk(b, k & 2), spu__xfk(c, k & 4))); }
-static inline u128 spu_fnms_k(u128 a, u128 b, u128 c, int k) { return spu__xf_out(SPU__XFNMS(spu__xfk(a, k & 1), spu__xfk(b, k & 2), spu__xfk(c, k & 4))); }
+SPU__XI __m128 spu__xfko(u128 a, int clean) { __m128 x = spu__xfk(a, clean); __asm__("" : "+x"(x)); return x; }
+static inline u128 spu_fa_k(u128 a, u128 b, int k) { return spu__xf_out(_mm_add_ps(spu__xfko(a, k & 1), spu__xfk(b, k & 2))); }
+static inline u128 spu_fs_k(u128 a, u128 b, int k) { return spu__xf_out(_mm_sub_ps(spu__xfko(a, k & 1), spu__xfk(b, k & 2))); }
+static inline u128 spu_fm_k(u128 a, u128 b, int k) { return spu__xf_out(_mm_mul_ps(spu__xfko(a, k & 1), spu__xfk(b, k & 2))); }
+static inline u128 spu_fma_k(u128 a, u128 b, u128 c, int k)  { return spu__xf_out(SPU__XFMA(spu__xfko(a, k & 1), spu__xfk(b, k & 2), spu__xfk(c, k & 4))); }
+static inline u128 spu_fms_k(u128 a, u128 b, u128 c, int k)  { return spu__xf_out(SPU__XFMS(spu__xfko(a, k & 1), spu__xfk(b, k & 2), spu__xfk(c, k & 4))); }
+static inline u128 spu_fnms_k(u128 a, u128 b, u128 c, int k) { return spu__xf_out(SPU__XFNMS(spu__xfko(a, k & 1), spu__xfk(b, k & 2), spu__xfk(c, k & 4))); }
 static inline u128 spu_fa(u128 a, u128 b) { return spu_fa_k(a, b, 0); }
 static inline u128 spu_fs(u128 a, u128 b) { return spu_fs_k(a, b, 0); }
 static inline u128 spu_fm(u128 a, u128 b) { return spu_fm_k(a, b, 0); }

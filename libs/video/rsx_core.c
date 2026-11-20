@@ -40,8 +40,9 @@ static struct {
     volatile LONG started;
 
     _Alignas(64) volatile u32 bell;
-    volatile u32 sleeping;
     volatile u32 immediate_flip;
+
+    _Alignas(64) volatile u32 sleeping;
 
     _Alignas(64) volatile u32 label_epoch;
     volatile u32 label_waiters;
@@ -181,8 +182,10 @@ static void rsx_fault(const char* what, u32 at, u32 word)
 
 void rsx_core_doorbell(void)
 {
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if (!__atomic_load_n(&s.sleeping, __ATOMIC_ACQUIRE)) return;
     __atomic_add_fetch(&s.bell, 1u, __ATOMIC_SEQ_CST);
-    if (__atomic_load_n(&s.sleeping, __ATOMIC_SEQ_CST)) WakeByAddressSingle((PVOID)&s.bell);
+    WakeByAddressSingle((PVOID)&s.bell);
 }
 
 static void rsx_core_window_written(void)
@@ -288,16 +291,36 @@ static void rsx_sleep_until(HANDLE timer, u64 target)
 static HANDLE rsx_timer_create(void) { return NULL; }
 #endif
 
-static void rsx_await_bell(u32 seen, DWORD ms)
+typedef struct rsx_hold {
+    u32 put;
+    u32 get;
+    u32 ea;
+    u32 word;
+} rsx_hold;
+
+static int rsx_idle_over(const rsx_hold* w)
 {
-    __atomic_store_n(&s.sleeping, 1u, __ATOMIC_SEQ_CST);
-    if (__atomic_load_n(&s.bell, __ATOMIC_SEQ_CST) == seen) WaitOnAddress((volatile VOID*)&s.bell, &seen, sizeof seen, ms);
+    if (__atomic_load_n(&s.immediate_flip, __ATOMIC_RELAXED) || (rsx_load(RSX_PUT_EA) & ~3u) != w->put || s.get != w->get) return 1;
+    return w->ea && rsx_load(w->ea) != w->word;
+}
+
+static void rsx_await(int (*over)(const rsx_hold*), const rsx_hold* w, DWORD ms)
+{
+    const u32 seen = __atomic_load_n(&s.bell, __ATOMIC_ACQUIRE);
+    __atomic_exchange_n(&s.sleeping, 1u, __ATOMIC_SEQ_CST);
+    if (!over(w)) WaitOnAddress((volatile VOID*)&s.bell, (PVOID)&seen, sizeof seen, ms);
     __atomic_store_n(&s.sleeping, 0u, __ATOMIC_RELAXED);
 }
 
-static void rsx_wait_bell(u32 seen)
+static int rsx_label_over(const rsx_hold* w)
 {
-    while (__atomic_load_n(&s.bell, __ATOMIC_ACQUIRE) == seen) rsx_await_bell(seen, INFINITE);
+    return __atomic_load_n(&s.immediate_flip, __ATOMIC_RELAXED) || rsx_load(w->ea) == w->word;
+}
+
+static void rsx_wait_change(u32 put)
+{
+    const rsx_hold w = { put, s.get, 0, 0 };
+    while (!rsx_idle_over(&w)) rsx_await(rsx_idle_over, &w, INFINITE);
 }
 
 static rsx_vblank_clock s_clock;
@@ -443,11 +466,11 @@ static void rsx_semaphore_acquire(u32 value)
     rsx_publish_get();
     rsx_flush();
     rsx_watch(ea);
+    const rsx_hold w = { 0, 0, ea, value };
     for (;;) {
-        const u32 seen = __atomic_load_n(&s.bell, __ATOMIC_ACQUIRE);
         rsx_service_immediate();
         if (rsx_load(ea) == value) break;
-        rsx_await_bell(seen, 1);
+        rsx_await(rsx_label_over, &w, 1);
     }
     vm_unwatch(ea);
 }
@@ -619,22 +642,23 @@ static void rsx_run_args(u32 put)
     rsx_publish_get();
 }
 
-static void rsx_park(u32 jump, u32 seen)
+static void rsx_park(u32 jump, u32 put)
 {
     s.batch++;
     const u32 ea = rsx_io_to_ea(s.get);
     rsx_publish_get();
     rsx_flush();
     rsx_watch(ea);
+    const rsx_hold w = { put, s.get, ea, jump };
     for (;;) {
         rsx_service_immediate();
-        if (rsx_load(ea) != jump || __atomic_load_n(&s.bell, __ATOMIC_ACQUIRE) != seen) break;
-        rsx_await_bell(seen, 1);
+        if (rsx_idle_over(&w)) break;
+        rsx_await(rsx_idle_over, &w, 1);
     }
     vm_unwatch(ea);
 }
 
-static void rsx_control(u32 cmd, u32 seen)
+static void rsx_control(u32 cmd, u32 put)
 {
     u32 target;
     if ((cmd & 0xE0000003u) == 0x20000000u) target = cmd & 0x1FFFFFFCu;
@@ -642,7 +666,7 @@ static void rsx_control(u32 cmd, u32 seen)
     else if ((cmd & 0x00000003u) == 0x00000002u) {
         if (s.ret != RSX_NO_RETURN) {
             rsx_fault("nested CALL", s.get, cmd);
-            rsx_wait_bell(seen);
+            rsx_wait_change(put);
             return;
         }
         s.ret = s.get + 4u;
@@ -652,7 +676,7 @@ static void rsx_control(u32 cmd, u32 seen)
     } else if ((cmd & 0xFFFF0003u) == 0x00020000u) {
         if (s.ret == RSX_NO_RETURN) {
             rsx_fault("RETURN without CALL", s.get, cmd);
-            rsx_wait_bell(seen);
+            rsx_wait_change(put);
             return;
         }
         s.get = s.ret;
@@ -661,11 +685,11 @@ static void rsx_control(u32 cmd, u32 seen)
         return;
     } else {
         rsx_fault("invalid command", s.get, cmd);
-        rsx_wait_bell(seen);
+        rsx_wait_change(put);
         return;
     }
     if (target == s.get) {
-        rsx_park(cmd, seen);
+        rsx_park(cmd, put);
         return;
     }
     s.get = target;
@@ -684,7 +708,6 @@ static DWORD WINAPI rsx_fifo_thread(LPVOID unused)
         _Exit(1);
     }
     for (;;) {
-        const u32 seen = __atomic_load_n(&s.bell, __ATOMIC_ACQUIRE);
         rsx_service_immediate();
         const u32 put = rsx_load(RSX_PUT_EA) & ~3u;
         if (put != s.put_seen) {
@@ -693,7 +716,7 @@ static DWORD WINAPI rsx_fifo_thread(LPVOID unused)
         }
         if (s.get == put) {
             rsx_flush();
-            rsx_wait_bell(seen);
+            rsx_wait_change(put);
             continue;
         }
         if (s.method_left) {
@@ -703,12 +726,12 @@ static DWORD WINAPI rsx_fifo_thread(LPVOID unused)
         const u32 ea = rsx_io_to_ea(s.get);
         if (!ea) {
             rsx_fault("get unmapped", s.get, 0);
-            rsx_wait_bell(seen);
+            rsx_wait_change(put);
             continue;
         }
         const u32 cmd = rsx_load(ea);
         if (cmd & 0xA0030003u) {
-            rsx_control(cmd, seen);
+            rsx_control(cmd, put);
             continue;
         }
         const u32 count = (cmd >> 18) & 0x7FFu;

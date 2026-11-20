@@ -184,7 +184,7 @@ int main(int argc, char** argv)
         memcpy(&b, &a, sizeof a);
         b.ls = b.ls_store;
         const unsigned csr = _mm_getcsr();
-        if (run & 1) _mm_setcsr(0xFFC0u);
+        _mm_setcsr(0xFFC0u);
         spu_func_00000000(&a);
         while (g_spu_trampoline_fn) { void (*t)(spu_context*) = g_spu_trampoline_fn; g_spu_trampoline_fn = 0; t(&a); }
         reference_run(&b);

@@ -335,7 +335,7 @@ class SPULifter:
         self._prom = False
         self._regs: set = set()
         self._jt_targets: list = []
-        self._clean: frozenset = frozenset()
+        self._facts: frozenset = frozenset()
 
     def _g(self, i) -> str:
         s = str(i).strip()
@@ -358,7 +358,7 @@ class SPULifter:
     def _spill(regs) -> str:
         return " ".join(f"ctx->gpr[{r}] = sr{r};" for r in sorted(regs))
 
-    def _clean_floats(self, fins, entries) -> list:
+    def _known_facts(self, fins, entries) -> list:
         n = len(fins)
         idx = {ins.addr: k for k, ins in enumerate(fins)}
         preds = [[] for _ in range(n)]
@@ -388,10 +388,13 @@ class SPULifter:
                     new.add(("c", d))
             elif mn in _CLEAN_FLOAT:
                 new.add(("c", d))
+            elif mn in ("cbd", "chd", "cwd", "cdd", "cbx", "chx", "cwx", "cdx"):
+                new.add(("i", d))
             elif mn in ("fcgt", "fceq", "fcmgt", "fcmeq", "ceq", "cgt", "clgt", "ceqi", "cgti", "clgti"):
                 new.add(("m", d))
             elif mn in _CLEAN_MOVE and (r[2] == 0 or (mn != "ori" and mn != "ai" and r[2] % 4 == 0)):
-                new |= {(f[0], d) + f[2:] for f in s if f[1] == r[1] and (r[2] == 0 or mn == "rotqbyi" or f[0] != "k")}
+                same = r[2] == 0 or (mn == "rotqbyi" and r[2] % 16 == 0)
+                new |= {(f[0], d) + f[2:] for f in s if f[1] == r[1] and (same or f[0] in ("c", "m") or (f[0] == "k" and mn == "rotqbyi"))}
             elif mn == "and":
                 new |= {("c", d)} if ("c", r[1]) in s or ("c", r[2]) in s else set()
                 new |= {("m", d)} if ("m", r[1]) in s and ("m", r[2]) in s else set()
@@ -404,7 +407,7 @@ class SPULifter:
             return frozenset(f for f in s if f[1] != d) | new
 
         out = [None] * n
-        clean = [frozenset()] * n
+        facts = [frozenset()] * n
         work = list(range(n - 1, -1, -1))
         queued = set(work)
         while work:
@@ -416,7 +419,7 @@ class SPULifter:
                 if not known:
                     continue
                 s = frozenset.intersection(*known)
-            clean[k] = frozenset(f[1] for f in s if f[0] == "c")
+            facts[k] = s
             o = transfer(fins[k], s)
             if o != out[k]:
                 out[k] = o
@@ -424,7 +427,7 @@ class SPULifter:
                     if j not in queued:
                         queued.add(j)
                         work.append(j)
-        return clean
+        return facts
 
     def _copy_loops(self, fins, labels) -> dict:
         idx = {ins.addr: k for k, ins in enumerate(fins)}
@@ -533,9 +536,9 @@ class SPULifter:
         texts = []
         last_insn = None
         copies = {} if self.trace else self._copy_loops(fins, internal | merged_starts)
-        clean = self._clean_floats(fins, merged_starts)
+        facts = self._known_facts(fins, merged_starts)
         for k, insn in enumerate(fins):
-            self._clean = clean[k]
+            self._facts = facts[k]
             if insn.addr in internal or insn.addr in merged_starts:
                 func.body_lines.append(f"loc_{insn.addr:08X}:")
             if insn.addr in merged_starts:
@@ -851,7 +854,7 @@ class SPULifter:
         }
         if mn in _CLEAN_FLOAT:
             srcs = [ra(), rb()] + ([_reg(ops[3])] if len(ops) > 3 else [])
-            k = sum(1 << i for i, r in enumerate(srcs) if int(r) in self._clean)
+            k = sum(1 << i for i, r in enumerate(srcs) if ("c", int(r)) in self._facts)
             args = ", ".join(g(r) for r in srcs)
             return f"{g(rt())} = spu_{mn}_k({args}, {k});" if k else f"{g(rt())} = spu_{mn}({args});"
         if mn in rr_bin:
@@ -916,7 +919,7 @@ class SPULifter:
             return f"{g(rt())} = spu_selb({g(ra())}, {g(rb())}, {g(rc)});"
         if mn == "shufb":
             rc = _reg(ops[3])
-            return f"{g(rt())} = spu_shufb({g(ra())}, {g(rb())}, {g(rc)});"
+            return f"{g(rt())} = spu_shufb{'_ins' if ('i', int(rc)) in self._facts else ''}({g(ra())}, {g(rb())}, {g(rc)});"
         if mn == "mpya":
             rc = _reg(ops[3])
             return f"{g(rt())} = spu_mpya({g(ra())}, {g(rb())}, {g(rc)});"
