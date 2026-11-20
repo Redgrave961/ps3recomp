@@ -122,6 +122,18 @@ static void ll_commit(spu_context* c, uint32_t ea, uint32_t lsa)
     spu_rsx_window_check(ea, MFC_ATOMIC_LINE);
 }
 
+static void ll_commit_changed(spu_context* c, uint32_t ea, uint32_t lsa)
+{
+    ea &= ~127u;
+    if (memcmp(vm_base + ea, c->ls + lsa, MFC_ATOMIC_LINE)) {
+        ll_commit(c, ea, lsa);
+        return;
+    }
+    __atomic_store_n(&c->resv, 0u, __ATOMIC_RELAXED);
+    c->atomic_stat = 0;
+    spu_lockline_unlock(ea);
+}
+
 static void ll_hold(spu_context* c, uint32_t ea, uint32_t lsa)
 {
     ea &= ~127u;
@@ -265,7 +277,7 @@ static void kernel_select(spu_context* c, uint32_t mode, uint32_t r[4])
     if (not_poll) vadd(ls + 0x120, base, inc);
     if (pd) vadd(ls + 0x130, pend, inc);
     else memcpy(ls + 0x130, pend, 16);
-    ll_commit(c, ea, 0x100);
+    ll_commit_changed(c, ea, 0x100);
     if (pd) memcpy(ls + 0x190, inc, 16);
     else memset(ls + 0x190, 0, 16);
     if (not_poll) memcpy(ls + 0x180, inc, 16);

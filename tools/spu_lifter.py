@@ -677,6 +677,7 @@ class SPULifter:
                 s.append(idx_of[tgt])
             s.extend(idx_of[int(a, 16)] for a in case.findall(texts[k]) if int(a, 16) in idx_of)
             succ.append(s)
+        self._locals(func, fins, texts, succ, regs)
         d_in = [0] * n
         d_out = [None] * n
         mask = [sum(1 << r for r in write[k]) for k in range(n)]
@@ -734,6 +735,102 @@ class SPULifter:
 
         func.body_lines = [tok.sub(sub, b) for b in func.body_lines]
         func.body_lines.insert(0, "    u128 " + ", ".join(f"sr{r} = ctx->gpr[{r}]" for r in sorted(regs)) + ";")
+
+    def _locals(self, func: LiftedFunction, fins, texts, succ, regs) -> None:
+        n = len(fins)
+        every = (1 << 128) - 1
+        ref = re.compile(r"ctx->gpr\[(\d+)\]|\bsr(\d+)\b")
+        starts = set(getattr(self, "func_starts", ()))
+        use, kill, wall = [], [], []
+        for k, ins in enumerate(fins):
+            cnt: dict = {}
+            for a, b in ref.findall(texts[k]):
+                cnt[int(a or b)] = cnt.get(int(a or b), 0) + 1
+            d = _dest_reg(ins)
+            own = ins.mnemonic not in _NO_RT_WRITE and re.match(rf"(ctx->gpr\[{d}\]|sr{d}) = (?!=)",
+                                                                 texts[k].rpartition("} ")[2])
+            if own:
+                cnt[d] -= 1
+            use.append(sum(1 << r for r, v in cnt.items() if v > 0))
+            kill.append(1 << d if own else 0)
+            wall.append(bool(re.search(r"@|\bctx\b(?!->gpr\[|->reloc_delta\b)", texts[k]))
+                        or ins.mnemonic in ("rdch", "rchcnt", "wrch") or bool(k) and ins.addr in starts)
+        succ = succ + [[]]
+        if f"@O{n - 1}@" in func.body_lines[-1]:
+            succ[n - 1] = succ[n - 1] + [n]
+        use.append(0)
+        kill.append(0)
+        wall.append(True)
+        live = [every if wall[k] else 0 for k in range(n + 1)]
+        changed = True
+        while changed:
+            changed = False
+            for k in range(n - 1, -1, -1):
+                o = every if not succ[k] else 0
+                for s in succ[k]:
+                    o |= live[s]
+                v = every if wall[k] else use[k] | (o & ~kill[k])
+                if v != live[k]:
+                    live[k], changed = v, True
+        defs: dict = {}
+        for k in range(n):
+            d = kill[k].bit_length() - 1
+            if d >= 0 and not wall[k] and d not in regs:
+                defs.setdefault(d, []).append(k)
+        resident = [0] + [s for k in range(n) if wall[k] for s in succ[k] if s < n]
+        new = list(texts)
+        names = set()
+        for d, ks in defs.items():
+            g, t = f"ctx->gpr[{d}]", f"tr{d}"
+            up = {-1: -1}
+
+            def find(x):
+                while up[x] != x:
+                    up[x] = up[up[x]]
+                    x = up[x]
+                return x
+
+            owner: dict = {}
+            for k in [-1] + ks:
+                up[k] = k
+                stack = list(resident if k < 0 else succ[k])
+                if not stack:
+                    up[k] = -1
+                seen = set()
+                while stack:
+                    j = stack.pop()
+                    if j in seen or not live[j] >> d & 1:
+                        continue
+                    seen.add(j)
+                    if wall[j] or not succ[j] and not kill[j] >> d & 1:
+                        up[find(k)] = find(-1)
+                        continue
+                    if use[j] >> d & 1:
+                        up[find(k)] = find(owner.setdefault(j, k))
+                    if not kill[j] >> d & 1:
+                        stack.extend(succ[j])
+            bad = find(-1)
+            lhs = {k for k in ks if find(k) != bad}
+            if not lhs:
+                continue
+            names.add(d)
+            for j in lhs | {j for j, k in owner.items() if find(k) != bad}:
+                head, sep, tail = new[j].rpartition("} ")
+                if find(owner.get(j, -1)) != bad:
+                    head = head.replace(g, t)
+                    tail = tail[:len(g)] + tail[len(g):].replace(g, t) if kill[j] >> d & 1 else tail.replace(g, t)
+                if j in lhs:
+                    tail = t + tail[len(g):]
+                new[j] = head + sep + tail
+        if not names:
+            return
+        i = 0
+        for k in range(n):
+            if texts[k]:
+                while func.body_lines[i] != f"    {texts[k]}":
+                    i += 1
+                func.body_lines[i] = f"    {new[k]}"
+        func.body_lines.insert(0, "    u128 " + ", ".join(f"tr{r}" for r in sorted(names)) + ";")
 
     def _pc(self, a: int) -> str:
         if self.reloc:
