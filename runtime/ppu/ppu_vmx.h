@@ -31,6 +31,9 @@ extern "C" {
 
 #define VMX_SAT 0x00000001u
 #define VMX_NJ  0x00010000u
+#define VMX_KA  0x10000000u
+#define VMX_KB  0x20000000u
+#define VMX_KC  0x40000000u
 #define VMX_INL static inline
 
 VMX_INL __m128i vmx_ld(const void* p) { return _mm_loadu_si128((const __m128i*)p); }
@@ -58,6 +61,7 @@ VMX_INL __m128 vmx_tiny(__m128 x) {
 /* Lanes the exact path would change: a NaN or (under NJ) denormal result, or a
  * denormal input under NJ. A NaN input needs no test of its own for these ops:
  * the host result is then a NaN too. */
+VMX_INL __m128 vmx_kq(__m128 x, uint32_t vscr, uint32_t k) { return (vscr & k) ? _mm_setzero_ps() : x; }
 VMX_INL int vmx_plain(__m128 r, __m128 x, __m128 y, __m128 z, uint32_t vscr) {
     __m128 bad = _mm_cmpunord_ps(r, r);
     if (vscr & VMX_NJ) bad = _mm_or_ps(bad, _mm_or_ps(_mm_or_ps(vmx_tiny(r), vmx_tiny(x)), _mm_or_ps(vmx_tiny(y), vmx_tiny(z))));
@@ -312,7 +316,7 @@ VMX_INL void vmx_vsro(VMX_D, VMX_A, VMX_B) { VMX_ARGS_PREP; int n = (vmx_b(b, 15
 VMX_INL void name(VMX_D, VMX_A, VMX_B, uint32_t vscr) { \
     __m128 x = vmx_ldf(a_), y = vmx_ldf(b_); \
     const __m128 q = op; \
-    if (vmx_plain(q, x, y, _mm_setzero_ps(), vscr)) { vmx_stf(d_, q); return; } \
+    if (vmx_plain(q, vmx_kq(x, vscr, VMX_KA), vmx_kq(y, vscr, VMX_KB), _mm_setzero_ps(), vscr)) { vmx_stf(d_, q); return; } \
     x = vmx_flushv(x, vscr); y = vmx_flushv(y, vscr); \
     vmx_stf(d_, vmx_flushv(vmx_nanv(vmx_nanv(vmx_fixv(op), y), x), vscr)); }
 VMX_FBIN(vmx_vaddfp, _mm_add_ps(x, y))
@@ -330,7 +334,7 @@ VMX_FMINMAX(vmx_vminfp, _mm_or_ps(_mm_min_ps(x, y), _mm_min_ps(y, x)))
 VMX_INL void name(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) { \
     __m128 x = vmx_ldf(a_), y = vmx_ldf(b_), z = vmx_ldf(c_); \
     const __m128 q = expr; \
-    if (vmx_plain(q, x, y, z, vscr)) { vmx_stf(d_, q); return; } \
+    if (vmx_plain(q, vmx_kq(x, vscr, VMX_KA), vmx_kq(y, vscr, VMX_KB), vmx_kq(z, vscr, VMX_KC), vscr)) { vmx_stf(d_, q); return; } \
     x = vmx_flushv(x, vscr); y = vmx_flushv(y, vscr); z = vmx_flushv(z, vscr); \
     vmx_stf(d_, vmx_flushv(vmx_fixv(expr), vscr)); }
 VMX_FMA(vmx_vmaddfp, _mm_fmadd_ps(x, z, y))
@@ -339,7 +343,7 @@ VMX_FMA(vmx_vnmsubfp, _mm_xor_ps(_mm_fmsub_ps(x, z, y), vmx_k(0x80000000u)))
 #define VMX_FUN(name, expr, flush_in) \
 VMX_INL void name(VMX_D, VMX_B, uint32_t vscr) { __m128 f = vmx_ldf(b_); \
     const __m128 q = expr; \
-    if (vmx_plain(q, flush_in ? f : _mm_setzero_ps(), _mm_setzero_ps(), _mm_setzero_ps(), vscr)) { vmx_stf(d_, q); return; } \
+    if (vmx_plain(q, flush_in ? vmx_kq(f, vscr, VMX_KB) : _mm_setzero_ps(), _mm_setzero_ps(), _mm_setzero_ps(), vscr)) { vmx_stf(d_, q); return; } \
     if (flush_in) f = vmx_flushv(f, vscr); \
     vmx_stf(d_, vmx_flushv(vmx_nanv(vmx_fixv(expr), f), vscr)); }
 VMX_FUN(vmx_vrefp, _mm_div_ps(_mm_set1_ps(1.0f), f), 1)

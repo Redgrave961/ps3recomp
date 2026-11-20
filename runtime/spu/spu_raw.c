@@ -42,6 +42,7 @@
 #include <string.h>
 #include "../platform/ps3_sync.h"
 #include "../memory/vm_fault_x86.h"
+#include "../memory/vm_page_map.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -597,7 +598,7 @@ void spu_raw_reg_store(uint32_t ea, uint32_t val, int width)
             if (r < s->get_runs)   s->get_hi[r] += size;
             else if (r < 8)      { s->get_lo[r] = lsa; s->get_hi[r] = lsa + size; s->get_runs++; }
         }
-        else if (cmd & 0x20u) memcpy(vm_base + ea, ls, size);   /* PUT: LS -> EA */
+        else if (cmd & 0x20u) { memcpy(vm_base + ea, ls, size); vm_track_write(ea, size); }   /* PUT: LS -> EA */
         if (dbg())
             fprintf(stderr, "[spu-raw] spu%u proxy cmd=0x%02X lsa=0x%05X ea=0x%08X size=0x%X\n",
                     (unsigned)(s - s_spu), cmd, lsa, ea, size);

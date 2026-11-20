@@ -874,6 +874,35 @@ def _ca_line(s: str) -> tuple[int, int]:
     return int("PPU_TAIL" in s or "ctx->xer" in _CA_WRITE_RE.sub("", s)), int(bool(write) and not s.startswith("if "))
 
 
+_VFP_RE = re.compile(r"^vmx_(vaddfp|vsubfp|vmaddfp|vnmsubfp|vmaxfp|vminfp|vrefp|vrsqrtefp|vrfin|vrfiz|vrfip|vrfim)"
+                     r"\(&ctx->vr\[(\d+)\]((?:, &ctx->vr\[\d+\])+), ctx->vscr\);$")
+_VFP_KEYS = {"vaddfp": "AB", "vsubfp": "AB", "vmaddfp": "ABC", "vnmsubfp": "ABC", "vrefp": "B", "vrsqrtefp": "B",
+             "vrfip": "B", "vrfim": "B"}
+_VFP_BITS = {"A": 0x10000000, "B": 0x20000000, "C": 0x40000000}
+_VFP_RESET_RE = re.compile(r"^loc_\w+:|[(,] ?ctx[,)]|PPU_TAIL|g_trampoline_fn|DRAIN_TRAMPOLINE|\breturn\b|ctx->vscr|ctx->vr\[[^\d]")
+
+
+def _vfp_clean(body_lines: list[str]) -> list[str]:
+    out, clean = [], set()
+    for ln in body_lines:
+        s = ln.strip()
+        m = _VFP_RE.match(s)
+        if m:
+            regs = [int(x) for x in re.findall(r"\[(\d+)\]", m.group(3))]
+            keys = _VFP_KEYS.get(m.group(1), "")
+            names = "B" if len(regs) == 1 else "ABC"[:len(regs)]
+            bits = sum(_VFP_BITS[k] for k, r in zip(names, regs) if k in keys and r in clean)
+            ln = ln.replace("ctx->vscr);", f"(ctx->vscr & 0x00010000u) | 0x{bits:08X}u);" if bits else "ctx->vscr & 0x00010000u);")
+            clean.add(int(m.group(2)))
+        elif _VFP_RESET_RE.search(s):
+            clean.clear()
+        else:
+            for x in re.findall(r"ctx->vr\[(\d+)\]", s):
+                clean.discard(int(x))
+        out.append(ln)
+    return out
+
+
 def _elide_ca(body_lines: list[str]) -> list[str]:
     if not any("ctx->xer = (ctx->xer & ~(1u << 29))" in ln for ln in body_lines):
         return body_lines
@@ -3774,8 +3803,8 @@ class PPULifter:
         clean = lambda m: m.group(1) if int(m.group(2), 16) in func_by_addr and int(m.group(2), 16) not in self.wrap \
             else m.group(0)
         body = [_CALL_DRAIN_RE.sub(clean, b) if "DRAIN" in b else b for b in func.body_lines]
-        body = _elide_ca(_fuse_cr(drop_callee_saves(func, body, self._emit_starts, func_by_addr, self._emit_snap_bodies),
-                                  self._cr_entry, self._cr_keep))
+        body = _vfp_clean(_elide_ca(_fuse_cr(drop_callee_saves(func, body, self._emit_starts, func_by_addr, self._emit_snap_bodies),
+                                             self._cr_entry, self._cr_keep)))
 
         # If a function doesn't end with blr/b/bctr (a return or unconditional
         # branch), PPC execution falls through to the next address. The lifter

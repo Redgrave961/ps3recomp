@@ -14,9 +14,30 @@ extern "C" {
 #endif
 
 #define VM_SLOW_PAGE_SHIFT 12
+#define VM_PAGE_TRACKED 4u
 
 VM_PAGE_MAP_SHARED unsigned char ppu_slow_page[1u << (32 - VM_SLOW_PAGE_SHIFT)] = {0};
+VM_PAGE_MAP_SHARED unsigned char vm_page_dirty[1u << (32 - VM_SLOW_PAGE_SHIFT)] = {0};
+VM_PAGE_MAP_SHARED uint64_t vm_dirty_group[1u << (32 - VM_SLOW_PAGE_SHIFT - 12)] = {0};
 VM_PAGE_MAP_SHARED uint32_t vm_watch_ea = 0;
+
+static inline void vm_page_mark_dirty(uint32_t page)
+{
+    __atomic_store_n(&vm_page_dirty[page], 1, __ATOMIC_RELAXED);
+    __atomic_fetch_or(&vm_dirty_group[page >> 12], 1ull << ((page >> 6) & 63u), __ATOMIC_RELEASE);
+}
+
+static inline void vm_track_dirty(uint32_t page)
+{
+    if (__atomic_fetch_and(&ppu_slow_page[page], (unsigned char)~VM_PAGE_TRACKED, __ATOMIC_ACQ_REL) & VM_PAGE_TRACKED)
+        vm_page_mark_dirty(page);
+}
+
+static inline void vm_track_write(uint32_t ea, uint64_t len)
+{
+    for (uint64_t p = ea >> VM_SLOW_PAGE_SHIFT; len && p <= ((uint64_t)ea + len - 1) >> VM_SLOW_PAGE_SHIFT; p++)
+        if (__atomic_load_n(&ppu_slow_page[p], __ATOMIC_RELAXED) & VM_PAGE_TRACKED) vm_track_dirty((uint32_t)p);
+}
 
 static inline void ppu_slow_pages(uint32_t ea, uint64_t len)
 {

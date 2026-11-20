@@ -1,4 +1,5 @@
 #include "vk_renderer.h"
+#include "../../../runtime/memory/vm_track.h"
 
 #include <algorithm>
 #include <chrono>
@@ -704,6 +705,7 @@ void renderer::download_surface(surface& s)
             break;
         }
     }
+    vm_track_write(s.ea, s.pitch * h);
     s.gpu_dirty = false;
 }
 

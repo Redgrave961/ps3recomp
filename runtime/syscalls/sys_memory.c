@@ -168,6 +168,7 @@ static int64_t memory_allocate(const ppu_context* ctx, uint64_t requested, uint3
         return (int64_t)(int32_t)CELL_ENOMEM;
     }
     memset(vm_to_host(addr), 0, size);
+    vm_track_write(addr, size);
     const int slot = alloc_after(addr);
     memmove(&g_sys_mem_allocs[slot + 1], &g_sys_mem_allocs[slot], (size_t)(s_alloc_count - slot) * sizeof g_sys_mem_allocs[0]);
     s_alloc_count++;
@@ -629,6 +630,7 @@ int64_t sys_mmapper_map_shared_memory(ppu_context* ctx)
 
     s->addr = addr;
     memset(vm_to_host(addr), 0, s->size);
+    vm_track_write(addr, s->size);
 
     return CELL_OK;
 }

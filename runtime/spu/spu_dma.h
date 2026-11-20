@@ -36,6 +36,7 @@ extern void (*g_rsx_window_write)(void);
 
 static inline void spu_rsx_window_check(uint32_t ea, uint32_t size)
 {
+    vm_track_write(ea, size);
     void (*notify)(void) = g_rsx_window_write;
     if (notify && ((ea < ppu_hle_inject_base + 0x10000u && (uint64_t)ea + size > ppu_hle_inject_base) || vm_watched(ea, size))) notify();
 }
@@ -197,6 +198,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
             spu_coh_notify_write_except(line, spu);
             spu_lockline_unlock(line);
         }
+        vm_track_write((uint32_t)ea, size);
         return 0;
     }
     if (!size) return 0;

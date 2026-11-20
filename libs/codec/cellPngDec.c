@@ -415,6 +415,7 @@ s32 cellPngDecDecodeData(CellPngDecMainHandle mainHandle,
         for (u32 y = 0; y < (u32)h; y++)
             memcpy(vm_base + data_addr + (u64)y * dst_pitch,
                    pixels + (u64)y * row_bytes, row_bytes);
+        if (h) vm_track_write(data_addr, (u64)(h - 1) * dst_pitch + row_bytes);
         stbi_image_free(pixels);
 
         printf("[cellPngDec]   decoded %ux%u -> guest 0x%08X (pitch %llu, row %u)\n",

@@ -411,6 +411,7 @@ static inline int ppu_store_conditional(ppu_context* self, uint32_t a, T expecte
         vm_coh_notify(a);
     }
     __atomic_fetch_add(line, ok ? 1 : ~0ull, __ATOMIC_RELEASE);
+    if (ok) vm_track_write(a, sizeof(T));
     return ok;
 }
 
@@ -770,11 +771,12 @@ static inline void vm_write_coh(uint32_t a, const void* src, uint32_t n)
         memcpy(vm_host(a), src, n);
         spu_coh_notify_write(a);
         spu_lockline_unlock(a);
-        return;
+    } else {
+        memcpy(vm_host(a), src, n);
+        __atomic_signal_fence(__ATOMIC_SEQ_CST);
+        if (spu_coh_line_reserved(a)) vm_coh_notify(a);
     }
-    memcpy(vm_host(a), src, n);
-    __atomic_signal_fence(__ATOMIC_SEQ_CST);
-    if (spu_coh_line_reserved(a)) vm_coh_notify(a);
+    vm_track_write(a, n);
 }
 
 extern "C" const char* cellGame_get_boot_path(void);
@@ -1010,6 +1012,7 @@ extern "C" void ppu_store_recheck(uint64_t ea)
 {
     const uint32_t a = (uint32_t)ea;
     if (spu_coh_line_reserved(a)) vm_coh_notify(a);
+    vm_track_write(a, 1);
     ppu_window_note(a, 16);
 }
 void vm_write8 (uint64_t a, uint8_t  v) { store8_at((uint32_t)a, v, __builtin_return_address(0)); }

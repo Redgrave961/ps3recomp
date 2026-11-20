@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "vm_page_map.h"
 
 #ifdef __cplusplus
 extern "C" {

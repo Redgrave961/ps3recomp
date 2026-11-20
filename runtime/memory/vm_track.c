@@ -1,83 +1,26 @@
 #include "vm_track.h"
+#include "vm_page_map.h"
 
 #ifdef _WIN32
 #include <windows.h>
-#include <stdlib.h>
+#else
+#include "../platform/win32_compat.h"
+#endif
 
 extern uint8_t* vm_base;
 
-enum { PROTECTED = 1, DIRTY = 2 };
 #define PAGE_SHIFT 12
-#define CHUNK_PAGES 16u
-#define PAGES ((1u << (32 - PAGE_SHIFT)) + CHUNK_PAGES)
+#define PAGES (1u << (32 - PAGE_SHIFT))
 
 static uint8_t s_tracked[PAGES];
-static uint8_t s_page[PAGES];
 static uint16_t s_pin[PAGES];
 static uint32_t s_dirty[PAGES];
-static uint32_t s_dirty_n;
 static SRWLOCK s_lock = SRWLOCK_INIT;
 
-static uint8_t* page_ptr(uint32_t page) { return vm_base + ((size_t)page << PAGE_SHIFT); }
-
-static uint32_t region_end(const MEMORY_BASIC_INFORMATION* mi, uint32_t limit)
+static int arm(uint32_t page)
 {
-    const uint64_t end = (uint64_t)((uint8_t*)mi->BaseAddress + mi->RegionSize - vm_base) >> PAGE_SHIFT;
-    return end < limit ? (uint32_t)end : limit;
-}
-
-static void mark_dirty(uint32_t page)
-{
-    if (s_page[page] & DIRTY) return;
-    s_page[page] |= DIRTY;
-    s_dirty[s_dirty_n++] = page;
-}
-
-static int protectable(uint32_t page)
-{
-    return s_tracked[page] && !(s_page[page] & PROTECTED) && !s_pin[page];
-}
-
-static void protect(uint32_t first, uint32_t end)
-{
-    for (uint32_t p = first; p < end;) {
-        if (!protectable(p)) {
-            p++;
-            continue;
-        }
-        MEMORY_BASIC_INFORMATION mi;
-        if (!VirtualQuery(page_ptr(p), &mi, sizeof mi)) return;
-        const uint32_t stop = region_end(&mi, end);
-        uint32_t q = p + 1u;
-        while (q < stop && protectable(q)) q++;
-        DWORD old;
-        if (mi.State == MEM_COMMIT && mi.Protect == PAGE_READWRITE && VirtualProtect(page_ptr(p), (size_t)(q - p) << PAGE_SHIFT, PAGE_READONLY, &old))
-            for (uint32_t k = p; k < q; k++) s_page[k] |= PROTECTED;
-        p = q;
-    }
-}
-
-static void unprotect(uint32_t page)
-{
-    DWORD old;
-    if (VirtualProtect(page_ptr(page), (size_t)1 << PAGE_SHIFT, PAGE_READWRITE, &old)) s_page[page] &= (uint8_t)~PROTECTED;
-}
-
-static int commit(uint32_t first, uint32_t end)
-{
-    for (uint32_t p = first; p < end;) {
-        MEMORY_BASIC_INFORMATION mi;
-        if (!VirtualQuery(page_ptr(p), &mi, sizeof mi)) return 0;
-        const uint32_t stop = region_end(&mi, end);
-        if (mi.State == MEM_RESERVE) {
-            if (!VirtualAlloc(page_ptr(p), (size_t)(stop - p) << PAGE_SHIFT, MEM_COMMIT, PAGE_READWRITE)) return 0;
-            for (uint32_t k = p; k < stop; k++)
-                if (s_tracked[k]) mark_dirty(k);
-        } else if (mi.State != MEM_COMMIT) {
-            return 0;
-        }
-        p = stop;
-    }
+    if (!s_tracked[page] || s_pin[page]) return 0;
+    __atomic_fetch_or(&ppu_slow_page[page], VM_PAGE_TRACKED, __ATOMIC_SEQ_CST);
     return 1;
 }
 
@@ -91,7 +34,36 @@ static int host_pages(const void* host, size_t size, uint32_t* first, uint32_t* 
     return 1;
 }
 
-static LONG CALLBACK track_fault(EXCEPTION_POINTERS* e)
+#ifdef _WIN32
+#define CHUNK_PAGES 16u
+
+static uint8_t* page_ptr(uint32_t page) { return vm_base + ((size_t)page << PAGE_SHIFT); }
+
+static uint32_t region_end(const MEMORY_BASIC_INFORMATION* mi, uint32_t limit)
+{
+    const uint64_t end = (uint64_t)((uint8_t*)mi->BaseAddress + mi->RegionSize - vm_base) >> PAGE_SHIFT;
+    return end < limit ? (uint32_t)end : limit;
+}
+
+static int commit(uint32_t first, uint32_t end)
+{
+    for (uint32_t p = first; p < end;) {
+        MEMORY_BASIC_INFORMATION mi;
+        if (!VirtualQuery(page_ptr(p), &mi, sizeof mi)) return 0;
+        const uint32_t stop = region_end(&mi, end);
+        if (mi.State == MEM_RESERVE) {
+            if (!VirtualAlloc(page_ptr(p), (size_t)(stop - p) << PAGE_SHIFT, MEM_COMMIT, PAGE_READWRITE)) return 0;
+            for (uint32_t k = p; k < stop; k++)
+                if (s_tracked[k]) vm_page_mark_dirty(k);
+        } else if (mi.State != MEM_COMMIT) {
+            return 0;
+        }
+        p = stop;
+    }
+    return 1;
+}
+
+static LONG CALLBACK commit_fault(EXCEPTION_POINTERS* e)
 {
     const EXCEPTION_RECORD* r = e->ExceptionRecord;
     uint32_t page, end;
@@ -104,10 +76,6 @@ static LONG CALLBACK track_fault(EXCEPTION_POINTERS* e)
         if (mi.State == MEM_RESERVE) {
             const uint32_t chunk = page & ~(CHUNK_PAGES - 1u);
             if (commit(chunk, chunk + CHUNK_PAGES)) out = EXCEPTION_CONTINUE_EXECUTION;
-        } else if (s_page[page] & PROTECTED) {
-            unprotect(page);
-            mark_dirty(page);
-            out = EXCEPTION_CONTINUE_EXECUTION;
         } else if (mi.State == MEM_COMMIT && mi.Protect == PAGE_READWRITE) {
             out = EXCEPTION_CONTINUE_EXECUTION;
         }
@@ -118,8 +86,23 @@ static LONG CALLBACK track_fault(EXCEPTION_POINTERS* e)
 
 void vm_track_install(void)
 {
-    AddVectoredExceptionHandler(1, track_fault);
+    AddVectoredExceptionHandler(1, commit_fault);
 }
+
+int vm_commit_host(const void* host, size_t size)
+{
+    uint32_t first, end;
+    if (!host_pages(host, size, &first, &end)) return 1;
+    AcquireSRWLockExclusive(&s_lock);
+    const int ok = commit(first, end);
+    ReleaseSRWLockExclusive(&s_lock);
+    return ok;
+}
+#else
+static int commit(uint32_t first, uint32_t end) { (void)first; (void)end; return 1; }
+void vm_track_install(void) {}
+int vm_commit_host(const void* host, size_t size) { (void)host; (void)size; return 1; }
+#endif
 
 void vm_track(uint32_t ea, uint32_t size, vm_page_fn changed, void* user)
 {
@@ -133,48 +116,35 @@ void vm_track(uint32_t ea, uint32_t size, vm_page_fn changed, void* user)
         __atomic_store_n(&s_tracked[p], 1, __ATOMIC_RELEASE);
         changed(user, p);
     }
-    protect(first, end);
+    int armed = 0;
+    for (p = first; p < end; p++) armed |= arm(p);
+    if (armed) FlushProcessWriteBuffers();
     ReleaseSRWLockExclusive(&s_lock);
-}
-
-
-static int by_page(const void* a, const void* b)
-{
-    const uint32_t x = *(const uint32_t*)a, y = *(const uint32_t*)b;
-    return x < y ? -1 : x > y;
 }
 
 uint32_t vm_track_drain(vm_page_fn changed, void* user)
 {
     AcquireSRWLockExclusive(&s_lock);
-    const uint32_t n = s_dirty_n;
-    s_dirty_n = 0;
-    qsort(s_dirty, n, sizeof s_dirty[0], by_page);
-    for (uint32_t i = 0; i < n;) {
-        uint32_t j = i + 1u;
-        while (j < n && s_dirty[j] == s_dirty[j - 1u] + 1u) j++;
-        const uint32_t lo = s_dirty[i], hi = s_dirty[j - 1u] + 1u;
-        protect(lo, hi);
-        for (uint32_t k = i; k < j; k++) {
-            const uint32_t pg = s_dirty[k];
-            s_page[pg] &= (uint8_t)~DIRTY;
-            changed(user, pg);
-            if (s_pin[pg]) mark_dirty(pg);
+    uint32_t n = 0;
+    int armed = 0;
+    for (uint32_t w = 0; w < sizeof vm_dirty_group / sizeof vm_dirty_group[0]; w++) {
+        if (!__atomic_load_n(&vm_dirty_group[w], __ATOMIC_RELAXED)) continue;
+        for (uint64_t bits = __atomic_exchange_n(&vm_dirty_group[w], 0, __ATOMIC_ACQ_REL); bits; bits &= bits - 1u) {
+            const uint32_t first = (w << 12) | ((uint32_t)__builtin_ctzll(bits) << 6);
+            for (uint32_t p = first; p < first + 64u; p++) {
+                if (!__atomic_load_n(&vm_page_dirty[p], __ATOMIC_RELAXED) || !__atomic_exchange_n(&vm_page_dirty[p], 0, __ATOMIC_ACQ_REL)) continue;
+                s_dirty[n++] = p;
+                armed |= arm(p);
+            }
         }
-        i = j;
+    }
+    if (armed) FlushProcessWriteBuffers();
+    for (uint32_t i = 0; i < n; i++) {
+        changed(user, s_dirty[i]);
+        if (s_pin[s_dirty[i]]) vm_page_mark_dirty(s_dirty[i]);
     }
     ReleaseSRWLockExclusive(&s_lock);
     return n;
-}
-
-int vm_commit_host(const void* host, size_t size)
-{
-    uint32_t first, end;
-    if (!host_pages(host, size, &first, &end)) return 1;
-    AcquireSRWLockExclusive(&s_lock);
-    const int ok = commit(first, end);
-    ReleaseSRWLockExclusive(&s_lock);
-    return ok;
 }
 
 void vm_io_begin(const void* host, size_t size)
@@ -186,8 +156,8 @@ void vm_io_begin(const void* host, size_t size)
     for (uint32_t p = first; p < end; p++) {
         s_pin[p]++;
         if (!s_tracked[p]) continue;
-        if (s_page[p] & PROTECTED) unprotect(p);
-        mark_dirty(p);
+        __atomic_fetch_and(&ppu_slow_page[p], (unsigned char)~VM_PAGE_TRACKED, __ATOMIC_ACQ_REL);
+        vm_page_mark_dirty(p);
     }
     ReleaseSRWLockExclusive(&s_lock);
 }
@@ -199,15 +169,7 @@ void vm_io_end(const void* host, size_t size)
     AcquireSRWLockExclusive(&s_lock);
     for (uint32_t p = first; p < end; p++) {
         s_pin[p]--;
-        if (s_tracked[p]) mark_dirty(p);
+        if (s_tracked[p]) vm_page_mark_dirty(p);
     }
     ReleaseSRWLockExclusive(&s_lock);
 }
-#else
-void vm_track_install(void) {}
-void vm_track(uint32_t ea, uint32_t size, vm_page_fn changed, void* user) { (void)ea; (void)size; (void)changed; (void)user; }
-uint32_t vm_track_drain(vm_page_fn changed, void* user) { (void)changed; (void)user; return 0; }
-int vm_commit_host(const void* host, size_t size) { (void)host; (void)size; return 1; }
-void vm_io_begin(const void* host, size_t size) { (void)host; (void)size; }
-void vm_io_end(const void* host, size_t size) { (void)host; (void)size; }
-#endif

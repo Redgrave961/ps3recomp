@@ -12,6 +12,7 @@
 #include "../../include/ps3emu/endian.h"
 #include "ppu_context.h"
 #include "../spu/spu_coh_bitmap.h"
+#include "../memory/vm_page_map.h"
 
 #include <stdint.h>
 #include <string.h>
@@ -121,6 +122,7 @@ void        spu_coh_notify_write(uint32_t addr);
         } else {                                                              \
             memcpy(vm_ptr8((uint32_t)(addr)), (src), (n));                    \
         }                                                                     \
+        vm_track_write((uint32_t)(addr), (n));                                \
     } while (0)
 
 /* ---------------------------------------------------------------------------

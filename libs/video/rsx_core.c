@@ -820,6 +820,7 @@ void rsx_mem_store(u32 ea, const void* src, u32 size)
             if (spu_coh_is_reserved(a)) spu_coh_notify_write(a);
         spu_lockline_unlock_range(ea, size);
     }
+    vm_track_write(ea, size);
 }
 
 int rsx_core_defer(const rsx_write* w)

@@ -210,14 +210,14 @@ s32 _sys_strncmp(const char* s1, const char* s2, u32 size)
 void* _sys_memset(void* dst, s32 val, u32 size)
 {
     void* d = yz_g2h(dst);
-    if (d) memset(d, val, size);
+    if (d) { memset(d, val, size); vm_track_write((uint32_t)(uintptr_t)dst, size); }
     return dst;
 }
 
 void* _sys_memcpy(void* dst, const void* src, u32 size)
 {
     void* d = yz_g2h(dst); const void* s = yz_g2h(src);
-    if (d && s) memcpy(d, s, size);
+    if (d && s) { memcpy(d, s, size); vm_track_write((uint32_t)(uintptr_t)dst, size); }
     return dst;
 }
 
