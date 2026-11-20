@@ -38,20 +38,20 @@ u32 texture_dims(const rsx::texture_desc& d, bool valid)
     return RSX_SPV_TEX_2D;
 }
 
-bool program_matches(const u32* ucode, const u32* words, const u32* mask, u32 count)
+bool program_matches(const u32* ucode, const u32* code, u32 count)
 {
     u32 i = 0;
-    for (; i + 8u <= count; i += 8u) {
+    for (; i + 8u <= count; i += 8u, code += 16) {
         const __m256i u = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ucode + i));
-        const __m256i m = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(mask + i));
-        const __m256i x = _mm256_xor_si256(_mm256_and_si256(u, m), _mm256_loadu_si256(reinterpret_cast<const __m256i*>(words + i)));
+        const __m256i m = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(code + 8));
+        const __m256i x = _mm256_xor_si256(_mm256_and_si256(u, m), _mm256_loadu_si256(reinterpret_cast<const __m256i*>(code)));
         if (!_mm256_testz_si256(x, x)) return false;
     }
     if (i == count) return true;
     const __m256i lanes = _mm256_cmpgt_epi32(_mm256_set1_epi32((int)(count - i)), _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7));
     const __m256i u = _mm256_maskload_epi32(reinterpret_cast<const int*>(ucode + i), lanes);
-    const __m256i m = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(mask + i));
-    const __m256i x = _mm256_xor_si256(_mm256_and_si256(u, m), _mm256_loadu_si256(reinterpret_cast<const __m256i*>(words + i)));
+    const __m256i m = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(code + 8));
+    const __m256i x = _mm256_xor_si256(_mm256_and_si256(u, m), _mm256_loadu_si256(reinterpret_cast<const __m256i*>(code)));
     return _mm256_testz_si256(x, x);
 }
 
@@ -382,14 +382,11 @@ bool renderer::cache_place(cached& e, u32 ea, u32 size, u32 bytes, u32& offset, 
 void renderer::evict(u64 age)
 {
     const auto drop = [&](auto& cache) {
-        for (auto it = cache.begin(); it != cache.end();) {
-            if (m_flips - it->second.used < age) {
-                ++it;
-                continue;
-            }
-            if (it->second.alloc) m_held_garbage.emplace_back(it->second.submission, it->second.alloc);
-            it = cache.erase(it);
-        }
+        cache.erase_if([&](const auto&, const cached& e) {
+            if (m_flips - e.used < age) return false;
+            if (e.alloc) m_held_garbage.emplace_back(e.submission, e.alloc);
+            return true;
+        });
     };
     drop(m_vertex_cache);
     drop(m_index_cache);
@@ -464,7 +461,7 @@ bool renderer::draw_setup()
     const u32 count = (u32)seen.slots.size();
     for (u32 k = 1; k <= count; k++) {
         const fp_candidate& c = seen.slots[(seen.next + count - k) % count];
-        if (c.fp && program_matches(ucode, c.words.data(), c.mask.data(), c.count)) {
+        if (c.fp && program_matches(ucode, c.code.data(), c.count)) {
             m_fp = c.fp;
             return true;
         }
@@ -475,15 +472,15 @@ bool renderer::draw_setup()
     seen.next = (seen.next + 1u) % count;
     c.fp = m_fp;
     c.count = m_fp->info.ucode_words;
-    const size_t padded = (c.count + 7u) & ~size_t(7);
-    c.words.assign(padded, 0u);
-    c.mask.assign(padded, 0u);
-    std::copy(ucode, ucode + c.count, c.words.begin());
-    std::fill(c.mask.begin(), c.mask.begin() + c.count, ~0u);
+    c.code.assign(((c.count + 7u) & ~size_t(7)) * 2u, 0u);
+    for (u32 i = 0; i < c.count; i++) {
+        c.code[(i & ~7u) * 2u + (i & 7u)] = ucode[i];
+        c.code[(i & ~7u) * 2u + 8u + (i & 7u)] = ~0u;
+    }
     for (u32 i = 0; i < m_fp->info.constant_count; i++)
-        for (u32 w = 0; w < 4u && m_fp->info.constant_word[i] + w < c.count; w++) {
-            c.words[m_fp->info.constant_word[i] + w] = 0u;
-            c.mask[m_fp->info.constant_word[i] + w] = 0u;
+        for (u32 w = m_fp->info.constant_word[i]; w < m_fp->info.constant_word[i] + 4u && w < c.count; w++) {
+            c.code[(w & ~7u) * 2u + (w & 7u)] = 0u;
+            c.code[(w & ~7u) * 2u + 8u + (w & 7u)] = 0u;
         }
     return true;
 }

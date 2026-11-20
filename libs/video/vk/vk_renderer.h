@@ -9,6 +9,7 @@
 #include "vk_occlusion.h"
 #include "vk_depth_pack.h"
 #include "vk_downscale.h"
+#include "vk_flat_map.h"
 #include "vk_scale.h"
 #include "rsx_texture.h"
 #include "../rsx_core.h"
@@ -16,7 +17,6 @@
 #include <array>
 #include <chrono>
 #include <cstring>
-#include <string_view>
 #include <cstdio>
 #include <atomic>
 #include <memory>
@@ -212,20 +212,16 @@ private:
         rsx_spv_fp_key key;
         bool operator==(const fp_seen_key& o) const { return !std::memcmp(this, &o, sizeof o); }
     };
-    struct fp_seen_hash {
-        size_t operator()(const fp_seen_key& k) const { return std::hash<std::string_view>()(std::string_view(reinterpret_cast<const char*>(&k), sizeof k)); }
-    };
     struct fp_candidate {
         const fragment_program* fp = nullptr;
         u32 count = 0;
-        std::vector<u32> words;
-        std::vector<u32> mask;
+        std::vector<u32> code;
     };
     struct fp_lookup {
         std::array<fp_candidate, 4> slots;
         u32 next = 0;
     };
-    std::unordered_map<fp_seen_key, fp_lookup, fp_seen_hash> m_fp_seen;
+    flat_map<fp_seen_key, fp_lookup> m_fp_seen;
     fp_seen_key m_fp_last_key{};
     fp_lookup* m_fp_last = nullptr;
     u32 m_fp_ea = 0;
@@ -241,10 +237,6 @@ private:
     std::vector<draw_sub> m_subs;
     struct index_key {
         u32 source, first, count, prim, restart_index, flags;
-        bool operator==(const index_key& o) const { return !std::memcmp(this, &o, sizeof o); }
-    };
-    struct index_key_hash {
-        size_t operator()(const index_key& k) const { return std::hash<std::string_view>()(std::string_view(reinterpret_cast<const char*>(&k), sizeof k)); }
     };
     struct cached {
         VmaVirtualAllocation alloc = VK_NULL_HANDLE;
@@ -260,8 +252,8 @@ private:
     bool cache_place(cached& e, u32 ea, u32 size, u32 bytes, u32& offset, uint8_t*& out);
     void evict(u64 age);
     void release_held();
-    std::unordered_map<uint64_t, cached> m_vertex_cache;
-    std::unordered_map<index_key, cached, index_key_hash> m_index_cache;
+    flat_map<uint64_t, cached> m_vertex_cache;
+    flat_map<index_key, cached> m_index_cache;
     std::vector<std::pair<uint64_t, VmaVirtualAllocation>> m_held_garbage;
     uint64_t m_reached = 0;
     u64 m_progress = 0;

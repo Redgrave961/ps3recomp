@@ -239,6 +239,11 @@ if(PS3RECOMP_BUILD_TESTS)
     add_test(NAME vmx_fmaf COMMAND test_vmx_fmaf)
     set_tests_properties(vmx_fmaf PROPERTIES TIMEOUT 120)
 
+    add_executable(test_flat_map libs/video/vk/tests/test_flat_map.cpp)
+    target_compile_options(test_flat_map PRIVATE -UNDEBUG)
+    add_test(NAME flat_map COMMAND test_flat_map)
+    set_tests_properties(flat_map PROPERTIES TIMEOUT 60)
+
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
         add_test(NAME spu_sdcrz
