@@ -72,6 +72,14 @@ SPU__XI __m128i spu__xflip(__m128i x) { return _mm_xor_si128(x, _mm_set1_epi32((
 #define SPU_X86 0
 #endif
 
+static inline uint32_t spu_pref_word(u128 a) {
+#if SPU_X86
+    return (uint32_t)_mm_cvtsi128_si32(spu__xl(a));
+#else
+    return a._u32[0];
+#endif
+}
+
 
 static inline u128 spu_absdb(u128 a, u128 b);
 static inline u128 spu_avgb(u128 a, u128 b);

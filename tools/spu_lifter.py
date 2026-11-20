@@ -634,7 +634,7 @@ class SPULifter:
             return f"{g(rt())} = spu_bgx({g(ra())}, {g(rb())}, {g(rt())});"
 
         if mn in ("hgti", "hlgti", "heqi", "hgt", "hlgt", "heq"):
-            pw = lambda i: f"{g(i)}._u32[0]"
+            pw = lambda i: f"spu_pref_word({g(i)})"
             if mn == "heqi":
                 cond = f"(int32_t){pw(ra())} == (int32_t)({_imm(ops[2])})"
             elif mn == "hgti":
@@ -771,11 +771,11 @@ class SPULifter:
         if mn == "lqd":
             disp, base = _disp_base(ops[1])
             if disp is not None:
-                return f"{g(rt())} = spu_ls_ld128(_ls, {g(base)}._u32[0] + {disp});"
+                return f"{g(rt())} = spu_ls_ld128(_ls, spu_pref_word({g(base)}) + {disp});"
         if mn == "stqd":
             disp, base = _disp_base(ops[1])
             if disp is not None:
-                return f"spu_ls_st128(_ls, {g(base)}._u32[0] + {disp}, {g(rt())});"
+                return f"spu_ls_st128(_ls, spu_pref_word({g(base)}) + {disp}, {g(rt())});"
         if mn in ("lqa", "lqr"):
             a = self._pc(int(_imm(ops[1]), 0)) if mn == "lqr" and self.reloc else _imm(ops[1])
             return f"{g(rt())} = spu_ls_ld128(_ls, {a});"
@@ -783,9 +783,9 @@ class SPULifter:
             a = self._pc(int(_imm(ops[1]), 0)) if mn == "stqr" and self.reloc else _imm(ops[1])
             return f"spu_ls_st128(_ls, {a}, {g(rt())});"
         if mn == "lqx":
-            return f"{g(rt())} = spu_ls_ld128(_ls, {g(ra())}._u32[0] + {g(rb())}._u32[0]);"
+            return f"{g(rt())} = spu_ls_ld128(_ls, spu_pref_word({g(ra())}) + spu_pref_word({g(rb())}));"
         if mn == "stqx":
-            return f"spu_ls_st128(_ls, {g(ra())}._u32[0] + {g(rb())}._u32[0], {g(rt())});"
+            return f"spu_ls_st128(_ls, spu_pref_word({g(ra())}) + spu_pref_word({g(rb())}), {g(rt())});"
 
         if mn == "rdch":
             return f"@SPILL@ {g(rt())} = spu_rdch(ctx, {_chan(ops[1])});"
@@ -795,7 +795,7 @@ class SPULifter:
             ch = _chan(ops[0])
             latch = _MFC_LATCH.get(ch)
             if latch:
-                return f"ctx->{latch[0]} = {g(_reg(ops[1]))}._u32[0]{latch[1]};"
+                return f"ctx->{latch[0]} = spu_pref_word({g(_reg(ops[1]))}){latch[1]};"
             return f"@SPILL@ spu_wrch(ctx, {ch}, {g(_reg(ops[1]))});"
 
         if mn in ("br", "bra"):
@@ -835,11 +835,11 @@ class SPULifter:
             tgt_reg = _reg(ops[0])
             if (tgt_reg == "0" and addr not in self.bi_r0_jump) \
                     or addr in self.link_return:
-                jr = self._jump(f"{g(tgt_reg)}._u32[0]", True)
+                jr = self._jump(f"spu_pref_word({g(tgt_reg)})", True)
                 if tgt_reg != "0":
                     return f"{_ied}{jr}@SPILL@ SPU_RET_REG(ctx, {tgt_reg});"
                 return f"{_ied}{jr}@SPILL@ SPU_RET(ctx);"
-            return (f"{_ied}ctx->pc = {g(tgt_reg)}._u32[0]; {self._jump('ctx->pc')}"
+            return (f"{_ied}ctx->pc = spu_pref_word({g(tgt_reg)}); {self._jump('ctx->pc')}"
                     f"@SPILL@ g_spu_trampoline_fn = spu_indirect_branch; return;")
         if mn == "iret":
             return (f"{_ied}ctx->pc = ctx->srr0; "
@@ -848,7 +848,7 @@ class SPULifter:
             link_rt = insn.raw & 0x7F
             tgt_reg = _reg(ops[-1])
             rs, rr = ("const int32_t _rd = ctx->reloc_delta; ", " ctx->reloc_delta = _rd;") if self.reloc else ("", "")
-            return (f"{{ uint32_t _tg = {g(tgt_reg)}._u32[0]; {g(link_rt)} = spu_link({self._pc((addr + 4) & 0x3FFFC)}); "
+            return (f"{{ uint32_t _tg = spu_pref_word({g(tgt_reg)}); {g(link_rt)} = spu_link({self._pc((addr + 4) & 0x3FFFC)}); "
                     f"int32_t _si = (int32_t)ctx->image_id; {rs}"
                     f"{_ied}ctx->pc = _tg; @SPILL@ ctx->host_depth++; "
                     f"SPU_ICALL(ctx); spu_call_return(ctx, {self._pc(addr + 4)}); "
@@ -856,7 +856,7 @@ class SPULifter:
         if mn in ("bisled",):
             link_rt = insn.raw & 0x7F
             tgt_reg = (insn.raw >> 7) & 0x7F
-            return (f"{{ uint32_t _tg = {g(tgt_reg)}._u32[0]; {g(link_rt)} = spu_link({self._pc((addr + 4) & 0x3FFFC)}); "
+            return (f"{{ uint32_t _tg = spu_pref_word({g(tgt_reg)}); {g(link_rt)} = spu_link({self._pc((addr + 4) & 0x3FFFC)}); "
                     f"if ((ctx->event_status & ctx->event_mask) != 0) {{ "
                     f"{_ied}ctx->pc = _tg; "
                     f"@SPILL@ g_spu_trampoline_fn = spu_indirect_branch; return; }} }}")
@@ -865,11 +865,11 @@ class SPULifter:
             tgt_reg = _reg(ops[1])
             if (tgt_reg == "0" and addr not in self.bi_r0_jump) \
                     or addr in self.link_return:
-                jr = self._jump(f"{g(tgt_reg)}._u32[0]", True)
+                jr = self._jump(f"spu_pref_word({g(tgt_reg)})", True)
                 if tgt_reg != "0":
                     return f"if ({cond}) {{ {_ied}{jr}@SPILL@ SPU_RET_REG(ctx, {tgt_reg}); }}"
                 return f"if ({cond}) {{ {_ied}{jr}@SPILL@ SPU_RET(ctx); }}"
-            return (f"if ({cond}) {{ {_ied}ctx->pc = {g(tgt_reg)}._u32[0]; {self._jump('ctx->pc')}"
+            return (f"if ({cond}) {{ {_ied}ctx->pc = spu_pref_word({g(tgt_reg)}); {self._jump('ctx->pc')}"
                     f"@SPILL@ g_spu_trampoline_fn = spu_indirect_branch; return; }}")
 
         if mn in ("hbr", "hbra", "hbrr"):
@@ -882,8 +882,8 @@ class SPULifter:
                 f'@SPILL@ spu_unsupported(0x{insn.addr:X}, "{mn}"); @RELOAD@')
 
     def _cond(self, mn: str, reg: str) -> str:
-        word = f"{self._g(reg)}._u32[0]"
-        half = f"{self._g(reg)}._u16[0]"
+        word = f"spu_pref_word({self._g(reg)})"
+        half = f"(uint16_t){word}"
         table = {
             "brz": f"{word} == 0",      "brnz": f"{word} != 0",
             "brhz": f"{half} == 0",     "brhnz": f"{half} != 0",
