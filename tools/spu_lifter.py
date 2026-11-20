@@ -154,6 +154,9 @@ def _bi_target_reg(insn):
 
 
 _RRR_DEST_OPS = {"selb", "shufb", "mpya", "fnms", "fma", "fms"}
+_CLEAN_FLOAT = {"fa", "fs", "fm", "fma", "fms", "fnms"}
+_CLEAN_MOVE = {"ori", "ai", "shlqbyi", "rotqbyi"}
+_CLOBBER_ALL = {"brsl", "brasl", "bisl", "bisled", "stop", "stopd", "iret"}
 
 def _dest_reg(insn) -> int:
     if insn.mnemonic in _RRR_DEST_OPS:
@@ -332,6 +335,7 @@ class SPULifter:
         self._prom = False
         self._regs: set = set()
         self._jt_targets: list = []
+        self._clean: frozenset = frozenset()
 
     def _g(self, i) -> str:
         s = str(i).strip()
@@ -353,6 +357,74 @@ class SPULifter:
     @staticmethod
     def _spill(regs) -> str:
         return " ".join(f"ctx->gpr[{r}] = sr{r};" for r in sorted(regs))
+
+    def _clean_floats(self, fins, entries) -> list:
+        n = len(fins)
+        idx = {ins.addr: k for k, ins in enumerate(fins)}
+        preds = [[] for _ in range(n)]
+        succs = [[] for _ in range(n)]
+        for k, ins in enumerate(fins):
+            for t in ([k + 1] if k + 1 < n and ins.mnemonic not in ("br", "bra", "bi", "iret") else []) + \
+                    ([idx[self._branch_target(ins)]] if self._branch_target(ins) in idx else []):
+                preds[t].append(k)
+                succs[k].append(t)
+
+        def transfer(ins, s):
+            mn, o = ins.mnemonic, _ops(ins.operands)
+            if mn in _CLOBBER_ALL:
+                return frozenset()
+            if mn in _NO_RT_WRITE:
+                return s
+            d = _dest_reg(ins)
+            r = [int(x[2:]) if re.fullmatch(r"\$r\d+", x) else int(x, 0) if re.fullmatch(r"-?(0x[0-9A-Fa-f]+|\d+)", x) else None for x in o]
+            const = {f[1]: f[2] for f in s if f[0] == "k"}
+            new = set()
+            if mn in ("il", "ila", "ilh", "ilhu", "iohl"):
+                v = {"il": r[1], "ila": r[1], "ilh": (r[1] & 0xFFFF) * 0x10001, "ilhu": (r[1] & 0xFFFF) << 16,
+                     "iohl": const.get(d, 0) | (r[1] & 0xFFFF)}[mn] & 0xFFFFFFFF
+                if mn != "iohl" or d in const:
+                    new.add(("k", d, v))
+                if (v >> 23) & 0xFF != 0xFF and (mn != "iohl" or d in const or ("c", d) in s):
+                    new.add(("c", d))
+            elif mn in _CLEAN_FLOAT:
+                new.add(("c", d))
+            elif mn in ("fcgt", "fceq", "fcmgt", "fcmeq", "ceq", "cgt", "clgt", "ceqi", "cgti", "clgti"):
+                new.add(("m", d))
+            elif mn in _CLEAN_MOVE and (r[2] == 0 or (mn != "ori" and mn != "ai" and r[2] % 4 == 0)):
+                new |= {(f[0], d) + f[2:] for f in s if f[1] == r[1] and (r[2] == 0 or mn == "rotqbyi" or f[0] != "k")}
+            elif mn == "and":
+                new |= {("c", d)} if ("c", r[1]) in s or ("c", r[2]) in s else set()
+                new |= {("m", d)} if ("m", r[1]) in s and ("m", r[2]) in s else set()
+            elif mn == "andc" and ("c", r[1]) in s:
+                new.add(("c", d))
+            elif mn == "xor" and any(("c", a) in s and not (const.get(b, -1) & 0x7F800000) for a, b in ((r[1], r[2]), (r[2], r[1]))):
+                new.add(("c", d))
+            elif mn == "selb" and ("c", r[1]) in s and ("c", r[2]) in s and ("m", r[3]) in s:
+                new.add(("c", d))
+            return frozenset(f for f in s if f[1] != d) | new
+
+        out = [None] * n
+        clean = [frozenset()] * n
+        work = list(range(n - 1, -1, -1))
+        queued = set(work)
+        while work:
+            k = work.pop()
+            queued.discard(k)
+            s = frozenset()
+            if k and fins[k].addr not in entries and preds[k]:
+                known = [out[p] for p in preds[k] if out[p] is not None]
+                if not known:
+                    continue
+                s = frozenset.intersection(*known)
+            clean[k] = frozenset(f[1] for f in s if f[0] == "c")
+            o = transfer(fins[k], s)
+            if o != out[k]:
+                out[k] = o
+                for j in succs[k]:
+                    if j not in queued:
+                        queued.add(j)
+                        work.append(j)
+        return clean
 
     def _copy_loops(self, fins, labels) -> dict:
         idx = {ins.addr: k for k, ins in enumerate(fins)}
@@ -461,7 +533,9 @@ class SPULifter:
         texts = []
         last_insn = None
         copies = {} if self.trace else self._copy_loops(fins, internal | merged_starts)
+        clean = self._clean_floats(fins, merged_starts)
         for k, insn in enumerate(fins):
+            self._clean = clean[k]
             if insn.addr in internal or insn.addr in merged_starts:
                 func.body_lines.append(f"loc_{insn.addr:08X}:")
             if insn.addr in merged_starts:
@@ -775,8 +849,11 @@ class SPULifter:
             "cbx": "spu_cbx", "chx": "spu_chx",
             "cwx": "spu_cwx", "cdx": "spu_cdx",
         }
-        if mn in ("fa", "fs", "fm"):
-            return f"{g(rt())} = spu_{mn}({g(ra())}, {g(rb())});"
+        if mn in _CLEAN_FLOAT:
+            srcs = [ra(), rb()] + ([_reg(ops[3])] if len(ops) > 3 else [])
+            k = sum(1 << i for i, r in enumerate(srcs) if int(r) in self._clean)
+            args = ", ".join(g(r) for r in srcs)
+            return f"{g(rt())} = spu_{mn}_k({args}, {k});" if k else f"{g(rt())} = spu_{mn}({args});"
         if mn in rr_bin:
             return f"{g(rt())} = {rr_bin[mn]}({g(ra())}, {g(rb())});"
 
@@ -840,9 +917,6 @@ class SPULifter:
         if mn == "shufb":
             rc = _reg(ops[3])
             return f"{g(rt())} = spu_shufb({g(ra())}, {g(rb())}, {g(rc)});"
-        if mn in ("fma", "fms", "fnms"):
-            rc = _reg(ops[3])
-            return f"{g(rt())} = spu_{mn}({g(ra())}, {g(rb())}, {g(rc)});"
         if mn == "mpya":
             rc = _reg(ops[3])
             return f"{g(rt())} = spu_mpya({g(ra())}, {g(rb())}, {g(rc)});"
