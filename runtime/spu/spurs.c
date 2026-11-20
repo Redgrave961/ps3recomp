@@ -487,18 +487,42 @@ static void ss_exit_if_no_work(spu_context* c)
     spu_exit_stop(c, 0x101, 0);
 }
 
-static int ss_idle_found(spu_context* c)
+static int ss_idle_found_in(const uint8_t* l, const uint8_t* ls)
 {
-    const uint8_t* ls = c->ls;
-    const uint32_t sig = g16(ls + 0x170), flag = g32(ls + 0x16C), recv = ls[0x177], run = g16(ls + 0x1EC);
+    const uint32_t sig = g16(l + 0x70), flag = g32(l + 0x6C), recv = l[0x77], run = g16(ls + 0x1EC);
     const uint32_t fm = flag == 0 && recv < 16 ? 0x8000u >> recv : 0u;
     for (uint32_t i = 0; i < 16; i++) {
-        const uint32_t ct = ls[0x120 + i], rc = ls[0x100 + i], idle = ls[0x110 + i];
+        const uint32_t ct = l[0x20 + i], rc = l[i], idle = l[0x10 + i];
         const uint32_t rdy = (rc > 8 ? 8 : rc) + (idle > 8 ? 8 : idle);
         const int ready = ((sig | fm) >> (15 - i)) & 1 || (rc != 0 && rdy > ct);
-        if (((run >> (15 - i)) & 1) && ls[0x1A0 + i] && ls[0x150 + i] > ct && ready) return 1;
+        if (((run >> (15 - i)) & 1) && ls[0x1A0 + i] && l[0x50 + i] > ct && ready) return 1;
     }
     return 0;
+}
+
+static int ss_idle_found(spu_context* c) { return ss_idle_found_in(c->ls + 0x100, c->ls); }
+
+static int ss_idle_wake(const spu_context* c, const uint8_t* l)
+{
+    const uint32_t s = g32(c->ls + 0x1C8), b = s < 8 ? 1u << s : 0u;
+    if ((l[0x74] & 0x40) || !(l[0x73] & b) || (l[0x72] & b)) return 2;
+    if ((uint32_t)__builtin_popcount(l[0x73]) == l[0x76] && (l[0x74] & 0x80)) return 2;
+    return ss_idle_found_in(l, c->ls);
+}
+
+static uint32_t ss_idle_slots(const uint8_t* l)
+{
+    const uint32_t sig = g16(l + 0x70), flag = g32(l + 0x6C), recv = l[0x77];
+    const uint32_t fm = flag == 0 && recv < 16 ? 0x8000u >> recv : 0u;
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < 16; i++) {
+        const uint32_t ct = l[0x20 + i], rc = l[i], idle = l[0x10 + i], mc = l[0x50 + i];
+        const uint32_t rdy = (rc > 8 ? 8 : rc) + (idle > 8 ? 8 : idle);
+        if (mc <= ct) continue;
+        if (rc != 0 && rdy > ct) n += (rdy < mc ? rdy : mc) - ct;
+        else if (((sig | fm) >> (15 - i)) & 1) n++;
+    }
+    return n ? n : 1u;
 }
 
 static void ss_idle_reserve(spu_context* c, uint32_t ea)
@@ -2229,6 +2253,8 @@ void spurs_register(uint32_t service_pm, uint32_t taskset_pm, uint32_t jobchain_
     s_pm_taskset = taskset_pm;
     s_pm_jobchain = jobchain_pm;
     s_pm_jobchain_plain = jobchain_plain_pm;
+    g_spu_idle_wake = ss_idle_wake;
+    g_spu_idle_slots = ss_idle_slots;
     spu_begin_image(SPURS_IMAGE);
     spu_register_function(0x818, spurs_kernel);
     spu_register_function(0xA70, ts_syscall);

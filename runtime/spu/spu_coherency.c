@@ -256,8 +256,12 @@ int spu_coh_reserve_fast(spu_context* ctx, uint32_t ea, uint32_t* seq)
     return !(*seq & 1u);
 }
 
+int (*g_spu_idle_wake)(const spu_context* ctx, const uint8_t* line);
+uint32_t (*g_spu_idle_slots)(const uint8_t* line);
+
 void spu_coh_notify_write_except(uint32_t ea, const void* self)
 {
+    uint32_t slots = ~0u;
     const uint32_t line = ea & ~127u;
     spu_coh_writer_fence();
     ppu_resv_break_line(ea);
@@ -269,7 +273,16 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
         if (!c || (const void*)c == self) continue;
         uint32_t r = __atomic_load_n(&c->resv, __ATOMIC_RELAXED);
         if ((r & ~SPU_RESV_BY_CONTENT) != (line | 1u)) continue;
-        if ((r & SPU_RESV_BY_CONTENT) && !memcmp(vm_base + line, c->resv_line, MFC_ATOMIC_LINE)) continue;
+        if (r & SPU_RESV_BY_CONTENT) {
+            if (!memcmp(vm_base + line, c->resv_line, MFC_ATOMIC_LINE)) continue;
+            const int need = g_spu_idle_wake ? g_spu_idle_wake(c, vm_base + line) : 2;
+            if (!need) continue;
+            if (need == 1) {
+                if (slots == ~0u) slots = g_spu_idle_slots(vm_base + line);
+                if (!slots) continue;
+                slots--;
+            }
+        }
         if (__atomic_compare_exchange_n(&c->resv, &r, line, 0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED)) {
             SPU_EVENT_SET(c, SPU_EVENT_LR);
             g_spu_lr_raise++;
