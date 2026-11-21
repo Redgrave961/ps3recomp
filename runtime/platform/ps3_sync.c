@@ -191,9 +191,19 @@ void ps3_sleep_us(uint64_t us)
 {
     if (!us) return;
 #if defined(_WIN32)
-    HANDLE timer = armed_timer(us);
+    static __declspec(thread) uint64_t t_credit_ns;
+    const uint64_t want = us * 1000ull;
+    if (t_credit_ns >= want) {
+        t_credit_ns -= want;
+        return;
+    }
+    const uint64_t need = want - t_credit_ns;
+    const uint64_t start = ps3_sync_now_ns();
+    HANDLE timer = armed_timer((need + 999) / 1000);
     if (timer) WaitForSingleObject(timer, INFINITE);
-    else Sleep((DWORD)((us + 999) / 1000));
+    else Sleep((DWORD)((need + 999999) / 1000000));
+    const uint64_t slept = ps3_sync_now_ns() - start;
+    t_credit_ns = slept > need ? slept - need : 0;
 #elif defined(__linux__)
     const uint64_t deadline = ps3_sync_now_ns() + us * 1000ull;
     struct timespec ts;
