@@ -302,7 +302,7 @@ extern "C" void (*g_rsx_window_write)(void);
 static inline void ppu_window_note(uint32_t a, uint32_t n)
 {
     void (*notify)(void) = g_rsx_window_write;
-    if (notify && (a - ppu_hle_inject_base < 0x10000u || vm_watched(a, n))) notify();
+    if (notify && (a - ppu_hle_inject_base < 0xB000u || vm_watched(a, n))) notify();
 }
 
 static void store_block_at(uint32_t a, const void* src, uint32_t n, void* ra)

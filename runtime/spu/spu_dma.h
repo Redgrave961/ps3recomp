@@ -24,7 +24,7 @@ static inline void spu_rsx_window_check(uint32_t ea, uint32_t size)
 {
     vm_track_write(ea, size);
     void (*notify)(void) = g_rsx_window_write;
-    if (notify && ((ea < ppu_hle_inject_base + 0x10000u && (uint64_t)ea + size > ppu_hle_inject_base) || vm_watched(ea, size))) notify();
+    if (notify && ((ea < ppu_hle_inject_base + 0xB000u && (uint64_t)ea + size > ppu_hle_inject_base) || vm_watched(ea, size))) notify();
 }
 
 static inline const unsigned char* mfc_coh_bits(void)
