@@ -129,6 +129,7 @@ static HANDLE armed_timer(uint64_t us)
 
 #define PS3_BRIEF_SLOTS 8u
 #define PS3_BRIEF_CLAIMED ((uintptr_t)1)
+#define PS3_BRIEF_SIGNALED ((uintptr_t)2)
 
 static struct { volatile uintptr_t addr; void* volatile event; } s_brief[PS3_BRIEF_SLOTS];
 static volatile uint32_t s_brief_waiters;
@@ -147,26 +148,33 @@ int ps3_brief_wait(volatile uint32_t* addr, uint32_t expected, uint64_t us)
 #if defined(_WIN32)
     static __declspec(thread) HANDLE t_event;
     if (!t_event) t_event = CreateEventW(NULL, FALSE, FALSE, NULL);
-    ResetEvent(t_event);
     __atomic_store_n(&s_brief[slot].event, (void*)t_event, __ATOMIC_RELAXED);
 #endif
     __atomic_add_fetch(&s_brief_waiters, 1u, __ATOMIC_SEQ_CST);
     __atomic_store_n(&s_brief[slot].addr, (uintptr_t)addr, __ATOMIC_SEQ_CST);
     int woken = 1;
-    if (__atomic_load_n(addr, __ATOMIC_SEQ_CST) == expected) {
 #if defined(_WIN32)
+    int consumed = 0;
+    if (__atomic_load_n(addr, __ATOMIC_SEQ_CST) == expected) {
         HANDLE timer = t_event ? armed_timer(us) : NULL;
         if (timer) {
             HANDLE both[2] = { t_event, timer };
-            woken = WaitForMultipleObjects(2, both, FALSE, INFINITE) == WAIT_OBJECT_0;
+            consumed = woken = WaitForMultipleObjects(2, both, FALSE, INFINITE) == WAIT_OBJECT_0;
         } else {
             ps3_sleep_us(us);
             woken = 0;
         }
+    }
+    uintptr_t mine = (uintptr_t)addr;
+    if (!consumed && !__atomic_compare_exchange_n(&s_brief[slot].addr, &mine, PS3_BRIEF_CLAIMED, 0, __ATOMIC_RELAXED,
+                                                  __ATOMIC_RELAXED)) {
+        WaitForSingleObject(t_event, INFINITE);
+        woken = 1;
+    }
 #else
+    if (__atomic_load_n(addr, __ATOMIC_SEQ_CST) == expected)
         woken = ps3_futex_wait(addr, expected, ps3_sync_now_ns() + us * 1000ull);
 #endif
-    }
     __atomic_store_n(&s_brief[slot].addr, (uintptr_t)0, __ATOMIC_RELEASE);
     __atomic_sub_fetch(&s_brief_waiters, 1u, __ATOMIC_RELEASE);
     return woken;
@@ -177,9 +185,12 @@ void ps3_brief_wake(volatile uint32_t* addr)
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     if (!__atomic_load_n(&s_brief_waiters, __ATOMIC_RELAXED)) return;
     for (unsigned slot = 0; slot < PS3_BRIEF_SLOTS; slot++) {
-        if (__atomic_load_n(&s_brief[slot].addr, __ATOMIC_ACQUIRE) != (uintptr_t)addr) continue;
+        uintptr_t want = (uintptr_t)addr;
+        if (__atomic_load_n(&s_brief[slot].addr, __ATOMIC_RELAXED) != want) continue;
 #if defined(_WIN32)
-        SetEvent((HANDLE)__atomic_load_n(&s_brief[slot].event, __ATOMIC_RELAXED));
+        if (__atomic_compare_exchange_n(&s_brief[slot].addr, &want, want | PS3_BRIEF_SIGNALED, 0, __ATOMIC_ACQUIRE,
+                                        __ATOMIC_RELAXED))
+            SetEvent((HANDLE)__atomic_load_n(&s_brief[slot].event, __ATOMIC_RELAXED));
 #else
         ps3_futex_wake_all(addr);
         return;

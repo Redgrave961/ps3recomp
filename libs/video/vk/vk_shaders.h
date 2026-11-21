@@ -36,8 +36,8 @@ public:
     static uint64_t program_hash(const uint32_t* program, uint32_t start);
 
 private:
-    template <typename T, typename Build>
-    const T* resolve(std::unordered_map<uint64_t, std::unique_ptr<T>>& map, uint64_t h, bool async, Build&& build);
+    template <typename T, typename Job>
+    const T* resolve(std::unordered_map<uint64_t, std::unique_ptr<T>>& map, uint64_t h, bool async, Job&& job);
     bool make_module(shader& s, const rsx_spv_blob& blob, VkShaderStageFlagBits stage);
 
     vk_device* m_d = nullptr;

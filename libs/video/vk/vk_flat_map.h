@@ -56,10 +56,27 @@ public:
     template <typename F>
     void erase_if(F&& erase)
     {
-        flat_map kept;
-        for (size_t i = 0; i < m_slots.size(); i++)
-            if (m_tags[i] && !erase(m_slots[i].key, m_slots[i].value)) kept.claim(hash_key(m_slots[i].key), m_tags[i]) = std::move(m_slots[i]);
-        *this = std::move(kept);
+        if (!m_size) return;
+        size_t i = 0;
+        while (m_tags[i]) i++;
+        i = (i + 1u) & m_mask;
+        for (size_t left = m_mask; left;) {
+            if (!m_tags[i] || !erase(m_slots[i].key, m_slots[i].value)) {
+                i = (i + 1u) & m_mask;
+                left--;
+                continue;
+            }
+            size_t hole = i;
+            for (size_t j = (i + 1u) & m_mask; m_tags[j]; j = (j + 1u) & m_mask)
+                if (((j - (size_t)hash_key(m_slots[j].key)) & m_mask) >= ((j - hole) & m_mask)) {
+                    m_tags[hole] = m_tags[j];
+                    m_slots[hole] = std::move(m_slots[j]);
+                    hole = j;
+                }
+            m_tags[hole] = 0;
+            m_slots[hole] = slot{};
+            m_size--;
+        }
     }
 
     size_t size() const { return m_size; }

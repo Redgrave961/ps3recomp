@@ -62,6 +62,20 @@ static inline int mfc_aligned(uint32_t lsa, uint64_t ea, uint32_t size)
     return !(size & (size - 1u)) && !((lsa | (uint32_t)ea) & (size - 1u)) && !((lsa ^ (uint32_t)ea) & 15u);
 }
 
+typedef uint8_t mfc_v16 __attribute__((vector_size(16)));
+typedef uint8_t mfc_v32 __attribute__((vector_size(32)));
+
+static inline void mfc_copy(uint8_t* d, const uint8_t* s, uint32_t n)
+{
+    mfc_v16 a, b;
+    mfc_v32 w, x, y, z;
+    if (n - 16u > 112u) { memcpy(d, s, n); return; }
+    if (n <= 32) { memcpy(&a, s, 16); memcpy(&b, s + n - 16, 16); memcpy(d, &a, 16); memcpy(d + n - 16, &b, 16); return; }
+    if (n <= 64) { memcpy(&w, s, 32); memcpy(&x, s + n - 32, 32); memcpy(d, &w, 32); memcpy(d + n - 32, &x, 32); return; }
+    memcpy(&w, s, 32); memcpy(&x, s + 32, 32); memcpy(&y, s + n - 64, 32); memcpy(&z, s + n - 32, 32);
+    memcpy(d, &w, 32); memcpy(d + 32, &x, 32); memcpy(d + n - 64, &y, 32); memcpy(d + n - 32, &z, 32);
+}
+
 static inline void mfc_fault(const spu_context* spu, const char* what, uint32_t cmd, uint32_t lsa, uint64_t ea, uint32_t size)
 {
     fprintf(stderr, "\n[mfc] FATAL: %s: img=%d pc=0x%05X cmd=0x%X lsa=0x%05X ea=0x%08llX size=%u\n", what, spu->image_id,
@@ -150,7 +164,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
     uint8_t* ea_ptr = vm_base + (uint32_t)ea;
 
     if (mfc_is_get(cmd)) {
-        memcpy(ls_ptr, ea_ptr, size);
+        mfc_copy(ls_ptr, ea_ptr, size);
         { extern void spu_overlay_note_get(spu_context*, uint32_t, const uint8_t*, uint32_t);
           spu_overlay_note_get(spu, (uint32_t)ea, (const uint8_t*)ls_ptr, size); }
     } else if (mfc_is_put(cmd)) {
@@ -167,7 +181,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                     const uint32_t lo = a > ea32 ? a - ea32 : 0u;
                     const uint32_t hi = a + 128u - ea32 < size ? a + 128u - ea32 : size;
                     if (mfc_line_reserved(bits, a)) locked_lines[i >> 6] |= 1ull << (i & 63u);
-                    else memcpy(ea_ptr + lo, ls_ptr + lo, hi - lo);
+                    else mfc_copy(ea_ptr + lo, ls_ptr + lo, hi - lo);
                     if (a == a1) break;
                 }
                 __atomic_signal_fence(__ATOMIC_SEQ_CST);
@@ -177,7 +191,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                     const uint32_t hi = a + 128u - ea32 < size ? a + 128u - ea32 : size;
                     if ((locked_lines[i >> 6] >> (i & 63u)) & 1u) {
                         spu_lockline_lock(a);
-                        memcpy(ea_ptr + lo, ls_ptr + lo, hi - lo);
+                        mfc_copy(ea_ptr + lo, ls_ptr + lo, hi - lo);
                         spu_coh_notify_write_except(a, spu);
                         spu_lockline_unlock(a);
                     } else if (mfc_line_reserved(bits, a)) {
@@ -189,14 +203,14 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                 }
             } else if (span_reserved) {
                 spu_lockline_lock_range((uint32_t)ea, size);
-                memcpy(ea_ptr, ls_ptr, size);
+                mfc_copy(ea_ptr, ls_ptr, size);
                 for (uint32_t a = a0; ; a += 128u) {
                     if (mfc_line_reserved(bits, a)) spu_coh_notify_write_except(a, spu);
                     if (a == a1) break;
                 }
                 spu_lockline_unlock_range((uint32_t)ea, size);
             } else {
-                memcpy(ea_ptr, ls_ptr, size);
+                mfc_copy(ea_ptr, ls_ptr, size);
                 __atomic_signal_fence(__ATOMIC_SEQ_CST);
                 bits = mfc_coh_bits();
                 if (mfc_span_reserved(bits, a0, a1)) {

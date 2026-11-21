@@ -149,7 +149,19 @@ endif()
 add_test(NAME event_queue_destroy COMMAND test_event_queue_destroy)
 set_tests_properties(event_queue_destroy PROPERTIES LABELS "runtime;sync" TIMEOUT 60)
 
-foreach(t sync_stress test_sync_semantics test_mutex_destroy test_event_queue_destroy test_cond_semantics)
+add_executable(test_brief_wait test_brief_wait.c)
+if(NOT WIN32)
+    target_sources(test_brief_wait PRIVATE
+        "${PS3RECOMP_TREE_ROOT}/runtime/platform/win32_compat.c")
+    find_package(Threads REQUIRED)
+    target_link_libraries(test_brief_wait PRIVATE Threads::Threads)
+endif()
+target_include_directories(test_brief_wait PRIVATE
+    "${PS3RECOMP_TREE_ROOT}" "${PS3RECOMP_TREE_ROOT}/include")
+add_test(NAME brief_wait COMMAND test_brief_wait)
+set_tests_properties(brief_wait PROPERTIES LABELS "runtime;sync" TIMEOUT 60)
+
+foreach(t sync_stress test_sync_semantics test_mutex_destroy test_event_queue_destroy test_cond_semantics test_brief_wait)
     if(TARGET ${t})
         target_sources(${t} PRIVATE "${PS3RECOMP_TREE_ROOT}/runtime/platform/ps3_sync.c")
         if(WIN32)
