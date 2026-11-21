@@ -8,6 +8,7 @@
 #include "rsx_vk.h"
 #include "vk_device.h"
 #include "vk_renderer.h"
+#include "../../input/pad_bindings.h"
 #include "ps3emu/thread_name.h"
 
 #include <SDL3/SDL.h>
@@ -112,6 +113,10 @@ struct state {
     std::mutex modes_lock;
     std::vector<rsx_vk_mode> modes;
     std::atomic<void (*)()> modes_listener{ nullptr };
+    std::mutex mouse_lock;
+    float mouse_dx = 0.f, mouse_dy = 0.f, mouse_travel = 0.f;
+    uint32_t mouse_buttons = 0;
+    int mouse_wheel = 0;
 };
 
 state g;
@@ -672,6 +677,7 @@ void window_main()
                 SDL_DestroySurface(icon);
             }
             apply_display();
+            SDL_HideCursor();
             SDL_ShowWindow(g.window);
             SDL_RaiseWindow(g.window);
             SDL_SyncWindow(g.window);
@@ -692,7 +698,37 @@ void window_main()
     g.cv.notify_all();
     if (ok < 0) return;
     SDL_Event e;
-    while (SDL_WaitEvent(&e)) {
+    bool relative = false;
+    for (;;) {
+        const bool got = SDL_WaitEventTimeout(&e, 50);
+        const bool look = (SDL_GetWindowFlags(g.window) & SDL_WINDOW_INPUT_FOCUS) && !pad_menu_active();
+        if (look != relative) {
+            relative = look;
+            SDL_SetWindowRelativeMouseMode(g.window, look);
+            std::lock_guard<std::mutex> hold(g.mouse_lock);
+            g.mouse_dx = g.mouse_dy = 0.f;
+        }
+        if (!got) continue;
+        if (e.type == SDL_EVENT_MOUSE_MOTION) {
+            std::lock_guard<std::mutex> hold(g.mouse_lock);
+            g.mouse_buttons = e.motion.state;
+            g.mouse_travel += std::fabs(e.motion.xrel) + std::fabs(e.motion.yrel);
+            if (relative) {
+                g.mouse_dx += e.motion.xrel;
+                g.mouse_dy += e.motion.yrel;
+            }
+            continue;
+        }
+        if (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN || e.type == SDL_EVENT_MOUSE_BUTTON_UP) {
+            std::lock_guard<std::mutex> hold(g.mouse_lock);
+            g.mouse_buttons = e.button.down ? g.mouse_buttons | SDL_BUTTON_MASK(e.button.button) : g.mouse_buttons & ~SDL_BUTTON_MASK(e.button.button);
+            continue;
+        }
+        if (e.type == SDL_EVENT_MOUSE_WHEEL) {
+            std::lock_guard<std::mutex> hold(g.mouse_lock);
+            g.mouse_wheel += e.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -e.wheel.integer_y : e.wheel.integer_y;
+            continue;
+        }
         if (e.type == g.display_event) {
             apply_display();
             continue;
@@ -1065,6 +1101,24 @@ extern "C" u32 rsx_vk_display_modes(rsx_vk_mode* out, u32 capacity)
 extern "C" void rsx_vk_on_display_modes(void (*listener)(void))
 {
     g.modes_listener = listener;
+}
+
+extern "C" void rsx_vk_mouse_motion(float* dx, float* dy)
+{
+    std::lock_guard<std::mutex> hold(g.mouse_lock);
+    *dx = g.mouse_dx;
+    *dy = g.mouse_dy;
+    g.mouse_dx = g.mouse_dy = 0.f;
+}
+
+extern "C" u32 rsx_vk_mouse_input(int* wheel, float* travel)
+{
+    std::lock_guard<std::mutex> hold(g.mouse_lock);
+    *wheel = g.mouse_wheel;
+    *travel = g.mouse_travel;
+    g.mouse_wheel = 0;
+    g.mouse_travel = 0.f;
+    return g.mouse_buttons;
 }
 
 extern "C" void rsx_vk_set_frame_rate(int free_flips, u32 hz)

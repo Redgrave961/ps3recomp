@@ -1,5 +1,6 @@
 #include <time.h>
 #include "cellPad.h"
+#include "pad_bindings.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -37,9 +38,7 @@ static double pad_clock(unsigned long long t0_ms)
   #include <xinput.h>
 #endif
 
-#if PAD_BACKEND_SDL
-  #include <SDL3/SDL.h>
-#endif
+#include <SDL3/SDL.h>
 
 #define PAD_MAX_HOST_PORTS  4
 
@@ -70,12 +69,7 @@ static u32           s_max_connect = 0;
 static u32           s_port_setting[CELL_PAD_MAX_PORT_NUM];
 static PadHostState  s_host_state[PAD_MAX_HOST_PORTS];
 static int s_data_fresh[PAD_MAX_HOST_PORTS];
-static int s_xbox_layout;
-
-int cellPad_xbox_layout(void)
-{
-    return __atomic_load_n(&s_xbox_layout, __ATOMIC_RELAXED);
-}
+static int s_far[PAD_MAX_HOST_PORTS];
 
 #if PAD_BACKEND_SDL
 static SDL_Gamepad*        s_sdl_controllers[PAD_MAX_HOST_PORTS];
@@ -146,23 +140,7 @@ static int pad_host_window_focused(void)
     GetWindowThreadProcessId(fg, &pid);
     return pid == GetCurrentProcessId();
 }
-static int pad_key_down(int key) { return (GetAsyncKeyState(key) & 0x8000) != 0; }
-#define PADKEY_UP VK_UP
-#define PADKEY_DOWN VK_DOWN
-#define PADKEY_LEFT VK_LEFT
-#define PADKEY_RIGHT VK_RIGHT
-#define PADKEY_Z 'Z'
-#define PADKEY_X 'X'
-#define PADKEY_A 'A'
-#define PADKEY_S 'S'
-#define PADKEY_Q 'Q'
-#define PADKEY_W 'W'
-#define PADKEY_1 '1'
-#define PADKEY_2 '2'
-#define PADKEY_RETURN VK_RETURN
-#define PADKEY_TAB VK_TAB
 #elif defined(__APPLE__)
-extern unsigned char CGEventSourceKeyState(int stateID, unsigned short key);
 extern void* objc_getClass(const char* name);
 extern void* sel_registerName(const char* name);
 extern void objc_msgSend(void);
@@ -173,92 +151,46 @@ static int pad_host_window_focused(void)
     void* app = ((void* (*)(void*, void*))objc_msgSend)(cls, sel_registerName("sharedApplication"));
     return app && ((signed char (*)(void*, void*))objc_msgSend)(app, sel_registerName("isActive"));
 }
-static int pad_key_down(int key)
-{
-    return CGEventSourceKeyState(0, (unsigned short)key) != 0;
-}
-#define PADKEY_UP 126
-#define PADKEY_DOWN 125
-#define PADKEY_LEFT 123
-#define PADKEY_RIGHT 124
-#define PADKEY_Z 6
-#define PADKEY_X 7
-#define PADKEY_A 0
-#define PADKEY_S 1
-#define PADKEY_Q 12
-#define PADKEY_W 13
-#define PADKEY_1 18
-#define PADKEY_2 19
-#define PADKEY_RETURN 36
-#define PADKEY_TAB 48
-#elif PAD_BACKEND_SDL
+#else
 static int pad_host_window_focused(void)
 {
     return SDL_GetKeyboardFocus() != NULL;
 }
-static int pad_key_down(int key)
-{
-    return SDL_GetKeyboardState(NULL)[SDL_GetScancodeFromKey((SDL_Keycode)key, NULL)];
-}
-#define PADKEY_UP SDLK_UP
-#define PADKEY_DOWN SDLK_DOWN
-#define PADKEY_LEFT SDLK_LEFT
-#define PADKEY_RIGHT SDLK_RIGHT
-#define PADKEY_Z SDLK_Z
-#define PADKEY_X SDLK_X
-#define PADKEY_A SDLK_A
-#define PADKEY_S SDLK_S
-#define PADKEY_Q SDLK_Q
-#define PADKEY_W SDLK_W
-#define PADKEY_1 SDLK_1
-#define PADKEY_2 SDLK_2
-#define PADKEY_RETURN SDLK_RETURN
-#define PADKEY_TAB SDLK_TAB
 #endif
 
-static void pad_poll_keyboard(void)
+static int pad_far(u8 v)
+{
+    return v < 32 || v > 224;
+}
+
+static void pad_note_input(int port, int sdl_gamepad_type, u16 prev)
+{
+    const PadHostState* hs = &s_host_state[port];
+    const int deflected = pad_far(hs->analog_lx) || pad_far(hs->analog_ly) || pad_far(hs->analog_rx) || pad_far(hs->analog_ry);
+    if ((hs->buttons & ~prev) || (deflected && !s_far[port])) pad_gamepad_seen(sdl_gamepad_type, 1);
+    s_far[port] = deflected;
+}
+
+static u8 pad_merge_axis(u8 pad, u8 kbm)
+{
+    return abs(kbm - 128) > abs(pad - 128) ? kbm : pad;
+}
+
+static void pad_merge_kbm(int focused)
 {
     static int off = -1;
     if (off < 0) off = getenv("PAD_NO_KEYBOARD") ? 1 : 0;
     if (off) return;
-
+    pad_kbm_state kbm;
+    pad_kbm_poll(focused, &kbm);
     PadHostState* hs = &s_host_state[0];
-    if (!pad_host_window_focused()) {
-        hs->buttons = 0;
-        hs->analog_lx = hs->analog_ly = 128;
-        hs->analog_rx = hs->analog_ry = 128;
-        hs->connected = 1;
-        return;
-    }
-
-    static const struct { int vk; u16 btn; } map[] = {
-        { PADKEY_UP,     CELL_PAD_CTRL_UP },      { PADKEY_DOWN,  CELL_PAD_CTRL_DOWN },
-        { PADKEY_LEFT,   CELL_PAD_CTRL_LEFT },    { PADKEY_RIGHT, CELL_PAD_CTRL_RIGHT },
-        { PADKEY_Z,      CELL_PAD_CTRL_CROSS },   { PADKEY_X,     CELL_PAD_CTRL_CIRCLE },
-        { PADKEY_A,      CELL_PAD_CTRL_SQUARE },  { PADKEY_S,     CELL_PAD_CTRL_TRIANGLE },
-        { PADKEY_Q,      CELL_PAD_CTRL_L1 },      { PADKEY_W,     CELL_PAD_CTRL_R1 },
-        { PADKEY_1,      CELL_PAD_CTRL_L2 },      { PADKEY_2,     CELL_PAD_CTRL_R2 },
-        { PADKEY_RETURN, CELL_PAD_CTRL_START },   { PADKEY_TAB,   CELL_PAD_CTRL_SELECT },
-    };
-
-    u16 btns = 0;
-    for (unsigned i = 0; i < sizeof map / sizeof map[0]; i++)
-        if (pad_key_down(map[i].vk)) btns |= map[i].btn;
-
-    hs->buttons   = btns;
-    hs->connected = 1;
-    hs->analog_lx = (u8)((btns & CELL_PAD_CTRL_LEFT) ? 0 :
-                         (btns & CELL_PAD_CTRL_RIGHT) ? 255 : 128);
-    hs->analog_ly = (u8)((btns & CELL_PAD_CTRL_UP) ? 0 :
-                         (btns & CELL_PAD_CTRL_DOWN) ? 255 : 128);
-    hs->analog_rx = hs->analog_ry = 128;
-    hs->trigger_l2 = (u8)((btns & CELL_PAD_CTRL_L2) ? 255 : 0);
-    hs->trigger_r2 = (u8)((btns & CELL_PAD_CTRL_R2) ? 255 : 0);
-
-    { static int said = 0;
-      if (!said && btns) { said = 1;
-          printf("[cellPad] keyboard fallback active on port 0 (no controller)\n");
-          fflush(stdout); } }
+    hs->buttons |= kbm.buttons;
+    hs->analog_lx = pad_merge_axis(hs->analog_lx, kbm.lx);
+    hs->analog_ly = pad_merge_axis(hs->analog_ly, kbm.ly);
+    hs->analog_rx = pad_merge_axis(hs->analog_rx, kbm.rx);
+    hs->analog_ry = pad_merge_axis(hs->analog_ry, kbm.ry);
+    if (kbm.buttons & CELL_PAD_CTRL_L2) hs->trigger_l2 = 255;
+    if (kbm.buttons & CELL_PAD_CTRL_R2) hs->trigger_r2 = 255;
 }
 
 #if PAD_BACKEND_XINPUT
@@ -318,7 +250,7 @@ static void pad_poll_xinput(void)
     const unsigned long long now = pad_now_ms();
     for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
         if (s_pad_empty_until[i] && now < s_pad_empty_until[i]) {
-            s_host_state[i].connected = 0;
+            pad_host_release(&s_host_state[i]);
             continue;
         }
         XINPUT_STATE state;
@@ -334,6 +266,7 @@ static void pad_poll_xinput(void)
         }
         s_pad_empty_until[i] = 0;
 
+        if (!s_host_state[i].connected) pad_gamepad_seen(SDL_GAMEPAD_TYPE_XBOX360, 0);
         s_host_state[i].connected = 1;
         XINPUT_GAMEPAD* gp = &state.Gamepad;
 
@@ -355,6 +288,7 @@ static void pad_poll_xinput(void)
         if (gp->wButtons & XINPUT_GAMEPAD_A)              btns |= CELL_PAD_CTRL_CROSS;
         if (gp->wButtons & XINPUT_GAMEPAD_X)              btns |= CELL_PAD_CTRL_SQUARE;
 
+        const u16 prev = s_host_state[i].buttons;
         s_host_state[i].buttons = btns;
 
         s_host_state[i].analog_lx = pad_xinput_stick_to_u8(gp->sThumbLX, PAD_STICK_DEADZONE);
@@ -364,6 +298,7 @@ static void pad_poll_xinput(void)
 
         s_host_state[i].trigger_l2 = gp->bLeftTrigger;
         s_host_state[i].trigger_r2 = gp->bRightTrigger;
+        pad_note_input(i, SDL_GAMEPAD_TYPE_XBOX360, prev);
 
         s_host_state[i].press_up       = (btns & CELL_PAD_CTRL_UP)       ? 255 : 0;
         s_host_state[i].press_down     = (btns & CELL_PAD_CTRL_DOWN)     ? 255 : 0;
@@ -449,13 +384,6 @@ static void pad_sdl_close(int p, int gone)
     pad_host_release(&s_host_state[p]);
 }
 
-static void pad_sdl_use_layout(SDL_Gamepad* gp)
-{
-    const SDL_GamepadType t = SDL_GetGamepadType(gp);
-    const int xbox = t != SDL_GAMEPAD_TYPE_PS3 && t != SDL_GAMEPAD_TYPE_PS4 && t != SDL_GAMEPAD_TYPE_PS5;
-    __atomic_store_n(&s_xbox_layout, xbox, __ATOMIC_RELAXED);
-}
-
 static void pad_sdl_scan(void)
 {
     int n = 0;
@@ -483,7 +411,7 @@ static void pad_sdl_scan(void)
         memset(&s_rumble[port], 0, sizeof s_rumble[port]);
         SDL_RumbleGamepad(gp, 0, 0, 0);
         SDL_SetGamepadLED(gp, 0xFF, 0x33, 0x00);
-        pad_sdl_use_layout(gp);
+        pad_gamepad_seen(SDL_GetGamepadType(gp), 0);
         SDL_SetGamepadSensorEnabled(gp, SDL_SENSOR_ACCEL, true);
         SDL_SetGamepadSensorEnabled(gp, SDL_SENSOR_GYRO, true);
         const char* name = SDL_GetGamepadName(gp);
@@ -521,12 +449,12 @@ static void pad_sdl_hotplug(int force)
     pad_sdl_scan();
 }
 
-static void pad_poll_sdl(void)
+static void pad_poll_sdl(int focused)
 {
     SDL_UpdateGamepads();
     pad_sdl_hotplug(0);
     static int was_focused = 1;
-    const int focused = pad_host_window_focused(), lost = was_focused && !focused;
+    const int lost = was_focused && !focused;
     was_focused = focused;
 
     for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
@@ -564,7 +492,7 @@ static void pad_poll_sdl(void)
         if (lt > 3000) btns |= CELL_PAD_CTRL_L2;
         if (rt > 3000) btns |= CELL_PAD_CTRL_R2;
 
-        if (btns & ~s_host_state[i].buttons) pad_sdl_use_layout(gp);
+        const u16 prev = s_host_state[i].buttons;
         s_host_state[i].buttons = btns;
 
         s_host_state[i].analog_lx = pad_sdl_axis_to_u8(SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_LEFTX));
@@ -574,6 +502,7 @@ static void pad_poll_sdl(void)
 
         s_host_state[i].trigger_l2 = pad_sdl_trigger_to_u8(lt);
         s_host_state[i].trigger_r2 = pad_sdl_trigger_to_u8(rt);
+        pad_note_input(i, SDL_GetGamepadType(gp), prev);
 
         s_host_state[i].press_up       = (btns & CELL_PAD_CTRL_UP)       ? 255 : 0;
         s_host_state[i].press_down     = (btns & CELL_PAD_CTRL_DOWN)     ? 255 : 0;
@@ -631,12 +560,13 @@ static void pad_poll_backend(void)
     s_last_ms = now;
     for (int _i = 0; _i < PAD_MAX_HOST_PORTS; _i++) s_data_fresh[_i] = 1;
 
+    const int focused = pad_host_window_focused();
 #if PAD_BACKEND_XINPUT
     pad_poll_xinput();
 #elif PAD_BACKEND_SDL
-    pad_poll_sdl();
+    pad_poll_sdl(focused);
 #endif
-    if (!s_host_state[0].connected) pad_poll_keyboard();
+    pad_merge_kbm(focused);
     pad_track_assign();
     pad_unlock();
 }
