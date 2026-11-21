@@ -33,7 +33,6 @@ namespace {
 constexpr uint32_t k_slots = 4;
 constexpr uint32_t k_present_frames = 3;
 
-enum class queue_wait { present_wait2, present_wait, fence };
 
 int64_t now_ns()
 {
@@ -49,7 +48,6 @@ struct slot {
     bool fitted = false;
     uint64_t rendered = 0;
     uint64_t released = 0;
-    uint64_t seq = 0;
 };
 
 struct present_frame {
@@ -64,7 +62,6 @@ struct swapchain {
     VkSurfaceFormatKHR format{ VK_FORMAT_UNDEFINED, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR };
     VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
     VkExtent2D extent{};
-    uint64_t first_id = 0;
     std::vector<VkImage> images;
     std::vector<VkSemaphore> ready;
 };
@@ -104,16 +101,9 @@ struct state {
     std::atomic<uint64_t> presented{ 0 };
     present_frame frames[k_present_frames];
     uint32_t frame_index = 0;
-    queue_wait wait = queue_wait::fence;
-    uint32_t repeat = 1;
-    std::atomic<uint64_t> flip_seq{ 0 };
-    std::mutex shown_lock;
-    std::condition_variable shown_cv;
-    uint64_t shown_seq = 0;
     std::atomic<uint32_t> frame_rate{ 0 };
     std::atomic<bool> replan{ false };
     std::atomic<bool> free_flips{ false };
-    std::atomic<bool> hidden{ false };
     std::atomic<rsx_vk_display> display{ RSX_VK_BORDERLESS };
     rsx_vk_display last_fullscreen = RSX_VK_BORDERLESS;
     std::atomic<void (*)(rsx_vk_display)> display_listener{ nullptr };
@@ -234,15 +224,8 @@ VkPresentModeKHR pick_mode()
     auto has = [&](VkPresentModeKHR m) { return std::find(list.begin(), list.end(), m) != list.end(); };
     if (!g.free_flips) return VK_PRESENT_MODE_FIFO_KHR;
     if (uncapped() && has(VK_PRESENT_MODE_IMMEDIATE_KHR)) return VK_PRESENT_MODE_IMMEDIATE_KHR;
-    if (!uncapped() && g.wait == queue_wait::fence) return VK_PRESENT_MODE_FIFO_KHR;
     if (has(VK_PRESENT_MODE_MAILBOX_KHR)) return VK_PRESENT_MODE_MAILBOX_KHR;
     return g.d.caps.fifo_latest_ready && has(VK_PRESENT_MODE_FIFO_LATEST_READY_KHR) ? VK_PRESENT_MODE_FIFO_LATEST_READY_KHR : VK_PRESENT_MODE_FIFO_KHR;
-}
-
-uint32_t refresh_multiple(float hz, uint32_t cap)
-{
-    const uint32_t k = (uint32_t)std::lround(hz / (float)cap);
-    return k && std::fabs(hz / (float)k - (float)cap) <= (float)cap * 0.01f ? k : 0;
 }
 
 void apply_plan()
@@ -250,15 +233,12 @@ void apply_plan()
     const float hz = g.refresh.load();
     const bool flips = g.free_flips;
     const uint32_t cap = flips ? g.frame_rate.load() : 30u;
-    const uint32_t k = cap && hz > 0.f ? refresh_multiple(hz, cap) : 0;
-    const bool timed = flips && cap && !k && (hz <= 0.f || (float)cap < hz);
-    g.repeat = flips && k ? k : 1;
-    rsx_core_set_frame_limit(timed ? cap : 0);
+    rsx_core_set_frame_limit(flips ? cap : 0);
     const VkPresentModeKHR mode = pick_mode();
     if (mode != g.sc.mode) g.resized = true;
     std::fprintf(stderr, "[vk] %.2f Hz display, %u fps cap: %s, %s\n", hz, cap,
                  mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate" : mode == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" : mode == VK_PRESENT_MODE_FIFO_LATEST_READY_KHR ? "fifo latest ready" : "fifo",
-                 !flips ? "59.94 Hz console clock" : !cap ? "uncapped" : k ? "every frame on whole refreshes" : timed ? "timer limited" : "display rate");
+                 !flips ? "59.94 Hz console clock" : !cap ? "uncapped" : "timer limited");
 }
 
 bool swapchain_build()
@@ -292,13 +272,11 @@ bool swapchain_build()
         : VkCompositeAlphaFlagBitsKHR(caps.supportedCompositeAlpha & (0u - caps.supportedCompositeAlpha));
     ci.presentMode = g.sc.mode;
     ci.clipped = VK_TRUE;
-    if (g.wait == queue_wait::present_wait2) ci.flags |= VK_SWAPCHAIN_CREATE_PRESENT_ID_2_BIT_KHR | VK_SWAPCHAIN_CREATE_PRESENT_WAIT_2_BIT_KHR;
     if (g.sc.handle) vkDestroySwapchainKHR(g.d.dev, g.sc.handle, nullptr);
     g.sc.handle = VK_NULL_HANDLE;
     VkSwapchainKHR made;
     VK_TRY(vkCreateSwapchainKHR(g.d.dev, &ci, nullptr, &made));
     g.sc.handle = made;
-    g.sc.first_id = g.presented.load() + 1u;
     uint32_t n = 0;
     vkGetSwapchainImagesKHR(g.d.dev, made, &n, nullptr);
     g.sc.images.resize(n);
@@ -462,30 +440,6 @@ void rebuild_swapchain()
     if (!swapchain_build()) std::fprintf(stderr, "[vk] swapchain rebuild failed\n");
 }
 
-void publish(uint64_t seq)
-{
-    {
-        std::lock_guard<std::mutex> hold(g.shown_lock);
-        g.shown_seq = std::max(g.shown_seq, seq);
-    }
-    g.shown_cv.notify_all();
-}
-
-void wait_presented(uint64_t id)
-{
-    if (id < g.sc.first_id) return;
-    if (g.wait == queue_wait::present_wait2) {
-        VkPresentWait2InfoKHR wi{ VK_STRUCTURE_TYPE_PRESENT_WAIT_2_INFO_KHR };
-        wi.presentId = id;
-        wi.timeout = 100000000ull;
-        vkWaitForPresent2KHR(g.d.dev, g.sc.handle, &wi);
-    } else if (g.wait == queue_wait::present_wait) {
-        vkWaitForPresentKHR(g.d.dev, g.sc.handle, id, 100000000ull);
-    } else {
-        timeline_wait(g.present_timeline, id);
-    }
-}
-
 bool present_image(slot& s)
 {
     if (!g.sc.extent.width || !g.sc.extent.height) {
@@ -533,10 +487,6 @@ bool present_image(slot& s)
     si.pSignalSemaphoreInfos = signals;
 
     VkPresentInfoKHR pi{ VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
-    VkPresentId2KHR id2{ VK_STRUCTURE_TYPE_PRESENT_ID_2_KHR, nullptr, 1, &value };
-    VkPresentIdKHR id1{ VK_STRUCTURE_TYPE_PRESENT_ID_KHR, nullptr, 1, &value };
-    if (g.wait == queue_wait::present_wait2) pi.pNext = &id2;
-    else if (g.wait == queue_wait::present_wait) pi.pNext = &id1;
     pi.waitSemaphoreCount = 1;
     pi.pWaitSemaphores = &g.sc.ready[index];
     pi.swapchainCount = 1;
@@ -585,7 +535,6 @@ bool present_image(slot& s)
     f.done = value;
     s.released = value;
     g.frame_index = (g.frame_index + 1u) % k_present_frames;
-    if (r < 0) g.sc.first_id = value + 1u;
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) g.resized = true;
     else if (r != VK_SUCCESS) std::fprintf(stderr, "[vk] present failed: %d\n", (int)r);
 
@@ -597,22 +546,6 @@ bool present_image(slot& s)
     return true;
 }
 
-void present_slot(uint32_t i)
-{
-    slot& s = g.slots[i];
-    if (!present_image(s)) {
-        publish(s.seq);
-        return;
-    }
-    if (uncapped() || g.hidden) {
-        publish(s.seq);
-        return;
-    }
-    const bool fifo = g.sc.mode == VK_PRESENT_MODE_FIFO_KHR;
-    wait_presented(g.presented.load() - (fifo ? 1u : 0u));
-    publish(s.seq - (fifo ? 1u : 0u));
-}
-
 void present_main()
 {
     ps3_thread_name("vk present");
@@ -620,16 +553,12 @@ void present_main()
     if (!swapchain_build()) std::fprintf(stderr, "[vk] swapchain creation failed\n");
     mark("swapchain");
     uint64_t seen = 0;
-    uint32_t times = 0;
     bool rebuilt = false;
     for (;;) {
         uint64_t tick;
         {
             std::unique_lock<std::mutex> hold(g.queue_lock);
-            g.queue_cv.wait(hold, [&] {
-                return g.tick != seen || g.resized.load() || g.display_changed.load() || g.replan.load() ||
-                       (g.free_flips && g.shown >= 0 && times < g.repeat);
-            });
+            g.queue_cv.wait(hold, [&] { return g.tick != seen || g.resized.load() || g.display_changed.load() || g.replan.load(); });
             tick = g.tick;
         }
         if (g.display_changed.exchange(false)) {
@@ -641,25 +570,22 @@ void present_main()
             rebuild_swapchain();
             rebuilt = true;
         }
-        const bool repeating = g.free_flips && times < g.repeat;
-        if (tick == seen && !repeating && !rebuilt) continue;
+        if (tick == seen && !rebuilt) continue;
         seen = tick;
         int pick = -1;
         {
             std::lock_guard<std::mutex> hold(g.queue_lock);
-            if (g.latest_new && (!g.free_flips || g.shown < 0 || times >= g.repeat)) {
+            if (g.latest_new) {
                 g.shown = g.latest;
                 g.latest_new = false;
                 pick = g.shown;
-                times = 0;
-            } else if (rebuilt || repeating) {
+            } else if (rebuilt) {
                 pick = g.shown;
             }
         }
         if (pick < 0) continue;
         rebuilt = false;
-        times++;
-        present_slot((uint32_t)pick);
+        present_image(g.slots[pick]);
     }
 }
 
@@ -701,28 +627,13 @@ bool slot_reserve(slot& s, uint32_t w, uint32_t h, VkFormat format)
     return true;
 }
 
-queue_wait pick_wait()
-{
-    if (g.d.caps.present_id2 && g.d.caps.present_wait2) {
-        VkSurfaceCapabilitiesPresentWait2KHR wait{ VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_PRESENT_WAIT_2_KHR };
-        VkSurfaceCapabilitiesPresentId2KHR id{ VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_PRESENT_ID_2_KHR, &wait };
-        VkSurfaceCapabilities2KHR caps{ VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR, &id };
-        VkPhysicalDeviceSurfaceInfo2KHR info{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR };
-        info.surface = g.surface;
-        if (vkGetPhysicalDeviceSurfaceCapabilities2KHR(g.d.gpu, &info, &caps) == VK_SUCCESS && id.presentId2Supported && wait.presentWait2Supported)
-            return queue_wait::present_wait2;
-    }
-    return g.d.caps.present_id && g.d.caps.present_wait ? queue_wait::present_wait : queue_wait::fence;
-}
-
 bool vulkan_open()
 {
 #ifdef _WIN32
-    const char* ext[] = { VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME, VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME };
+    const char* ext[] = { VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME };
 #else
     const bool wayland = SDL_GetPointerProperty(SDL_GetWindowProperties(g.window), SDL_PROP_WINDOW_WAYLAND_DISPLAY_POINTER, nullptr) != nullptr;
-    const char* ext[] = { VK_KHR_SURFACE_EXTENSION_NAME, wayland ? VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME : VK_KHR_XLIB_SURFACE_EXTENSION_NAME,
-                          VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME };
+    const char* ext[] = { VK_KHR_SURFACE_EXTENSION_NAME, wayland ? VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME : VK_KHR_XLIB_SURFACE_EXTENSION_NAME };
 #endif
     mark("window");
     if (!vk_instance_create(g.d, ext, (uint32_t)std::size(ext))) return false;
@@ -733,9 +644,6 @@ bool vulkan_open()
     }
     if (!vk_device_create(g.d, g.surface)) return false;
     mark("device");
-    g.wait = pick_wait();
-    std::fprintf(stderr, "[vk] frame queue: next flip waits for the previous frame via %s\n",
-                 g.wait == queue_wait::present_wait2 ? "present wait 2" : g.wait == queue_wait::present_wait ? "present wait" : "its GPU fence");
     if (!presenter_build()) return false;
     mark("renderer");
     read_refresh();
@@ -746,7 +654,6 @@ bool vulkan_open()
 void update_hidden()
 {
     const bool hidden = (SDL_GetWindowFlags(g.window) & (SDL_WINDOW_MINIMIZED | SDL_WINDOW_HIDDEN | SDL_WINDOW_OCCLUDED)) != 0;
-    g.hidden = hidden;
     rsx_core_set_hidden_refresh(hidden ? std::max(1u, (u32)std::lround(g.refresh.load())) : 0u);
 }
 
@@ -945,7 +852,7 @@ void write_bmp(const char* path, const uint8_t* bgra, uint32_t w, uint32_t h)
     std::fclose(f);
 }
 
-void vk_present(void*, u32, const rsx_display_buffer* db)
+int vk_present(void*, u32, const rsx_display_buffer* db)
 {
     const uint32_t w = db->width, h = db->height, pitch = db->pitch;
     static uint32_t last_w, last_h, last_p;
@@ -961,7 +868,7 @@ void vk_present(void*, u32, const rsx_display_buffer* db)
     const uint64_t fit = g.fit.load(std::memory_order_acquire);
     if (!ea || (content && content == shown && fit == shown_fit)) {
         g.r.flush();
-        return;
+        return 0;
     }
 
     uint32_t i = 0;
@@ -980,7 +887,7 @@ void vk_present(void*, u32, const rsx_display_buffer* db)
     const uint32_t sw = std::min(scale.edge(w), src ? src->width : 0u), sh = std::min(scale.edge(h), src ? src->height : 0u);
     if (!src) {
         g.r.flush();
-        return;
+        return 0;
     }
     static const char* capture = std::getenv("PS3_VK_CAPTURE");
     static uint64_t flips;
@@ -999,7 +906,7 @@ void vk_present(void*, u32, const rsx_display_buffer* db)
                         (src->format == VK_FORMAT_B8G8R8A8_UNORM || src->format == VK_FORMAT_R8G8B8A8_UNORM);
     if (!(fitted ? slot_reserve(s, out.width, out.height, out_format) : slot_reserve(s, sw, sh, VK_FORMAT_B8G8R8A8_UNORM))) {
         g.r.flush();
-        return;
+        return 0;
     }
     s.fitted = fitted;
     std::optional<vk::trace_span> span;
@@ -1064,7 +971,6 @@ void vk_present(void*, u32, const rsx_display_buffer* db)
         vmaDestroyBuffer(g.d.vma, cap_buf, cap_mem);
         std::fprintf(stderr, "[vk] captured flip %llu to %s\n", (unsigned long long)flips, capture_path);
     }
-    s.seq = ++g.flip_seq;
     {
         std::lock_guard<std::mutex> hold(g.queue_lock);
         if (g.free_flips) {
@@ -1104,14 +1010,7 @@ void vk_present(void*, u32, const rsx_display_buffer* db)
                  st.deferred_transfers, st.deferred_labels, st.scan_ns, st.changed_pages };
         last_rsx_cpu = rsx_cpu;
     }
-}
-
-void vk_throttle(void*)
-{
-    if (uncapped()) return;
-    const uint64_t flip = g.flip_seq.load();
-    std::unique_lock<std::mutex> hold(g.shown_lock);
-    g.shown_cv.wait(hold, [flip] { return g.shown_seq + 1u >= flip; });
+    return 1;
 }
 
 void vk_close(void*)
@@ -1126,7 +1025,7 @@ void vk_close(void*)
 extern "C" const rsx_renderer* rsx_vk_renderer(const char* title, const char* cache_path, const char* icon_path)
 {
     static const rsx_renderer renderer = {
-        nullptr, vk_open, vk_methods, vk_flush, vk_sync, vk_reset, vk_report, vk_defer, vk_present, vk_read_back, vk_settle, vk_wrote, vk_blit, vk_vblank, vk_close, vk_throttle,
+        nullptr, vk_open, vk_methods, vk_flush, vk_sync, vk_reset, vk_report, vk_defer, vk_present, vk_read_back, vk_settle, vk_wrote, vk_blit, vk_vblank, vk_close,
     };
     static std::once_flag started;
     std::call_once(started, [title, cache_path, icon_path] {

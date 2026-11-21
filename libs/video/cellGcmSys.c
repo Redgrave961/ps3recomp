@@ -205,7 +205,6 @@ static s32 gcm_prepare_flip(u32 ctx, u32 id, int reserve)
         if (r) return r;
     }
     gcm_emit(ctx, GCM_METHOD_FLIP, &id, 1);
-    rsx_core_flip_emitted();
     if (reserve && ctx == GCM_CONTEXT_EA) gcm_put(vm_read32(RSX_PUT_EA) + 8u);
     return (s32)id;
 }

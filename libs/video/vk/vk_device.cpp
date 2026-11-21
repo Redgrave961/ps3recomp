@@ -48,14 +48,6 @@ const ext_entry k_extensions[] = {
       sizeof(VkPhysicalDevicePresentModeFifoLatestReadyFeaturesKHR), &vk_caps::fifo_latest_ready },
     { VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME, VkStructureType(0), 0, &vk_caps::host_memory },
     { VK_EXT_MEMORY_BUDGET_EXTENSION_NAME, VkStructureType(0), 0, &vk_caps::memory_budget },
-    { VK_KHR_PRESENT_ID_2_EXTENSION_NAME, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_2_FEATURES_KHR,
-      sizeof(VkPhysicalDevicePresentId2FeaturesKHR), &vk_caps::present_id2 },
-    { VK_KHR_PRESENT_WAIT_2_EXTENSION_NAME, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_2_FEATURES_KHR,
-      sizeof(VkPhysicalDevicePresentWait2FeaturesKHR), &vk_caps::present_wait2 },
-    { VK_KHR_PRESENT_ID_EXTENSION_NAME, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR,
-      sizeof(VkPhysicalDevicePresentIdFeaturesKHR), &vk_caps::present_id },
-    { VK_KHR_PRESENT_WAIT_EXTENSION_NAME, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR,
-      sizeof(VkPhysicalDevicePresentWaitFeaturesKHR), &vk_caps::present_wait },
 };
 
 VKAPI_ATTR VkBool32 VKAPI_CALL vk_message(VkDebugUtilsMessageSeverityFlagBitsEXT, VkDebugUtilsMessageTypeFlagsEXT,

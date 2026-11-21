@@ -82,14 +82,13 @@ typedef struct rsx_renderer {
     void (*reset)(void* user);
     int  (*report)(void* user, u32 type, u32 ea);
     int  (*defer)(void* user, const rsx_write* w);
-    void (*present)(void* user, u32 buffer, const rsx_display_buffer* display);
+    int (*present)(void* user, u32 buffer, const rsx_display_buffer* display);
     void (*read_back)(void* user, u32 ea, u32 size);
     void (*settle)(void* user, u32 ea, u32 size);
     void (*wrote)(void* user, u32 ea, u32 size);
     int  (*blit)(void* user, const rsx_blit* b);
     void (*vblank)(void* user, u64 count);
     void (*close)(void* user);
-    void (*throttle)(void* user);
 } rsx_renderer;
 
 typedef void (*rsx_event_sink)(enum rsx_event event, u32 arg);
@@ -117,7 +116,6 @@ u64  rsx_core_progress(void);
 void rsx_core_set_hidden_refresh(u32 hz);
 u64  rsx_core_batch(void);
 void rsx_core_flip_immediate(u32 buffer);
-void rsx_core_flip_emitted(void);
 u32  rsx_core_flip_status(void);
 void rsx_core_set_flip_status(u32 status);
 u64  rsx_core_last_flip_time(void);

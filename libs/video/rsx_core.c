@@ -186,15 +186,10 @@ void rsx_core_doorbell(void)
     WakeByAddressSingle((PVOID)&s.bell);
 }
 
-static _Thread_local int t_flip;
-static _Thread_local u32 t_flip_put;
-static void rsx_flip_throttle(void);
-
 static void rsx_core_window_written(void)
 {
     rsx_core_doorbell();
     rsx_label_wake();
-    if (t_flip && rsx_load(RSX_PUT_EA) != t_flip_put) rsx_flip_throttle();
 }
 
 static void rsx_irq_push(enum rsx_event event, u32 arg)
@@ -381,30 +376,17 @@ static void rsx_frame_limit(void)
     const u64 idle = __atomic_load_n(&s.hidden_period, __ATOMIC_ACQUIRE);
     const u64 period = chosen > idle ? chosen : idle;
     if (!period) return;
-    static _Thread_local HANDLE timer;
-    static _Thread_local u64 due;
+    static HANDLE timer;
+    static u64 due;
     if (!timer) timer = rsx_timer_create();
     const u64 now = rsx_ticks();
     due = due + 2u * period < now ? now : due + period;
     rsx_sleep_until(timer, due);
 }
 
-static void rsx_flip_throttle(void)
-{
-    t_flip = 0;
-    if (s.renderer && s.renderer->throttle) s.renderer->throttle(s.renderer->user);
-    rsx_frame_limit();
-}
-
-void rsx_core_flip_emitted(void)
-{
-    t_flip_put = rsx_load(RSX_PUT_EA);
-    t_flip = 1;
-}
-
 static void rsx_scanout(u32 buffer)
 {
-    if (s.renderer && s.renderer->present) s.renderer->present(s.renderer->user, buffer, &s.display[buffer]);
+    if (s.renderer && s.renderer->present && s.renderer->present(s.renderer->user, buffer, &s.display[buffer])) rsx_frame_limit();
 }
 
 static void rsx_flip_done(u32 buffer)
