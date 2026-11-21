@@ -17,7 +17,8 @@ typedef struct rsx_vk_mode {
 
 typedef struct rsx_vk_texture_patch {
     u32 (*variant)(void);
-    int (*apply)(u32 variant, u32 gcm_format, u32 width, u32 height, uint8_t* data, uint64_t size);
+    int (*apply)(u32 variant, u32 gcm_format, u32 width, u32 height, const uint8_t* guest, uint64_t guest_size,
+                 uint8_t* staging);
 } rsx_vk_texture_patch;
 
 const rsx_renderer* rsx_vk_renderer(const char* title);

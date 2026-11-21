@@ -546,7 +546,7 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
         e->patched = false;
         if (const rsx_vk_texture_patch* patch = g_patch.load(std::memory_order_acquire)) {
             e->variant = patch->variant();
-            e->patched = patch->apply(e->variant, d.gcm_format, d.width, d.height, slice.ptr, bytes) != 0;
+            e->patched = patch->apply(e->variant, d.gcm_format, d.width, d.height, vm_base + ea, d.guest_size, slice.ptr) != 0;
         }
         end_rendering();
         const trace_span span(*this, c, "texture upload %ux%u fmt %d %llu bytes", e->img.width, e->img.height, (int)d.format,
