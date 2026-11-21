@@ -25,13 +25,8 @@ SPU_THREAD_LOCAL unsigned g_spu_pch_n;
 
 extern void spu_halt(spu_context*);
 
-#if defined(_MSC_VER)
-#define SPU_DRAIN_COLD __declspec(noinline)
-#define SPU_DRAIN_INLINE static __forceinline
-#else
 #define SPU_DRAIN_COLD __attribute__((noinline, cold))
 #define SPU_DRAIN_INLINE static inline __attribute__((always_inline))
-#endif
 static SPU_DRAIN_COLD void spu_task_launch_slow(spu_context* ctx);
 
 SPU_DRAIN_INLINE void spu_task_launch_check_inline(spu_context* ctx)

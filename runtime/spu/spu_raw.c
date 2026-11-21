@@ -432,7 +432,7 @@ int spu_raw_reg_load(uint32_t ea, uint32_t* out)
     return 0;
 }
 
-#if defined(__x86_64__) || defined(_M_X64)
+#if defined(__x86_64__)
 static void raw_read(uint32_t g, int width, uint8_t* out)
 {
     uint32_t v;

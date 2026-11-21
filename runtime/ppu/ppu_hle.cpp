@@ -163,18 +163,8 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
     ctx->gpr[3] = r;
 }
 
-#if defined(_MSC_VER)
-extern "C" void ppu_hle_register_all_default(void) {}
-extern "C" void ppu_hle_register_all(void);
-#  if defined(_M_IX86)
-#    pragma comment(linker, "/alternatename:_ppu_hle_register_all=_ppu_hle_register_all_default")
-#  else
-#    pragma comment(linker, "/alternatename:ppu_hle_register_all=ppu_hle_register_all_default")
-#  endif
-#else
 extern "C" void ppu_hle_register_all(void) __attribute__((weak));
 extern "C" void ppu_hle_register_all(void) {}
-#endif
 
 extern "C" void ppu_hle_init(void)
 {

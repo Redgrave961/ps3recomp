@@ -9,6 +9,7 @@ import sys
 
 TOOLS = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(TOOLS)
+LLVM_MINGW_CXX = r"E:\tools\llvm-mingw\bin\x86_64-w64-mingw32-clang++.exe"
 sys.path.insert(0, TOOLS)
 
 import ppu_disasm
@@ -682,14 +683,13 @@ static void check_fpr(const char* name, int reg, uint64_t got, uint64_t want) {
  * (RA writeback needs a real access to write RA back after); EAs are masked
  * into it. Widths beyond what these cases need aren't provided -- add as
  * later memory-op tranches need them. */
-#include <stdlib.h>   /* MSVC _byteswap_* */
+#include <stdlib.h>
 static uint8_t g_vm_stub[65536];
 extern "C" { uint8_t* vm_base = g_vm_stub; }
 #define VMOFF(a) ((uint32_t)(a) & 0xFFFFu)
 /* The lifter's raw (guest byte order) accessors live in its HEADER preamble,
  * which this driver does not include (it has its own memory): the same
  * accessors over the stub, through the same 64 KiB window as vm_read*. */
-/* A template, not a statement expression: cl builds this driver on Windows. */
 template <class T> static inline T vm_raw_ld_(uint64_t ea) { T v; memcpy(&v, g_vm_stub + VMOFF(ea), sizeof(T)); return v; }
 #define VM_RAW_LD(T, ea) vm_raw_ld_<T>(ea)
 static inline void vm_raw_ld16(void* dst, uint64_t ea) { memcpy(dst, g_vm_stub + VMOFF(ea), 16); }
@@ -697,16 +697,27 @@ static inline void vm_write_raw(uint64_t ea, const void* src, uint32_t n) { memc
 static inline void vm_write128(uint64_t ea, const void* src) { memcpy(g_vm_stub + VMOFF(ea), src, 16); }
 /* Trap guard. A "may_trap" case exists to prove lifted code does NOT fault --
  * e.g. divw by zero must be lowered to a defined result, not a hardware trap.
- * MSVC catches that with SEH. POSIX has no SEH, so arm a signal handler and
- * siglongjmp back: without this the whole run dies on the first bad case and
+ * Without this the whole run dies on the first bad case and
  * the remaining 1300 checks never report. */
-#ifdef _MSC_VER
-#  define CONF_TRY     __try {
-#  define CONF_EXCEPT  } __except (1) {
-#  define CONF_ENDTRY  }
+#include <setjmp.h>
+#include <signal.h>
+#ifdef _WIN32
+static jmp_buf g_conf_jmp;
+static volatile sig_atomic_t g_conf_armed = 0;
+static void conf_trap_handler(int sig) {
+    signal(sig, conf_trap_handler);
+    if (g_conf_armed) { g_conf_armed = 0; longjmp(g_conf_jmp, 1); }
+    abort();
+}
+#  define CONF_TRY                                                          \
+     { signal(SIGFPE, conf_trap_handler);                                   \
+       signal(SIGSEGV, conf_trap_handler);                                  \
+       signal(SIGILL, conf_trap_handler);                                   \
+       g_conf_armed = 1;                                                    \
+       if (setjmp(g_conf_jmp) == 0) {
+#  define CONF_EXCEPT  } else {
+#  define CONF_ENDTRY  } g_conf_armed = 0; }
 #else
-#  include <setjmp.h>
-#  include <signal.h>
 static sigjmp_buf g_conf_jmp;
 static volatile sig_atomic_t g_conf_armed = 0;
 static void conf_trap_handler(int sig) {
@@ -731,15 +742,8 @@ static void conf_trap_handler(int sig) {
        sigaction(SIGSEGV, &_osegv, 0);                                      \
        sigaction(SIGILL,  &_oill,  0); }
 #endif
-/* _byteswap_* are MSVC intrinsics; this driver is built with plain cl on
- * Windows and with clang/gcc everywhere else, so pick per compiler. */
-#ifdef _MSC_VER
-#  define CONF_BSWAP32 _byteswap_ulong
-#  define CONF_BSWAP64 _byteswap_uint64
-#else
-#  define CONF_BSWAP32 __builtin_bswap32
-#  define CONF_BSWAP64 __builtin_bswap64
-#endif
+#define CONF_BSWAP32 __builtin_bswap32
+#define CONF_BSWAP64 __builtin_bswap64
 extern "C" uint32_t vm_read32(uint64_t a) { uint32_t v; memcpy(&v, g_vm_stub + VMOFF(a), 4); return CONF_BSWAP32(v); }
 extern "C" void vm_write32(uint64_t a, uint32_t v) { v = CONF_BSWAP32(v); memcpy(g_vm_stub + VMOFF(a), &v, 4); }
 extern "C" uint64_t vm_read64(uint64_t a) { uint64_t v; memcpy(&v, g_vm_stub + VMOFF(a), 8); return CONF_BSWAP64(v); }
@@ -921,36 +925,27 @@ def main():
     log = os.path.join(ROOT, "scratch", "ppu_conformance.log")
 
     if os.name == "nt":
-        from msvc_env import find_vcvars
-        vcvars = find_vcvars() or ""
-        bat = os.path.join(ROOT, "scratch", "ppu_conformance_run.bat")
-        with open(bat, "w") as f:
-            f.write("@echo off\n")
-            f.write(f'call "{vcvars}" >nul 2>nul\n')
-            f.write(f'cd /d "{ROOT}"\n')
-            f.write(f'cl /nologo /O1 /W3 /I runtime\\ppu /Fe:"{epath}" "{cpath}" > "{log}" 2>&1\n')
-            f.write("if errorlevel 1 exit /b 2\n")
-            f.write(f'"{epath}" >> "{log}" 2>&1\n')
-        rc = subprocess.run(["cmd", "/c", bat], cwd=ROOT).returncode
+        cxx, static = LLVM_MINGW_CXX, ["-static"]
     else:
         cxx = (os.environ.get("CXX") or shutil.which("c++")
                or shutil.which("clang++") or shutil.which("g++"))
-        if not cxx:
+        static = []
+    if not cxx or not shutil.which(cxx):
+        rc = 2
+        with open(log, "w") as f:
+            f.write("no C++ compiler found (set CXX)\n")
+    else:
+        with open(log, "w") as f:
+            cp = subprocess.run([cxx, "-std=c++17", "-O1", "-w", "-march=x86-64-v3", "-ffp-contract=off", *static,
+                                 "-I", os.path.join("runtime", "ppu"),
+                                 "-o", epath, cpath],
+                                cwd=ROOT, stdout=f, stderr=subprocess.STDOUT)
+        if cp.returncode != 0:
             rc = 2
-            with open(log, "w") as f:
-                f.write("no C++ compiler found (set CXX)\n")
         else:
-            with open(log, "w") as f:
-                cp = subprocess.run([cxx, "-std=c++17", "-O1", "-w",
-                                     "-I", os.path.join("runtime", "ppu"),
-                                     "-o", epath, cpath],
-                                    cwd=ROOT, stdout=f, stderr=subprocess.STDOUT)
-            if cp.returncode != 0:
-                rc = 2
-            else:
-                with open(log, "a") as f:
-                    rc = subprocess.run([epath], cwd=ROOT, stdout=f,
-                                        stderr=subprocess.STDOUT).returncode
+            with open(log, "a") as f:
+                rc = subprocess.run([epath], cwd=ROOT, stdout=f,
+                                    stderr=subprocess.STDOUT).returncode
     tail = open(log).read() if os.path.exists(log) else ""
     fails = [ln for ln in tail.splitlines() if ln.startswith("FAIL")]
     for ln in fails[:40]:
@@ -961,13 +956,11 @@ def main():
         if "[ppu-conformance]" in ln or "error C" in ln or "error:" in ln:
             print(ln)
     if rc == 2:
-        no_compiler = ("is not recognized as an internal or external command" in tail
-                       or "no C++ compiler found" in tail)
-        if no_compiler:
+        if "no C++ compiler found" in tail:
             print("SKIPPED: no C++ compiler available -- the generated code was",
                   "NOT compiled or run, so the conformance checks above did not",
-                  "execute. Install a compiler (or run from a Visual Studio",
-                  "developer prompt) for real coverage.")
+                  "execute. Install a compiler (llvm-mingw on Windows) for real",
+                  "coverage.")
             if os.environ.get("CI"):
                 print("...and this is CI, where skipping the only test that runs",
                       "lifted code is a failure, not a pass.")

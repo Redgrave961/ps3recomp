@@ -1,7 +1,7 @@
 #ifndef PS3RECOMP_MSVC_COMPAT_H
 #define PS3RECOMP_MSVC_COMPAT_H
 
-#if defined(_MSC_VER) || defined(_WIN32)
+#if defined(_WIN32)
 #  include <intrin.h>
 #  include <stdlib.h>
 #  include <string.h>

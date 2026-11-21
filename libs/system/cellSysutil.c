@@ -67,11 +67,6 @@ static pthread_mutex_t s_completion_lock = PTHREAD_MUTEX_INITIALIZER;
 #define COMPLETION_LOCK() pthread_mutex_lock(&s_completion_lock)
 #define COMPLETION_UNLOCK() pthread_mutex_unlock(&s_completion_lock)
 #endif
-#if defined(_MSC_VER)
-#define COMPLETION_TLS __declspec(thread)
-#else
-#define COMPLETION_TLS _Thread_local
-#endif
 
 typedef struct GuestCompletion {
     struct GuestCompletion* next;
@@ -103,7 +98,7 @@ s32 cellSysutilQueueGuestCallback(u32 opd, u64 arg0, u64 arg1)
 
 static void drain_guest_completions(void)
 {
-    static COMPLETION_TLS int draining;
+    static _Thread_local int draining;
     if (draining || !g_ps3_guest_caller) return;
     draining = 1;
     COMPLETION_LOCK();

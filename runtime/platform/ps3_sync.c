@@ -119,7 +119,7 @@ void ps3_futex_wake_all(volatile uint32_t* addr)
 #if defined(_WIN32)
 static HANDLE armed_timer(uint64_t us)
 {
-    static __declspec(thread) HANDLE t_timer;
+    static _Thread_local HANDLE t_timer;
     if (!t_timer) t_timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
     LARGE_INTEGER due;
     due.QuadPart = -(LONGLONG)(us * 10ull);
@@ -146,7 +146,7 @@ int ps3_brief_wait(volatile uint32_t* addr, uint32_t expected, uint64_t us)
         return 0;
     }
 #if defined(_WIN32)
-    static __declspec(thread) HANDLE t_event;
+    static _Thread_local HANDLE t_event;
     if (!t_event) t_event = CreateEventW(NULL, FALSE, FALSE, NULL);
     __atomic_store_n(&s_brief[slot].event, (void*)t_event, __ATOMIC_RELAXED);
 #endif
@@ -202,7 +202,7 @@ void ps3_sleep_us(uint64_t us)
 {
     if (!us) return;
 #if defined(_WIN32)
-    static __declspec(thread) uint64_t t_credit_ns;
+    static _Thread_local uint64_t t_credit_ns;
     const uint64_t want = us * 1000ull;
     if (t_credit_ns >= want) {
         t_credit_ns -= want;

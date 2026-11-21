@@ -13,8 +13,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 option(PS3RECOMP_BUILD_TESTS "Build unit tests" OFF)
 set(PS3RECOMP_OPT_FLAG "-O2" CACHE STRING "Optimisation flag for every non-Debug configuration of the runtime and the lifted SPU code")
 
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64" AND NOT "${CMAKE_C_FLAGS} ${CMAKE_C_FLAGS_RELEASE}" MATCHES "march|/arch")
-    add_compile_options($<IF:$<STREQUAL:${CMAKE_C_COMPILER_FRONTEND_VARIANT},MSVC>,/arch:AVX2,-march=x86-64-v3>)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64" AND NOT "${CMAKE_C_FLAGS} ${CMAKE_C_FLAGS_RELEASE}" MATCHES "march")
+    add_compile_options(-march=x86-64-v3)
+endif()
+add_compile_options(-fno-strict-aliasing -fms-volatile)
+if(WIN32)
+    add_link_options(-static)
 endif()
 
 file(GLOB_RECURSE HLE_SOURCES
@@ -64,7 +68,7 @@ find_package(VulkanMemoryAllocator CONFIG REQUIRED)
 file(GLOB VK_RENDERER_SOURCES CONFIGURE_DEPENDS "libs/video/vk/*.cpp")
 target_sources(ps3recomp_runtime PRIVATE ${VK_RENDERER_SOURCES})
 set_source_files_properties(${VK_RENDERER_SOURCES} PROPERTIES
-    COMPILE_DEFINITIONS "NOMINMAX;_CRT_SECURE_NO_WARNINGS"
+    COMPILE_DEFINITIONS "NOMINMAX"
     COMPILE_OPTIONS "-Wno-nullability-completeness;-Wno-missing-field-initializers")
 set_source_files_properties("libs/video/vk/vk_device.cpp" PROPERTIES COMPILE_OPTIONS "-Wno-nullability-completeness;-Wno-missing-field-initializers;-Wno-unused-variable")
 target_link_libraries(ps3recomp_runtime PRIVATE SDL3::SDL3 Vulkan::Headers volk::volk GPUOpen::VulkanMemoryAllocator)
@@ -85,43 +89,19 @@ else()
     target_link_libraries(ps3recomp_runtime PRIVATE Threads::Threads)
 endif()
 
-if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
-    target_compile_options(ps3recomp_runtime PRIVATE
-        $<IF:$<STREQUAL:${CMAKE_C_COMPILER_FRONTEND_VARIANT},MSVC>,/W4,-Wall$<SEMICOLON>-Wextra>
-        -Wno-unused-parameter
-        -fno-strict-aliasing
-        $<$<STREQUAL:${CMAKE_C_COMPILER_FRONTEND_VARIANT},MSVC>:/Zc:tlsGuards->
-        $<IF:$<STREQUAL:${CMAKE_C_COMPILER_FRONTEND_VARIANT},MSVC>,/clang:-ffp-contract=off,-ffp-contract=off>
-        $<$<NOT:$<CONFIG:Debug>>:${PS3RECOMP_OPT_FLAG}>
-    )
-    include(CheckCCompilerFlag)
-    check_c_compiler_flag(-msse4.1 PS3RECOMP_HAS_MSSE41)
-    if(PS3RECOMP_HAS_MSSE41)
-        target_compile_options(ps3recomp_runtime PUBLIC -msse4.1)
-    endif()
-elseif(MSVC)
-    message(WARNING
-        "Building with cl.exe (MSVC). This is not currently supported.\n"
-        "  The runtime uses __atomic_* builtins, __int128 and __builtin_bswap*, "
-        "and the lifted output uses __int128 for the PPC 64x64 multiplies. "
-        "cl has none of them.\n"
-        "  Use clang-cl instead -- it consumes the MSVC headers and libraries, "
-        "so nothing else about a Visual Studio build changes:\n"
-        "    cmake -S . -B build -G Ninja "
-        "-DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl\n"
-        "  See docs/BUILDING.md. Porting the intrinsics to cl is a welcome "
-        "contribution; nothing else stands in the way.")
-    target_compile_options(ps3recomp_runtime PRIVATE
-        /W3 /wd4100 /wd4244 /wd4267 /wd4996
-        /Zc:__cplusplus
-        /experimental:c11atomics
-    )
-    target_compile_definitions(ps3recomp_runtime PRIVATE
-        _CRT_SECURE_NO_WARNINGS
-    )
+target_compile_options(ps3recomp_runtime PRIVATE
+    -Wall -Wextra
+    -Wno-unused-parameter
+    -ffp-contract=off
+    $<$<NOT:$<CONFIG:Debug>>:${PS3RECOMP_OPT_FLAG}>
+)
+include(CheckCCompilerFlag)
+check_c_compiler_flag(-msse4.1 PS3RECOMP_HAS_MSSE41)
+if(PS3RECOMP_HAS_MSSE41)
+    target_compile_options(ps3recomp_runtime PUBLIC -msse4.1)
 endif()
 
-if(NOT MSVC AND NOT WIN32)
+if(NOT WIN32)
     target_compile_definitions(ps3recomp_runtime PRIVATE _GNU_SOURCE)
 endif()
 
@@ -178,7 +158,6 @@ if(PS3RECOMP_BUILD_TESTS)
     target_include_directories(test_spurs PRIVATE include runtime/spu runtime/platform)
     target_compile_options(test_spurs PRIVATE -UNDEBUG)
     if(WIN32)
-        target_compile_definitions(test_spurs PRIVATE _CRT_SECURE_NO_WARNINGS)
         target_link_libraries(test_spurs PRIVATE synchronization)
     else()
         target_link_libraries(test_spurs PRIVATE Threads::Threads m)
@@ -203,7 +182,6 @@ if(PS3RECOMP_BUILD_TESTS)
         target_include_directories(test_${t} PRIVATE include runtime/spu runtime/platform)
         target_compile_options(test_${t} PRIVATE -UNDEBUG)
         if(WIN32)
-            target_compile_definitions(test_${t} PRIVATE _CRT_SECURE_NO_WARNINGS)
             target_link_libraries(test_${t} PRIVATE synchronization)
         else()
             target_link_libraries(test_${t} PRIVATE Threads::Threads m)
@@ -226,7 +204,6 @@ if(PS3RECOMP_BUILD_TESTS)
     target_include_directories(test_spu_wake_stress PRIVATE include runtime/spu runtime/platform)
     target_compile_options(test_spu_wake_stress PRIVATE -UNDEBUG)
     if(WIN32)
-        target_compile_definitions(test_spu_wake_stress PRIVATE _CRT_SECURE_NO_WARNINGS)
         target_link_libraries(test_spu_wake_stress PRIVATE synchronization)
     else()
         target_link_libraries(test_spu_wake_stress PRIVATE Threads::Threads m)
@@ -248,7 +225,6 @@ if(PS3RECOMP_BUILD_TESTS)
         target_include_directories(test_${t} PRIVATE include runtime/spu runtime/platform)
         target_compile_options(test_${t} PRIVATE -UNDEBUG)
         if(WIN32)
-            target_compile_definitions(test_${t} PRIVATE _CRT_SECURE_NO_WARNINGS)
             target_link_libraries(test_${t} PRIVATE synchronization)
         else()
             target_link_libraries(test_${t} PRIVATE Threads::Threads m)

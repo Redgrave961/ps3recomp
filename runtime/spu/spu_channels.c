@@ -50,20 +50,14 @@ static uint64_t spu_host_ns(void)
 #endif
 }
 
-#if defined(_MSC_VER)
-#  define SPU_TLS __declspec(thread)
-#else
-#  define SPU_TLS __thread
-#endif
-
-static SPU_TLS jmp_buf s_spu_halt_env;
-static SPU_TLS int     s_spu_halt_armed = 0;
+static __thread jmp_buf s_spu_halt_env;
+static __thread int     s_spu_halt_armed = 0;
 
 #define SPUCHECK_ABNORMAL(ctx) ((void)0)
 
 void spu_jmp_no_unwind(void* env)
 {
-#if defined(_WIN64) && defined(_MSC_VER)
+#if defined(_WIN64)
     ((_JUMP_BUFFER*)env)->Frame = 0;
 #else
     (void)env;
@@ -508,7 +502,7 @@ void spu_ch_wake(spu_context* ctx)
     ps3_futex_wake_all(&ctx->ch_wake_seq);
 }
 
-static SPU_TLS uint64_t t_ft_busy0;
+static __thread uint64_t t_ft_busy0;
 
 static void spu_ft_wait_span(spu_context* ctx, uint32_t channel, uint64_t t0)
 {
@@ -714,7 +708,7 @@ spu_fn spu_lookup(uint32_t addr, int image_id)
 
 typedef struct { uint32_t addr, gen; int image; spu_fn fn; } spu_lookup_memo;
 #define SPU_LOOKUP_MEMO_SIZE 512
-static SPU_TLS spu_lookup_memo t_lookup_memo[SPU_LOOKUP_MEMO_SIZE];
+static __thread spu_lookup_memo t_lookup_memo[SPU_LOOKUP_MEMO_SIZE];
 static spu_fn spu_lookup_memoized(uint32_t addr, int image_id)
 {
     spu_lookup_memo* m = &t_lookup_memo[((addr >> 2) ^ ((uint32_t)image_id * 0x9E3779B1u)) &
@@ -776,7 +770,7 @@ typedef struct {
     int32_t reloc_delta;
 } spu_dcache_ent;
 #define SPU_DCACHE_ENTRIES 512u
-static SPU_TLS spu_dcache_ent t_dcache[SPU_DCACHE_ENTRIES];
+static __thread spu_dcache_ent t_dcache[SPU_DCACHE_ENTRIES];
 static uint32_t s_dcache_next_id;
 static void spu_dcache_residency_changed(spu_context* ctx) { ctx->dcache_residency++; }
 spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)

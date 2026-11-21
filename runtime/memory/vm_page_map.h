@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 
-#if defined(_MSC_VER) || defined(__MINGW32__)
+#if defined(_WIN32)
 #  define VM_PAGE_MAP_SHARED __declspec(selectany)
 #else
 #  define VM_PAGE_MAP_SHARED __attribute__((weak))

@@ -3,7 +3,6 @@
 
 #ifdef _WIN32
 #include <winsock2.h>
-#pragma comment(lib, "ws2_32.lib")
 #endif
 
 static int s_http_initialized = 0;

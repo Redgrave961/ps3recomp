@@ -10,7 +10,7 @@ the runtime library on its own.
 |------|---------|---------|
 | CMake | 3.20+ | Build system generator |
 | Ninja | any | Generator used by the port and CI |
-| clang-cl (Windows) / GCC or Clang (Linux) | C17, C++20 | Runtime and HLE modules |
+| llvm-mingw Clang (Windows) / GCC or Clang (Linux) | C17, C++20 | Runtime and HLE modules |
 | Python | 3.10+ | Lifter and generator tools |
 | SDL3, Vulkan-Headers, volk, VulkanMemoryAllocator | | Found with `find_package(... CONFIG REQUIRED)`; vcpkg provides all four |
 
@@ -22,9 +22,9 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
 cmake --build build
 ```
 
-On Windows configure with `-DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl`
-from an environment with the MSVC headers and libraries. Plain `cl` is not
-supported: the runtime uses `__atomic_*`, `__int128` and `__builtin_bswap*`.
+On Windows configure with llvm-mingw (x86_64-w64-mingw32, UCRT):
+`-DCMAKE_C_COMPILER=<llvm-mingw>/bin/x86_64-w64-mingw32-clang.exe -DCMAKE_CXX_COMPILER=<llvm-mingw>/bin/x86_64-w64-mingw32-clang++.exe`.
+Executables link statically; no Visual Studio or Windows SDK is needed.
 
 | CMake option | Default | Description |
 |---|---|---|
@@ -60,7 +60,7 @@ records the error count per toolchain; the check fails if a count goes up.
 
 ## Platforms
 
-- **Windows** (clang-cl): the platform the port runs on. Links `ws2_32`,
+- **Windows** (llvm-mingw): the platform the port runs on. Links `ws2_32`,
   `ole32`, `bcrypt`, `synchronization`.
 - **Linux** (GCC, Clang): the runtime builds and its tests run in CI
   (`.github/workflows/linux.yml`). Links `Threads::Threads`; `_GNU_SOURCE` is

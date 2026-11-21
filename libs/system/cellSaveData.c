@@ -417,7 +417,7 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
             return CELL_SAVEDATA_ERROR_ACCESS_ERROR;
         }
         if (set->fileOffset > 0) {
-#ifdef _MSC_VER
+#ifdef _WIN32
             _fseeki64(fp, (long long)set->fileOffset, SEEK_SET);
 #else
             fseeko(fp, (off_t)set->fileOffset, SEEK_SET);
@@ -451,7 +451,7 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
             return CELL_SAVEDATA_ERROR_ACCESS_ERROR;
         }
         if (set->fileOffset > 0) {
-#ifdef _MSC_VER
+#ifdef _WIN32
             _fseeki64(fp, (long long)set->fileOffset, SEEK_SET);
 #else
             fseeko(fp, (off_t)set->fileOffset, SEEK_SET);

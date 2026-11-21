@@ -69,11 +69,7 @@ typedef union {
 typedef struct ppu_context {
     uint64_t gpr[32];   /* General-purpose registers  */
     double   fpr[32];   /* Floating-point registers   */
-#ifdef _MSC_VER
-    __declspec(align(16)) ppu_vr vr[32];  /* VMX/AltiVec vector regs */
-#else
     ppu_vr   vr[32] __attribute__((aligned(16)));
-#endif
     uint32_t cr;        /* Condition register          */
     uint64_t lr;        /* Link register               */
     uint64_t ctr;       /* Count register              */
@@ -140,13 +136,8 @@ void ppu_store_recheck(uint64_t ea);
 typedef uint16_t __attribute__((aligned(1), may_alias)) vm_u16;
 typedef uint32_t __attribute__((aligned(1), may_alias)) vm_u32;
 typedef uint64_t __attribute__((aligned(1), may_alias)) vm_u64;
-#ifdef _MSC_VER
-#define VM_LD8V(p) ((uint8_t)__iso_volatile_load8((const volatile char*)(p)))
-#define VM_ST8V(p, v) __iso_volatile_store8((volatile char*)(p), (char)(v))
-#else
-#define VM_LD8V(p) (*(const volatile uint8_t*)(p))
-#define VM_ST8V(p, v) (*(volatile uint8_t*)(p) = (uint8_t)(v))
-#endif
+#define VM_LD8V(p) __atomic_load_n((const volatile uint8_t*)(p), __ATOMIC_RELAXED)
+#define VM_ST8V(p, v) __atomic_store_n((volatile uint8_t*)(p), (uint8_t)(v), __ATOMIC_RELAXED)
 static inline uint8_t  vm_ld8  (const uint8_t* p) { return VM_LD8V(p); }
 static inline uint16_t vm_ldr16(const uint8_t* p) { return *(const volatile vm_u16*)p; }
 static inline uint32_t vm_ldr32(const uint8_t* p) { return *(const volatile vm_u32*)p; }
@@ -268,11 +259,7 @@ void lv2_syscall(ppu_context* ctx);
 #  else
 #    define PPU_TLS_CONSTINIT
 #  endif
-#  ifdef _MSC_VER
-#    define PPU_THREAD_LOCAL PPU_TLS_CONSTINIT __declspec(thread)
-#  else
-#    define PPU_THREAD_LOCAL PPU_TLS_CONSTINIT __thread
-#  endif
+#  define PPU_THREAD_LOCAL PPU_TLS_CONSTINIT __thread
 #endif
 
 /* Function table (defined in the generated source, sentinel-terminated).
@@ -436,46 +423,12 @@ extern "C" uint64_t ppu_timebase_now(void);
 extern uint64_t ppu_timebase_now(void);
 #endif
 
-/* MSVC compatibility helpers */
-#ifdef _MSC_VER
-#include <intrin.h>
-/* clang-cl defines _MSC_VER but provides __builtin_clz/clzll natively, so
- * redefining them is a hard error there -- only polyfill for real MSVC. */
-#ifndef __clang__
-static inline int __builtin_clz(unsigned int x) {
-    /* BSR leaves the index undefined for x==0; PowerPC cntlzw(0) is DEFINED
-     * as 32. Without the guard this returned 31 minus an uninitialized
-     * index for zero inputs. */
-    unsigned long idx;
-    if (!x) return 32;
-    _BitScanReverse(&idx, x);
-    return 31 - (int)idx;
-}
-static inline int __builtin_clzll(unsigned long long x) {
-    unsigned long idx;
-    if (!x) return 64;
-    _BitScanReverse64(&idx, x);
-    return 63 - (int)idx;
-}
-#endif
-static inline int64_t ppc_mulhd(int64_t a, int64_t b) {
-    int64_t hi;
-    _mul128(a, b, &hi);
-    return hi;
-}
-static inline uint64_t ppc_mulhdu(uint64_t a, uint64_t b) {
-    uint64_t hi;
-    _umul128(a, b, &hi);
-    return hi;
-}
-#else
 static inline int64_t ppc_mulhd(int64_t a, int64_t b) {
     return (int64_t)((__int128)(int64_t)a * (__int128)(int64_t)b >> 64);
 }
 static inline uint64_t ppc_mulhdu(uint64_t a, uint64_t b) {
     return (uint64_t)((unsigned __int128)a * (unsigned __int128)b >> 64);
 }
-#endif
 
 #include "ppu_vmx.h"   /* exact VMX semantics (runtime/ppu/ppu_vmx.h) */
 

@@ -5,9 +5,8 @@ import shutil
 import subprocess
 import sys
 
-from msvc_env import find_vcvars
-
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LLVM_MINGW_CC = r"E:\tools\llvm-mingw\bin\x86_64-w64-mingw32-clang.exe"
 SCRATCH = os.path.join(ROOT, "scratch")
 
 N_THREADS, N_ITERS, N_KEYS = 4, 1000, 8
@@ -108,30 +107,13 @@ int main(int argc, char** argv)
 
 def build(driver_c, exe):
     if os.name == "nt":
-        clang = shutil.which("clang-cl") or r"C:\Program Files\LLVM\bin\clang-cl.exe"
-        if not os.path.exists(clang) and not shutil.which("clang-cl"):
-            return False, "clang-cl not found"
-        vcvars = find_vcvars()
-        if not vcvars:
-            return False, "vcvars64.bat not found"
-        bat = os.path.join(SCRATCH, "milestone_build.bat")
-        log = os.path.join(SCRATCH, "milestone_build.log")
-        with open(bat, "w") as f:
-            f.write("@echo off\n")
-            f.write('call "%s" >nul 2>nul\n' % vcvars)
-            f.write('cd /d "%s"\n' % ROOT)
-            f.write('"%s" /nologo /W3 /I include /Fe:"%s" "%s" runtime\\milestone.c '
-                    '> "%s" 2>&1\n' % (clang, exe, driver_c, log))
-        rc = subprocess.run(["cmd", "/c", bat], cwd=ROOT).returncode
-        if rc != 0:
-            return False, open(log).read() if os.path.exists(log) else "compile failed"
-        return True, ""
-
-    cc = os.environ.get("CC") or shutil.which("cc") or shutil.which("clang") or shutil.which("gcc")
-    if not cc:
+        cc, libs = LLVM_MINGW_CC, ["-static"]
+    else:
+        cc, libs = os.environ.get("CC") or shutil.which("cc") or shutil.which("clang") or shutil.which("gcc"), ["-lpthread"]
+    if not cc or not shutil.which(cc):
         return False, "no C compiler found (set CC)"
     cp = subprocess.run([cc, "-O1", "-w", "-I", "include", "-o", exe, driver_c,
-                         os.path.join("runtime", "milestone.c"), "-lpthread"],
+                         os.path.join("runtime", "milestone.c"), *libs],
                         cwd=ROOT, capture_output=True, text=True)
     if cp.returncode != 0:
         return False, cp.stdout + cp.stderr

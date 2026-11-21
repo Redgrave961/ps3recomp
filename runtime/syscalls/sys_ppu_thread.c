@@ -1,12 +1,7 @@
 #include <setjmp.h>
 
-#if defined(_MSC_VER)
-#  define PPU_TLS __declspec(thread)
-#else
-#  define PPU_TLS __thread
-#endif
-static PPU_TLS jmp_buf s_exit_jmp;
-static PPU_TLS int     s_exit_armed = 0;
+static __thread jmp_buf s_exit_jmp;
+static __thread int     s_exit_armed = 0;
 
 #include <stddef.h>
 #include "sys_ppu_thread.h"

@@ -9,6 +9,7 @@ import tempfile
 import unittest
 
 TOOLS = Path(__file__).resolve().parent
+LLVM_MINGW_CC = r'E:\tools\llvm-mingw\bin\x86_64-w64-mingw32-clang.exe'
 
 
 def elf(value=7, *, bad_bounds=False, unsupported=False, multi=False, rodata=False):
@@ -67,7 +68,7 @@ class Pipeline(unittest.TestCase):
         channels = (runtime / 'spu_channels.c').read_text()
         channels = channels[channels.index('typedef void (*spu_fn)'):
                             channels.index('int spu_image_of_function(')]
-        tls = '#if defined(_MSC_VER)\n#define SPU_TLS __declspec(thread)\n#else\n#define SPU_TLS __thread\n#endif\n'
+        tls = '#define SPU_TLS __thread\n'
         (self.root / 'registry.c').write_text('#include "spu_context.h"\n#include <stdio.h>\n' + tls + channels)
         return runtime
 
@@ -174,7 +175,7 @@ class Pipeline(unittest.TestCase):
         self.assertFalse((self.output / 'spu_workloads.c').exists())
 
     def test_load_overwrite_and_bss_overlap_are_rejected(self):
-        cc = shutil.which('clang') or shutil.which('cc')
+        cc = LLVM_MINGW_CC if sys.platform == 'win32' else shutil.which('clang') or shutil.which('cc')
         for bss in (False, True):
             with self.subTest(bss=bss):
                 blob = bytearray(elf(7, multi=True))
@@ -234,7 +235,7 @@ class Pipeline(unittest.TestCase):
                 subprocess.run([str(binary)], check=True)
 
     def test_compiled_runtime_registration_and_cmake(self):
-        cc = shutil.which('clang') or shutil.which('cc')
+        cc = LLVM_MINGW_CC if sys.platform == 'win32' else shutil.which('clang') or shutil.which('cc')
         cmake = shutil.which('cmake')
         if not cc or not cmake:
             if __import__('os').environ.get('CI'):

@@ -34,7 +34,7 @@ static uint32_t guest_alloc(uint32_t size)
     return (uint32_t)addr;
 }
 
-static __declspec(thread) uint32_t t_tid = 0;
+static _Thread_local uint32_t t_tid = 0;
 uint32_t yz_thread_current_id(void) { return t_tid; }
 
 static LONG volatile g_next_tid = 1;

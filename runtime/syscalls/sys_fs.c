@@ -12,7 +12,6 @@
   #include <direct.h>
   #include <io.h>
   #define stat _stat64
-  #define S_ISDIR(m) (((m) & _S_IFDIR) != 0)
 #else
   #include <unistd.h>
   #include <time.h>

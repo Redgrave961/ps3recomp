@@ -4,12 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if defined(_MSC_VER) && !defined(__clang__)
-#include <intrin.h>
-#define PS3_ENV_ONCE_INLINE static __inline
-#else
 #define PS3_ENV_ONCE_INLINE static inline
-#endif
 
 #define PS3_ENV_ONCE_SLOTS    64
 #define PS3_ENV_ONCE_NAME_MAX 48
@@ -21,26 +16,6 @@ typedef struct {
     const char* value;
 } ps3_env_once_slot;
 
-#if defined(_MSC_VER) && !defined(__clang__)
-static __forceinline long ps3_env_once_load(volatile long* p)
-{
-#if defined(_M_ARM64) || defined(_M_ARM)
-    return _InterlockedOr(p, 0);
-#else
-    const long v = *p;
-    _ReadWriteBarrier();
-    return v;
-#endif
-}
-static __forceinline void ps3_env_once_publish(volatile long* p, long v)
-{
-    _InterlockedExchange(p, v);
-}
-static __forceinline int ps3_env_once_claim(volatile long* p)
-{
-    return _InterlockedCompareExchange(p, 1, 0) == 0;
-}
-#else
 PS3_ENV_ONCE_INLINE long ps3_env_once_load(volatile long* p)
 {
     return __atomic_load_n(p, __ATOMIC_ACQUIRE);
@@ -54,7 +29,6 @@ PS3_ENV_ONCE_INLINE int ps3_env_once_claim(volatile long* p)
     long expected = 0;
     return __atomic_compare_exchange_n(p, &expected, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
 }
-#endif
 
 PS3_ENV_ONCE_INLINE const char* ps3_env_once(const char* name)
 {

@@ -29,6 +29,8 @@ add_executable(sync_stress
 if(NOT WIN32)
     target_sources(sync_stress PRIVATE
         "${PS3RECOMP_TREE_ROOT}/runtime/platform/win32_compat.c")
+    find_package(Threads REQUIRED)
+    target_link_libraries(sync_stress PRIVATE Threads::Threads)
 endif()
 
 target_include_directories(sync_stress PRIVATE
@@ -37,17 +39,7 @@ target_include_directories(sync_stress PRIVATE
     "${PS3RECOMP_TREE_ROOT}/include"
 )
 
-if(MSVC)
-    target_compile_options(sync_stress PRIVATE
-        /W3 /wd4100 /wd4244 /wd4267
-        /experimental:c11atomics
-    )
-    target_compile_definitions(sync_stress PRIVATE _CRT_SECURE_NO_WARNINGS)
-else()
-    target_compile_options(sync_stress PRIVATE -Wall -Wextra -Wno-unused-parameter)
-    find_package(Threads REQUIRED)
-    target_link_libraries(sync_stress PRIVATE Threads::Threads)
-endif()
+target_compile_options(sync_stress PRIVATE -Wall -Wextra -Wno-unused-parameter)
 
 add_test(NAME sync_stress COMMAND sync_stress)
 set_tests_properties(sync_stress PROPERTIES
@@ -80,12 +72,7 @@ endif()
 target_include_directories(test_sync_semantics PRIVATE
     "${PS3RECOMP_TREE_ROOT}" "${PS3RECOMP_TREE_ROOT}/include"
     "${RUNTIME_SYNC_DIR}" "${PS3RECOMP_TREE_ROOT}/runtime")
-if(MSVC)
-    target_compile_definitions(test_sync_semantics PRIVATE _CRT_SECURE_NO_WARNINGS)
-    target_compile_options(test_sync_semantics PRIVATE /experimental:c11atomics)
-else()
-    target_compile_options(test_sync_semantics PRIVATE -Wall -Wextra -Wno-unused-parameter)
-endif()
+target_compile_options(test_sync_semantics PRIVATE -Wall -Wextra -Wno-unused-parameter)
 add_test(NAME sync_semantics COMMAND test_sync_semantics)
 set_tests_properties(sync_semantics PROPERTIES LABELS "runtime;sync" TIMEOUT 60)
 
@@ -102,9 +89,6 @@ endif()
 target_include_directories(test_mutex_destroy PRIVATE
     "${PS3RECOMP_TREE_ROOT}" "${PS3RECOMP_TREE_ROOT}/include"
     "${RUNTIME_SYNC_DIR}" "${PS3RECOMP_TREE_ROOT}/runtime")
-if(MSVC)
-    target_compile_definitions(test_mutex_destroy PRIVATE _CRT_SECURE_NO_WARNINGS)
-endif()
 add_test(NAME mutex_destroy COMMAND test_mutex_destroy)
 set_tests_properties(mutex_destroy PROPERTIES LABELS "runtime;sync" TIMEOUT 20)
 
@@ -120,9 +104,6 @@ if(NOT WIN32)
 endif()
 target_include_directories(test_cond_semantics PRIVATE
     "${PS3RECOMP_TREE_ROOT}" "${PS3RECOMP_TREE_ROOT}/include")
-if(MSVC)
-    target_compile_definitions(test_cond_semantics PRIVATE _CRT_SECURE_NO_WARNINGS)
-endif()
 foreach(mode owner recursive spurious)
     add_test(NAME cond_${mode} COMMAND test_cond_semantics ${mode})
     set_tests_properties(cond_${mode} PROPERTIES TIMEOUT 10)
@@ -140,12 +121,7 @@ endif()
 target_include_directories(test_event_queue_destroy PRIVATE
     "${PS3RECOMP_TREE_ROOT}" "${PS3RECOMP_TREE_ROOT}/include"
     "${RUNTIME_SYNC_DIR}" "${PS3RECOMP_TREE_ROOT}/runtime")
-if(MSVC)
-    target_compile_definitions(test_event_queue_destroy PRIVATE _CRT_SECURE_NO_WARNINGS)
-    target_compile_options(test_event_queue_destroy PRIVATE /experimental:c11atomics)
-else()
-    target_compile_options(test_event_queue_destroy PRIVATE -Wall -Wextra -Wno-unused-parameter)
-endif()
+target_compile_options(test_event_queue_destroy PRIVATE -Wall -Wextra -Wno-unused-parameter)
 add_test(NAME event_queue_destroy COMMAND test_event_queue_destroy)
 set_tests_properties(event_queue_destroy PROPERTIES LABELS "runtime;sync" TIMEOUT 60)
 

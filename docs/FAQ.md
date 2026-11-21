@@ -34,7 +34,7 @@ This tree serves the Asura's Wrath port (`../port`, BLES01227).
 
 ### What platforms are supported?
 
-- **Windows** — clang-cl, XInput or SDL3, WASAPI; the host the port runs on
+- **Windows** — llvm-mingw Clang, XInput or SDL3, WASAPI; the host the port runs on
 - **Linux** — GCC/Clang, SDL3; the runtime builds and its tests run in CI
 
 ---

@@ -7,11 +7,7 @@
 #  else
 #    define PPU_TLS_CONSTINIT
 #  endif
-#  ifdef _MSC_VER
-#    define PPU_THREAD_LOCAL PPU_TLS_CONSTINIT __declspec(thread)
-#  else
-#    define PPU_THREAD_LOCAL PPU_TLS_CONSTINIT __thread
-#  endif
+#  define PPU_THREAD_LOCAL PPU_TLS_CONSTINIT __thread
 #endif
 
 #endif

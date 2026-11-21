@@ -234,13 +234,7 @@ int spu_coh_is_reserved(uint32_t addr)
     return spu_coh_line_reserved(addr);
 }
 
-#if defined(_MSC_VER)
-void ppu_resv_break_line(uint32_t ea);
-void ppu_resv_break_line_absent(uint32_t ea) { (void)ea; }
-#pragma comment(linker, "/alternatename:ppu_resv_break_line=ppu_resv_break_line_absent")
-#else
 __attribute__((weak)) void ppu_resv_break_line(uint32_t ea) { (void)ea; }
-#endif
 
 static inline void spu_coh_writer_fence(void) { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
 

@@ -4,14 +4,7 @@
 #include <stdint.h>
 #include <string.h>
 
-#if defined(_MSC_VER)
-  #include <stdlib.h>
-
-  static inline uint16_t ps3_bswap16(uint16_t v) { return _byteswap_ushort(v); }
-  static inline uint32_t ps3_bswap32(uint32_t v) { return _byteswap_ulong(v);  }
-  static inline uint64_t ps3_bswap64(uint64_t v) { return _byteswap_uint64(v); }
-
-#elif defined(__GNUC__) || defined(__clang__)
+#if defined(__GNUC__) || defined(__clang__)
 
   static inline uint16_t ps3_bswap16(uint16_t v) { return __builtin_bswap16(v); }
   static inline uint32_t ps3_bswap32(uint32_t v) { return __builtin_bswap32(v); }

@@ -17,11 +17,7 @@ typedef struct ppu_context {
 
     double   fpr[32];
 
-#ifdef _MSC_VER
-    __declspec(align(16)) u128 vr[32];
-#else
     u128     vr[32] __attribute__((aligned(16)));
-#endif
 
     uint32_t cr;
 

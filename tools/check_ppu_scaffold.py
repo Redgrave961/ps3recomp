@@ -58,28 +58,9 @@ def compiler_family(cxx: str) -> str:
 
 
 def pick_toolchain(explicit=None):
-    if explicit:
-        cxx = explicit
-    else:
-        cxx = os.environ.get("CXX")
-
-    if sys.platform == "win32":
-        if not cxx:
-            for cand in ("clang-cl",
-                         r"C:\Program Files\LLVM\bin\clang-cl.exe"):
-                if shutil.which(cand) or os.path.exists(cand):
-                    cxx = cand
-                    break
-        if not cxx:
-            return None, None
-        return "windows-clang-cl", [cxx, "/std:c++20", "/c", "/W0", "/EHsc",
-                                    "/D_CRT_SECURE_NO_WARNINGS",
-                                    "/clang:-ferror-limit=0"]
-
-    if not cxx:
-        cxx = "c++"
+    cxx = explicit or os.environ.get("CXX") or "c++"
     family = compiler_family(cxx)
-    osname = "darwin" if sys.platform == "darwin" else "linux"
+    osname = {"win32": "windows", "darwin": "darwin"}.get(sys.platform, "linux")
     argv = [cxx, "-std=c++20", "-fsyntax-only", "-w"]
     if family == "clang":
         argv.append("-ferror-limit=0")
@@ -101,18 +82,14 @@ def main() -> int:
     args = ap.parse_args()
 
     key, prefix = pick_toolchain(args.cxx)
-    if not key:
-        print("[ppu-scaffold] no usable C++ compiler found; skipping")
-        return 0
 
     tmp = tempfile.mkdtemp(prefix="ppu_scaffold_")
     try:
         with open(os.path.join(tmp, "ppu_recomp.h"), "w") as fh:
             fh.write(stub_header())
 
-        inc_flag = "/I" if key.startswith("windows") else "-I"
-        incs = [inc_flag + tmp]
-        incs += [inc_flag + os.path.join(ROOT, d) for d in INCLUDE_DIRS]
+        incs = ["-I" + tmp]
+        incs += ["-I" + os.path.join(ROOT, d) for d in INCLUDE_DIRS]
 
         print(f"[ppu-scaffold] toolchain: {key}")
         print(f"[ppu-scaffold] {' '.join(os.path.basename(p) for p in prefix[:1])}"
@@ -120,10 +97,7 @@ def main() -> int:
 
         results, total = {}, 0
         for src in SOURCES:
-            cmd = list(prefix) + incs
-            if key.startswith("windows"):
-                cmd += [f"/Fo{os.path.join(tmp, os.path.basename(src))}.obj"]
-            cmd += [os.path.join(ROOT, src)]
+            cmd = list(prefix) + incs + [os.path.join(ROOT, src)]
             proc = subprocess.run(cmd, capture_output=True, text=True)
             n = count_errors(proc.stdout + proc.stderr)
             results[src] = n

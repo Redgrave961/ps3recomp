@@ -23,7 +23,7 @@ enum ps3_ft_kind {
     PS3_FT_HLE         = 15,
 };
 
-#if defined(_MSC_VER) || defined(__MINGW32__)
+#if defined(_WIN32)
 #  define PS3_FT_SHARED __declspec(selectany)
 #else
 #  define PS3_FT_SHARED __attribute__((weak))

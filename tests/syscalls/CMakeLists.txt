@@ -20,11 +20,7 @@ target_include_directories(test_lock_line PRIVATE
     "${PS3RECOMP_ROOT}/include"
 )
 
-if(MSVC)
-    target_compile_definitions(test_lock_line PRIVATE _CRT_SECURE_NO_WARNINGS)
-else()
-    target_compile_options(test_lock_line PRIVATE -Wall -Wextra -Wno-unused-parameter)
-endif()
+target_compile_options(test_lock_line PRIVATE -Wall -Wextra -Wno-unused-parameter)
 
 add_test(NAME lock_line COMMAND test_lock_line)
 set_tests_properties(lock_line PROPERTIES
@@ -45,11 +41,7 @@ target_include_directories(test_sys_fs PRIVATE
     "${PS3RECOMP_ROOT}/include"
     "${PS3RECOMP_ROOT}/libs/filesystem"
 )
-if(MSVC)
-    target_compile_definitions(test_sys_fs PRIVATE _CRT_SECURE_NO_WARNINGS)
-else()
-    target_compile_options(test_sys_fs PRIVATE -Wall -Wextra -Wno-unused-parameter)
-endif()
+target_compile_options(test_sys_fs PRIVATE -Wall -Wextra -Wno-unused-parameter)
 if(NOT WIN32)
     find_package(Threads REQUIRED)
     target_link_libraries(test_sys_fs PRIVATE Threads::Threads)
@@ -68,11 +60,7 @@ target_include_directories(test_ppu_thread_join PRIVATE
     "${PS3RECOMP_ROOT}/runtime"
     "${PS3RECOMP_ROOT}/include"
 )
-if(MSVC)
-    target_compile_definitions(test_ppu_thread_join PRIVATE _CRT_SECURE_NO_WARNINGS)
-else()
-    target_compile_options(test_ppu_thread_join PRIVATE -Wall -Wextra -Wno-unused-parameter -UNDEBUG)
-endif()
+target_compile_options(test_ppu_thread_join PRIVATE -Wall -Wextra -Wno-unused-parameter -UNDEBUG)
 if(WIN32)
     target_link_libraries(test_ppu_thread_join PRIVATE synchronization)
 else()

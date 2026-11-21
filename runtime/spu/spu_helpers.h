@@ -9,23 +9,9 @@
 extern "C" {
 #endif
 
-#ifdef _MSC_VER
-#include <intrin.h>
-static inline int spu_clz32(uint32_t x) {
-    unsigned long idx;
-    if (!x) return 32;
-    _BitScanReverse(&idx, x);
-    return 31 - (int)idx;
-}
-#else
 static inline int spu_clz32(uint32_t x) { return x ? __builtin_clz(x) : 32; }
-#endif
 
-#ifdef _MSC_VER
-static inline void spu_arch_fence(void) { long spu_fence_tmp = 0; _InterlockedExchange(&spu_fence_tmp, 1); }
-#else
 static inline void spu_arch_fence(void) { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
-#endif
 
 #define SPU_W(P) (((P) & ~3) | (3 - ((P) & 3)))
 
@@ -531,35 +517,6 @@ static inline u128 spu_rotqbii(u128 a, int sh) { sh&=7; if(!sh) return a;
     uint64_t nhi=(hi<<sh)|(lo>>(64-sh)), nlo=(lo<<sh)|(hi>>(64-sh));
     u128 r; r._u32[0]=(uint32_t)(nhi>>32); r._u32[1]=(uint32_t)nhi; r._u32[2]=(uint32_t)(nlo>>32); r._u32[3]=(uint32_t)nlo; return r; }
 
-#if defined(_MSC_VER)
-#include <intrin.h>
-typedef struct { uint64_t hi, lo; } spu__u128;
-static inline spu__u128 spu__u128_from64(uint64_t v) { spu__u128 r; r.hi = 0; r.lo = v; return r; }
-static inline int spu__u128_top(spu__u128 v) {
-    unsigned long i;
-    if (v.hi) { _BitScanReverse64(&i, v.hi); return 64 + (int)i; }
-    _BitScanReverse64(&i, v.lo); return (int)i;
-}
-static inline uint32_t spu__u128_frac24(spu__u128 v, int top) {
-    if (top >= 23) {
-        const int n = top - 23;
-        if (n >= 64) return (uint32_t)(v.hi >> (n - 64));
-        if (n == 0) return (uint32_t)v.lo;
-        return (uint32_t)((v.hi << (64 - n)) | (v.lo >> n));
-    }
-    return (uint32_t)(v.lo << (23 - top));
-}
-static inline uint32_t spu__sf_pack128(uint32_t sign, spu__u128 sig, int e2) {
-    const int top = spu__u128_top(sig);
-    const int biased = top + e2 + 127;
-    if (biased > 255) return sign | 0x7FFFFFFFu;
-    if (biased < 1)   return 0;
-    return sign | ((uint32_t)biased << 23) | (spu__u128_frac24(sig, top) & 0x7FFFFFu);
-}
-static inline uint32_t spu__sf_pack(uint32_t sign, uint64_t sig, int e2) {
-    return spu__sf_pack128(sign, spu__u128_from64(sig), e2);
-}
-#else
 static inline uint32_t spu__sf_pack(uint32_t sign, unsigned __int128 sig, int e2) {
     const uint64_t hi = (uint64_t)(sig >> 64), lo = (uint64_t)sig;
     const int top = hi ? 127 - __builtin_clzll(hi) : 63 - __builtin_clzll(lo);
@@ -569,7 +526,6 @@ static inline uint32_t spu__sf_pack(uint32_t sign, unsigned __int128 sig, int e2
     const uint32_t m24 = top >= 23 ? (uint32_t)(sig >> (top - 23)) : (uint32_t)(sig << (23 - top));
     return sign | ((uint32_t)biased << 23) | (m24 & 0x7FFFFFu);
 }
-#endif
 static inline int spu__sf_split(uint32_t x, uint32_t* sig, int* e2) {
     const uint32_t be = (x >> 23) & 0xFFu;
     if (!be) return 0;
@@ -786,7 +742,7 @@ static inline u128 spu_mpyhhau_ref(u128 a, u128 b, u128 t) { u128 r; for(int i=0
 static inline u128 spu_dfcgt_h_(u128 a, u128 b)  { u128 r; for(int i=0;i<2;i++){ uint64_t m=(spu__dget(a,i)>spu__dget(b,i))?~0ull:0ull; r._u32[i*2]=(uint32_t)(m>>32); r._u32[i*2+1]=(uint32_t)m; } return r; }
 static inline u128 spu_dfcmgt_h_(u128 a, u128 b) { u128 r; for(int i=0;i<2;i++){ double x=spu__dget(a,i),y=spu__dget(b,i); if(x<0)x=-x; if(y<0)y=-y; uint64_t m=(x>y)?~0ull:0ull; r._u32[i*2]=(uint32_t)(m>>32); r._u32[i*2+1]=(uint32_t)m; } return r; }
 
-#if defined(__aarch64__) || ((defined(__x86_64__) || defined(_M_X64)) && defined(__AVX2__) && !defined(SPU_SCALAR_HELPERS))
+#if defined(__aarch64__) || (defined(__x86_64__) && defined(__AVX2__) && !defined(SPU_SCALAR_HELPERS))
 #if defined(__aarch64__)
 static inline uint64_t spu__fpcr_now(void) { uint64_t v; __asm__ volatile("mrs %0, fpcr" : "=r"(v)); return v; }
 static inline void spu__fpcr_put(uint64_t v) { __asm__ volatile("msr fpcr, %0" :: "r"(v)); }

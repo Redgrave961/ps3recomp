@@ -13,11 +13,7 @@
 extern "C" {
 #endif
 
-#if defined(_MSC_VER)
-#  define SPU_ALIGN16 __declspec(align(16))
-#else
-#  define SPU_ALIGN16 __attribute__((aligned(16)))
-#endif
+#define SPU_ALIGN16 __attribute__((aligned(16)))
 
 #define SPU_LS_SIZE         (256 * 1024)
 #define SPU_LS_MASK         (SPU_LS_SIZE - 1)
@@ -185,14 +181,8 @@ typedef struct spu_context {
     int coh_listed;
 } spu_context;
 
-#if defined(_MSC_VER)
-#include <intrin.h>
-#define SPU_EVENT_SET(c, b)   _InterlockedOr((volatile long*)&(c)->event_status, (long)(uint32_t)(b))
-#define SPU_EVENT_CLEAR(c, b) _InterlockedAnd((volatile long*)&(c)->event_status, (long)~(uint32_t)(b))
-#else
 #define SPU_EVENT_SET(c, b)   __atomic_fetch_or(&(c)->event_status, (uint32_t)(b), __ATOMIC_SEQ_CST)
 #define SPU_EVENT_CLEAR(c, b) __atomic_fetch_and(&(c)->event_status, ~(uint32_t)(b), __ATOMIC_SEQ_CST)
-#endif
 
 void spu_mfc_release(spu_context* ctx);
 void spu_mfc_forget_range(uintptr_t lo, uintptr_t hi);
@@ -223,11 +213,7 @@ static inline void spu_ls_write32(spu_context* ctx, uint32_t lsa, uint32_t val)
     p[3] = (uint8_t)(val);
 }
 
-#if defined(_MSC_VER)
-#include <stdlib.h>
-#define SPU_BSWAP32(x) _byteswap_ulong(x)
-#define SPU_LS_FAST 1
-#elif defined(__GNUC__) || defined(__clang__)
+#if defined(__GNUC__) || defined(__clang__)
 #define SPU_BSWAP32(x) __builtin_bswap32(x)
 #define SPU_LS_FAST 1
 #endif
@@ -235,7 +221,7 @@ static inline void spu_ls_write32(spu_context* ctx, uint32_t lsa, uint32_t val)
 #include <arm_neon.h>
 #endif
 #if !defined(SPU_LS_VEC) && !defined(__ARM_NEON) && defined(__SSSE3__) && \
-    (defined(__x86_64__) || defined(_M_X64))
+    defined(__x86_64__)
 #define SPU_LS_VEC 1
 #endif
 #if SPU_LS_VEC
@@ -339,11 +325,7 @@ static inline int spu_channel_has_data(const spu_channel* ch)
     return ch->count > 0;
 }
 
-#if defined(_MSC_VER)
-#  define SPU_THREAD_LOCAL __declspec(thread)
-#else
-#  define SPU_THREAD_LOCAL __thread
-#endif
+#define SPU_THREAD_LOCAL __thread
 
 void spu_indirect_branch(spu_context* ctx);
 

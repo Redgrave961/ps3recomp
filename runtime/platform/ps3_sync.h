@@ -21,10 +21,7 @@ void ps3_futex_wake_all(volatile uint32_t* addr);
 int  ps3_brief_wait(volatile uint32_t* addr, uint32_t expected, uint64_t us);
 void ps3_brief_wake(volatile uint32_t* addr);
 
-#if defined(_MSC_VER) && !defined(__clang__)
-#  include <intrin.h>
-#  define ps3_pause() _mm_pause()
-#elif defined(__x86_64__) || defined(__i386__)
+#if defined(__x86_64__) || defined(__i386__)
 #  define ps3_pause() __builtin_ia32_pause()
 #elif defined(__aarch64__)
 #  define ps3_pause() __asm__ __volatile__("yield" ::: "memory")
