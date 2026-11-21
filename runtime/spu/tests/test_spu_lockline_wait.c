@@ -6,6 +6,8 @@
 #include <time.h>
 #include "../spu_coherency.c"
 
+uint8_t* vm_base;
+
 void spu_ch_wake(spu_context* ctx) { (void)ctx; }
 
 static atomic_int waiting;

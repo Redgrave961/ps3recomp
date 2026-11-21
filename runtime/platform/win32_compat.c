@@ -25,6 +25,10 @@
 #endif
 
 #if defined(__linux__)
+#  include <SDL3/SDL_error.h>
+#  include <SDL3/SDL_system.h>
+#  include <SDL3/SDL_thread.h>
+#  include <sched.h>
 #  define PS3_SUSPEND_SIGNAL (SIGRTMIN + 4)
 #endif
 
@@ -334,17 +338,19 @@ static void apply_priority(pthread_t pt, DWORD tid, int level, int is_self)
     }
     (void)tid;
 #elif defined(__linux__)
-    int nice;
-    if      (level >= THREAD_PRIORITY_TIME_CRITICAL) nice = -20;
-    else if (level >= THREAD_PRIORITY_HIGHEST)       nice = -10;
-    else if (level >= THREAD_PRIORITY_ABOVE_NORMAL)  nice = -5;
-    else if (level == THREAD_PRIORITY_NORMAL)        nice = 0;
-    else if (level >= THREAD_PRIORITY_BELOW_NORMAL)  nice = 5;
-    else if (level >= THREAD_PRIORITY_LOWEST)        nice = 10;
-    else                                             nice = 19;
-    if (is_self) tid = (DWORD)syscall(SYS_gettid);
-    if (tid) setpriority(PRIO_PROCESS, (id_t)tid, nice);
     (void)pt;
+    if (is_self) tid = (DWORD)syscall(SYS_gettid);
+    if (!tid) return;
+    if (level >= THREAD_PRIORITY_ABOVE_NORMAL) {
+        static int s_denied;
+        const int critical = level >= THREAD_PRIORITY_TIME_CRITICAL;
+        if (!SDL_SetLinuxThreadPriorityAndPolicy((Sint64)tid, critical ? SDL_THREAD_PRIORITY_TIME_CRITICAL : SDL_THREAD_PRIORITY_HIGH,
+                                                 critical ? SCHED_RR : SCHED_OTHER) &&
+            !__atomic_exchange_n(&s_denied, 1, __ATOMIC_RELAXED))
+            fprintf(stderr, "[thread] raising thread priority was denied (rtkit: %s); threads keep normal priority\n", SDL_GetError());
+        return;
+    }
+    setpriority(PRIO_PROCESS, (id_t)tid, level == THREAD_PRIORITY_NORMAL ? 0 : level >= THREAD_PRIORITY_BELOW_NORMAL ? 5 : level >= THREAD_PRIORITY_LOWEST ? 10 : 19);
 #else
     (void)pt; (void)tid; (void)level; (void)is_self;
 #endif

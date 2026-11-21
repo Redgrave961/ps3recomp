@@ -198,22 +198,22 @@ static int pad_host_window_focused(void)
 }
 static int pad_key_down(int key)
 {
-    return SDL_GetKeyboardState(NULL)[key];
+    return SDL_GetKeyboardState(NULL)[SDL_GetScancodeFromKey((SDL_Keycode)key, NULL)];
 }
-#define PADKEY_UP SDL_SCANCODE_UP
-#define PADKEY_DOWN SDL_SCANCODE_DOWN
-#define PADKEY_LEFT SDL_SCANCODE_LEFT
-#define PADKEY_RIGHT SDL_SCANCODE_RIGHT
-#define PADKEY_Z SDL_SCANCODE_Z
-#define PADKEY_X SDL_SCANCODE_X
-#define PADKEY_A SDL_SCANCODE_A
-#define PADKEY_S SDL_SCANCODE_S
-#define PADKEY_Q SDL_SCANCODE_Q
-#define PADKEY_W SDL_SCANCODE_W
-#define PADKEY_1 SDL_SCANCODE_1
-#define PADKEY_2 SDL_SCANCODE_2
-#define PADKEY_RETURN SDL_SCANCODE_RETURN
-#define PADKEY_TAB SDL_SCANCODE_TAB
+#define PADKEY_UP SDLK_UP
+#define PADKEY_DOWN SDLK_DOWN
+#define PADKEY_LEFT SDLK_LEFT
+#define PADKEY_RIGHT SDLK_RIGHT
+#define PADKEY_Z SDLK_Z
+#define PADKEY_X SDLK_X
+#define PADKEY_A SDLK_A
+#define PADKEY_S SDLK_S
+#define PADKEY_Q SDLK_Q
+#define PADKEY_W SDLK_W
+#define PADKEY_1 SDLK_1
+#define PADKEY_2 SDLK_2
+#define PADKEY_RETURN SDLK_RETURN
+#define PADKEY_TAB SDLK_TAB
 #endif
 
 static void pad_poll_keyboard(void)

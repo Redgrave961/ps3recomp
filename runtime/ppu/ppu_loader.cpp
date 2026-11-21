@@ -76,7 +76,6 @@ static int vm_oob_report(uint32_t a, uint32_t n)
         static int logged = 0;
         if (logged < 40) {
             fprintf(stderr, "[vm] OOB access 0x%08X (+%u)\n", a, n);
-#ifdef _WIN32
             static int bt = 0;
             if (PS3_LOG_FIRST(bt, 3)) {
                 void* fr[20]; USHORT m = RtlCaptureStackBackTrace(0, 20, fr, NULL);
@@ -93,7 +92,6 @@ static int vm_oob_report(uint32_t a, uint32_t n)
                                 (unsigned long long)((char*)fr[i] - (char*)self));
                 }
             }
-#endif
             logged++;
         }
         return 1;
@@ -964,12 +962,8 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
     ctx.gpr[13] = PPU_TLS_TP;
     ctx.cia     = code;
     ppu_context* saved_active = g_active_ctx;
-#ifdef _WIN32
     ctx.thread_id = saved_active ? saved_active->thread_id
                                  : (0x7FFF0000ull | (GetCurrentThreadId() & 0xFFFFu));
-#else
-    ctx.thread_id = saved_active ? saved_active->thread_id : 0x7FFF0000ull;
-#endif
     g_active_ctx = &ctx;
     fn(&ctx);
     while (g_trampoline_fn) { void (*tf)(void*) = g_trampoline_fn; g_trampoline_fn = 0; tf(&ctx); }
@@ -1006,12 +1000,8 @@ extern "C" int ppu_guest_call_ct_checked(uint32_t code, uint32_t toc,
     ctx.gpr[13] = PPU_TLS_TP;
     ctx.cia     = code;
     ppu_context* saved_active = g_active_ctx;
-#ifdef _WIN32
     ctx.thread_id = saved_active ? saved_active->thread_id
                                  : (0x7FFF0000ull | (GetCurrentThreadId() & 0xFFFFu));
-#else
-    ctx.thread_id = saved_active ? saved_active->thread_id : 0x7FFF0000ull;
-#endif
     ppu_active_context_scope active_scope(&ctx);
     struct callback_trampoline_scope {
         void (*previous)(void*);

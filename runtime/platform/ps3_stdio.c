@@ -1,5 +1,6 @@
 #include "ps3_stdio.h"
 #include "win32_compat.h"
+#include "ps3emu/thread_name.h"
 
 #include <signal.h>
 #include <stdio.h>
@@ -27,6 +28,7 @@ static void (*s_prev_abort)(int);
 static DWORD WINAPI ps3_stdio_flusher(LPVOID arg)
 {
     (void)arg;
+    ps3_thread_name("stdio flush");
     for (;;) {
         WaitForSingleObject(s_wake, s_flush_ms);
         if (__atomic_load_n(&s_stop, __ATOMIC_ACQUIRE)) return 0;

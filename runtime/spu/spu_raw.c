@@ -183,7 +183,7 @@ static void raw_spu_stopped(raw_spu* s)
 
 static void raw_spu_run(raw_spu* s)
 {
-    ps3_thread_name("raw spu");
+    ps3_thread_name("raw spu %u", (unsigned)(s - s_spu));
     spu_context* c = s->ctx;
 
     c->status = SPU_STATUS_RUNNING;

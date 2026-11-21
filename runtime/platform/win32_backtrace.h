@@ -13,13 +13,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
-
-#if defined(__GLIBC__) || defined(__APPLE__)
-#  include <execinfo.h>
-#  define PS3_HAVE_BACKTRACE 1
-#else
-#  define PS3_HAVE_BACKTRACE 0
-#endif
+#include <unwind.h>
 #include <dlfcn.h>
 #if defined(__GLIBC__) && !defined(__USE_GNU)
 #  error "win32_backtrace.h needs _GNU_SOURCE defined before the first #include on glibc (dladdr's Dl_info)"
@@ -84,33 +78,29 @@ static inline int GetModuleHandleExW(unsigned long flags, LPCWSTR addr,
     return *out != NULL;
 }
 
-static inline USHORT RtlCaptureStackBackTrace(unsigned long skip,
-                                             unsigned long count,
-                                             void** frames,
-                                             unsigned long* hash)
+typedef struct {
+    void** frames;
+    unsigned long skip;
+    unsigned long count;
+    unsigned long n;
+} ps3__bt_walk;
+
+static inline _Unwind_Reason_Code ps3__bt_frame(struct _Unwind_Context* uc, void* arg)
+{
+    ps3__bt_walk* w = (ps3__bt_walk*)arg;
+    if (w->skip) { w->skip--; return _URC_NO_REASON; }
+    if (w->n == w->count) return _URC_END_OF_STACK;
+    w->frames[w->n++] = (void*)_Unwind_GetIP(uc);
+    return _URC_NO_REASON;
+}
+
+static __attribute__((noinline, unused)) USHORT RtlCaptureStackBackTrace(unsigned long skip, unsigned long count, void** frames, unsigned long* hash)
 {
     if (hash) *hash = 0;
     if (!frames || count == 0) return 0;
-#if PS3_HAVE_BACKTRACE
-    enum { PS3_BT_CAP = 160 };
-    void* raw[PS3_BT_CAP];
-    unsigned long want = skip + count + 1;
-    if (want > PS3_BT_CAP) want = PS3_BT_CAP;
-
-    int got = backtrace(raw, (int)want);
-    if (got <= 0) return 0;
-
-    unsigned long first = skip + 1;
-    if (first >= (unsigned long)got) return 0;
-
-    unsigned long n = (unsigned long)got - first;
-    if (n > count) n = count;
-    for (unsigned long i = 0; i < n; i++) frames[i] = raw[first + i];
-    return (USHORT)n;
-#else
-    (void)skip; (void)count;
-    return 0;
-#endif
+    ps3__bt_walk w = { frames, skip + 1, count, 0 };
+    _Unwind_Backtrace(ps3__bt_frame, &w);
+    return (USHORT)w.n;
 }
 
 typedef struct {

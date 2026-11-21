@@ -115,12 +115,10 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
             if((v>=0x00010000u&&v<0x00900000u)||(v>=0x30000000u&&v<0x30100000u)){
               if(v!=prev){ p+=snprintf(b+p,sizeof(b)-p," %08X",v); prev=v; found++; } } }
           fprintf(stderr,"%s\n",b); }
-#ifdef _WIN32
         { void* bt[40]; unsigned short fr=RtlCaptureStackBackTrace(0,40,bt,0);
           char* mb=(char*)GetModuleHandleA(0); char line[1100]; int p=snprintf(line,sizeof line,"[exit-chain] HOST-bt rva:");
           for(int i=0;i<fr;i++) p+=snprintf(line+p,sizeof(line)-p," %llX",(unsigned long long)((char*)bt[i]-mb));
           fprintf(stderr,"%s\n",line); }
-#endif
     }
     vm_write64(ctx->gpr[1] + 0x28, ctx->gpr[2]);
 

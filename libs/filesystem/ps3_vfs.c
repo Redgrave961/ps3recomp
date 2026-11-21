@@ -229,6 +229,7 @@ static vfs_mount* open_image(const char* host_dir, const char* image)
         free(m);
         return NULL;
     }
+    posix_fadvise(m->fd, 0, 0, POSIX_FADV_RANDOM);
 #endif
     m->prefix = normalize(host_dir);
     m->prefix_len = m->prefix ? strlen(m->prefix) : 0;

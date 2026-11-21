@@ -7,6 +7,7 @@
 #include <windows.h>
 #else
 #include "../../runtime/platform/win32_compat.h"
+#include <SDL3/SDL_messagebox.h>
 #include <time.h>
 #endif
 
@@ -63,8 +64,6 @@ static struct {
     u32 sema4097_off;
     u32 report_ctx;
     u32 notify_ctx;
-    u64 frame_due;
-    HANDLE frame_timer;
     volatile u64 progress;
     u32 put_seen;
     u64 batch;
@@ -187,10 +186,15 @@ void rsx_core_doorbell(void)
     WakeByAddressSingle((PVOID)&s.bell);
 }
 
+static _Thread_local int t_flip;
+static _Thread_local u32 t_flip_put;
+static void rsx_flip_throttle(void);
+
 static void rsx_core_window_written(void)
 {
     rsx_core_doorbell();
     rsx_label_wake();
+    if (t_flip && rsx_load(RSX_PUT_EA) != t_flip_put) rsx_flip_throttle();
 }
 
 static void rsx_irq_push(enum rsx_event event, u32 arg)
@@ -249,21 +253,12 @@ static u64 rsx_tick_freq(void)
     return (u64)s_qpc_freq.QuadPart;
 }
 
-static void rsx_sleep_until(HANDLE timer, u64 target, int precise)
+static void rsx_sleep_os(HANDLE timer, u64 left)
 {
-    const u64 freq = rsx_tick_freq(), slack = precise ? freq / 1000u : 0u, spin = freq / 20000u;
-    u64 now = rsx_ticks();
-    if (now >= target) return;
-    if (target - now > slack) {
-        const u64 left = target - now - slack;
-        LARGE_INTEGER due;
-        due.QuadPart = -(LONGLONG)((left / freq) * 10000000ull + (left % freq) * 10000000ull / freq);
-        if (due.QuadPart && SetWaitableTimerEx(timer, &due, 0, NULL, NULL, NULL, 0)) WaitForSingleObject(timer, INFINITE);
-    }
-    while (precise && (now = rsx_ticks()) < target) {
-        if (target - now > spin) SwitchToThread();
-        else YieldProcessor();
-    }
+    const u64 freq = rsx_tick_freq();
+    LARGE_INTEGER due;
+    due.QuadPart = -(LONGLONG)((left / freq) * 10000000ull + (left % freq) * 10000000ull / freq);
+    if (due.QuadPart && SetWaitableTimerEx(timer, &due, 0, NULL, NULL, NULL, 0)) WaitForSingleObject(timer, INFINITE);
 }
 
 static HANDLE rsx_timer_create(void)
@@ -280,16 +275,24 @@ static u64 rsx_ticks(void)
 
 static u64 rsx_tick_freq(void) { return 1000000000ull; }
 
-static void rsx_sleep_until(HANDLE timer, u64 target, int precise)
+static void rsx_sleep_os(HANDLE timer, u64 left)
 {
     (void)timer;
-    (void)precise;
+    const u64 target = rsx_ticks() + left;
     struct timespec ts = { (time_t)(target / 1000000000ull), (long)(target % 1000000000ull) };
     while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) != 0) {}
 }
 
 static HANDLE rsx_timer_create(void) { return NULL; }
 #endif
+
+static void rsx_sleep_until(HANDLE timer, u64 target)
+{
+    const u64 spin = rsx_tick_freq() * 3u / 5000u, now = rsx_ticks();
+    if (now >= target) return;
+    if (target - now > spin) rsx_sleep_os(timer, target - now - spin);
+    while (rsx_ticks() < target) YieldProcessor();
+}
 
 typedef struct rsx_hold {
     u32 put;
@@ -323,15 +326,6 @@ static void rsx_wait_change(u32 put)
     while (!rsx_idle_over(&w)) rsx_await(rsx_idle_over, &w, INFINITE);
 }
 
-static rsx_vblank_clock s_clock;
-static void* s_clock_user;
-
-void rsx_core_set_vblank_clock(rsx_vblank_clock clock, void* user)
-{
-    __atomic_store_n(&s_clock_user, user, __ATOMIC_RELEASE);
-    __atomic_store_n(&s_clock, clock, __ATOMIC_RELEASE);
-}
-
 static DWORD WINAPI rsx_vblank_thread(LPVOID unused)
 {
     (void)unused;
@@ -339,21 +333,15 @@ static DWORD WINAPI rsx_vblank_thread(LPVOID unused)
     const u64 group = rsx_tick_freq() * 1001ull / 1000ull;
     u64 base = rsx_ticks();
     for (u32 n = 1;; n++) {
-        const rsx_vblank_clock clock = __atomic_load_n(&s_clock, __ATOMIC_ACQUIRE);
-        if (clock && clock(__atomic_load_n(&s_clock_user, __ATOMIC_ACQUIRE))) {
-            base = rsx_ticks();
-            n = 0;
-        } else {
-            if (n > RSX_VBLANK_GROUP) {
-                base += group;
-                n = 1;
-            }
-            if (base + group * n / RSX_VBLANK_GROUP + group < rsx_ticks()) {
-                base = rsx_ticks();
-                n = 1;
-            }
-            rsx_sleep_until(timer, base + group * n / RSX_VBLANK_GROUP, 1);
+        if (n > RSX_VBLANK_GROUP) {
+            base += group;
+            n = 1;
         }
+        if (base + group * n / RSX_VBLANK_GROUP + group < rsx_ticks()) {
+            base = rsx_ticks();
+            n = 1;
+        }
+        rsx_sleep_until(timer, base + group * n / RSX_VBLANK_GROUP);
         AcquireSRWLockExclusive(&s.vblank_lock);
         const u64 count = ++s.vblank_count;
         ReleaseSRWLockExclusive(&s.vblank_lock);
@@ -393,16 +381,30 @@ static void rsx_frame_limit(void)
     const u64 idle = __atomic_load_n(&s.hidden_period, __ATOMIC_ACQUIRE);
     const u64 period = chosen > idle ? chosen : idle;
     if (!period) return;
-    if (!s.frame_timer) s.frame_timer = rsx_timer_create();
+    static _Thread_local HANDLE timer;
+    static _Thread_local u64 due;
+    if (!timer) timer = rsx_timer_create();
     const u64 now = rsx_ticks();
-    s.frame_due = s.frame_due + 2u * period < now ? now : s.frame_due + period;
-    rsx_sleep_until(s.frame_timer, s.frame_due, !idle);
+    due = due + 2u * period < now ? now : due + period;
+    rsx_sleep_until(timer, due);
+}
+
+static void rsx_flip_throttle(void)
+{
+    t_flip = 0;
+    if (s.renderer && s.renderer->throttle) s.renderer->throttle(s.renderer->user);
+    rsx_frame_limit();
+}
+
+void rsx_core_flip_emitted(void)
+{
+    t_flip_put = rsx_load(RSX_PUT_EA);
+    t_flip = 1;
 }
 
 static void rsx_scanout(u32 buffer)
 {
-    if (s.renderer && s.renderer->present && s.renderer->present(s.renderer->user, buffer, &s.display[buffer]))
-        rsx_frame_limit();
+    if (s.renderer && s.renderer->present) s.renderer->present(s.renderer->user, buffer, &s.display[buffer]);
 }
 
 static void rsx_flip_done(u32 buffer)
@@ -704,6 +706,8 @@ static DWORD WINAPI rsx_fifo_thread(LPVOID unused)
         fflush(NULL);
 #ifdef _WIN32
         MessageBoxA(NULL, "The Vulkan renderer failed to start. The console log has the reason.", "Renderer error", MB_OK | MB_ICONERROR);
+#else
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Renderer error", "The Vulkan renderer failed to start. The console log has the reason.", NULL);
 #endif
         _Exit(1);
     }

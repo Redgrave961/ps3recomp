@@ -30,7 +30,17 @@ static inline void ps3_thread_name(const char* fmt, ...)
     set_desc(GetCurrentThread(), w);
 }
 #else
-static inline void ps3_thread_name(const char* fmt, ...) { (void)fmt; }
+#include <sys/prctl.h>
+
+static inline void ps3_thread_name(const char* fmt, ...)
+{
+    char s[16];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(s, sizeof s, fmt, ap);
+    va_end(ap);
+    prctl(PR_SET_NAME, s);
+}
 #endif
 
 #endif

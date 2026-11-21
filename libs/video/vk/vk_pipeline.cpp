@@ -1,5 +1,6 @@
 #include "vk_pipeline.h"
 #include "vk_shaders.h"
+#include "ps3emu/thread_name.h"
 
 #include <algorithm>
 #include <cstring>
@@ -126,7 +127,11 @@ bool pipelines::create(vk_device& d, const std::string& cache_path)
     m_db = std::fopen((m_cache_path.substr(0, slash == std::string::npos ? 0 : slash + 1) + "vk_shaders.db").c_str(), "ab+");
     const unsigned n = std::max(3u, std::thread::hardware_concurrency() / 2u);
     m_background_limit = n - 2u;
-    for (unsigned i = 0; i < n; i++) m_workers.emplace_back(&pipelines::worker, this);
+    for (unsigned i = 0; i < n; i++)
+        m_workers.emplace_back([this, i] {
+            ps3_thread_name("vk pipeline %u", i);
+            worker();
+        });
     std::fprintf(stderr, "[vk] pipelines: %s, %u compile threads\n", m_libraries ? "libraries with fast link" : "monolithic", n);
     return true;
 }

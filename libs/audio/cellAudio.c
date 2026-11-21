@@ -8,6 +8,7 @@
 #include <math.h>
 #include "ps3emu/log_first.h"
 #include "ps3emu/thread_name.h"
+#include "../../runtime/platform/ps3_sync.h"
 
 #if defined(_WIN32)
   #define AUDIO_BACKEND_SDL     0
@@ -80,9 +81,7 @@ static int            s_audio_initialized = 0;
 static AudioPortSlot  s_ports[CELL_AUDIO_PORT_MAX];
 
 static unsigned long long g_audio_dropped;
-#ifdef _WIN32
 static unsigned g_audio_holes[CELL_AUDIO_PORT_MAX];
-#endif
 static volatile int  s_mix_thread_running = 0;
 static thread_t      s_mix_thread;
 #ifndef _WIN32
@@ -148,6 +147,14 @@ static int audio_backend_room(void)
 }
 
 static void audio_backend_wait(void) { SDL_Delay(1); }
+
+static unsigned audio_backend_device_frames(void)
+{
+    SDL_AudioSpec spec;
+    int frames = 0;
+    if (s_sdl_audio_stream) SDL_GetAudioDeviceFormat(SDL_GetAudioStreamDevice(s_sdl_audio_stream), &spec, &frames);
+    return (unsigned)frames;
+}
 
 #endif
 
@@ -380,14 +387,12 @@ static void audio_mix_one_block(void)
                         p, (unsigned long long)port->read_index, block_idx, map);
             } } }
 
-#ifdef _WIN32
         { static int hole_on = -1; static u32 prev_nz[CELL_AUDIO_PORT_MAX];
           if (hole_on < 0) hole_on = getenv("AUDIO_RATE") ? 1 : 0;
           if (hole_on) { int nz = 0;
             for (u32 s2 = 0; s2 < CELL_AUDIO_BLOCK_SAMPLES * nch; s2 += 2) if (src[s2] != 0.0f) { nz = 1; break; }
             if (!nz && prev_nz[p]) g_audio_holes[p]++;
             prev_nz[p] = nz; } }
-#endif
 
         for (u32 s = 0; s < CELL_AUDIO_BLOCK_SAMPLES; s++) {
             float left, right;
@@ -445,14 +450,14 @@ static void audio_dump_mix(void)
     if (wf) fwrite(s_mix_buffer, sizeof(float), CELL_AUDIO_BLOCK_SAMPLES * 2, wf);
 }
 
-#ifdef _WIN32
 static unsigned long long g_audio_underruns;
-static unsigned __stdcall audio_mix_thread_func(void* arg)
+
+static void audio_mix_loop(void)
 {
-    (void)arg;
     ps3_thread_name("audio mix");
     printf("[cellAudio] Mixing thread started\n");
 
+#ifdef _WIN32
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
     { HMODULE avrt = LoadLibraryW(L"avrt.dll");
       typedef HANDLE (WINAPI *set_mm_fn)(LPCWSTR, LPDWORD);
@@ -460,8 +465,12 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
       DWORD task = 0;
       if (set_mm && !set_mm(L"Pro Audio", &task))
           fprintf(stderr, "[cellAudio] MMCSS Pro Audio unavailable (%lu)%c", (unsigned long)GetLastError(), 10); }
+#else
+    SDL_SetCurrentThreadPriority(SDL_THREAD_PRIORITY_TIME_CRITICAL);
+#endif
 
-    LARGE_INTEGER qf, q0; QueryPerformanceFrequency(&qf); QueryPerformanceCounter(&q0);
+    const unsigned long long block_ns = 1000000000ull * CELL_AUDIO_BLOCK_SAMPLES / CELL_AUDIO_SAMPLE_RATE;
+    unsigned long long t_start = ps3_sync_now_ns();
     unsigned long long blocks = 0;
     while (s_mix_thread_running) {
         const int room = audio_backend_room();
@@ -469,15 +478,13 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
 #if AUDIO_BACKEND_WASAPI
         if (room >= 0 && blocks > 64 &&
             (UINT32)room + CELL_AUDIO_BLOCK_SAMPLES / 2 >= s_wasapi_buf_frames) g_audio_underruns++;
+#else
+        if (room >= 0 && blocks > 64 && !audio_backend_queued_samples()) g_audio_underruns++;
 #endif
         if (room < 0) {
-            LARGE_INTEGER now; QueryPerformanceCounter(&now);
-            const long long due = q0.QuadPart +
-                (long long)(blocks * CELL_AUDIO_BLOCK_SAMPLES * qf.QuadPart / CELL_AUDIO_SAMPLE_RATE);
-            if (now.QuadPart < due) { Sleep(1); continue; }
-            if (now.QuadPart - due > qf.QuadPart / 20)
-                q0.QuadPart = now.QuadPart -
-                    (long long)(blocks * CELL_AUDIO_BLOCK_SAMPLES * qf.QuadPart / CELL_AUDIO_SAMPLE_RATE);
+            const unsigned long long now = ps3_sync_now_ns(), due = t_start + blocks * block_ns;
+            if (now < due) { ps3_sleep_us(1000); continue; }
+            if (now - due > 50000000ull) t_start = now - blocks * block_ns;
         }
         blocks++;
         audio_mix_one_block();
@@ -488,57 +495,41 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
         audio_dump_mix();
         audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
         { static int on = -1; if (on < 0) on = getenv("AUDIO_RATE") ? 1 : 0;
-          if (on) { static ULONGLONG t0; static unsigned n, z; static unsigned long long d0, u0;
-            ULONGLONG now = GetTickCount64(); if (!t0) t0 = now; n++;
+          if (on) { static unsigned long long t0; static unsigned n, z; static unsigned long long d0, u0;
+            const unsigned long long now = ps3_sync_now_ns() / 1000000ull; if (!t0) t0 = now; n++;
             { int nz = 0; for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) if (s_mix_buffer[i] != 0.0f) { nz = 1; break; }
               if (!nz) z++; }
             if (now - t0 >= 5000) {
                 fprintf(stderr, "[audio-rate] %.1f blocks/s (real time 187.5), silent %.1f%%, dropped %.0f frames/s, underruns %llu, device buf %u, holes %u+%u%c",
                         n * 1000.0 / (now - t0), n ? 100.0 * z / n : 0.0, (g_audio_dropped - d0) * 1000.0 / (now - t0),
                         g_audio_underruns - u0,
-                #if AUDIO_BACKEND_WASAPI
+#if AUDIO_BACKEND_WASAPI
                         (unsigned)s_wasapi_buf_frames, g_audio_holes[0], g_audio_holes[1], 10);
 #else
-                        0u, g_audio_holes[0], g_audio_holes[1], 10);
+                        audio_backend_device_frames(), g_audio_holes[0], g_audio_holes[1], 10);
 #endif
                 g_audio_holes[0] = g_audio_holes[1] = 0;
                 n = z = 0; d0 = g_audio_dropped; u0 = g_audio_underruns; t0 = now; } } }
-
     }
 
     printf("[cellAudio] Mixing thread stopped\n");
+}
+
+#ifdef _WIN32
+static unsigned __stdcall audio_mix_thread_func(void* arg)
+{
+    (void)arg;
+    audio_mix_loop();
     return 0;
 }
 #else
 static void* audio_mix_thread_func(void* arg)
 {
     (void)arg;
-    printf("[cellAudio] Mixing thread started\n");
-
-    unsigned long blocks = 0; float peak = 0.0f;
-    while (s_mix_thread_running) {
-        audio_mix_one_block();
-        audio_dump_mix();
-        audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
-        { static int pk_on = -1; if (pk_on < 0) pk_on = getenv("AUDIO_PEAK") ? 1 : 0;
-          if (pk_on) {
-              const float pk = audio_mix_peak(); if (pk > peak) peak = pk;
-              if (++blocks % 188 == 0) { fprintf(stderr, "[audio-peak] %lu s: peak %.4f\n", blocks / 188, peak); peak = 0.0f; }
-          } }
-
-        u32 queued = audio_backend_queued_samples();
-        if (queued > CELL_AUDIO_BLOCK_SAMPLES * 4) {
-            usleep(5000);
-        } else {
-            usleep(2000);
-        }
-    }
-
-    printf("[cellAudio] Mixing thread stopped\n");
+    audio_mix_loop();
     return NULL;
 }
 #endif
-
 static int audio_start_mix_thread(void)
 {
     s_mix_thread_running = 1;

@@ -43,7 +43,10 @@ uint64_t ppu_timebase_now(void)
     uint64_t q = (uint64_t)s_qpc_freq.QuadPart;
     return (d / q) * PS3_TIMEBASE_FREQ + (d % q) * PS3_TIMEBASE_FREQ / q;
 #else
-    const uint64_t ns = host_monotonic_ns();
+    static uint64_t t0 = 0;
+    const uint64_t now = host_monotonic_ns();
+    if (!t0) t0 = now;
+    const uint64_t ns = now - t0;
     return (ns / 1000000000ull) * PS3_TIMEBASE_FREQ +
            (ns % 1000000000ull) * PS3_TIMEBASE_FREQ / 1000000000ull;
 #endif
@@ -219,7 +222,7 @@ static uint64_t timer_now_us(void)
 static DWORD WINAPI timer_thread_proc(LPVOID param)
 {
     sys_timer_info* t = (sys_timer_info*)param;
-    ps3_thread_name("lv2 timer");
+    ps3_thread_name("lv2 timer %u", (unsigned)(t - g_sys_timers) + 1u);
 
     while (t->running) {
         DWORD ms = (DWORD)(t->period_usec / 1000);
@@ -242,10 +245,12 @@ static void* timer_thread_proc(void* param)
 {
     sys_timer_info* t = (sys_timer_info*)param;
 
+    ps3_thread_name("lv2 timer %u", (unsigned)(t - g_sys_timers) + 1u);
+
     pthread_mutex_lock(&t->mtx);
     while (!t->stop_flag) {
         struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
+        clock_gettime(CLOCK_MONOTONIC, &ts);
         ts.tv_sec  += (time_t)(t->period_usec / 1000000);
         ts.tv_nsec += (long)((t->period_usec % 1000000) * 1000);
         if (ts.tv_nsec >= 1000000000L) {
@@ -306,7 +311,13 @@ int64_t sys_timer_create(ppu_context* ctx)
     t->timer_handle  = NULL;
 #else
     pthread_mutex_init(&t->mtx, NULL);
-    pthread_cond_init(&t->cv, NULL);
+    {
+        pthread_condattr_t ca;
+        pthread_condattr_init(&ca);
+        pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
+        pthread_cond_init(&t->cv, &ca);
+        pthread_condattr_destroy(&ca);
+    }
     t->stop_flag = 0;
 #endif
 

@@ -201,7 +201,6 @@ void ps3_brief_wake(volatile uint32_t* addr)
 void ps3_sleep_us(uint64_t us)
 {
     if (!us) return;
-#if defined(_WIN32)
     static _Thread_local uint64_t t_credit_ns;
     const uint64_t want = us * 1000ull;
     if (t_credit_ns >= want) {
@@ -210,21 +209,22 @@ void ps3_sleep_us(uint64_t us)
     }
     const uint64_t need = want - t_credit_ns;
     const uint64_t start = ps3_sync_now_ns();
+#if defined(_WIN32)
     HANDLE timer = armed_timer((need + 999) / 1000);
     if (timer) WaitForSingleObject(timer, INFINITE);
     else Sleep((DWORD)((need + 999999) / 1000000));
-    const uint64_t slept = ps3_sync_now_ns() - start;
-    t_credit_ns = slept > need ? slept - need : 0;
 #elif defined(__linux__)
-    const uint64_t deadline = ps3_sync_now_ns() + us * 1000ull;
+    const uint64_t deadline = start + need;
     struct timespec ts;
     ts.tv_sec  = (time_t)(deadline / 1000000000ull);
     ts.tv_nsec = (long)(deadline % 1000000000ull);
     while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) != 0) {}
 #else
-    struct timespec ts = { (time_t)(us / 1000000ull), (long)(us % 1000000ull) * 1000L };
+    struct timespec ts = { (time_t)(need / 1000000000ull), (long)(need % 1000000000ull) };
     while (nanosleep(&ts, &ts) != 0) {}
 #endif
+    const uint64_t slept = ps3_sync_now_ns() - start;
+    t_credit_ns = slept > need ? slept - need : 0;
 }
 
 void ps3_lock_slow(ps3_lock* l, unsigned spin)

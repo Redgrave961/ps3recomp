@@ -100,7 +100,6 @@ int vm_commit_host(const void* host, size_t size)
 }
 #else
 static int commit(uint32_t first, uint32_t end) { (void)first; (void)end; return 1; }
-void vm_track_install(void) {}
 int vm_commit_host(const void* host, size_t size) { (void)host; (void)size; return 1; }
 #endif
 

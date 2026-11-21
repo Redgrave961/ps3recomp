@@ -30,6 +30,10 @@ struct vk_caps {
     bool memory_budget;
     bool buffer_address;
     bool fifo_latest_ready;
+    bool present_id2;
+    bool present_wait2;
+    bool present_id;
+    bool present_wait;
 };
 
 struct vk_device {

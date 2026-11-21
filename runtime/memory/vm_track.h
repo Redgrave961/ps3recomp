@@ -11,7 +11,9 @@ extern "C" {
 
 typedef void (*vm_page_fn)(void* user, uint32_t page);
 
+#ifdef _WIN32
 void vm_track_install(void);
+#endif
 void vm_track(uint32_t ea, uint32_t size, vm_page_fn changed, void* user);
 uint32_t vm_track_drain(vm_page_fn changed, void* user);
 int vm_commit_host(const void* host, size_t size);

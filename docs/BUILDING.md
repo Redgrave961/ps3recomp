@@ -1,7 +1,8 @@
 # Building ps3recomp
 
 The runtime is built as part of the port: `port/CMakeLists.txt` adds this tree
-with `add_subdirectory` and `port/build.ps1` drives the build. This page covers
+with `add_subdirectory` and `port/build.ps1` (Windows, or `-Target linux`) or
+`port/build.sh` (Linux) drives the build. This page covers
 the runtime library on its own.
 
 ## Prerequisites

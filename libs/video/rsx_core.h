@@ -82,22 +82,21 @@ typedef struct rsx_renderer {
     void (*reset)(void* user);
     int  (*report)(void* user, u32 type, u32 ea);
     int  (*defer)(void* user, const rsx_write* w);
-    int (*present)(void* user, u32 buffer, const rsx_display_buffer* display);
+    void (*present)(void* user, u32 buffer, const rsx_display_buffer* display);
     void (*read_back)(void* user, u32 ea, u32 size);
     void (*settle)(void* user, u32 ea, u32 size);
     void (*wrote)(void* user, u32 ea, u32 size);
     int  (*blit)(void* user, const rsx_blit* b);
     void (*vblank)(void* user, u64 count);
     void (*close)(void* user);
+    void (*throttle)(void* user);
 } rsx_renderer;
 
 typedef void (*rsx_event_sink)(enum rsx_event event, u32 arg);
-typedef int (*rsx_vblank_clock)(void* user);
 
 void rsx_core_init(u32 local_size, u32 main_size);
 void rsx_core_set_renderer(const rsx_renderer* renderer);
 void rsx_core_set_event_sink(rsx_event_sink sink);
-void rsx_core_set_vblank_clock(rsx_vblank_clock clock, void* user);
 void rsx_core_start(void);
 void rsx_core_fifo_reset(u32 put, u32 get);
 void rsx_core_doorbell(void);
@@ -118,6 +117,7 @@ u64  rsx_core_progress(void);
 void rsx_core_set_hidden_refresh(u32 hz);
 u64  rsx_core_batch(void);
 void rsx_core_flip_immediate(u32 buffer);
+void rsx_core_flip_emitted(void);
 u32  rsx_core_flip_status(void);
 void rsx_core_set_flip_status(u32 status);
 u64  rsx_core_last_flip_time(void);

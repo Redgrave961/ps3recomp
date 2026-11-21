@@ -23,6 +23,7 @@
 #endif
 #include <time.h>
 #include "../platform/win32_compat.h"
+#include "../platform/win32_backtrace.h"
 #include "ps3emu/log_first.h"
 
 #ifdef __cplusplus
@@ -1402,14 +1403,12 @@ void spu_indirect_branch(spu_context* ctx)
       if (PS3_LOG_FIRST(_n, 2)) {
         fprintf(stderr, "[SPU] branch-to-0 lr=0x%05X r1=0x%05X\n",
                 ctx->gpr[0]._u32[0] & SPU_LS_MASK, ctx->gpr[1]._u32[0] & SPU_LS_MASK);
-#ifdef _WIN32
         void* frames[24]; unsigned short fn = RtlCaptureStackBackTrace(0, 24, frames, NULL);
         char* base = (char*)GetModuleHandleA(NULL);
         fprintf(stderr, "[SPU] host bt RVAs:");
         for (unsigned short i = 0; i < fn; i++)
             fprintf(stderr, " 0x%zX", (size_t)((char*)frames[i] - base));
         fprintf(stderr, "\n");
-#endif
         fprintf(stderr, "[SPU] image_id=%d  GPR dump (r0..r127, hi64:lo64 of each quadword, preferred slot = _u32[0]):\n", ctx->image_id);
         for (int g = 0; g < 128; g++) {
             fprintf(stderr, " r%-3d=%08X %08X %08X %08X", g,

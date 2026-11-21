@@ -148,10 +148,12 @@ static void* ppu_host_thread_proc(void* param)
 #endif
 {
     ppu_thread_info* info = (ppu_thread_info*)param;
-    ps3_thread_name("ppu %s", info->name);
+    ps3_thread_name("P%u %s", (unsigned)info->ctx.thread_id, info->name);
 
 #ifdef _WIN32
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
+#else
+    if (info->priority < 256) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
 #endif
 
     ps3_tprof_thread('P', (uint32_t)info->ctx.thread_id);
@@ -240,7 +242,7 @@ uint64_t ppu_thread_register_main(void)
         strncpy(t->name, "main", sizeof(t->name) - 1);
         ps3_ft_name(1, "main");
         ps3_tprof_thread('P', 1);
-        ps3_thread_name("ppu main");
+        ps3_thread_name("P1 main");
 #ifdef _WIN32
         t->finish_event = CreateEventA(NULL, TRUE, FALSE, NULL);
 #else
@@ -281,7 +283,7 @@ ppu_context* ppu_thread_adopt(const char* name, uint32_t stack_size, int32_t pri
 #endif
     table_unlock();
     ps3_ft_name((uint32_t)slot + 1u, t->name);
-    ps3_thread_name("ppu %s", t->name);
+    ps3_thread_name("P%u %s", (unsigned)slot + 1u, t->name);
     ps3_tprof_thread('P', (uint32_t)slot + 1u);
     { extern PPU_THREAD_LOCAL ppu_context* g_active_ctx; g_active_ctx = &t->ctx; }
     return &t->ctx;
@@ -527,7 +529,18 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
     t->host_thread = NULL;
     t->finish_event = NULL;
 #else
-    pthread_join(t->host_thread, NULL);
+    {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        ts.tv_sec += 5;
+        if (pthread_clockjoin_np(t->host_thread, NULL, CLOCK_MONOTONIC, &ts) == ETIMEDOUT) {
+            static int s_warned = 0;
+            if (s_warned++ < 4)
+                fprintf(stderr, "[SYS] ppu_thread_join(tid=%llu): host thread still running 5 s "
+                                "after exit -- freeing the slot anyway\n", (unsigned long long)tid);
+            pthread_detach(t->host_thread);
+        }
+    }
     table_lock();
     pthread_mutex_destroy(&t->finish_mutex);
     pthread_cond_destroy(&t->finish_cond);

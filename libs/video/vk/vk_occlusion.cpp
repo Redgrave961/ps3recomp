@@ -1,4 +1,5 @@
 #include "vk_occlusion.h"
+#include "ps3emu/thread_name.h"
 
 #include <algorithm>
 #include <cstring>
@@ -189,6 +190,7 @@ void occlusion::submitted(uint64_t value)
 
 void occlusion::worker()
 {
+    ps3_thread_name("vk occlusion");
     for (;;) {
         job j;
         {

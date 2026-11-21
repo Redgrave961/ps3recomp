@@ -6,15 +6,6 @@
 #include <chrono>
 #include <cstring>
 
-#ifndef _WIN32
-#include <fcntl.h>
-#include <linux/fs.h>
-#include <linux/userfaultfd.h>
-#include <sys/ioctl.h>
-#include <sys/syscall.h>
-#include <unistd.h>
-#endif
-
 namespace vk {
 
 namespace {
@@ -22,10 +13,6 @@ namespace {
 std::atomic<const rsx_vk_texture_patch*> g_patch{ nullptr };
 
 constexpr u32 k_page_shift = 12;
-#ifndef _WIN32
-constexpr u32 k_region_shift = 20;
-constexpr u32 k_merge_gap = 1;
-#endif
 
 u32 texel_bytes(VkFormat f)
 {
@@ -43,7 +30,6 @@ u32 texel_bytes(VkFormat f)
     }
 }
 
-#ifdef _WIN32
 struct page_stamper {
     std::vector<u32>& stamps;
     u32& clock;
@@ -56,54 +42,7 @@ void stamp_page(void* user, uint32_t page)
     if (!s.stamp) s.stamp = ++s.clock;
     s.stamps[page] = s.stamp;
 }
-#else
-struct write_tracker {
-    int uffd = -1;
-    int pagemap = -1;
-    bool ok = false;
 
-    write_tracker()
-    {
-        constexpr uint64_t span = 1ull << 32;
-        uffd = (int)syscall(__NR_userfaultfd, O_CLOEXEC | O_NONBLOCK);
-        if (uffd < 0) return;
-        uffdio_api api{ UFFD_API, UFFD_FEATURE_WP_ASYNC | UFFD_FEATURE_WP_UNPOPULATED, 0 };
-        uffdio_register reg{ { (uintptr_t)vm_base, span }, UFFDIO_REGISTER_MODE_WP, 0 };
-        uffdio_writeprotect wp{ { (uintptr_t)vm_base, span }, UFFDIO_WRITEPROTECT_MODE_WP };
-        if (ioctl(uffd, UFFDIO_API, &api) || ioctl(uffd, UFFDIO_REGISTER, &reg) || ioctl(uffd, UFFDIO_WRITEPROTECT, &wp)) return;
-        pagemap = open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
-        ok = pagemap >= 0;
-    }
-};
-
-bool scan_writes(u32 base, u32 bytes, std::vector<u32>& stamps, u32& clock, u64& changed)
-{
-    static const write_tracker tracker;
-    if (!tracker.ok) return false;
-    page_region regions[32];
-    pm_scan_arg arg{};
-    arg.size = sizeof arg;
-    arg.flags = PM_SCAN_WP_MATCHING | PM_SCAN_CHECK_WPASYNC;
-    arg.start = (uintptr_t)(vm_base + base);
-    arg.end = arg.start + bytes;
-    arg.vec = (uintptr_t)regions;
-    arg.vec_len = 32;
-    arg.category_mask = PAGE_IS_WRITTEN;
-    arg.return_mask = PAGE_IS_WRITTEN;
-    for (;;) {
-        const long n = ioctl(tracker.pagemap, PAGEMAP_SCAN, &arg);
-        if (n < 0) return false;
-        if (n) {
-            const u32 s = ++clock;
-            for (long i = 0; i < n; i++)
-                for (uint64_t a = regions[i].start; a < regions[i].end; a += 1u << k_page_shift, changed++)
-                    stamps[(u32)(a - (uintptr_t)vm_base) >> k_page_shift] = s;
-        }
-        if (arg.walk_end >= arg.end) return true;
-        arg.start = arg.walk_end;
-    }
-}
-#endif
 uint64_t mix(uint64_t h, uint64_t v)
 {
     h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
@@ -141,70 +80,21 @@ void renderer::watch(u32 ea, u32 size)
     await_writes(ea, size);
     stats.watch_calls++;
     stats.watch_bytes += size;
-    if (m_page_stamp.empty()) {
-        m_page_stamp.assign(1u << (32 - k_page_shift), 0u);
-#ifndef _WIN32
-        m_region_batch.assign(1u << (32 - k_region_shift), ~0ull);
-        m_region_used.assign(1u << (32 - k_region_shift), ~0ull);
-#endif
-    }
+    if (m_page_stamp.empty()) m_page_stamp.assign(1u << (32 - k_page_shift), 0u);
     const u64 batch = rsx_core_batch();
     if (batch != m_scan_batch) prescan(batch);
-#ifdef _WIN32
     page_stamper s{ m_page_stamp, m_stamp, 0 };
     vm_track(ea, size, stamp_page, &s);
-#else
-    const u32 last = (u32)(((uint64_t)ea + size - 1u) >> k_region_shift);
-    for (u32 r = ea >> k_region_shift; r <= last; r++) {
-        if (m_region_used[r] == batch) continue;
-        m_region_used[r] = batch;
-        m_hot.push_back(r);
-    }
-    for (u32 r = ea >> k_region_shift; r <= last; r++) {
-        if (m_region_batch[r] == batch) continue;
-        u32 end = r;
-        while (end + 1 <= last && m_region_batch[end + 1] != batch) end++;
-        if (!scan(r << k_region_shift, (end - r + 1) << k_region_shift)) {
-            mark_written(ea, size);
-            return;
-        }
-        for (u32 k = r; k <= end; k++) m_region_batch[k] = batch;
-        r = end;
-    }
-#endif
 }
-
-#ifndef _WIN32
-bool renderer::scan(u32 base, u32 bytes)
-{
-    const auto start = std::chrono::steady_clock::now();
-    const bool ok = scan_writes(base, bytes, m_page_stamp, m_stamp, stats.changed_pages);
-    stats.scans++;
-    stats.scan_ns += (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
-    return ok;
-}
-#endif
 
 void renderer::prescan(u64 batch)
 {
     m_scan_batch = batch;
-#ifdef _WIN32
     const auto start = std::chrono::steady_clock::now();
     page_stamper s{ m_page_stamp, m_stamp, 0 };
     stats.changed_pages += vm_track_drain(stamp_page, &s);
     stats.scans++;
     stats.scan_ns += (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
-#else
-    std::sort(m_hot.begin(), m_hot.end());
-    for (size_t i = 0; i < m_hot.size();) {
-        const u32 r = m_hot[i];
-        u32 end = r;
-        while (++i < m_hot.size() && m_hot[i] <= end + 1u + k_merge_gap) end = m_hot[i];
-        if (!scan(r << k_region_shift, (end - r + 1) << k_region_shift)) continue;
-        for (u32 k = r; k <= end; k++) m_region_batch[k] = batch;
-    }
-    m_hot.clear();
-#endif
 }
 
 bool renderer::memory_changed(u32 ea, u32 size, u32 stamp)

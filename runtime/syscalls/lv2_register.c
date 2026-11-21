@@ -356,7 +356,7 @@ static void* spu_exec_thread_proc(void* arg)
 #endif
     spu_thread_t* t = (spu_thread_t*)arg;
     { const spu_group_t* g = spu_find_group(t->group_id);
-      ps3_thread_name("spu %s:%u", g && g->name[0] ? g->name : "group", t->index); }
+      ps3_thread_name("S%u.%u %s", t->group_id & 0xFFFFu, t->index, g && g->name[0] ? g->name : "group"); }
     spu_lifted_thread_result r;
     spu_lifted_thread_run(t->sctx, &r);
     t->exit_status = r.exit_status;
@@ -394,7 +394,7 @@ static void* spu_fallback_thread_proc(void* arg)
 #endif
     spu_thread_t* t = (spu_thread_t*)arg;
     { const spu_group_t* g = spu_find_group(t->group_id);
-      ps3_thread_name("spu-hle %s:%u", g && g->name[0] ? g->name : "group", t->index); }
+      ps3_thread_name("H%u.%u %s", t->group_id & 0xFFFFu, t->index, g && g->name[0] ? g->name : "group"); }
     int32_t rc = 0;
     if (t->fb_handler) {
         rc = t->fb_handler(t->tid, t->args_ea, t->args_size, t->fb_user);
