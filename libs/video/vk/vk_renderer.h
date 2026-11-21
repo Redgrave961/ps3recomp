@@ -189,8 +189,15 @@ private:
     bool m_trace_timed = false;
     u32 m_trace_draws = 0;
     void trace_report();
+    void trace_mark(VkCommandBuffer c, u32 id);
+    struct trace_point {
+        u32 id;
+        u64 vp, fp;
+        u32 width, height;
+    };
     VkQueryPool m_trace_pool = VK_NULL_HANDLE;
     std::vector<std::string> m_trace_spans;
+    std::vector<trace_point> m_trace_points;
     bool m_trace_open = false;
     u32 m_trace_pass_first = 0;
     bool upload_vertices(const rsx::draw_clause& clause, u32 first, u32 count, u32 vertex_base, VkDescriptorBufferInfo& layout);

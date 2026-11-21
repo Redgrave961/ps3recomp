@@ -177,6 +177,8 @@ constexpr VkAccessFlags2 k_writes = VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_C
                                     VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT |
                                     VK_ACCESS_2_HOST_WRITE_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
 constexpr u32 k_trace_queries = 8192;
+constexpr u32 k_trace_points = 8192;
+constexpr u32 k_pass_start = ~0u;
 
 bool renderer::readable(const image& img)
 {
@@ -203,6 +205,14 @@ void renderer::trace_end(VkCommandBuffer c, const char* fmt, ...)
     m_trace_open = false;
 }
 
+void renderer::trace_mark(VkCommandBuffer c, u32 id)
+{
+    if (!m_trace_timed || !m_trace_pool || m_trace_points.size() >= k_trace_points) return;
+    vkCmdWriteTimestamp2(c, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, m_trace_pool, k_trace_queries + (u32)m_trace_points.size());
+    const ratio& sc = m_fb.scale;
+    m_trace_points.push_back({ id, m_vp ? m_vp->hash : 0, m_fp ? m_fp->hash : 0, sc.edge(m_fb.width * m_fb.aa_u), sc.edge(m_fb.height * m_fb.aa_v) });
+}
+
 trace_span::trace_span(renderer& r, VkCommandBuffer c, const char* fmt, ...)
 {
     if (!r.tracing()) return;
@@ -222,14 +232,23 @@ trace_span::~trace_span()
 
 void renderer::trace_report()
 {
-    const u32 n = (u32)m_trace_spans.size();
-    if (!n) return;
+    const u32 n = (u32)m_trace_spans.size(), m = (u32)m_trace_points.size();
+    if (!n && !m) return;
     flush();
-    std::vector<uint64_t> t((size_t)n * 2u);
-    if (vkGetQueryPoolResults(m_d->dev, m_trace_pool, 0, n * 2u, t.size() * sizeof(uint64_t), t.data(), sizeof(uint64_t),
-                              VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) != VK_SUCCESS)
-        return;
     const double us = (double)m_d->props.limits.timestampPeriod / 1000.0;
+    std::vector<uint64_t> p(m);
+    if (m && vkGetQueryPoolResults(m_d->dev, m_trace_pool, k_trace_queries, m, p.size() * sizeof(uint64_t), p.data(), sizeof(uint64_t),
+                                   VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS)
+        for (u32 i = 1; i < m; i++) {
+            const trace_point& d = m_trace_points[i];
+            if (d.id == k_pass_start) continue;
+            std::fprintf(m_trace, "[gpu-draw] %u %9.2f us %ux%u vp %016llX fp %016llX\n", d.id, p[i] > p[i - 1] ? (double)(p[i] - p[i - 1]) * us : 0.0,
+                         d.width, d.height, (unsigned long long)d.vp, (unsigned long long)d.fp);
+        }
+    std::vector<uint64_t> t((size_t)n * 2u);
+    if (!n || vkGetQueryPoolResults(m_d->dev, m_trace_pool, 0, n * 2u, t.size() * sizeof(uint64_t), t.data(), sizeof(uint64_t),
+                                    VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) != VK_SUCCESS)
+        return;
     std::vector<std::pair<double, u32>> busy(n);
     uint64_t done = t[0];
     double total = 0;
@@ -916,6 +935,7 @@ void renderer::begin_rendering()
     ri.pDepthAttachment = m_fb.depth ? &depth : nullptr;
     ri.pStencilAttachment = stencil.imageView ? &stencil : nullptr;
     trace_begin(c);
+    trace_mark(c, k_pass_start);
     m_trace_pass_first = m_trace_draws;
     vkCmdBeginRendering(c, &ri);
     m_rendering = true;
@@ -1296,13 +1316,15 @@ void renderer::flip_reset()
     if (m_trace) {
         std::fprintf(m_trace, "[trace] frame end, %u draws\n", m_trace_draws);
         if (m_trace_timed) trace_report();
-        m_trace_timed = false;
+        if (m_trace_pool) vkResetQueryPool(m_d->dev, m_trace_pool, 0, k_trace_queries + k_trace_points);
         m_trace_spans.clear();
+        m_trace_points.clear();
         m_trace_open = false;
         if (trace_frames.fetch_sub(1, std::memory_order_relaxed) <= 1) {
             trace_frames.store(0, std::memory_order_relaxed);
             std::fclose(m_trace);
             m_trace = nullptr;
+            m_trace_timed = false;
         } else {
             std::fprintf(m_trace, "[trace] frame %llu\n", (unsigned long long)m_flips);
         }
@@ -1321,10 +1343,10 @@ void renderer::flip_reset()
         if (m_trace && !m_trace_pool) {
             VkQueryPoolCreateInfo qi{ VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
             qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
-            qi.queryCount = k_trace_queries;
+            qi.queryCount = k_trace_queries + k_trace_points;
             if (vkCreateQueryPool(m_d->dev, &qi, nullptr, &m_trace_pool) != VK_SUCCESS) m_trace_pool = VK_NULL_HANDLE;
         }
-        if (m_trace_pool) vkResetQueryPool(m_d->dev, m_trace_pool, 0, k_trace_queries);
+        if (m_trace_pool) vkResetQueryPool(m_d->dev, m_trace_pool, 0, k_trace_queries + k_trace_points);
     }
     frontend::reset();
     m_fb_valid = false;

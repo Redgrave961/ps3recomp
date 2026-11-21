@@ -1518,6 +1518,8 @@ typedef struct fpc {
     u32 count;
     u32 words;
     u32 r[64];
+    u32 h[128];
+    u8 width[64];
     u32 cc[2];
     u32 vin[RSX_SPV_VAR_COUNT];
     u32 fragcoord, frontfacing, pointcoord;
@@ -1658,6 +1660,35 @@ static int fp_scan(fpc* c, const u32* ucode, u32 max_words)
     return 0;
 }
 
+enum { FP_WIDTH_R = 1, FP_WIDTH_H = 2 };
+
+static void fp_mark(fpc* c, u32 reg, int fp16)
+{
+    if (fp16) c->width[(reg >> 1) & 63u] |= FP_WIDTH_H;
+    else c->width[reg & 63u] |= FP_WIDTH_R;
+}
+
+static void fp_widths(fpc* c, const rsx_spv_fp_key* key, int depth)
+{
+    for (u32 pc = 0; pc < c->nprog;) {
+        fpi i;
+        fp_decode(c, pc, &i);
+        if (!fp_is_flow(i.op) && i.op != FP_NOP) {
+            const u32 srcs[3] = { i.s0, i.s1, i.s2 };
+            for (u32 n = 0; n < fp_nsrc(i.op); n++)
+                if ((srcs[n] & 3u) == 0u) fp_mark(c, bf(srcs[n], 2, 6), (int)bf(srcs[n], 8, 1));
+            if (!bf(i.d, 30, 1)) fp_mark(c, bf(i.d, 1, 6), (int)bf(i.d, 7, 1));
+        }
+        pc += fp_has_const(&i) ? 2u : 1u;
+    }
+    static const u32 rregs[4] = { 0, 2, 3, 4 };
+    static const u32 hregs[4] = { 0, 4, 6, 8 };
+    const int fp32 = (key->control & RSX_SPV_FPCTL_32BIT_EXPORTS) != 0;
+    for (u32 k = 0; k < 4; k++)
+        if (!k || (key->output_mask & (1u << k))) fp_mark(c, fp32 ? rregs[k] : hregs[k], !fp32);
+    if (depth) fp_mark(c, 1, 0);
+}
+
 static void fp_fill_info(const fpc* c, rsx_spv_fp_info* info, int depth_export)
 {
     if (!info) return;
@@ -1734,9 +1765,18 @@ static u32 fp_readR(fpc* c, u32 n)
     return bc(s, tv4(s), ld(s, tu4(s), fp_rvar(c, n)));
 }
 
+static int fp_split(const fpc* c, u32 m) { return c->width[m >> 1] == FP_WIDTH_H; }
+
+static u32 fp_hvar(fpc* c, u32 m)
+{
+    if (!c->h[m]) c->h[m] = gvar(c->s, tv4(c->s), SC_Private, cvs(c->s, 0.0f));
+    return c->h[m];
+}
+
 static u32 fp_readH(fpc* c, u32 m)
 {
     spv* s = c->s;
+    if (fp_split(c, m)) return ld(s, tv4(s), fp_hvar(c, m));
     u32 v = ld(s, tu4(s), fp_rvar(c, m >> 1));
     u32 b = (m & 1u) * 2u;
     u32 lo = X(s, tv2(s), GL_UnpackHalf2x16, ex(s, tu(s), v, b));
@@ -1799,6 +1839,17 @@ static void fp_writeH(fpc* c, u32 m, u32 v, u32 mask, u32 condv)
 {
     spv* s = c->s;
     u32 q = f16_quantize(s, v);
+    if (fp_split(c, m)) {
+        u32 var = fp_hvar(c, m);
+        if (mask == 0xFu && !condv) {
+            st(s, var, q);
+            return;
+        }
+        u32 old = ld(s, tv4(s), var);
+        if (condv) q = sel(s, tv4(s), condv, q, old);
+        st(s, var, mask4(s, old, q, tv4(s), mask));
+        return;
+    }
     u32 w[2];
     w[0] = X(s, tu(s), GL_PackHalf2x16, I(s, OpVectorShuffle, tv2(s), q, q, 0, 1));
     w[1] = X(s, tu(s), GL_PackHalf2x16, I(s, OpVectorShuffle, tv2(s), q, q, 2, 3));
@@ -2565,6 +2616,7 @@ int rsx_spv_fragment(const u32* ucode, u32 max_words, const rsx_spv_fp_key* key,
     c->key = key;
     u32 mainid = s->id++;
     int depth = (key->control & RSX_SPV_FPCTL_DEPTH_EXPORT) != 0;
+    fp_widths(c, key, depth);
     u32 modes[2] = { 7, 12 };
     u32 nmodes = 1;
     fn_begin(s, mainid);

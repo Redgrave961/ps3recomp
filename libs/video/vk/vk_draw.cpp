@@ -735,6 +735,7 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
         if (s.indexed) vkCmdDrawIndexed(c, s.count, 1, s.first, s.vertex_offset, 0);
         else vkCmdDraw(c, s.count, 1, s.first, 0);
     }
+    trace_mark(c, id);
 
     for (u32 k = 0; k < m_fb.count; k++)
         if (m_fb.color[k] && m_fb.color_write[k]) {
