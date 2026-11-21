@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vk_device.h"
+#include "vk_flat_map.h"
 #include "../rsx_spirv.h"
 
 #include <atomic>
@@ -14,7 +15,6 @@
 #include <mutex>
 #include <string>
 #include <thread>
-#include <unordered_map>
 #include <vector>
 
 namespace vk {
@@ -45,12 +45,6 @@ struct pipeline_key {
     uint32_t depth_clip;
     uint32_t provoking_last;
     blend_attachment blend[4];
-
-    bool operator==(const pipeline_key& o) const;
-};
-
-struct pipeline_key_hash {
-    size_t operator()(const pipeline_key& k) const;
 };
 
 struct shader {
@@ -111,9 +105,9 @@ private:
     bool m_dynamic_provoking = false;
 
     std::mutex m_map_lock;
-    std::unordered_map<pipeline_key, std::unique_ptr<entry>, pipeline_key_hash> m_map;
+    flat_map<pipeline_key, std::unique_ptr<entry>> m_map;
     std::mutex m_lib_lock;
-    std::unordered_map<pipeline_key, VkPipeline, pipeline_key_hash> m_output;
+    flat_map<pipeline_key, VkPipeline> m_output;
     VkPipeline m_input[3] = {};
 
     std::mutex m_db_lock;

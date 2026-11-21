@@ -114,7 +114,6 @@ void rsx_core_set_display_buffer(u32 id, const rsx_display_buffer* buffer);
 int  rsx_core_display_buffer(u32 id, rsx_display_buffer* out);
 void rsx_core_set_vsync(int vsync);
 void rsx_core_set_frame_limit(u32 hz);
-int  rsx_core_free_flips(void);
 u64  rsx_core_progress(void);
 void rsx_core_set_hidden_refresh(u32 hz);
 u64  rsx_core_batch(void);

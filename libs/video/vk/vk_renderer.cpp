@@ -155,10 +155,14 @@ void renderer::close()
     m_surfaces.clear();
     m_garbage.clear();
     for (image& i : m_dummy) destroy_image(i);
-    for (auto& [k, e] : m_textures) destroy_image(e->img);
-    m_textures.clear();
-    for (auto& [k, s] : m_samplers) vkDestroySampler(m_d->dev, s, nullptr);
-    m_samplers.clear();
+    m_textures.erase_if([this](uint64_t, const std::unique_ptr<texture_entry>& e) {
+        destroy_image(e->img);
+        return true;
+    });
+    m_samplers.erase_if([this](uint64_t, VkSampler s) {
+        vkDestroySampler(m_d->dev, s, nullptr);
+        return true;
+    });
     if (m_dummy_sampler) vkDestroySampler(m_d->dev, m_dummy_sampler, nullptr);
     if (m_buffer_pool) vkDestroyDescriptorPool(m_d->dev, std::exchange(m_buffer_pool, VK_NULL_HANDLE), nullptr);
     m_pipelines.destroy();
@@ -1325,15 +1329,12 @@ void renderer::flip_reset()
     frontend::reset();
     m_fb_valid = false;
     if ((++m_flips & 255u) == 0)
-        for (auto it = m_textures.begin(); it != m_textures.end();) {
-            if (m_flips - it->second->used <= 1800u) {
-                ++it;
-                continue;
-            }
-            discard(it->second->img);
-            it = m_textures.erase(it);
+        m_textures.erase_if([this](uint64_t, const std::unique_ptr<texture_entry>& e) {
+            if (m_flips - e->used <= 1800u) return false;
+            discard(e->img);
             m_binding_gen++;
-        }
+            return true;
+        });
     if ((m_flips & 63u) == 0) evict(64);
 }
 

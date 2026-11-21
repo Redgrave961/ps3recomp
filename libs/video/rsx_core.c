@@ -63,7 +63,6 @@ static struct {
     u32 sema4097_off;
     u32 report_ctx;
     u32 notify_ctx;
-    int free_flips;
     u64 frame_due;
     HANDLE frame_timer;
     volatile u64 progress;
@@ -250,9 +249,9 @@ static u64 rsx_tick_freq(void)
     return (u64)s_qpc_freq.QuadPart;
 }
 
-static void rsx_sleep_until(HANDLE timer, u64 target)
+static void rsx_sleep_until(HANDLE timer, u64 target, int precise)
 {
-    const u64 freq = rsx_tick_freq(), slack = freq / 1000u, spin = freq / 20000u;
+    const u64 freq = rsx_tick_freq(), slack = precise ? freq / 1000u : 0u, spin = freq / 20000u;
     u64 now = rsx_ticks();
     if (now >= target) return;
     if (target - now > slack) {
@@ -261,7 +260,7 @@ static void rsx_sleep_until(HANDLE timer, u64 target)
         due.QuadPart = -(LONGLONG)((left / freq) * 10000000ull + (left % freq) * 10000000ull / freq);
         if (due.QuadPart && SetWaitableTimerEx(timer, &due, 0, NULL, NULL, NULL, 0)) WaitForSingleObject(timer, INFINITE);
     }
-    while ((now = rsx_ticks()) < target) {
+    while (precise && (now = rsx_ticks()) < target) {
         if (target - now > spin) SwitchToThread();
         else YieldProcessor();
     }
@@ -281,9 +280,10 @@ static u64 rsx_ticks(void)
 
 static u64 rsx_tick_freq(void) { return 1000000000ull; }
 
-static void rsx_sleep_until(HANDLE timer, u64 target)
+static void rsx_sleep_until(HANDLE timer, u64 target, int precise)
 {
     (void)timer;
+    (void)precise;
     struct timespec ts = { (time_t)(target / 1000000000ull), (long)(target % 1000000000ull) };
     while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) != 0) {}
 }
@@ -352,7 +352,7 @@ static DWORD WINAPI rsx_vblank_thread(LPVOID unused)
                 base = rsx_ticks();
                 n = 1;
             }
-            rsx_sleep_until(timer, base + group * n / RSX_VBLANK_GROUP);
+            rsx_sleep_until(timer, base + group * n / RSX_VBLANK_GROUP, 1);
         }
         AcquireSRWLockExclusive(&s.vblank_lock);
         const u64 count = ++s.vblank_count;
@@ -396,7 +396,7 @@ static void rsx_frame_limit(void)
     if (!s.frame_timer) s.frame_timer = rsx_timer_create();
     const u64 now = rsx_ticks();
     s.frame_due = s.frame_due + 2u * period < now ? now : s.frame_due + period;
-    rsx_sleep_until(s.frame_timer, s.frame_due);
+    rsx_sleep_until(s.frame_timer, s.frame_due, !idle);
 }
 
 static void rsx_scanout(u32 buffer)
@@ -772,7 +772,6 @@ void rsx_core_init(u32 local_size, u32 main_size)
     s.sema4097_ctx = RSX_DMA_SEMAPHORE_RW;
     s.report_ctx = RSX_DMA_REPORT_LOCAL;
     s.vsync = 1;
-    s.free_flips = getenv("PS3_FREE_FLIPS") != NULL;
     s.flip_status = 0;
     memset(s.display, 0, sizeof s.display);
     s.display_mask = 0;
@@ -793,7 +792,6 @@ void rsx_core_init(u32 local_size, u32 main_size)
 }
 
 void rsx_core_set_renderer(const rsx_renderer* renderer) { s.renderer = renderer; }
-int rsx_core_free_flips(void) { return s.free_flips; }
 u64 rsx_core_progress(void) { return __atomic_load_n(&s.progress, __ATOMIC_RELAXED); }
 u64 rsx_core_batch(void) { return s.batch; }
 void rsx_core_set_event_sink(rsx_event_sink sink) { s.sink = sink; }

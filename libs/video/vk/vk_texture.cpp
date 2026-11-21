@@ -273,13 +273,13 @@ VkSampler renderer::sampler_for(const VkSamplerCreateInfo& info, const VkSampler
         std::memcpy(b, border->customBorderColor.uint32, 16);
         h = mix(mix(h, b[0]), b[1]);
     }
-    if (auto it = m_samplers.find(h); it != m_samplers.end()) return it->second;
+    if (const VkSampler* found = m_samplers.find(h)) return *found;
     VkSamplerCreateInfo ci = info;
     ci.pNext = border;
     if (ci.anisotropyEnable && !m_d->features.features.samplerAnisotropy) ci.anisotropyEnable = VK_FALSE;
     VkSampler s = VK_NULL_HANDLE;
     vkCreateSampler(m_d->dev, &ci, nullptr, &s);
-    m_samplers.emplace(h, s);
+    m_samplers[h] = s;
     return s;
 }
 
@@ -499,8 +499,8 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
     path = "dummy: texture creation failed";
 
     const uint64_t key = texture_key(d, ea);
-    auto it = m_textures.find(key);
-    texture_entry* e = it != m_textures.end() ? it->second.get() : nullptr;
+    const std::unique_ptr<texture_entry>* found = m_textures.find(key);
+    texture_entry* e = found ? found->get() : nullptr;
     if (e) e->used = m_flips;
     bool upload = false;
     if (!e) {
@@ -526,7 +526,7 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
         e->img.aspect = d.aspect;
         e->img.width = ii.extent.width;
         e->img.height = ii.extent.height;
-        m_textures.emplace(key, std::move(made));
+        m_textures[key] = std::move(made);
         watch(ea, d.guest_size);
         upload = true;
     } else if (e->checked != m_epoch) {

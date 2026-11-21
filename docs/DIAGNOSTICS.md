@@ -117,8 +117,6 @@ not changed while a title runs.
   `runtime/syscalls/sys_fs.c:182`
 - **`PS3_EXIT_CHAIN`** — sys_process_exit (abort path): dump the guest back-chain so we see WHO aborted. Always-on for a NONZERO exit code (error/abort) -- the rare loader-thread abort is usually a race that will not reproduce on demand, so capture it whenever it fires. Clean code=0 exits (normal shutdown) stay quiet; PS3_EXIT_CHAIN=1 dumps those too. */
   `runtime/ppu/ppu_hle.cpp:288`
-- **`PS3_FREE_FLIPS`** — _(no description in source)_
-  `libs/video/rsx_core.c:728`
 - **`PS3_FSLOG`** — _(no description in source)_
   `runtime/ppu/ppu_fs.cpp:417`  _(+4 more sites)_
 - **`PS3_GAMEDATA_ROOT`** — _(no description in source)_

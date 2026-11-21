@@ -116,6 +116,7 @@ struct state {
     std::atomic<uint32_t> generation{ 0 };
     std::condition_variable picked;
     std::atomic<bool> vsync{ false };
+    std::atomic<bool> free_flips{ false };
     std::atomic<rsx_vk_display> display{ RSX_VK_BORDERLESS };
     rsx_vk_display last_fullscreen = RSX_VK_BORDERLESS;
     std::atomic<void (*)(rsx_vk_display)> display_listener{ nullptr };
@@ -417,8 +418,8 @@ VkPresentModeKHR pick_mode()
     vkGetPhysicalDeviceSurfacePresentModesKHR(g.d.gpu, g.surface, &n, list.data());
     auto has = [&](VkPresentModeKHR m) { return std::find(list.begin(), list.end(), m) != list.end(); };
     const bool latest = g.d.caps.fifo_latest_ready && has(VK_PRESENT_MODE_FIFO_LATEST_READY_KHR);
-    if (rsx_core_free_flips() && !g.vsync) return has(VK_PRESENT_MODE_MAILBOX_KHR) ? VK_PRESENT_MODE_MAILBOX_KHR : VK_PRESENT_MODE_IMMEDIATE_KHR;
-    if (!rsx_core_free_flips() && (g.mode == pacing::vrr || g.mode == pacing::measuring)) return VK_PRESENT_MODE_FIFO_KHR;
+    if (g.free_flips && !g.vsync) return has(VK_PRESENT_MODE_MAILBOX_KHR) ? VK_PRESENT_MODE_MAILBOX_KHR : VK_PRESENT_MODE_IMMEDIATE_KHR;
+    if (!g.free_flips && (g.mode == pacing::vrr || g.mode == pacing::measuring)) return VK_PRESENT_MODE_FIFO_KHR;
     return latest ? VK_PRESENT_MODE_FIFO_LATEST_READY_KHR : VK_PRESENT_MODE_FIFO_KHR;
 }
 
@@ -774,7 +775,7 @@ void present_main()
 
 void vk_vblank(void*, u64 count)
 {
-    if (rsx_core_free_flips()) return;
+    if (g.free_flips) return;
     {
         std::lock_guard<std::mutex> hold(g.queue_lock);
         g.tick = count;
@@ -1151,7 +1152,7 @@ int vk_present(void*, u32, const rsx_display_buffer* db)
     }
     {
         std::unique_lock<std::mutex> hold(g.queue_lock);
-        if (rsx_core_free_flips()) {
+        if (g.free_flips) {
             g.picked.wait(hold, [] { return !g.latest_new || !g.vsync; });
             g.latest = (int)i;
             g.latest_new = true;
@@ -1250,4 +1251,20 @@ extern "C" void rsx_vk_set_vsync(int vsync)
     g.resized = true;
     g.queue_cv.notify_one();
     g.picked.notify_one();
+}
+
+extern "C" void rsx_vk_set_free_flips(int free_flips)
+{
+    if (g.free_flips.exchange(free_flips != 0) == (free_flips != 0)) return;
+    {
+        std::lock_guard<std::mutex> hold(g.queue_lock);
+        if (g.queued >= 0) {
+            g.latest = g.queued;
+            g.latest_new = true;
+            g.queued = -1;
+            g.tick++;
+        }
+    }
+    g.resized = true;
+    g.queue_cv.notify_one();
 }

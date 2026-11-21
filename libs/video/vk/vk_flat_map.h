@@ -44,13 +44,16 @@ public:
     V& operator[](const K& key)
     {
         const uint64_t h = hash_key(key);
-        const uint32_t tag = (uint32_t)(h >> 32) | 1u;
-        if (m_size)
-            for (size_t i = (size_t)h & m_mask; m_tags[i]; i = (i + 1u) & m_mask)
-                if (m_tags[i] == tag && !std::memcmp(&m_slots[i].key, &key, sizeof(K))) return m_slots[i].value;
-        slot& s = claim(h, tag);
+        if (slot* found = probe(h, key)) return found->value;
+        slot& s = claim(h, (uint32_t)(h >> 32) | 1u);
         s.key = key;
         return s.value;
+    }
+
+    V* find(const K& key)
+    {
+        slot* found = probe(hash_key(key), key);
+        return found ? &found->value : nullptr;
     }
 
     template <typename F>
@@ -86,6 +89,15 @@ private:
         K key{};
         V value{};
     };
+
+    slot* probe(uint64_t h, const K& key)
+    {
+        if (!m_size) return nullptr;
+        const uint32_t tag = (uint32_t)(h >> 32) | 1u;
+        for (size_t i = (size_t)h & m_mask; m_tags[i]; i = (i + 1u) & m_mask)
+            if (m_tags[i] == tag && !std::memcmp(&m_slots[i].key, &key, sizeof(K))) return &m_slots[i];
+        return nullptr;
+    }
 
     slot& claim(uint64_t h, uint32_t tag)
     {

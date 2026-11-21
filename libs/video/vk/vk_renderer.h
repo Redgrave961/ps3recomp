@@ -22,7 +22,6 @@
 #include <deque>
 #include <memory>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 namespace vk {
@@ -325,8 +324,8 @@ private:
     unit_resolved m_resolved[rsx::TEXTURES + rsx::VERTEX_TEXTURES];
     u64 m_binding_gen = 1;
     const char* m_texture_path[rsx::TEXTURES + rsx::VERTEX_TEXTURES]{};
-    std::unordered_map<uint64_t, std::unique_ptr<texture_entry>> m_textures;
-    std::unordered_map<uint64_t, VkSampler> m_samplers;
+    flat_map<uint64_t, std::unique_ptr<texture_entry>> m_textures;
+    flat_map<uint64_t, VkSampler> m_samplers;
     std::vector<u32> m_page_stamp;
 #ifndef _WIN32
     std::vector<u64> m_region_batch;

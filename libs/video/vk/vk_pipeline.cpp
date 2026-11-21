@@ -29,25 +29,6 @@ bool read_file(const std::string& path, std::vector<uint8_t>& out)
 
 }
 
-bool pipeline_key::operator==(const pipeline_key& o) const
-{
-    return std::memcmp(this, &o, sizeof *this) == 0;
-}
-
-size_t pipeline_key_hash::operator()(const pipeline_key& k) const
-{
-    const uint64_t* w = reinterpret_cast<const uint64_t*>(&k);
-    uint64_t h = 0x9E3779B97F4A7C15ull;
-    for (size_t i = 0; i < sizeof k / 8; i++) {
-        h ^= w[i];
-        h *= 0xFF51AFD7ED558CCDull;
-        h ^= h >> 32;
-    }
-    return (size_t)h;
-}
-
-static_assert(sizeof(pipeline_key) % 8 == 0);
-
 bool pipelines::create(vk_device& d, const std::string& cache_path)
 {
     m_d = &d;
@@ -202,14 +183,16 @@ void pipelines::destroy()
     for (std::thread& t : m_workers) t.join();
     m_workers.clear();
     save_cache();
-    for (auto& [k, e] : m_map) {
+    m_map.erase_if([this](const pipeline_key&, const std::unique_ptr<entry>& e) {
         const VkPipeline p = e->pipe.load();
         if (p) vkDestroyPipeline(m_d->dev, p, nullptr);
         if (e->fast && e->fast != p) vkDestroyPipeline(m_d->dev, e->fast, nullptr);
-    }
-    m_map.clear();
-    for (auto& [k, p] : m_output) vkDestroyPipeline(m_d->dev, p, nullptr);
-    m_output.clear();
+        return true;
+    });
+    m_output.erase_if([this](const pipeline_key&, VkPipeline p) {
+        vkDestroyPipeline(m_d->dev, p, nullptr);
+        return true;
+    });
     for (VkPipeline& p : m_input)
         if (p) vkDestroyPipeline(m_d->dev, std::exchange(p, VK_NULL_HANDLE), nullptr);
     if (m_db) std::fclose(std::exchange(m_db, nullptr));
@@ -502,7 +485,7 @@ VkPipeline pipelines::output_library(const pipeline_key& k)
     o.logic_enable = k.logic_enable;
     o.logic_op = k.logic_op;
     std::lock_guard<std::mutex> hold(m_lib_lock);
-    if (auto it = m_output.find(o); it != m_output.end()) return it->second;
+    if (const VkPipeline* found = m_output.find(o)) return *found;
     VkPipelineRenderingCreateInfo ri{ VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
     VkGraphicsPipelineLibraryCreateInfoEXT gl{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT, &ri };
     gl.flags = VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT;
@@ -522,7 +505,7 @@ VkPipeline pipelines::output_library(const pipeline_key& k)
     pi.pDynamicState = &dy;
     VkPipeline p = VK_NULL_HANDLE;
     if (vkCreateGraphicsPipelines(m_d->dev, m_cache, 1, &pi, nullptr, &p) != VK_SUCCESS) p = VK_NULL_HANDLE;
-    m_output.emplace(o, p);
+    m_output[o] = p;
     return p;
 }
 
@@ -548,10 +531,10 @@ VkPipeline pipelines::get(const pipeline_key& key, const shader& vs, const shade
     bool owner;
     {
         std::lock_guard<std::mutex> hold(m_map_lock);
-        auto [it, inserted] = m_map.try_emplace(k);
-        if (inserted) it->second = std::make_unique<entry>();
-        e = it->second.get();
-        owner = inserted;
+        std::unique_ptr<entry>& slot = m_map[k];
+        owner = !slot;
+        if (owner) slot = std::make_unique<entry>();
+        e = slot.get();
     }
     if (!owner) {
         if (!e->done.load(std::memory_order_acquire)) {
