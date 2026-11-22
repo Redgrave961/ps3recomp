@@ -33,6 +33,7 @@ public:
     void clear();
     bool report(uint32_t ea, bool counted);
     bool ordered(const rsx_write& w) const;
+    bool has_pending_reports() const { return m_pending_reports; }
     void defer(const rsx_write& w);
     void submitted(uint64_t value);
     bool idle() const { return m_written.load(std::memory_order_acquire) == m_issued; }
@@ -70,6 +71,7 @@ private:
     VkQueryControlFlags m_control = 0;
     bool m_enabled = false;
     bool m_active = false;
+    bool m_pending_reports = false;
     std::vector<segment> m_segments;
     std::vector<job> m_pending;
     uint64_t m_issued = 0;

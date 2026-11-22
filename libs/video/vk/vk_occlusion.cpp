@@ -133,6 +133,7 @@ void occlusion::enqueue(job&& j)
         m_issued++;
     }
     if (j.release || !j.queries.empty() || !m_pending.empty()) {
+        if (!j.release && !j.queries.empty()) m_pending_reports = true;
         m_pending.push_back(std::move(j));
         return;
     }
@@ -202,12 +203,14 @@ void occlusion::submitted(uint64_t value)
         }
     }
     m_pending.clear();
+    m_pending_reports = false;
     m_work.notify_one();
 }
 
 void occlusion::worker()
 {
     ps3_thread_name("vk occlusion");
+    uint64_t done = 0;
     for (;;) {
         job j;
         {
@@ -223,11 +226,14 @@ void occlusion::worker()
                 m_flight_src_size = j.src_size;
             }
         }
-        VkSemaphoreWaitInfo wi{ VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
-        wi.semaphoreCount = 1;
-        wi.pSemaphores = &m_timeline;
-        wi.pValues = &j.value;
-        vkWaitSemaphores(m_d->dev, &wi, UINT64_MAX);
+        if (j.value > done) {
+            VkSemaphoreWaitInfo wi{ VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
+            wi.semaphoreCount = 1;
+            wi.pSemaphores = &m_timeline;
+            wi.pValues = &j.value;
+            vkWaitSemaphores(m_d->dev, &wi, UINT64_MAX);
+            done = j.value;
+        }
         if (j.release) {
             for (const segment& g : j.queries) vkResetQueryPool(m_d->dev, m_pool, g.query, 1);
             {

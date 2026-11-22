@@ -1158,9 +1158,10 @@ bool renderer::report(u32 type, u32 ea)
 bool renderer::defer(const rsx_write& w)
 {
     if (!m_occlusion.ordered(w)) return false;
+    const bool flush_reports = w.barrier && m_occlusion.has_pending_reports();
     download(w.src, w.src_size);
     m_occlusion.defer(w);
-    if (!hle_window(w.ea, w.size) || !hle_window(w.src, w.src_size)) flush();
+    if (flush_reports || !hle_window(w.ea, w.size) || !hle_window(w.src, w.src_size)) flush();
     queued();
     if (w.barrier) stats.deferred_labels++;
     else stats.deferred_transfers++;

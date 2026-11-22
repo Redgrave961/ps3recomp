@@ -1747,11 +1747,29 @@ static inline u128 spu_gb(u128 a) {
     static const uint8_t rev4[16] = {0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15};
     return spu_pref_u32(rev4[_mm_movemask_ps(_mm_castsi128_ps(_mm_slli_epi32(spu__xl(a), 31)))]);
 }
-static inline u128 spu_gbh(u128 a) { return spu_gbh_ref(a); }
-static inline u128 spu_gbb(u128 a) { return spu_gbb_ref(a); }
-static inline u128 spu_fsm(u128 a) { return spu_fsm_ref(a); }
-static inline u128 spu_fsmh(u128 a) { return spu_fsmh_ref(a); }
-static inline u128 spu_fsmb(u128 a) { return spu_fsmb_ref(a); }
+static inline u128 spu_gbh(u128 a) {
+    const __m128i p = _mm_shuffle_epi8(spu__xl(a), _mm_setr_epi8(12, 14, 8, 10, 4, 6, 0, 2, -1, -1, -1, -1, -1, -1, -1, -1));
+    return spu_pref_u32((uint32_t)_mm_movemask_epi8(_mm_slli_epi16(p, 7)));
+}
+static inline u128 spu_gbb(u128 a) {
+    const __m128i r = _mm_shuffle_epi32(spu__xl(a), _MM_SHUFFLE(0, 1, 2, 3));
+    return spu_pref_u32((uint32_t)_mm_movemask_epi8(_mm_slli_epi16(r, 7)));
+}
+static inline u128 spu_fsm(u128 a) {
+    const __m128i m = _mm_setr_epi32(8, 4, 2, 1);
+    return spu__xs(_mm_cmpeq_epi32(_mm_and_si128(_mm_set1_epi32((int)a._u32[0]), m), m));
+}
+static inline u128 spu_fsmh(u128 a) {
+    const __m128i m = _mm_setr_epi16(0x40, 0x80, 0x10, 0x20, 0x04, 0x08, 0x01, 0x02);
+    return spu__xs(_mm_cmpeq_epi16(_mm_and_si128(_mm_set1_epi16((short)a._u32[0]), m), m));
+}
+static inline u128 spu_fsmb(u128 a) {
+    const __m128i b = _mm_shuffle_epi8(_mm_cvtsi32_si128((int)a._u32[0]),
+                                       _mm_setr_epi8(1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0));
+    const __m128i m = _mm_setr_epi8(0x10, 0x20, 0x40, (char)0x80, 0x01, 0x02, 0x04, 0x08,
+                                    0x10, 0x20, 0x40, (char)0x80, 0x01, 0x02, 0x04, 0x08);
+    return spu__xs(_mm_cmpeq_epi8(_mm_and_si128(b, m), m));
+}
 #else
 static inline u128 spu_absdb(u128 a, u128 b) { return spu_absdb_ref(a, b); }
 static inline u128 spu_avgb(u128 a, u128 b) { return spu_avgb_ref(a, b); }

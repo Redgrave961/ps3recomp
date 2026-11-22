@@ -752,6 +752,7 @@ int spu_have_function(uint32_t addr)
 }
 
 static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot);
+static int spu_overlay_resolve_at_lazy(spu_context* ctx, uint32_t lsa);
 static spu_lifted_fn spu_lifted_lookup_full(const spu_context* ctx, uint32_t lsa, int* reloc)
 {
     if (!ctx) return (spu_lifted_fn)spu_lookup_memoized(lsa, 0);
@@ -772,6 +773,9 @@ static spu_lifted_fn spu_lifted_lookup_full(const spu_context* ctx, uint32_t lsa
             }
             return (spu_lifted_fn)f;
         }
+    const int lazy_img = spu_overlay_resolve_at_lazy((spu_context*)ctx, lsa);
+    if (lazy_img > 0)
+        return (spu_lifted_fn)spu_lookup_memoized(lsa, lazy_img);
     spu_fn fn = NULL;
     if (ctx->resident_ovl) fn = spu_lookup_memoized(lsa, ctx->resident_ovl);
     if (!fn) fn = spu_lookup_memoized(lsa, ctx->image_id);
@@ -848,6 +852,36 @@ static int spu_ovl_ea_known(uint32_t ea)
     return 1;
 }
 
+#define SPU_OVL_SIG_SET 512u
+static uint64_t s_ovl_sig_set[SPU_OVL_SIG_SET];
+static uint8_t s_ovl_sig_used[SPU_OVL_SIG_SET];
+static inline unsigned spu_ovl_sig_slot(uint64_t sig0)
+{
+    return (unsigned)(((uint32_t)(sig0 ^ (sig0 >> 32)) * 0x9E3779B1u) >> 23) & (SPU_OVL_SIG_SET - 1);
+}
+static void spu_ovl_sig_add(const uint8_t sig[16])
+{
+    uint64_t sig0;
+    memcpy(&sig0, sig, 8);
+    for (unsigned i = spu_ovl_sig_slot(sig0), n = 0; n < SPU_OVL_SIG_SET; ++n, i = (i + 1) & (SPU_OVL_SIG_SET - 1)) {
+        if (__atomic_load_n(&s_ovl_sig_used[i], __ATOMIC_ACQUIRE)) {
+            if (s_ovl_sig_set[i] == sig0) return;
+            continue;
+        }
+        s_ovl_sig_set[i] = sig0;
+        __atomic_store_n(&s_ovl_sig_used[i], 1, __ATOMIC_RELEASE);
+        return;
+    }
+}
+static inline int spu_ovl_sig_known(uint64_t sig0)
+{
+    for (unsigned i = spu_ovl_sig_slot(sig0), n = 0; n < SPU_OVL_SIG_SET; ++n, i = (i + 1) & (SPU_OVL_SIG_SET - 1)) {
+        if (!__atomic_load_n(&s_ovl_sig_used[i], __ATOMIC_ACQUIRE)) return 0;
+        if (s_ovl_sig_set[i] == sig0) return 1;
+    }
+    return 1;
+}
+
 void spu_overlay_register_source(uint32_t content_ea, int image_id)
 {
     if (s_ovl_src_count < SPU_OVL_SRC_MAX) {
@@ -906,11 +940,35 @@ int spu_overlay_register_verified_region(uint32_t content_ea, uint32_t load_lsa,
 }
 
 #define SPU_OVL_AT_MAX 256
-static struct { uint32_t ea, lsa, span; int image_id; } s_ovl_at[SPU_OVL_AT_MAX];
+static struct { uint32_t ea, lsa, span; int image_id; uint64_t head8; } s_ovl_at[SPU_OVL_AT_MAX];
 static int s_ovl_at_count;
 #define SPU_OVL_AT_BLOCK_SHIFT 11
 #define SPU_OVL_AT_WORDS (SPU_OVL_AT_MAX / 64)
 static uint64_t s_ovl_at_blocks[SPU_LS_SIZE >> SPU_OVL_AT_BLOCK_SHIFT][SPU_OVL_AT_WORDS];
+#define SPU_OVL_AT_DELTA_SET 512u
+static uint32_t s_ovl_at_delta_set[SPU_OVL_AT_DELTA_SET];
+static uint8_t s_ovl_at_delta_used[SPU_OVL_AT_DELTA_SET];
+static inline unsigned spu_ovl_at_delta_slot(uint32_t d) { return (d * 0x9E3779B1u) >> 23; }
+static void spu_ovl_at_delta_add(uint32_t d)
+{
+    for (unsigned i = spu_ovl_at_delta_slot(d), n = 0; n < SPU_OVL_AT_DELTA_SET; ++n, i = (i + 1) & (SPU_OVL_AT_DELTA_SET - 1)) {
+        if (__atomic_load_n(&s_ovl_at_delta_used[i], __ATOMIC_ACQUIRE)) {
+            if (s_ovl_at_delta_set[i] == d) return;
+            continue;
+        }
+        s_ovl_at_delta_set[i] = d;
+        __atomic_store_n(&s_ovl_at_delta_used[i], 1, __ATOMIC_RELEASE);
+        return;
+    }
+}
+static inline int spu_ovl_at_delta_known(uint32_t d)
+{
+    for (unsigned i = spu_ovl_at_delta_slot(d), n = 0; n < SPU_OVL_AT_DELTA_SET; ++n, i = (i + 1) & (SPU_OVL_AT_DELTA_SET - 1)) {
+        if (!__atomic_load_n(&s_ovl_at_delta_used[i], __ATOMIC_ACQUIRE)) return 0;
+        if (s_ovl_at_delta_set[i] == d) return 1;
+    }
+    return 1;
+}
 void spu_overlay_register_region_at(uint32_t content_ea, uint32_t lsa, uint32_t span, int image_id)
 {
     if (!span || image_id <= 0 || lsa >= SPU_LS_SIZE || span > SPU_LS_SIZE - lsa) return;
@@ -921,6 +979,8 @@ void spu_overlay_register_region_at(uint32_t content_ea, uint32_t lsa, uint32_t 
     }
     s_ovl_at[n].ea = content_ea; s_ovl_at[n].lsa = lsa;
     s_ovl_at[n].span = span; s_ovl_at[n].image_id = image_id;
+    s_ovl_at[n].head8 = 0;
+    spu_ovl_at_delta_add(content_ea - lsa);
     for (uint32_t b = lsa >> SPU_OVL_AT_BLOCK_SHIFT; b <= (lsa + span - 1u) >> SPU_OVL_AT_BLOCK_SHIFT; b++)
         __atomic_fetch_or(&s_ovl_at_blocks[b][n >> 6], 1ull << (n & 63), __ATOMIC_RELAXED);
     __atomic_store_n(&s_ovl_at_count, n + 1, __ATOMIC_RELEASE);
@@ -984,6 +1044,7 @@ int spu_overlay_register_reloc_content(const uint8_t* code, uint32_t span, uint3
     o->load_lsa = canon;
     o->code = copy;
     o->code_count = 1;
+    spu_ovl_sig_add(o->sig);
     atomic_store_explicit(&s_ovl_has_sig, 1, memory_order_release);
     __atomic_store_n(&s_ovl_src_count, s_ovl_src_count + 1, __ATOMIC_RELEASE);
     return 1;
@@ -1046,6 +1107,7 @@ void spu_overlay_register_sig(const uint8_t sig[16], int image_id)
         s_ovl_src[s_ovl_src_count].image_id = image_id;
         memcpy(s_ovl_src[s_ovl_src_count].sig, sig, 16);
         s_ovl_src[s_ovl_src_count].has_sig = 1;
+        spu_ovl_sig_add(sig);
         atomic_store_explicit(&s_ovl_has_sig, 1, memory_order_release);
         __atomic_store_n(&s_ovl_src_count, s_ovl_src_count + 1, __ATOMIC_RELEASE);
     }
@@ -1091,6 +1153,62 @@ static inline int spu_is_all_zero(const uint8_t* p, uint32_t n)
     return 1;
 }
 
+static int spu_overlay_resolve_at_lazy(spu_context* ctx, uint32_t lsa)
+{
+    const int nat = __atomic_load_n(&s_ovl_at_count, __ATOMIC_ACQUIRE);
+    if (!nat || lsa >= SPU_LS_SIZE) return 0;
+    const unsigned nwords = (unsigned)((nat + 63) >> 6);
+    const uint32_t b = lsa >> SPU_OVL_AT_BLOCK_SHIFT;
+    for (unsigned w = 0; w < nwords; w++) {
+        uint64_t bits = __atomic_load_n(&s_ovl_at_blocks[b][w], __ATOMIC_RELAXED);
+        for (; bits; bits &= bits - 1) {
+            const int i = (int)(w * 64u + (unsigned)__builtin_ctzll(bits));
+            if (i >= nat) break;
+            const uint32_t rlo = s_ovl_at[i].lsa, span = s_ovl_at[i].span;
+            if (lsa < rlo || lsa - rlo >= span) continue;
+            const uint8_t* ls_p = ctx->ls + rlo;
+            const uint8_t* orig = vm_base + s_ovl_at[i].ea;
+            if (span >= 8) {
+                uint64_t h = __atomic_load_n(&s_ovl_at[i].head8, __ATOMIC_RELAXED);
+                if (!h) {
+                    memcpy(&h, orig, 8);
+                    if (h) __atomic_store_n(&s_ovl_at[i].head8, h, __ATOMIC_RELAXED);
+                }
+                if (h) {
+                    uint64_t q0;
+                    memcpy(&q0, ls_p, 8);
+                    if (q0 != h) continue;
+                }
+            }
+            const uint32_t check_n = span < 256u ? span : 256u;
+            if (spu_bytes_differ(ls_p, orig, check_n)) continue;
+            const uint32_t off = lsa - rlo;
+            const uint32_t at_n = (span - off) < 64u ? (span - off) : 64u;
+            if (spu_bytes_differ(ctx->ls + lsa, orig + off, at_n)) continue;
+            if (spu_is_all_zero(ctx->ls + lsa, at_n)) continue;
+            int free_slot = -1;
+            for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot) {
+                if (!ctx->resident_code[slot].image_id || ctx->resident_code[slot].lsa == rlo) {
+                    free_slot = (int)slot;
+                    break;
+                }
+            }
+            if (free_slot >= 0) {
+                ctx->resident_code[free_slot].lsa = rlo;
+                ctx->resident_code[free_slot].size = span;
+                ctx->resident_code[free_slot].source_ea = s_ovl_at[i].ea;
+                ctx->resident_code[free_slot].image_id = s_ovl_at[i].image_id;
+                ctx->resident_code[free_slot].verify_state = 0;
+                ctx->resident_code[free_slot].source_index = 0;
+                ctx->resident_code[free_slot].canon = 0;
+                spu_dcache_residency_changed(ctx);
+            }
+            return s_ovl_at[i].image_id;
+        }
+    }
+    return 0;
+}
+
 void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint32_t size)
 {
     uint32_t lsa = (uint32_t)(ls - ctx->ls);
@@ -1115,24 +1233,27 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
         }
     }
     const int nat = __atomic_load_n(&s_ovl_at_count, __ATOMIC_ACQUIRE);
-    if (nat && size) {
+    if (nat && size && spu_ovl_at_delta_known(ea - lsa)) {
+        const unsigned nwords = (unsigned)((nat + 63) >> 6);
         uint64_t cover[SPU_OVL_AT_WORDS] = { 0 };
         const uint32_t last = (uint32_t)(SPU_LS_SIZE >> SPU_OVL_AT_BLOCK_SHIFT) - 1u;
         const uint32_t b1 = (lsa + size - 1u) >> SPU_OVL_AT_BLOCK_SHIFT;
         const uint32_t bend = b1 < last ? b1 : last;
         uint64_t any = 0;
         for (uint32_t b = lsa >> SPU_OVL_AT_BLOCK_SHIFT; b <= bend; b++)
-            for (unsigned w = 0; w < SPU_OVL_AT_WORDS; w++) {
+            for (unsigned w = 0; w < nwords; w++) {
                 const uint64_t v = __atomic_load_n(&s_ovl_at_blocks[b][w], __ATOMIC_RELAXED);
                 cover[w] |= v;
                 any |= v;
             }
         if (any) {
-            for (unsigned w = 0; w < SPU_OVL_AT_WORDS; w++)
+            const uint32_t delta = ea - lsa;
+            for (unsigned w = 0; w < nwords; w++)
             for (uint64_t bits = cover[w]; bits; bits &= bits - 1) {
                 const int i = (int)(w * 64u + (unsigned)__builtin_ctzll(bits));
                 if (i >= nat) break;
                 const uint32_t rlo = s_ovl_at[i].lsa, rhi = rlo + s_ovl_at[i].span;
+                if (s_ovl_at[i].ea - rlo != delta) continue;
                 const uint32_t lo = lsa > rlo ? lsa : rlo;
                 const uint32_t hi = (lsa + size) < rhi ? (lsa + size) : rhi;
                 if (lo >= hi || (hi - lo < 128 && hi - lo != size)) continue;
@@ -1144,10 +1265,7 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
                         free_slot = (int)slot;
                 }
                 if (have) continue;
-                const uint8_t* q = ls + (lo - lsa);
-                const uint32_t src = s_ovl_at[i].ea + (lo - rlo);
-                if (ea + (lo - lsa) != src && spu_bytes_differ(q, vm_base + src, hi - lo)) continue;
-                if (spu_is_all_zero(q, hi - lo)) continue;
+                if (spu_is_all_zero(ls + (lo - lsa), hi - lo)) continue;
                 if (free_slot < 0) {
                     fprintf(stderr, "[spu-ovl] no free resident code span for image %d\n", s_ovl_at[i].image_id);
                     continue;
@@ -1165,22 +1283,28 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
     }
     int nsrc = __atomic_load_n(&s_ovl_src_count, __ATOMIC_ACQUIRE);
     if (!nsrc) return;
-    if ((size < 512 || !atomic_load_explicit(&s_ovl_has_sig, memory_order_acquire)) &&
-        !spu_ovl_ea_known(ea)) return;
+    int sig_ok = 0;
+    uint64_t a0 = 0, a1 = 0;
+    if (size >= 512 && atomic_load_explicit(&s_ovl_has_sig, memory_order_acquire)) {
+        memcpy(&a0, ls, 8);
+        sig_ok = spu_ovl_sig_known(a0);
+        if (sig_ok) memcpy(&a1, ls + 8, 8);
+    }
+    const int ea_ok = spu_ovl_ea_known(ea);
+    if (!sig_ok && !ea_ok) return;
     for (int i = 0; i < nsrc; i++) {
         const spu_ovl_src* o = &s_ovl_src[i];
         int hit;
         if (o->has_sig) {
-            if (size >= 512) {
-                uint64_t a0, a1, b0, b1;
-                memcpy(&a0, ls, 8); memcpy(&a1, ls + 8, 8);
+            if (sig_ok) {
+                uint64_t b0, b1;
                 memcpy(&b0, o->sig, 8); memcpy(&b1, o->sig + 8, 8);
                 hit = (a0 == b0 && a1 == b1);
             } else {
                 hit = 0;
             }
         } else {
-            hit = (o->src_ea == ea);
+            hit = ea_ok && (o->src_ea == ea);
         }
         if (hit) {
             if (o->span) {
