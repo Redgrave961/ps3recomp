@@ -7,16 +7,17 @@ sys_mutex_info g_sys_mutexes[SYS_MUTEX_MAX];
 
 static ps3_lock s_mtx_table_lock;
 
-static uint32_t read_be32(const uint8_t* p)
+static inline uint32_t read_be32(const uint8_t* p)
 {
-    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+    uint32_t v;
+    memcpy(&v, p, 4);
+    return __builtin_bswap32(v);
 }
 
-static void write_be32(uint32_t addr, uint32_t val)
+static inline void write_be32(uint32_t addr, uint32_t val)
 {
-    uint8_t* p = (uint8_t*)vm_to_host(addr);
-    p[0] = (uint8_t)(val >> 24); p[1] = (uint8_t)(val >> 16);
-    p[2] = (uint8_t)(val >> 8);  p[3] = (uint8_t)val;
+    const uint32_t b = __builtin_bswap32(val);
+    memcpy(vm_to_host(addr), &b, 4);
 }
 
 static uint32_t queue_protocol(const sys_mutex_info* m)

@@ -7,11 +7,10 @@ sys_semaphore_info g_sys_semaphores[SYS_SEMAPHORE_MAX];
 
 static ps3_lock s_sem_table_lock;
 
-static void write_be32(uint32_t addr, uint32_t val)
+static inline void write_be32(uint32_t addr, uint32_t val)
 {
-    uint8_t* p = (uint8_t*)vm_to_host(addr);
-    p[0] = (uint8_t)(val >> 24); p[1] = (uint8_t)(val >> 16);
-    p[2] = (uint8_t)(val >> 8);  p[3] = (uint8_t)val;
+    const uint32_t b = __builtin_bswap32(val);
+    memcpy(vm_to_host(addr), &b, 4);
 }
 
 static sys_semaphore_info* sem_get(uint32_t id)

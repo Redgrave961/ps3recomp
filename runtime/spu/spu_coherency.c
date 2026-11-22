@@ -7,6 +7,9 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
 #include "ps3emu/log_first.h"
 
 #ifdef __cplusplus
@@ -140,12 +143,16 @@ static unsigned char s_coh_bitmap[SPU_COH_BITMAP_SZ];
 
 #define SPU_COH_BLOCK  256u
 #define SPU_COH_BLOCKS 256u
-static spu_context** s_coh_blocks[SPU_COH_BLOCKS];
+static spu_context* s_coh_fast[SPU_COH_BLOCK];
+static spu_context** s_coh_blocks[SPU_COH_BLOCKS] = { s_coh_fast };
 static unsigned s_coh_n;
 static ps3_lock s_coh_reg;
 #define SPU_COH_PREFETCH 4
 
-static inline spu_context** spu_coh_slot(unsigned i) { return &s_coh_blocks[i / SPU_COH_BLOCK][i % SPU_COH_BLOCK]; }
+static inline spu_context** spu_coh_slot(unsigned i)
+{
+    return i < SPU_COH_BLOCK ? &s_coh_fast[i] : &s_coh_blocks[i >> 8][i & (SPU_COH_BLOCK - 1u)];
+}
 static inline spu_context* spu_coh_holder(unsigned i) { return __atomic_load_n(spu_coh_slot(i), __ATOMIC_ACQUIRE); }
 static inline void spu_coh_prefetch_holder(unsigned i, unsigned n)
 {
@@ -207,6 +214,9 @@ void spu_coh_unregister(spu_context* ctx)
     ps3_lock_acquire(&s_coh_reg);
     for (unsigned i = 0; i < s_coh_n; i++)
         if (spu_coh_holder(i) == ctx) __atomic_store_n(spu_coh_slot(i), NULL, __ATOMIC_SEQ_CST);
+    unsigned trim = s_coh_n;
+    while (trim > 0 && !spu_coh_holder(trim - 1u)) trim--;
+    if (trim != s_coh_n) __atomic_store_n(&s_coh_n, trim, __ATOMIC_RELEASE);
     __atomic_store_n(&ctx->coh_listed, 0, __ATOMIC_RELAXED);
     ps3_lock_release(&s_coh_reg);
     spu_ll_quiesce();
@@ -264,14 +274,35 @@ static uint32_t spu_coh_free_slots(uint32_t line, unsigned n)
     return s > k ? s - k : 0u;
 }
 
+static inline int spu_coh_line_differs_128(const uint8_t* a, const uint8_t* b)
+{
+#ifdef __AVX2__
+    const __m256i d0 = _mm256_xor_si256(_mm256_loadu_si256((const __m256i*)(a + 0)), _mm256_loadu_si256((const __m256i*)(b + 0)));
+    const __m256i d1 = _mm256_xor_si256(_mm256_loadu_si256((const __m256i*)(a + 32)), _mm256_loadu_si256((const __m256i*)(b + 32)));
+    const __m256i d2 = _mm256_xor_si256(_mm256_loadu_si256((const __m256i*)(a + 64)), _mm256_loadu_si256((const __m256i*)(b + 64)));
+    const __m256i d3 = _mm256_xor_si256(_mm256_loadu_si256((const __m256i*)(a + 96)), _mm256_loadu_si256((const __m256i*)(b + 96)));
+    const __m256i any = _mm256_or_si256(_mm256_or_si256(d0, d1), _mm256_or_si256(d2, d3));
+    return !_mm256_testz_si256(any, any);
+#else
+    return memcmp(a, b, MFC_ATOMIC_LINE) != 0;
+#endif
+}
+
 static void spu_coh_scan(uint32_t line, const void* self, int written)
 {
     uint32_t slots = ~0u;
     const unsigned n = __atomic_load_n(&s_coh_n, __ATOMIC_ACQUIRE);
-    for (unsigned i = 0; i < SPU_COH_PREFETCH; i++) spu_coh_prefetch_holder(i, n);
+    const int fast = __builtin_expect(n <= SPU_COH_BLOCK, 1);
+    if (!fast)
+        for (unsigned i = 0; i < SPU_COH_PREFETCH; i++) spu_coh_prefetch_holder(i, n);
     for (unsigned i = 0; i < n; i++) {
-        spu_coh_prefetch_holder(i + SPU_COH_PREFETCH, n);
-        spu_context* c = spu_coh_holder(i);
+        spu_context* c;
+        if (fast) {
+            c = __atomic_load_n(&s_coh_fast[i], __ATOMIC_ACQUIRE);
+        } else {
+            spu_coh_prefetch_holder(i + SPU_COH_PREFETCH, n);
+            c = spu_coh_holder(i);
+        }
         if (!c || (const void*)c == self) continue;
         uint32_t r = __atomic_load_n(&c->resv, __ATOMIC_RELAXED);
         if ((r & ~SPU_RESV_BY_CONTENT) != (line | 1u)) continue;
@@ -279,7 +310,7 @@ static void spu_coh_scan(uint32_t line, const void* self, int written)
         if (r & SPU_RESV_BY_CONTENT) {
             need = g_spu_idle_wake ? g_spu_idle_wake(c, vm_base + line) : 2;
             if (!need) continue;
-            if (!memcmp(vm_base + line, c->resv_line, MFC_ATOMIC_LINE)) continue;
+            if (!spu_coh_line_differs_128(vm_base + line, c->resv_line)) continue;
             if (need == 1) {
                 if (__atomic_load_n(&c->idle_claim, __ATOMIC_RELAXED) == (line | 1u)) continue;
                 if (slots == ~0u) slots = spu_coh_free_slots(line, n);

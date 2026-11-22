@@ -112,6 +112,13 @@ static void rsx_publish_get(void)
     }
 }
 
+static inline void rsx_publish_get_fast(void)
+{
+    __atomic_store_n((u32*)(vm_base + RSX_GET_EA), __builtin_bswap32(s.get), __ATOMIC_RELEASE);
+    if (__builtin_expect(__atomic_load_n(&s.get_waiters, __ATOMIC_RELAXED) != 0, 0))
+        rsx_publish_get();
+}
+
 void rsx_core_wait_get_outside(u32 lo, u32 hi)
 {
     __atomic_add_fetch(&s.get_waiters, 1u, __ATOMIC_SEQ_CST);
@@ -151,9 +158,9 @@ static void rsx_store_label(u32 ea, u32 value)
     rsx_label_wake();
 }
 
-static u64 rsx_tb_scale(u64 tb, u64 unit)
+static inline u64 rsx_tb_scale(u64 tb, u64 unit)
 {
-    return (tb / RSX_TB_FREQ) * unit + (tb % RSX_TB_FREQ) * unit / RSX_TB_FREQ;
+    return (u64)(((unsigned __int128)tb * unit) / RSX_TB_FREQ);
 }
 
 u64 rsx_core_system_time(void)
@@ -286,7 +293,9 @@ static void rsx_sleep_until(HANDLE timer, u64 target)
     const u64 spin = rsx_tick_freq() * 3u / 5000u, now = rsx_ticks();
     if (now >= target) return;
     if (target - now > spin) rsx_sleep_os(timer, target - now - spin);
-    while (rsx_ticks() < target) YieldProcessor();
+    while (rsx_ticks() < target) {
+        for (int i = 0; i < 8; i++) YieldProcessor();
+    }
 }
 
 typedef struct rsx_hold {
@@ -623,7 +632,7 @@ static void rsx_run_args(u32 put)
         s.get += n << 2;
         s.method_left -= n;
     }
-    rsx_publish_get();
+    rsx_publish_get_fast();
 }
 
 static void rsx_park(u32 jump, u32 put)
@@ -701,6 +710,7 @@ static DWORD WINAPI rsx_fifo_thread(LPVOID unused)
             s.batch++;
         }
         if (s.get == put) {
+            rsx_publish_get();
             rsx_flush();
             rsx_wait_change(put);
             continue;
@@ -723,7 +733,7 @@ static DWORD WINAPI rsx_fifo_thread(LPVOID unused)
         const u32 count = (cmd >> 18) & 0x7FFu;
         s.get += 4u;
         if (!count) {
-            rsx_publish_get();
+            rsx_publish_get_fast();
             continue;
         }
         s.method_reg = cmd & 0xFFFCu;

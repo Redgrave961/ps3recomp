@@ -1,4 +1,5 @@
 #include "vk_renderer.h"
+#include <immintrin.h>
 #include "../../../runtime/memory/vm_track.h"
 
 #include <algorithm>
@@ -364,6 +365,9 @@ void renderer::submit(VkSemaphore wait, VkPipelineStageFlags2 wait_stage, VkSema
     m_submissions[m_submission].done = value;
     m_submission = (m_submission + 1u) % (u32)m_submissions.size();
     m_recording = false;
+    m_dynamic.valid = false;
+    m_bound.valid = false;
+    m_bound.pipeline = VK_NULL_HANDLE;
     m_ring.close(value);
     m_occlusion.submitted(value);
 
@@ -519,6 +523,7 @@ surface* renderer::surface_for(u32 ea, u32 pitch, u32 width, u32 height, u32 for
         s->state = grow_from->state;
         s->gpu_dirty = grow_from->gpu_dirty;
         retire(grow_from);
+        m_fb_dirty = true;
     }
 
     const u32 bytes = s->bytes();
@@ -592,6 +597,44 @@ bool renderer::scale_depth(VkCommandBuffer c, image& src, image& dst)
     return true;
 }
 
+static inline void bswap16_row(uint8_t* out, const uint8_t* in, u32 row)
+{
+    u32 x = 0;
+#ifdef __AVX2__
+    const __m256i shuf = _mm256_setr_epi8(
+        1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14,
+        1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14);
+    for (; x + 32u <= row; x += 32u)
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(out + x),
+                            _mm256_shuffle_epi8(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(in + x)), shuf));
+#endif
+    for (; x + 2u <= row; x += 2u) {
+        uint16_t v;
+        std::memcpy(&v, in + x, 2);
+        v = __builtin_bswap16(v);
+        std::memcpy(out + x, &v, 2);
+    }
+}
+
+static inline void bswap32_row(uint8_t* out, const uint8_t* in, u32 row)
+{
+    u32 x = 0;
+#ifdef __AVX2__
+    const __m256i shuf = _mm256_setr_epi8(
+        3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12,
+        3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
+    for (; x + 32u <= row; x += 32u)
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(out + x),
+                            _mm256_shuffle_epi8(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(in + x)), shuf));
+#endif
+    for (; x + 4u <= row; x += 4u) {
+        uint32_t v;
+        std::memcpy(&v, in + x, 4);
+        v = __builtin_bswap32(v);
+        std::memcpy(out + x, &v, 4);
+    }
+}
+
 void renderer::load_surface(surface& s)
 {
     stats.surface_loads++;
@@ -611,29 +654,11 @@ void renderer::load_surface(surface& s)
                 case 1:
                     std::memcpy(out, in, row);
                     break;
-                case 2:
-                    for (u32 x = 0; x < row; x += 2) {
-                        uint16_t v;
-                        std::memcpy(&v, in + x, 2);
-                        v = __builtin_bswap16(v);
-                        std::memcpy(out + x, &v, 2);
-                    }
-                    break;
-                case 8:
-                    for (u32 x = 0; x < row; x += 2) {
-                        uint16_t v;
-                        std::memcpy(&v, in + x, 2);
-                        v = __builtin_bswap16(v);
-                        std::memcpy(out + x, &v, 2);
-                    }
+                case 2: case 8:
+                    bswap16_row(out, in, row);
                     break;
                 default:
-                    for (u32 x = 0; x < row; x += 4) {
-                        uint32_t v;
-                        std::memcpy(&v, in + x, 4);
-                        v = __builtin_bswap32(v);
-                        std::memcpy(out + x, &v, 4);
-                    }
+                    bswap32_row(out, in, row);
                     break;
                 }
             }
@@ -711,20 +736,10 @@ void renderer::download_surface(surface& s)
             std::memcpy(out, in, row);
             break;
         case 2: case 8:
-            for (u32 x = 0; x < row; x += 2) {
-                uint16_t v;
-                std::memcpy(&v, in + x, 2);
-                v = __builtin_bswap16(v);
-                std::memcpy(out + x, &v, 2);
-            }
+            bswap16_row(out, in, row);
             break;
         default:
-            for (u32 x = 0; x < row; x += 4) {
-                uint32_t v;
-                std::memcpy(&v, in + x, 4);
-                v = __builtin_bswap32(v);
-                std::memcpy(out + x, &v, 4);
-            }
+            bswap32_row(out, in, row);
             break;
         }
     }
@@ -748,6 +763,14 @@ void renderer::end_rendering()
 
 bool renderer::bind_framebuffer(u32 context)
 {
+    constexpr u32 k_fb_mask = rsx::D_SURFACE | rsx::D_DEPTH_STENCIL | rsx::D_BLEND | rsx::D_VIEWPORT;
+    const u32 fb_bits = dirty & k_fb_mask;
+    if (!m_fb_dirty && !fb_bits && m_fb_context == context) return m_fb_valid;
+    m_dyn_dirty |= fb_bits;
+    dirty &= ~k_fb_mask;
+    m_fb_dirty = false;
+    m_fb_context = context;
+
     framebuffer fb{};
     const u32 clip_h = r(rsx::M_SURFACE_CLIP_H), clip_v = r(rsx::M_SURFACE_CLIP_V);
     u32 width = clip_h >> 16, height = clip_v >> 16;
@@ -892,6 +915,7 @@ bool renderer::bind_framebuffer(u32 context)
     if (!(fb == m_fb) || !m_fb_valid) {
         end_rendering();
         m_fb = fb;
+        m_dyn_dirty = ~0u;
     }
     m_fb_valid = true;
     return true;
@@ -1165,11 +1189,8 @@ void renderer::present_source(u32 ea, u32 width, u32 height, u32 pitch, image*& 
     vk_slice slice = m_ring.alloc((VkDeviceSize)width * height * 4u, 16);
     if (!slice.ptr) return;
     const uint8_t* src = vm_base + ea;
-    for (u32 y = 0; y < height; y++) {
-        const uint32_t* in = reinterpret_cast<const uint32_t*>(src + (size_t)y * pitch);
-        uint32_t* o = reinterpret_cast<uint32_t*>(slice.ptr + (size_t)y * width * 4u);
-        for (u32 x = 0; x < width; x++) o[x] = __builtin_bswap32(in[x]);
-    }
+    for (u32 y = 0; y < height; y++)
+        bswap32_row(slice.ptr + (size_t)y * width * 4u, src + (size_t)y * pitch, width * 4u);
     const trace_span span(*this, c, "scanout upload %ux%u", width, height);
     barrier(c, m_display, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
     VkBufferImageCopy region{};
@@ -1188,14 +1209,17 @@ void renderer::read_back(u32 ea, u32 size)
 
 void renderer::download(u32 ea, u32 size)
 {
-    const auto start = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point start{};
     bool stalled = false;
     for (auto& p : m_surfaces)
         if (p->gpu_dirty && ranges_overlap(p->ea, p->bytes(), ea, size)) {
+            if (!stalled) {
+                start = std::chrono::steady_clock::now();
+                stalled = true;
+            }
             download_surface(*p);
             stats.surface_stalls++;
             stats.stall_bytes += p->bytes();
-            stalled = true;
         }
     if (stalled) stall(start, ea, size);
 }
@@ -1350,6 +1374,8 @@ void renderer::flip_reset()
     }
     frontend::reset();
     m_fb_valid = false;
+    m_fb_dirty = true;
+    m_dyn_dirty = ~0u;
     if ((++m_flips & 255u) == 0)
         m_textures.erase_if([this](uint64_t, const std::unique_ptr<texture_entry>& e) {
             if (m_flips - e->used <= 1800u) return false;
@@ -1364,6 +1390,8 @@ void renderer::rescale(ratio scale)
 {
     resolution_scale = scale;
     m_binding_gen++;
+    m_fb_dirty = true;
+    m_dyn_dirty = ~0u;
     VkCommandBuffer c = cmd();
     end_rendering();
     for (auto& p : m_surfaces) {

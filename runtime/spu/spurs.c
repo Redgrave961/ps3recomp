@@ -1,6 +1,7 @@
 #include "spurs.h"
 #include "spu_dma.h"
 
+#include <immintrin.h>
 #include <setjmp.h>
 #include <stdio.h>
 #include <string.h>
@@ -18,21 +19,33 @@ enum { SPURS_IMAGE = 99 };
 
 static uint64_t s_pm_service, s_pm_taskset, s_pm_jobchain, s_pm_jobchain_plain;
 
-static inline uint32_t g16(const uint8_t* p) { return (uint32_t)p[0] << 8 | p[1]; }
-static inline uint32_t g32(const uint8_t* p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
-static inline uint64_t g64(const uint8_t* p) { return (uint64_t)g32(p) << 32 | g32(p + 4); }
-static inline void p16(uint8_t* p, uint32_t v) { p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; }
-static inline void p32(uint8_t* p, uint32_t v) { p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v; }
-static inline void p64(uint8_t* p, uint64_t v) { p32(p, (uint32_t)(v >> 32)); p32(p + 4, (uint32_t)v); }
-static inline void psplat(uint8_t* p, uint32_t v) { for (int i = 0; i < 16; i += 4) p32(p + i, v); }
+static inline uint32_t g16(const uint8_t* p) { uint16_t v; memcpy(&v, p, 2); return __builtin_bswap16(v); }
+static inline uint32_t g32(const uint8_t* p) { uint32_t v; memcpy(&v, p, 4); return __builtin_bswap32(v); }
+static inline uint64_t g64(const uint8_t* p) { uint64_t v; memcpy(&v, p, 8); return __builtin_bswap64(v); }
+static inline void p16(uint8_t* p, uint32_t v) { const uint16_t b = __builtin_bswap16((uint16_t)v); memcpy(p, &b, 2); }
+static inline void p32(uint8_t* p, uint32_t v) { const uint32_t b = __builtin_bswap32(v); memcpy(p, &b, 4); }
+static inline void p64(uint8_t* p, uint64_t v) { const uint64_t b = __builtin_bswap64(v); memcpy(p, &b, 8); }
+static inline void psplat(uint8_t* p, uint32_t v) { _mm_storeu_si128((__m128i*)p, _mm_set1_epi32((int)__builtin_bswap32(v))); }
 static inline uint32_t bit32(uint32_t n) { return n < 32 ? 1u << n : 0u; }
 static inline u128 pref(uint32_t v) { return spu_make_preferred_u32(v); }
 static inline u128 qsplat(uint32_t v) { u128 r; r._u32[0] = r._u32[1] = r._u32[2] = r._u32[3] = v; return r; }
 static inline u128 qwords(uint32_t a, uint32_t b, uint32_t c, uint32_t d) { u128 r; r._u32[0] = a; r._u32[1] = b; r._u32[2] = c; r._u32[3] = d; return r; }
 static inline uint8_t* lsp(spu_context* c, uint32_t a) { return c->ls + (a & SPU_LS_MASK); }
 
-static void vsub(uint8_t* d, const uint8_t* a, const uint8_t* b) { for (int i = 0; i < 16; i += 4) p32(d + i, g32(a + i) - g32(b + i)); }
-static void vadd(uint8_t* d, const uint8_t* a, const uint8_t* b) { for (int i = 0; i < 16; i += 4) p32(d + i, g32(a + i) + g32(b + i)); }
+static inline void vsub(uint8_t* d, const uint8_t* a, const uint8_t* b)
+{
+    const __m128i sh = _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
+    const __m128i va = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)a), sh);
+    const __m128i vb = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)b), sh);
+    _mm_storeu_si128((__m128i*)d, _mm_shuffle_epi8(_mm_sub_epi32(va, vb), sh));
+}
+static inline void vadd(uint8_t* d, const uint8_t* a, const uint8_t* b)
+{
+    const __m128i sh = _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
+    const __m128i va = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)a), sh);
+    const __m128i vb = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)b), sh);
+    _mm_storeu_si128((__m128i*)d, _mm_shuffle_epi8(_mm_add_epi32(va, vb), sh));
+}
 
 static void spurs_fatal(const char* what, uint64_t v)
 {
@@ -123,10 +136,24 @@ static void ll_commit(spu_context* c, uint32_t ea, uint32_t lsa)
     spu_rsx_window_check(ea, MFC_ATOMIC_LINE);
 }
 
+static inline int line_differs_128(const uint8_t* a, const uint8_t* b)
+{
+#ifdef __AVX2__
+    const __m256i d0 = _mm256_xor_si256(_mm256_loadu_si256((const __m256i*)(a + 0)), _mm256_loadu_si256((const __m256i*)(b + 0)));
+    const __m256i d1 = _mm256_xor_si256(_mm256_loadu_si256((const __m256i*)(a + 32)), _mm256_loadu_si256((const __m256i*)(b + 32)));
+    const __m256i d2 = _mm256_xor_si256(_mm256_loadu_si256((const __m256i*)(a + 64)), _mm256_loadu_si256((const __m256i*)(b + 64)));
+    const __m256i d3 = _mm256_xor_si256(_mm256_loadu_si256((const __m256i*)(a + 96)), _mm256_loadu_si256((const __m256i*)(b + 96)));
+    const __m256i any = _mm256_or_si256(_mm256_or_si256(d0, d1), _mm256_or_si256(d2, d3));
+    return !_mm256_testz_si256(any, any);
+#else
+    return memcmp(a, b, MFC_ATOMIC_LINE) != 0;
+#endif
+}
+
 static void ll_commit_changed(spu_context* c, uint32_t ea, uint32_t lsa)
 {
     ea &= ~127u;
-    if (memcmp(vm_base + ea, c->ls + lsa, MFC_ATOMIC_LINE)) {
+    if (line_differs_128(vm_base + ea, c->ls + lsa)) {
         ll_commit(c, ea, lsa);
         return;
     }

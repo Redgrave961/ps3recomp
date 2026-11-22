@@ -166,6 +166,12 @@ private:
     u64 m_draw_counter = 0;
     framebuffer m_fb;
     bool m_fb_valid = false;
+    bool m_fb_dirty = true;
+    u32 m_fb_context = ~0u;
+    u32 m_dyn_dirty = ~0u;
+    u32 m_last_dyn_prim = ~0u;
+    bool m_last_dyn_restart = false;
+    pipeline_key m_last_pipe_key{};
     std::vector<std::unique_ptr<surface>> m_surfaces;
     std::vector<std::pair<uint64_t, image>> m_garbage;
     struct scratch {
@@ -272,6 +278,7 @@ private:
         u32 offsets[4];
         VkDescriptorImageInfo images[rsx::TEXTURES + rsx::VERTEX_TEXTURES];
         VkPipeline pipeline = VK_NULL_HANDLE;
+        VkIndexType index_type = VK_INDEX_TYPE_MAX_ENUM;
         bool valid = false;
     };
     bound_descriptors m_bound;
@@ -337,6 +344,7 @@ private:
     u64 m_flips = 0;
     u64 m_content_clock = 0;
     std::vector<rsx::texture_copy> m_copies;
+    std::vector<VkBufferImageCopy> m_copy_regions;
 
 public:
     struct counters {

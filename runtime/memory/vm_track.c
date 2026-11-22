@@ -1,5 +1,8 @@
 #include "vm_track.h"
 #include "vm_page_map.h"
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
 
 #ifdef _WIN32
 #include <windows.h>
@@ -121,8 +124,24 @@ void vm_track(uint32_t ea, uint32_t size, vm_page_fn changed, void* user)
     ReleaseSRWLockExclusive(&s_lock);
 }
 
+static int vm_dirty_any(void)
+{
+    const uint32_t nw = (uint32_t)(sizeof vm_dirty_group / sizeof vm_dirty_group[0]);
+    uint32_t w = 0;
+#ifdef __AVX2__
+    __m256i acc = _mm256_setzero_si256();
+    for (; w + 4u <= nw; w += 4u)
+        acc = _mm256_or_si256(acc, _mm256_loadu_si256((const __m256i*)&vm_dirty_group[w]));
+    if (!_mm256_testz_si256(acc, acc)) return 1;
+#endif
+    for (; w < nw; w++)
+        if (__atomic_load_n(&vm_dirty_group[w], __ATOMIC_RELAXED)) return 1;
+    return 0;
+}
+
 uint32_t vm_track_drain(vm_page_fn changed, void* user)
 {
+    if (!vm_dirty_any()) return 0;
     AcquireSRWLockExclusive(&s_lock);
     uint32_t n = 0;
     int armed = 0;

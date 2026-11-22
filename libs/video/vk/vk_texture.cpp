@@ -90,11 +90,13 @@ void renderer::watch(u32 ea, u32 size)
 void renderer::prescan(u64 batch)
 {
     m_scan_batch = batch;
-    const auto start = std::chrono::steady_clock::now();
+    const bool timed = tracing();
+    const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     page_stamper s{ m_page_stamp, m_stamp, 0 };
     stats.changed_pages += vm_track_drain(stamp_page, &s);
     stats.scans++;
-    stats.scan_ns += (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
+    if (timed)
+        stats.scan_ns += (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
 }
 
 bool renderer::memory_changed(u32 ea, u32 size, u32 stamp)
@@ -442,18 +444,20 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
         const trace_span span(*this, c, "texture upload %ux%u fmt %d %llu bytes", e->img.width, e->img.height, (int)d.format,
                               (unsigned long long)bytes);
         barrier(c, e->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
-        std::vector<VkBufferImageCopy> regions(m_copies.size());
+        m_copy_regions.resize(m_copies.size());
         for (size_t i = 0; i < m_copies.size(); i++) {
             const rsx::texture_copy& cp = m_copies[i];
-            VkBufferImageCopy& rg = regions[i];
+            VkBufferImageCopy& rg = m_copy_regions[i];
+            rg = {};
             rg.bufferOffset = slice.offset + cp.offset;
             rg.bufferRowLength = cp.row_texels;
             rg.bufferImageHeight = cp.rows;
             rg.imageSubresource = { d.aspect, cp.level, cp.layer, 1 };
             rg.imageExtent = { cp.width, cp.height, std::max(cp.depth, 1u) };
         }
-        if (!regions.empty())
-            vkCmdCopyBufferToImage(c, slice.buffer, e->img.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, (u32)regions.size(), regions.data());
+        if (!m_copy_regions.empty())
+            vkCmdCopyBufferToImage(c, slice.buffer, e->img.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, (u32)m_copy_regions.size(),
+                                   m_copy_regions.data());
     }
     if (!readable(e->img)) {
         end_rendering();

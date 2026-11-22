@@ -25,21 +25,27 @@ typedef void (*hle_ctx_fn)(ppu_context*);
 static struct { uint32_t nid; hle_ctx_fn fn; const char* name; } g_ctx[HLE_CTX_CAP];
 static uint32_t g_ctx_count = 0;
 
-struct HleSlot { uint32_t nid, ctx_n, tab_n; int32_t ctx_i, tab_i; };
+extern "C" uint32_t prx_resolve_export(uint32_t nid);
+extern "C" uint32_t prx_export_registry_count(void);
+
+struct HleSlot { uint32_t nid, ctx_n, tab_n, prx_n, prx_opd; int32_t ctx_i, tab_i; };
 static thread_local HleSlot t_hle_slot[1024];
 static const HleSlot* hle_slot(uint32_t nid)
 {
     HleSlot* s = &t_hle_slot[(nid * 2654435761u) >> 22];
-    const uint32_t ctx_n = g_ctx_count, tab_n = g_hle_inited ? g_hle_nids.count : 0;
-    if (s->nid != nid || s->ctx_n != ctx_n || s->tab_n != tab_n || (!s->ctx_n && !s->tab_n)) {
+    const uint32_t ctx_n = g_ctx_count, tab_n = g_hle_inited ? g_hle_nids.count : 0, prx_n = prx_export_registry_count();
+    if (s->nid != nid || s->ctx_n != ctx_n || s->tab_n != tab_n || s->prx_n != prx_n || (!s->ctx_n && !s->tab_n && !s->prx_n)) {
+        s->prx_opd = prx_resolve_export(nid);
         s->ctx_i = s->tab_i = -1;
-        for (uint32_t i = 0; i < ctx_n; i++)
-            if (g_ctx[i].nid == nid) { s->ctx_i = (int32_t)i; break; }
-        if (s->ctx_i < 0 && tab_n) {
-            const ps3_nid_entry* e = ps3_nid_table_find(&g_hle_nids, nid);
-            if (e) s->tab_i = (int32_t)(e - g_hle_nids.entries);
+        if (!s->prx_opd) {
+            for (uint32_t i = 0; i < ctx_n; i++)
+                if (g_ctx[i].nid == nid) { s->ctx_i = (int32_t)i; break; }
+            if (s->ctx_i < 0 && tab_n) {
+                const ps3_nid_entry* e = ps3_nid_table_find(&g_hle_nids, nid);
+                if (e) s->tab_i = (int32_t)(e - g_hle_nids.entries);
+            }
         }
-        s->nid = nid; s->ctx_n = ctx_n; s->tab_n = tab_n;
+        s->nid = nid; s->ctx_n = ctx_n; s->tab_n = tab_n; s->prx_n = prx_n;
     }
     return s;
 }
@@ -86,7 +92,6 @@ extern "C" const char* g_last_hle_name = "";
 #define PS3_HLE_INFLIGHT_MAX 64
 extern "C" const char* g_hle_inflight[PS3_HLE_INFLIGHT_MAX] = { nullptr };
 
-extern "C" uint32_t prx_resolve_export(uint32_t nid);
 extern "C" void     ps3_indirect_call(ppu_context* ctx);
 extern "C" uint32_t vm_read32(uint64_t a);
 #include "../platform/win32_backtrace.h"
@@ -122,15 +127,14 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
     }
     vm_write64(ctx->gpr[1] + 0x28, ctx->gpr[2]);
 
-    if (const uint32_t opd = prx_resolve_export(nid)) {
+    const HleSlot* hs = hle_slot(nid);
+    if (const uint32_t opd = hs->prx_opd) {
         ctx->gpr[2] = vm_read32(opd + 4);
         ctx->ctr    = vm_read32(opd);
         ps3_indirect_call(ctx);
         ps3_msf("prx:0x%08X", nid);
         return;
     }
-
-    const HleSlot* hs = hle_slot(nid);
     if (hs->ctx_i >= 0) {
             const uint32_t i = (uint32_t)hs->ctx_i;
             ps3_msf("hle:%s", g_ctx[i].name);

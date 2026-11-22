@@ -195,28 +195,39 @@ static inline void spu_context_init(spu_context* ctx, uint32_t spu_id)
     ctx->status = SPU_STATUS_STOPPED;
 }
 
+#if defined(__GNUC__) || defined(__clang__)
+#define SPU_BSWAP32(x) __builtin_bswap32(x)
+#define SPU_LS_FAST 1
+#endif
+
 static inline uint32_t spu_ls_read32(const spu_context* ctx, uint32_t lsa)
 {
     lsa &= SPU_LS_MASK;
     const uint8_t* p = &ctx->ls[lsa];
+#ifdef SPU_LS_FAST
+    uint32_t w;
+    memcpy(&w, p, 4);
+    return SPU_BSWAP32(w);
+#else
     return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
            ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
+#endif
 }
 
 static inline void spu_ls_write32(spu_context* ctx, uint32_t lsa, uint32_t val)
 {
     lsa &= SPU_LS_MASK;
     uint8_t* p = &ctx->ls[lsa];
+#ifdef SPU_LS_FAST
+    uint32_t w = SPU_BSWAP32(val);
+    memcpy(p, &w, 4);
+#else
     p[0] = (uint8_t)(val >> 24);
     p[1] = (uint8_t)(val >> 16);
     p[2] = (uint8_t)(val >> 8);
     p[3] = (uint8_t)(val);
-}
-
-#if defined(__GNUC__) || defined(__clang__)
-#define SPU_BSWAP32(x) __builtin_bswap32(x)
-#define SPU_LS_FAST 1
 #endif
+}
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif

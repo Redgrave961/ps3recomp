@@ -337,14 +337,30 @@ bool renderer::upload_vertices(const rsx::draw_clause& clause, u32 first, u32 co
     return upload(m_layout_upload, &layout, sizeof layout, layout_info);
 }
 
+static inline bool bytes_equal(const uint8_t* a, const uint8_t* b, u32 n)
+{
+#ifdef __AVX2__
+    u32 i = 0;
+    for (; i + 32u <= n; i += 32u) {
+        const __m256i d = _mm256_xor_si256(_mm256_loadu_si256((const __m256i*)(a + i)),
+                                           _mm256_loadu_si256((const __m256i*)(b + i)));
+        if (!_mm256_testz_si256(d, d)) return false;
+    }
+    return i == n || std::memcmp(a + i, b + i, n - i) == 0;
+#else
+    return std::memcmp(a, b, n) == 0;
+#endif
+}
+
 bool renderer::upload(reused_upload& u, const void* data, u32 size, VkDescriptorBufferInfo& out)
 {
     const uint64_t submission = *m_submitted + 1u;
-    if (u.submission != submission || u.bytes.size() != size || std::memcmp(u.bytes.data(), data, size) != 0) {
+    if (u.submission != submission || u.bytes.size() != size || !bytes_equal(u.bytes.data(), (const uint8_t*)data, size)) {
         const vk_slice s = m_ring.alloc(size, m_ubo_align);
         if (!s.ptr) return false;
         std::memcpy(s.ptr, data, size);
-        u.bytes.assign(static_cast<const uint8_t*>(data), static_cast<const uint8_t*>(data) + size);
+        u.bytes.resize(size);
+        std::memcpy(u.bytes.data(), data, size);
         u.submission = submission;
         u.info = { s.buffer, s.offset, size };
     }
@@ -508,8 +524,19 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
         const uint8_t* base = nullptr;
         u32 source = 0;
         if (clause.immediate) {
-            m_index_scratch.resize(clause.elements.size() * 4u);
-            for (size_t i = 0; i < clause.elements.size(); i++) {
+            const size_t n = clause.elements.size();
+            m_index_scratch.resize(n * 4u);
+            size_t i = 0;
+#ifdef __AVX2__
+            const __m256i shuf = _mm256_setr_epi8(
+                3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12,
+                3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
+            for (; i + 8u <= n; i += 8u) {
+                const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(clause.elements.data() + i));
+                _mm256_storeu_si256(reinterpret_cast<__m256i*>(m_index_scratch.data() + i * 4u), _mm256_shuffle_epi8(v, shuf));
+            }
+#endif
+            for (; i < n; i++) {
                 const u32 v = __builtin_bswap32(clause.elements[i]);
                 std::memcpy(m_index_scratch.data() + i * 4u, &v, 4u);
             }
@@ -628,16 +655,20 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
     }
 
     const rsx_spv_fp_info& fi = m_fp->info;
-    const u32 nconst = std::max(fi.constant_count, 1u);
-    m_fp_constants.assign((size_t)nconst * 4u, 0u);
-    const u32* ucode = reinterpret_cast<const u32*>(vm_base + m_fp_ea);
-    for (u32 i = 0; i < fi.constant_count; i++)
-        for (u32 w = 0; w < 4; w++) {
-            const u32 v = __builtin_bswap32(ucode[fi.constant_word[i] + w]);
-            m_fp_constants[i * 4u + w] = (v << 16) | (v >> 16);
-        }
     VkDescriptorBufferInfo fp_consts{};
-    if (!upload(m_fp_constant_upload, m_fp_constants.data(), nconst * 16u, fp_consts)) return;
+    if (fi.constant_count) {
+        m_fp_constants.resize((size_t)fi.constant_count * 4u);
+        const u32* ucode = reinterpret_cast<const u32*>(vm_base + m_fp_ea);
+        const __m128i swap16 = _mm_setr_epi8(1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14);
+        for (u32 i = 0; i < fi.constant_count; i++) {
+            const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(ucode + fi.constant_word[i]));
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(m_fp_constants.data() + i * 4u), _mm_shuffle_epi8(v, swap16));
+        }
+        if (!upload(m_fp_constant_upload, m_fp_constants.data(), fi.constant_count * 16u, fp_consts)) return;
+    } else {
+        static constexpr u32 k_zero_const[4] = {};
+        if (!upload(m_fp_constant_upload, k_zero_const, sizeof k_zero_const, fp_consts)) return;
+    }
 
     rsx_spv_fragment_state fs{};
     if (r(rsx::M_ALPHA_TEST_ENABLE)) fs.flags |= RSX_SPV_FPF_ALPHA_TEST;
@@ -678,21 +709,27 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
     VkDescriptorBufferInfo fp_state{};
     if (!upload(m_fp_state_upload, &fs, sizeof fs, fp_state)) return;
 
+    constexpr u32 k_dyn_mask = rsx::D_SURFACE | rsx::D_VIEWPORT | rsx::D_RASTER | rsx::D_DEPTH_STENCIL | rsx::D_BLEND;
+    const bool restart_en = restart && clause.kind == rsx::draw_kind::indexed;
+    const bool dyn_changed = !m_dynamic.valid || m_dyn_dirty || (dirty & k_dyn_mask) || m_last_dyn_prim != prim || m_last_dyn_restart != restart_en;
     draw_target t{};
-    t.width = m_fb.width;
-    t.height = m_fb.height;
-    t.aa_u = m_fb.aa_u;
-    t.aa_v = m_fb.aa_v;
-    t.scale = m_fb.scale;
-    t.depth = m_fb.depth != nullptr;
-    t.stencil = m_fb.depth && (m_fb.depth->img.aspect & VK_IMAGE_ASPECT_STENCIL_BIT);
-    for (u32 k = 0; k < 4; k++) t.color_format[k] = m_fb.color_format[k];
+    if (dyn_changed) {
+        t.width = m_fb.width;
+        t.height = m_fb.height;
+        t.aa_u = m_fb.aa_u;
+        t.aa_v = m_fb.aa_v;
+        t.scale = m_fb.scale;
+        t.depth = m_fb.depth != nullptr;
+        t.stencil = m_fb.depth && (m_fb.depth->img.aspect & VK_IMAGE_ASPECT_STENCIL_BIT);
+        for (u32 k = 0; k < 4; k++) t.color_format[k] = m_fb.color_format[k];
+        m_last_pipe_key = {};
+        fill_pipeline_state(*this, *m_d, t, prim, m_last_pipe_key);
+    }
 
-    pipeline_key key{};
+    pipeline_key key = m_last_pipe_key;
     key.vs = m_vp->hash;
     key.fs = m_fp->hash;
     key.depth_format = m_fb.depth_format;
-    fill_pipeline_state(*this, *m_d, t, prim, key);
     const VkPipeline pipe = m_pipelines.get(key, m_vp->code, m_fp->code);
     if (!pipe) {
         if (m_trace) std::fprintf(m_trace, "[trace] %u skipped: pipeline compiling or failed\n", id);
@@ -706,7 +743,13 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
         vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
         m_bound.pipeline = pipe;
     }
-    set_dynamic_state(c, *this, *m_d, m_pipelines, t, prim, restart && clause.kind == rsx::draw_kind::indexed, key, m_dynamic);
+    if (dyn_changed) {
+        set_dynamic_state(c, *this, *m_d, m_pipelines, t, prim, restart_en, key, m_dynamic);
+        m_dyn_dirty = 0;
+        dirty &= ~k_dyn_mask;
+        m_last_dyn_prim = prim;
+        m_last_dyn_restart = restart_en;
+    }
 
     const bool all = !m_bound.valid;
     const u32 offsets[4] = { (u32)m_constants.offset, (u32)vlayout.offset, (u32)fp_consts.offset, (u32)fp_state.offset };
@@ -728,9 +771,13 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
         x.pImageInfo = &last;
     }
     m_bound.valid = true;
+    if (all) m_bound.index_type = VK_INDEX_TYPE_MAX_ENUM;
     if (nw) vkCmdPushDescriptorSetKHR(c, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelines.layout(), RSX_SPV_SET_TEXTURES, nw, w);
 
-    if (subs.front().indexed) vkCmdBindIndexBuffer(c, m_ring.buffer(), 0, index_type);
+    if (subs.front().indexed && m_bound.index_type != index_type) {
+        vkCmdBindIndexBuffer(c, m_ring.buffer(), 0, index_type);
+        m_bound.index_type = index_type;
+    }
     for (const draw_sub& s : subs) {
         if (s.indexed) vkCmdDrawIndexed(c, s.count, 1, s.first, s.vertex_offset, 0);
         else vkCmdDraw(c, s.count, 1, s.first, 0);

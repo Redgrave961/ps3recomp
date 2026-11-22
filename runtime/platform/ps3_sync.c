@@ -28,15 +28,14 @@ static uint64_t s_qpc_freq;
 
 uint64_t ps3_sync_now_ns(void)
 {
-    if (!s_qpc_freq) {
+    if (__builtin_expect(!s_qpc_freq, 0)) {
         LARGE_INTEGER f;
         QueryPerformanceFrequency(&f);
         s_qpc_freq = (uint64_t)f.QuadPart;
     }
     LARGE_INTEGER c;
     QueryPerformanceCounter(&c);
-    const uint64_t t = (uint64_t)c.QuadPart;
-    return (t / s_qpc_freq) * 1000000000ull + (t % s_qpc_freq) * 1000000000ull / s_qpc_freq;
+    return (uint64_t)(((unsigned __int128)(uint64_t)c.QuadPart * 1000000000ull) / s_qpc_freq);
 }
 #else
 uint64_t ps3_sync_now_ns(void)

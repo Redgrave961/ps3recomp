@@ -23,6 +23,7 @@
 #endif
 #include <time.h>
 #include "../platform/win32_compat.h"
+static inline int spu_line_differs_128(const uint8_t* a, const uint8_t* b);
 #include "../platform/win32_backtrace.h"
 #include "ps3emu/log_first.h"
 
@@ -345,7 +346,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         }
         spu_lockline_lock(ea);
         if ((__atomic_load_n(&ctx->resv, __ATOMIC_RELAXED) & ~SPU_RESV_BY_CONTENT) == ((ea & ~127u) | 1u) &&
-            memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) == 0) {
+            !spu_line_differs_128(mem, ctx->resv_line)) {
             memcpy(mem, ls, MFC_ATOMIC_LINE);
             __atomic_store_n(&ctx->resv, 0u, __ATOMIC_RELAXED);
             spu_coh_notify_write(ea);
@@ -464,12 +465,26 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
     }
 }
 
+static inline int spu_line_differs_128(const uint8_t* a, const uint8_t* b)
+{
+#ifdef __AVX2__
+    const __m256i d0 = _mm256_xor_si256(_mm256_loadu_si256((const __m256i*)(a + 0)), _mm256_loadu_si256((const __m256i*)(b + 0)));
+    const __m256i d1 = _mm256_xor_si256(_mm256_loadu_si256((const __m256i*)(a + 32)), _mm256_loadu_si256((const __m256i*)(b + 32)));
+    const __m256i d2 = _mm256_xor_si256(_mm256_loadu_si256((const __m256i*)(a + 64)), _mm256_loadu_si256((const __m256i*)(b + 64)));
+    const __m256i d3 = _mm256_xor_si256(_mm256_loadu_si256((const __m256i*)(a + 96)), _mm256_loadu_si256((const __m256i*)(b + 96)));
+    const __m256i any = _mm256_or_si256(_mm256_or_si256(d0, d1), _mm256_or_si256(d2, d3));
+    return !_mm256_testz_si256(any, any);
+#else
+    return memcmp(a, b, MFC_ATOMIC_LINE) != 0;
+#endif
+}
+
 static void spu_resv_lost_poll(spu_context* ctx)
 {
     uint32_t r = __atomic_load_n(&ctx->resv, __ATOMIC_RELAXED);
     if (!(ctx->event_mask & 0x400u) || !(r & 1u)) return;
     if (!vm_base || !(r & ~127u)) return;
-    if (memcmp(vm_base + (r & ~127u), ctx->resv_line, 128) != 0 &&
+    if (spu_line_differs_128(vm_base + (r & ~127u), ctx->resv_line) &&
         __atomic_compare_exchange_n(&ctx->resv, &r, r & ~1u, 0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED))
         SPU_EVENT_SET(ctx, 0x400u);
 }
@@ -802,7 +817,7 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
 
 typedef struct { uint32_t src_ea; int image_id; uint8_t sig[16]; int has_sig; uint32_t span;
                  uint32_t load_lsa; unsigned code_count; spu_overlay_code_segment* code;
-                 uint32_t canon; } spu_ovl_src;
+                 uint32_t canon; uint32_t verified_ea; } spu_ovl_src;
 #define SPU_OVL_SRC_MAX 128
 static spu_ovl_src s_ovl_src[SPU_OVL_SRC_MAX];
 static int s_ovl_src_count = 0;
@@ -911,18 +926,39 @@ void spu_overlay_register_region_at(uint32_t content_ea, uint32_t lsa, uint32_t 
     __atomic_store_n(&s_ovl_at_count, n + 1, __ATOMIC_RELEASE);
 }
 
+static inline int spu_bytes_differ(const uint8_t* a, const uint8_t* b, uint32_t n);
+
+static inline int spu_eq16(const uint8_t* a, const uint8_t* b)
+{
+    uint64_t a0, a1, b0, b1;
+    memcpy(&a0, a, 8); memcpy(&a1, a + 8, 8);
+    memcpy(&b0, b, 8); memcpy(&b1, b + 8, 8);
+    return a0 == b0 && a1 == b1;
+}
+
 static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot)
 {
     int* state = &ctx->resident_code[slot].verify_state;
     if (*state == SPU_OVERLAY_PENDING) {
-        const spu_ovl_src* o = &s_ovl_src[ctx->resident_code[slot].source_index];
+        spu_ovl_src* o = &s_ovl_src[ctx->resident_code[slot].source_index];
         const uint32_t canon = ctx->resident_code[slot].canon;
+        const uint32_t sea = ctx->resident_code[slot].source_ea;
+        const int fast_ea = sea && sea == __atomic_load_n(&o->verified_ea, __ATOMIC_ACQUIRE);
         int match = 1;
         for (unsigned i = 0; match && i < o->code_count; ++i) {
+            const uint32_t sz = o->code[i].size;
             const uint32_t at = canon ? ctx->resident_code[slot].lsa + (o->code[i].lsa - canon) : o->code[i].lsa;
-            match = at <= SPU_LS_SIZE - o->code[i].size &&
-                    !memcmp(ctx->ls + at, o->code[i].bytes, o->code[i].size);
+            if (at > SPU_LS_SIZE - sz) {
+                match = 0;
+            } else if (fast_ea && sz >= 48) {
+                const uint8_t* p = ctx->ls + at;
+                const uint8_t* q = o->code[i].bytes;
+                match = spu_eq16(p, q) && spu_eq16(p + (sz >> 1), q + (sz >> 1)) && spu_eq16(p + sz - 16, q + sz - 16);
+            } else {
+                match = !spu_bytes_differ(ctx->ls + at, o->code[i].bytes, sz);
+            }
         }
+        if (match && sea && !fast_ea) __atomic_store_n(&o->verified_ea, sea, __ATOMIC_RELEASE);
         *state = match ? SPU_OVERLAY_VERIFIED : SPU_OVERLAY_REJECTED;
     }
     return *state == SPU_OVERLAY_VERIFIED;
@@ -1023,7 +1059,17 @@ static inline int spu_bytes_differ(const uint8_t* a, const uint8_t* b, uint32_t 
         memcpy(&y, b, 8);
         if (x != y) return 1;
     }
+#ifdef __AVX2__
+    uint32_t i = 0;
+    for (; i + 32 <= n; i += 32) {
+        const __m256i d = _mm256_xor_si256(_mm256_loadu_si256((const __m256i*)(a + i)),
+                                           _mm256_loadu_si256((const __m256i*)(b + i)));
+        if (!_mm256_testz_si256(d, d)) return 1;
+    }
+    return i < n ? (memcmp(a + i, b + i, n - i) != 0) : 0;
+#else
     return memcmp(a, b, n) != 0;
+#endif
 }
 
 void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint32_t size)
@@ -1052,62 +1098,82 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
         }
     }
     const int nat = __atomic_load_n(&s_ovl_at_count, __ATOMIC_ACQUIRE);
-    uint64_t cover[SPU_OVL_AT_WORDS] = { 0 };
     if (nat && size) {
+        uint64_t cover[SPU_OVL_AT_WORDS] = { 0 };
         const uint32_t last = (uint32_t)(SPU_LS_SIZE >> SPU_OVL_AT_BLOCK_SHIFT) - 1u;
         const uint32_t b1 = (lsa + size - 1u) >> SPU_OVL_AT_BLOCK_SHIFT;
-        for (uint32_t b = lsa >> SPU_OVL_AT_BLOCK_SHIFT; b <= (b1 < last ? b1 : last); b++)
-            for (unsigned w = 0; w < SPU_OVL_AT_WORDS; w++) cover[w] |= __atomic_load_n(&s_ovl_at_blocks[b][w], __ATOMIC_RELAXED);
-    }
-    for (unsigned w = 0; w < SPU_OVL_AT_WORDS; w++)
-    for (uint64_t bits = cover[w]; bits; bits &= bits - 1) {
-        const int i = (int)(w * 64u + (unsigned)__builtin_ctzll(bits));
-        if (i >= nat) break;
-        const uint32_t rlo = s_ovl_at[i].lsa;
-        __builtin_prefetch(vm_base + s_ovl_at[i].ea + ((lsa > rlo ? lsa : rlo) - rlo));
-    }
-    for (unsigned w = 0; w < SPU_OVL_AT_WORDS; w++)
-    for (uint64_t bits = cover[w]; bits; bits &= bits - 1) {
-        const int i = (int)(w * 64u + (unsigned)__builtin_ctzll(bits));
-        if (i >= nat) break;
-        const uint32_t rlo = s_ovl_at[i].lsa, rhi = rlo + s_ovl_at[i].span;
-        const uint32_t lo = lsa > rlo ? lsa : rlo;
-        const uint32_t hi = (lsa + size) < rhi ? (lsa + size) : rhi;
-        if (lo >= hi || (hi - lo < 128 && hi - lo != size)) continue;
-        const uint8_t* q = ls + (lo - lsa);
-        const uint32_t src = s_ovl_at[i].ea + (lo - rlo);
-        if (ea + (lo - lsa) != src && spu_bytes_differ(q, vm_base + src, hi - lo)) continue;
-        uint32_t k = 0;
-        while (k < hi - lo && !q[k]) k++;
-        if (k == hi - lo) continue;
-        int have = 0, free_slot = -1;
-        for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot) {
-            if (ctx->resident_code[slot].image_id == s_ovl_at[i].image_id &&
-                ctx->resident_code[slot].lsa == rlo) have = 1;
-            if (free_slot < 0 && (!ctx->resident_code[slot].image_id || ctx->resident_code[slot].lsa == rlo))
-                free_slot = (int)slot;
+        const uint32_t bend = b1 < last ? b1 : last;
+        uint64_t any = 0;
+        for (uint32_t b = lsa >> SPU_OVL_AT_BLOCK_SHIFT; b <= bend; b++)
+            for (unsigned w = 0; w < SPU_OVL_AT_WORDS; w++) {
+                const uint64_t v = __atomic_load_n(&s_ovl_at_blocks[b][w], __ATOMIC_RELAXED);
+                cover[w] |= v;
+                any |= v;
+            }
+        if (any) {
+            for (unsigned w = 0; w < SPU_OVL_AT_WORDS; w++)
+            for (uint64_t bits = cover[w]; bits; bits &= bits - 1) {
+                const int i = (int)(w * 64u + (unsigned)__builtin_ctzll(bits));
+                if (i >= nat) break;
+                const uint32_t rlo = s_ovl_at[i].lsa;
+                __builtin_prefetch(vm_base + s_ovl_at[i].ea + ((lsa > rlo ? lsa : rlo) - rlo));
+            }
+            for (unsigned w = 0; w < SPU_OVL_AT_WORDS; w++)
+            for (uint64_t bits = cover[w]; bits; bits &= bits - 1) {
+                const int i = (int)(w * 64u + (unsigned)__builtin_ctzll(bits));
+                if (i >= nat) break;
+                const uint32_t rlo = s_ovl_at[i].lsa, rhi = rlo + s_ovl_at[i].span;
+                const uint32_t lo = lsa > rlo ? lsa : rlo;
+                const uint32_t hi = (lsa + size) < rhi ? (lsa + size) : rhi;
+                if (lo >= hi || (hi - lo < 128 && hi - lo != size)) continue;
+                const uint8_t* q = ls + (lo - lsa);
+                const uint32_t src = s_ovl_at[i].ea + (lo - rlo);
+                if (ea + (lo - lsa) != src && spu_bytes_differ(q, vm_base + src, hi - lo)) continue;
+                uint32_t k = 0;
+                while (k < hi - lo && !q[k]) k++;
+                if (k == hi - lo) continue;
+                int have = 0, free_slot = -1;
+                for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot) {
+                    if (ctx->resident_code[slot].image_id == s_ovl_at[i].image_id &&
+                        ctx->resident_code[slot].lsa == rlo) have = 1;
+                    if (free_slot < 0 && (!ctx->resident_code[slot].image_id || ctx->resident_code[slot].lsa == rlo))
+                        free_slot = (int)slot;
+                }
+                if (have) continue;
+                if (free_slot < 0) {
+                    fprintf(stderr, "[spu-ovl] no free resident code span for image %d\n", s_ovl_at[i].image_id);
+                    continue;
+                }
+                ctx->resident_code[free_slot].lsa = rlo;
+                ctx->resident_code[free_slot].size = s_ovl_at[i].span;
+                ctx->resident_code[free_slot].source_ea = s_ovl_at[i].ea;
+                ctx->resident_code[free_slot].image_id = s_ovl_at[i].image_id;
+                ctx->resident_code[free_slot].verify_state = 0;
+                ctx->resident_code[free_slot].source_index = 0;
+                ctx->resident_code[free_slot].canon = 0;
+                spu_dcache_residency_changed(ctx);
+            }
         }
-        if (have) continue;
-        if (free_slot < 0) {
-            fprintf(stderr, "[spu-ovl] no free resident code span for image %d\n", s_ovl_at[i].image_id);
-            continue;
-        }
-        ctx->resident_code[free_slot].lsa = rlo;
-        ctx->resident_code[free_slot].size = s_ovl_at[i].span;
-        ctx->resident_code[free_slot].source_ea = s_ovl_at[i].ea;
-        ctx->resident_code[free_slot].image_id = s_ovl_at[i].image_id;
-        ctx->resident_code[free_slot].verify_state = 0;
-        ctx->resident_code[free_slot].source_index = 0;
-        ctx->resident_code[free_slot].canon = 0;
-        spu_dcache_residency_changed(ctx);
     }
     int nsrc = __atomic_load_n(&s_ovl_src_count, __ATOMIC_ACQUIRE);
+    if (!nsrc) return;
     if ((size < 512 || !atomic_load_explicit(&s_ovl_has_sig, memory_order_acquire)) &&
         !spu_ovl_ea_known(ea)) return;
     for (int i = 0; i < nsrc; i++) {
         const spu_ovl_src* o = &s_ovl_src[i];
-        int hit = o->has_sig ? (size >= 512 && memcmp(ls, o->sig, 16) == 0)
-                             : (o->src_ea == ea);
+        int hit;
+        if (o->has_sig) {
+            if (size >= 512) {
+                uint64_t a0, a1, b0, b1;
+                memcpy(&a0, ls, 8); memcpy(&a1, ls + 8, 8);
+                memcpy(&b0, o->sig, 8); memcpy(&b1, o->sig + 8, 8);
+                hit = (a0 == b0 && a1 == b1);
+            } else {
+                hit = 0;
+            }
+        } else {
+            hit = (o->src_ea == ea);
+        }
         if (hit) {
             if (o->span) {
                 if (lsa + o->span > SPU_LS_SIZE) return;

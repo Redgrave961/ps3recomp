@@ -7,29 +7,43 @@
 extern uint8_t* vm_base;
 
 typedef struct { uint32_t nid; uint32_t guest_addr; } prx_export_reg_entry;
-#define PRX_EXPORT_REG_CAP 2048
+#define PRX_EXPORT_REG_CAP 4096u
+#define PRX_EXPORT_REG_MASK (PRX_EXPORT_REG_CAP - 1u)
 static prx_export_reg_entry s_export_reg[PRX_EXPORT_REG_CAP];
 static uint32_t             s_export_reg_n = 0;
 
+static inline uint32_t prx_export_slot(uint32_t nid)
+{
+    return (nid * 2654435761u) >> 20;
+}
+
 static void prx_export_register(uint32_t nid, uint32_t guest_addr)
 {
-    for (uint32_t i = 0; i < s_export_reg_n; i++) {
+    if (!nid) return;
+    uint32_t i = prx_export_slot(nid);
+    for (uint32_t probe = 0; probe < PRX_EXPORT_REG_CAP; probe++, i = (i + 1u) & PRX_EXPORT_REG_MASK) {
         if (s_export_reg[i].nid == nid) {
             s_export_reg[i].guest_addr = guest_addr;
             return;
         }
+        if (s_export_reg[i].nid == 0) {
+            s_export_reg[i] = (prx_export_reg_entry){ nid, guest_addr };
+            s_export_reg_n++;
+            return;
+        }
     }
-    if (s_export_reg_n < PRX_EXPORT_REG_CAP)
-        s_export_reg[s_export_reg_n++] = (prx_export_reg_entry){ nid, guest_addr };
-    else
-        fprintf(stderr, "[prx] export registry full, dropping NID 0x%08X\n", nid);
+    fprintf(stderr, "[prx] export registry full, dropping NID 0x%08X\n", nid);
 }
 
 uint32_t prx_resolve_export(uint32_t nid)
 {
-    for (uint32_t i = 0; i < s_export_reg_n; i++)
-        if (s_export_reg[i].nid == nid)
-            return s_export_reg[i].guest_addr;
+    if (!nid || !s_export_reg_n) return 0;
+    uint32_t i = prx_export_slot(nid);
+    for (uint32_t probe = 0; probe < PRX_EXPORT_REG_CAP; probe++, i = (i + 1u) & PRX_EXPORT_REG_MASK) {
+        const uint32_t k = s_export_reg[i].nid;
+        if (!k) return 0;
+        if (k == nid) return s_export_reg[i].guest_addr;
+    }
     return 0;
 }
 

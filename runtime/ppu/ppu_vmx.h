@@ -36,15 +36,17 @@ VMX_INL __m128 vmx_fixv(__m128 r) { return _mm_blendv_ps(r, vmx_k(0x7FC00000u), 
 VMX_INL __m128 vmx_nanv(__m128 r, __m128 x) {
     return _mm_blendv_ps(r, _mm_or_ps(x, vmx_k(0x7FC00000u)), _mm_cmpunord_ps(x, x));
 }
-VMX_INL __m128 vmx_tiny(__m128 x) {
-    return _mm_and_ps(_mm_cmp_ps(_mm_and_ps(x, vmx_k(0x7FFFFFFFu)), _mm_set1_ps(FLT_MIN), _CMP_LT_OQ),
-                      _mm_cmp_ps(x, _mm_setzero_ps(), _CMP_NEQ_OQ));
+VMX_INL __m128i vmx_tiny_i(__m128 x) {
+    const __m128i xi = _mm_castps_si128(x);
+    return _mm_and_si128(_mm_cmpeq_epi32(_mm_and_si128(xi, _mm_set1_epi32(0x7F800000)), _mm_setzero_si128()), xi);
 }
 VMX_INL __m128 vmx_kq(__m128 x, uint32_t vscr, uint32_t k) { return (vscr & k) ? _mm_setzero_ps() : x; }
 VMX_INL int vmx_plain(__m128 r, __m128 x, __m128 y, __m128 z, uint32_t vscr) {
-    __m128 bad = _mm_cmpunord_ps(r, r);
-    if (vscr & VMX_NJ) bad = _mm_or_ps(bad, _mm_or_ps(_mm_or_ps(vmx_tiny(r), vmx_tiny(x)), _mm_or_ps(vmx_tiny(y), vmx_tiny(z))));
-    return _mm_testz_ps(bad, bad);
+    __m128i bad = _mm_castps_si128(_mm_cmpunord_ps(r, r));
+    if (vscr & VMX_NJ)
+        bad = _mm_or_si128(bad, _mm_or_si128(_mm_or_si128(vmx_tiny_i(r), vmx_tiny_i(x)),
+                                             _mm_or_si128(vmx_tiny_i(y), vmx_tiny_i(z))));
+    return _mm_testz_si128(bad, _mm_set1_epi32(0x7FFFFFFF));
 }
 VMX_INL uint32_t vmx_cr6(int mask, int full) { return (uint32_t)((mask == full) << 3 | (mask == 0) << 1); }
 
@@ -128,8 +130,8 @@ VMX_INL void vmx_lvrx(VMX_D, uint64_t lo, uint64_t hi, uint32_t sh) {
     vmx_st(d_, _mm_shuffle_epi8(_mm_set_epi64x((long long)hi, (long long)lo), _mm_sub_epi8(_mm_set1_epi8((char)(sh - 1)), vmx_iota())));
 }
 
-VMX_BIN(vmx_vavgub, 16, vmx_b, vmx_sb, (uint8_t)((x + y + 1) >> 1))
-VMX_BIN(vmx_vavguh, 8, vmx_h, vmx_sh, (uint16_t)((x + y + 1) >> 1))
+VMX_INL void vmx_vavgub(VMX_D, VMX_A, VMX_B) { vmx_st(d_, _mm_avg_epu8(vmx_ld(a_), vmx_ld(b_))); }
+VMX_INL void vmx_vavguh(VMX_D, VMX_A, VMX_B) { vmx_st(d_, _mm_avg_epu16(vmx_ld(a_), vmx_ld(b_))); }
 VMX_BIN(vmx_vavguw, 4, vmx_w, vmx_sw, (uint32_t)((x + y + 1) >> 1))
 VMX_BIN(vmx_vavgsb, 16, vmx_b, vmx_sb, (uint8_t)(((int64_t)(int8_t)x + (int8_t)y + 1) >> 1))
 VMX_BIN(vmx_vavgsh, 8, vmx_h, vmx_sh, (uint16_t)(((int64_t)(int16_t)x + (int16_t)y + 1) >> 1))
@@ -178,8 +180,8 @@ VMX_INL void vmx_vmhraddshs(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t* vscr) { VMX_AR
         int64_t p = ((int64_t)(int16_t)vmx_h(a, i) * (int16_t)vmx_h(b, i) + 0x4000) >> 15;
         vmx_sh(r, i, (uint16_t)vmx_sat_s(p + (int16_t)vmx_h(c, i), -32768, 32767, vscr));
     } VMX_OUT; }
-VMX_INL void vmx_vmladduhm(VMX_D, VMX_A, VMX_B, VMX_C) { VMX_ARGS_PREP; const uint8_t* c = (const uint8_t*)c_;
-    for (int i = 0; i < 8; i++) vmx_sh(r, i, (uint16_t)(vmx_h(a, i) * vmx_h(b, i) + vmx_h(c, i))); VMX_OUT; }
+VMX_INL void vmx_vmladduhm(VMX_D, VMX_A, VMX_B, VMX_C) {
+    vmx_st(d_, _mm_add_epi16(_mm_mullo_epi16(vmx_ld(a_), vmx_ld(b_)), vmx_ld(c_))); }
 VMX_INL void vmx_vmsumubm(VMX_D, VMX_A, VMX_B, VMX_C) { VMX_ARGS_PREP; const uint8_t* c = (const uint8_t*)c_;
     for (int i = 0; i < 4; i++) { uint32_t s = vmx_w(c, i);
         for (int j = 0; j < 4; j++) s += (uint32_t)vmx_b(a, 4 * i + j) * vmx_b(b, 4 * i + j);
@@ -261,11 +263,33 @@ VMX_INL void vmx_vslo(VMX_D, VMX_A, VMX_B) { VMX_ARGS_PREP; int n = (vmx_b(b, 15
 VMX_INL void vmx_vsro(VMX_D, VMX_A, VMX_B) { VMX_ARGS_PREP; int n = (vmx_b(b, 15) >> 3) & 15;
     for (int i = 0; i < 16; i++) vmx_sb(r, i, i - n >= 0 ? vmx_b(a, i - n) : 0); VMX_OUT; }
 
+#ifdef PPU_FAST_FP
+#define VMX_FBIN(name, op) \
+VMX_INL void name(VMX_D, VMX_A, VMX_B, uint32_t vscr) { (void)vscr; \
+    const __m128 x = vmx_ldf(a_), y = vmx_ldf(b_); vmx_stf(d_, op); }
+VMX_FBIN(vmx_vaddfp, _mm_add_ps(x, y))
+VMX_FBIN(vmx_vsubfp, _mm_sub_ps(x, y))
+
+#define VMX_FMINMAX(name, op) \
+VMX_INL void name(VMX_D, VMX_A, VMX_B, uint32_t vscr) { (void)vscr; \
+    const __m128 x = vmx_ldf(a_), y = vmx_ldf(b_); vmx_stf(d_, op); }
+VMX_FMINMAX(vmx_vmaxfp, _mm_max_ps(x, y))
+VMX_FMINMAX(vmx_vminfp, _mm_min_ps(x, y))
+
+#define VMX_FMA(name, expr) \
+VMX_INL void name(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) { (void)vscr; \
+    const __m128 x = vmx_ldf(a_), y = vmx_ldf(b_), z = vmx_ldf(c_); vmx_stf(d_, expr); }
+VMX_FMA(vmx_vmaddfp, _mm_fmadd_ps(x, z, y))
+VMX_FMA(vmx_vnmsubfp, _mm_fnmadd_ps(x, z, y))
+
+#define VMX_FUN(name, expr, flush_in) \
+VMX_INL void name(VMX_D, VMX_B, uint32_t vscr) { (void)vscr; const __m128 f = vmx_ldf(b_); vmx_stf(d_, expr); }
+#else
 #define VMX_FBIN(name, op) \
 VMX_INL void name(VMX_D, VMX_A, VMX_B, uint32_t vscr) { \
     __m128 x = vmx_ldf(a_), y = vmx_ldf(b_); \
     const __m128 q = op; \
-    if (vmx_plain(q, vmx_kq(x, vscr, VMX_KA), vmx_kq(y, vscr, VMX_KB), _mm_setzero_ps(), vscr)) { vmx_stf(d_, q); return; } \
+    if (__builtin_expect(vmx_plain(q, vmx_kq(x, vscr, VMX_KA), vmx_kq(y, vscr, VMX_KB), _mm_setzero_ps(), vscr), 1)) { vmx_stf(d_, q); return; } \
     x = vmx_flushv(x, vscr); y = vmx_flushv(y, vscr); \
     vmx_stf(d_, vmx_flushv(vmx_nanv(vmx_nanv(vmx_fixv(op), y), x), vscr)); }
 VMX_FBIN(vmx_vaddfp, _mm_add_ps(x, y))
@@ -283,18 +307,19 @@ VMX_FMINMAX(vmx_vminfp, _mm_or_ps(_mm_min_ps(x, y), _mm_min_ps(y, x)))
 VMX_INL void name(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) { \
     __m128 x = vmx_ldf(a_), y = vmx_ldf(b_), z = vmx_ldf(c_); \
     const __m128 q = expr; \
-    if (vmx_plain(q, vmx_kq(x, vscr, VMX_KA), vmx_kq(y, vscr, VMX_KB), vmx_kq(z, vscr, VMX_KC), vscr)) { vmx_stf(d_, q); return; } \
+    if (__builtin_expect(vmx_plain(q, vmx_kq(x, vscr, VMX_KA), vmx_kq(y, vscr, VMX_KB), vmx_kq(z, vscr, VMX_KC), vscr), 1)) { vmx_stf(d_, q); return; } \
     x = vmx_flushv(x, vscr); y = vmx_flushv(y, vscr); z = vmx_flushv(z, vscr); \
     vmx_stf(d_, vmx_flushv(vmx_fixv(expr), vscr)); }
 VMX_FMA(vmx_vmaddfp, _mm_fmadd_ps(x, z, y))
-VMX_FMA(vmx_vnmsubfp, _mm_xor_ps(_mm_fmsub_ps(x, z, y), vmx_k(0x80000000u)))
+VMX_FMA(vmx_vnmsubfp, _mm_fnmadd_ps(x, z, y))
 
 #define VMX_FUN(name, expr, flush_in) \
 VMX_INL void name(VMX_D, VMX_B, uint32_t vscr) { __m128 f = vmx_ldf(b_); \
     const __m128 q = expr; \
-    if (vmx_plain(q, flush_in ? vmx_kq(f, vscr, VMX_KB) : _mm_setzero_ps(), _mm_setzero_ps(), _mm_setzero_ps(), vscr)) { vmx_stf(d_, q); return; } \
+    if (__builtin_expect(vmx_plain(q, flush_in ? vmx_kq(f, vscr, VMX_KB) : _mm_setzero_ps(), _mm_setzero_ps(), _mm_setzero_ps(), vscr), 1)) { vmx_stf(d_, q); return; } \
     if (flush_in) f = vmx_flushv(f, vscr); \
     vmx_stf(d_, vmx_flushv(vmx_nanv(vmx_fixv(expr), f), vscr)); }
+#endif
 VMX_FUN(vmx_vrefp, _mm_div_ps(_mm_set1_ps(1.0f), f), 1)
 VMX_FUN(vmx_vrsqrtefp, _mm_div_ps(_mm_set1_ps(1.0f), _mm_sqrt_ps(f)), 1)
 VMX_FUN(vmx_vrfin, _mm_round_ps(f, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC), 0)
