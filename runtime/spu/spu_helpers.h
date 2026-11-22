@@ -1103,6 +1103,68 @@ static inline u128 spu_cflts(u128 a, int i8) {
 static inline u128 spu_cfltu(u128 a, int i8)   { return spu_cfltu_ref(a, i8); }
 static inline u128 spu_csflt(u128 a, int i8)   { return spu_csflt_ref(a, i8); }
 static inline u128 spu_cuflt(u128 a, int i8)   { return spu_cuflt_ref(a, i8); }
+#elif SPU_X86
+static inline u128 spu_fi(u128 a, u128 b) {
+    const __m128i est = spu__xl(b), av = spu__xl(a);
+    const __m128i exp  = _mm_and_si128(_mm_srli_epi32(est, 23), _mm_set1_epi32(0xFF));
+    const __m128i u0   = _mm_slli_epi32(_mm_and_si128(_mm_srli_epi32(est, 10), _mm_set1_epi32(0x1FFF)), 19);
+    const __m128i t    = _mm_mullo_epi32(_mm_and_si128(est, _mm_set1_epi32(0x3FF)), _mm_and_si128(av, _mm_set1_epi32(0x7FFFF)));
+    const __m128i u    = _mm_sub_epi32(u0, t);
+    const __m128i brw  = _mm_cmpgt_epi32(spu__xflip(t), spu__xflip(u0));
+    const __m128i frac = _mm_blendv_epi8(_mm_srli_epi32(u, 9), _mm_and_si128(_mm_srli_epi32(u, 8), _mm_set1_epi32(0x7FFFFF)), brw);
+    const __m128i e2   = _mm_add_epi32(exp, brw);
+    __m128i r = _mm_or_si128(_mm_or_si128(_mm_and_si128(est, _mm_set1_epi32((int)0x80000000u)), _mm_slli_epi32(e2, 23)), frac);
+    const __m128i z = _mm_setzero_si128();
+    r = _mm_andnot_si128(_mm_or_si128(_mm_cmpeq_epi32(exp, z), _mm_cmpeq_epi32(e2, z)), r);
+    return spu__xs(r);
+}
+static inline u128 spu_frest(u128 a)           { return spu_frest_ref(a); }
+static inline u128 spu_frsqest(u128 a)         { return spu_frsqest_ref(a); }
+static inline u128 spu_cflts(u128 a, int i8) {
+    const int scale = 173 - (i8 & 0xFF);
+    if (scale < 0 || scale > 127) return spu_cflts_ref(a, i8);
+    const __m128i x = spu__xl(a);
+    const __m128 f = scale ? _mm_mul_ps(_mm_castsi128_ps(x), _mm_castsi128_ps(_mm_set1_epi32((int)((uint32_t)(scale + 127) << 23)))) : _mm_castsi128_ps(x);
+    const __m128i e = _mm_and_si128(_mm_srli_epi32(x, 23), _mm_set1_epi32(0xFF));
+    const __m128 hi = _mm_cmpge_ps(f, _mm_set1_ps(2147483648.0f));
+    __m128i r = _mm_blendv_epi8(_mm_cvttps_epi32(f), _mm_set1_epi32(0x7FFFFFFF), _mm_castps_si128(hi));
+    const __m128i sat = _mm_add_epi32(_mm_srli_epi32(x, 31), _mm_set1_epi32(0x7FFFFFFF));
+    r = _mm_blendv_epi8(r, sat, _mm_cmpeq_epi32(e, _mm_set1_epi32(0xFF)));
+    r = _mm_andnot_si128(_mm_cmpeq_epi32(e, _mm_setzero_si128()), r);
+    return spu__xs(r);
+}
+static inline u128 spu_cfltu(u128 a, int i8) {
+    const int scale = 173 - (i8 & 0xFF);
+    if (scale < 0 || scale > 127) return spu_cfltu_ref(a, i8);
+    const __m128i x = spu__xl(a);
+    const __m128 f = scale ? _mm_mul_ps(_mm_castsi128_ps(x), _mm_castsi128_ps(_mm_set1_epi32((int)((uint32_t)(scale + 127) << 23)))) : _mm_castsi128_ps(x);
+    const __m128 two31 = _mm_set1_ps(2147483648.0f);
+    const __m128 hi = _mm_cmpge_ps(f, _mm_set1_ps(4294967296.0f));
+    const __m128 big = _mm_cmpge_ps(f, two31);
+    const __m128i t = _mm_cvttps_epi32(_mm_sub_ps(f, _mm_and_ps(big, two31)));
+    __m128i r = _mm_xor_si128(t, _mm_and_si128(_mm_castps_si128(big), _mm_set1_epi32((int)0x80000000u)));
+    const __m128i e = _mm_and_si128(_mm_srli_epi32(x, 23), _mm_set1_epi32(0xFF));
+    r = _mm_or_si128(r, _mm_or_si128(_mm_castps_si128(hi), _mm_cmpeq_epi32(e, _mm_set1_epi32(0xFF))));
+    r = _mm_andnot_si128(_mm_or_si128(_mm_srai_epi32(x, 31), _mm_cmpeq_epi32(e, _mm_setzero_si128())), r);
+    return spu__xs(r);
+}
+static inline u128 spu_csflt(u128 a, int i8) {
+    const int scale = (i8 & 0xFF) - 155;
+    if (scale < -126 || scale > 127) return spu_csflt_ref(a, i8);
+    const __m128 f = _mm_cvtepi32_ps(spu__xl(a));
+    if (scale == 0) return spu__xs(_mm_castps_si128(f));
+    return spu__xs(_mm_castps_si128(_mm_mul_ps(f, _mm_castsi128_ps(_mm_set1_epi32((int)((uint32_t)(scale + 127) << 23))))));
+}
+static inline u128 spu_cuflt(u128 a, int i8) {
+    const int scale = (i8 & 0xFF) - 155;
+    if (scale < -126 || scale > 127) return spu_cuflt_ref(a, i8);
+    const __m128i u = spu__xl(a);
+    const __m128 hi = _mm_cvtepi32_ps(_mm_srli_epi32(u, 16));
+    const __m128 lo = _mm_cvtepi32_ps(_mm_and_si128(u, _mm_set1_epi32(0xFFFF)));
+    const __m128 f = SPU__XFMA(hi, _mm_set1_ps(65536.0f), lo);
+    if (scale == 0) return spu__xs(_mm_castps_si128(f));
+    return spu__xs(_mm_castps_si128(_mm_mul_ps(f, _mm_castsi128_ps(_mm_set1_epi32((int)((uint32_t)(scale + 127) << 23))))));
+}
 #else
 static inline u128 spu_fi(u128 a, u128 b)      { return spu_fi_ref(a, b); }
 static inline u128 spu_frest(u128 a)           { return spu_frest_ref(a); }

@@ -5,6 +5,9 @@
 #include <algorithm>
 #include <cstring>
 #include <utility>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 namespace vk {
 
@@ -125,11 +128,14 @@ bool pipelines::create(vk_device& d, const std::string& cache_path)
 
     const size_t slash = m_cache_path.find_last_of("/\\");
     m_db = std::fopen((m_cache_path.substr(0, slash == std::string::npos ? 0 : slash + 1) + "vk_shaders.db").c_str(), "ab+");
-    const unsigned n = std::max(3u, std::thread::hardware_concurrency() / 2u);
+    const unsigned n = std::max(3u, std::thread::hardware_concurrency());
     m_background_limit = n - 2u;
     for (unsigned i = 0; i < n; i++)
         m_workers.emplace_back([this, i] {
             ps3_thread_name("vk pipeline %u", i);
+#ifdef _WIN32
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
             worker();
         });
     std::fprintf(stderr, "[vk] pipelines: %s, %u compile threads\n", m_libraries ? "libraries with fast link" : "monolithic", n);

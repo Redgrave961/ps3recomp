@@ -1072,6 +1072,25 @@ static inline int spu_bytes_differ(const uint8_t* a, const uint8_t* b, uint32_t 
 #endif
 }
 
+static inline int spu_is_all_zero(const uint8_t* p, uint32_t n)
+{
+    uint32_t i = 0;
+#ifdef __AVX2__
+    for (; i + 32 <= n; i += 32) {
+        const __m256i v = _mm256_loadu_si256((const __m256i*)(p + i));
+        if (!_mm256_testz_si256(v, v)) return 0;
+    }
+#endif
+    for (; i + 8 <= n; i += 8) {
+        uint64_t w;
+        memcpy(&w, p + i, 8);
+        if (w) return 0;
+    }
+    for (; i < n; i++)
+        if (p[i]) return 0;
+    return 1;
+}
+
 void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint32_t size)
 {
     uint32_t lsa = (uint32_t)(ls - ctx->ls);
@@ -1085,9 +1104,7 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
                     const uint32_t lo = lsa > base ? lsa : base;
                     const uint32_t hi = (lsa + size) < end ? (lsa + size) : end;
                     const uint8_t* orig = vm_base + ctx->resident_code[slot].source_ea + (lo - base);
-                    uint32_t k = 0;
-                    while (k < hi - lo && !orig[k]) k++;
-                    if (k == hi - lo || !spu_bytes_differ(ls + (lo - lsa), orig, hi - lo)) continue;
+                    if (spu_is_all_zero(orig, hi - lo) || !spu_bytes_differ(ls + (lo - lsa), orig, hi - lo)) continue;
                 }
                 ctx->resident_code[slot].image_id = 0;
                 spu_dcache_residency_changed(ctx);
@@ -1115,31 +1132,22 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
             for (uint64_t bits = cover[w]; bits; bits &= bits - 1) {
                 const int i = (int)(w * 64u + (unsigned)__builtin_ctzll(bits));
                 if (i >= nat) break;
-                const uint32_t rlo = s_ovl_at[i].lsa;
-                __builtin_prefetch(vm_base + s_ovl_at[i].ea + ((lsa > rlo ? lsa : rlo) - rlo));
-            }
-            for (unsigned w = 0; w < SPU_OVL_AT_WORDS; w++)
-            for (uint64_t bits = cover[w]; bits; bits &= bits - 1) {
-                const int i = (int)(w * 64u + (unsigned)__builtin_ctzll(bits));
-                if (i >= nat) break;
                 const uint32_t rlo = s_ovl_at[i].lsa, rhi = rlo + s_ovl_at[i].span;
                 const uint32_t lo = lsa > rlo ? lsa : rlo;
                 const uint32_t hi = (lsa + size) < rhi ? (lsa + size) : rhi;
                 if (lo >= hi || (hi - lo < 128 && hi - lo != size)) continue;
-                const uint8_t* q = ls + (lo - lsa);
-                const uint32_t src = s_ovl_at[i].ea + (lo - rlo);
-                if (ea + (lo - lsa) != src && spu_bytes_differ(q, vm_base + src, hi - lo)) continue;
-                uint32_t k = 0;
-                while (k < hi - lo && !q[k]) k++;
-                if (k == hi - lo) continue;
                 int have = 0, free_slot = -1;
                 for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot) {
                     if (ctx->resident_code[slot].image_id == s_ovl_at[i].image_id &&
-                        ctx->resident_code[slot].lsa == rlo) have = 1;
+                        ctx->resident_code[slot].lsa == rlo) { have = 1; break; }
                     if (free_slot < 0 && (!ctx->resident_code[slot].image_id || ctx->resident_code[slot].lsa == rlo))
                         free_slot = (int)slot;
                 }
                 if (have) continue;
+                const uint8_t* q = ls + (lo - lsa);
+                const uint32_t src = s_ovl_at[i].ea + (lo - rlo);
+                if (ea + (lo - lsa) != src && spu_bytes_differ(q, vm_base + src, hi - lo)) continue;
+                if (spu_is_all_zero(q, hi - lo)) continue;
                 if (free_slot < 0) {
                     fprintf(stderr, "[spu-ovl] no free resident code span for image %d\n", s_ovl_at[i].image_id);
                     continue;
