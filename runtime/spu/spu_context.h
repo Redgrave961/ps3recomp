@@ -142,6 +142,8 @@ typedef struct spu_context {
         int verify_state, source_index;
         uint32_t canon;
     } resident_code[SPU_RESIDENT_CODE_SLOTS];
+    uint32_t resident_code_mask;
+    uint32_t resident_code_lo, resident_code_hi;
     int32_t reloc_delta;
 
     uint32_t dcache_id, dcache_residency;

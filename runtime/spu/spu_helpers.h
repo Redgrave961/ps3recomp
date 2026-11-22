@@ -1109,6 +1109,15 @@ SPU__XE_INLINE __m128i spu__xe_cxflt(__m256d d, __m128i sign, __m128i nz, int i8
 }
 SPU__XE_INLINE u128 spu_csflt(u128 a, int i8) {
     const __m128i v = spu__xe_ld(a);
+    const int k = i8 & 0xFF;
+    if (k >= 29 && k <= 251) {
+        __m128 f = _mm_cvtepi32_ps(v);
+        if (k != 155) {
+            const uint32_t scale_bits = (uint32_t)(127 + (k - 155)) << 23;
+            f = _mm_mul_ps(f, _mm_castsi128_ps(_mm_set1_epi32((int)scale_bits)));
+        }
+        return spu__xe_st(_mm_castps_si128(f));
+    }
     const __m256d d = _mm256_andnot_pd(_mm256_set1_pd(-0.0), _mm256_cvtepi32_pd(v));
     const __m128i sign = _mm_and_si128(v, _mm_set1_epi32((int)0x80000000u));
     const __m128i nz = _mm_xor_si128(_mm_cmpeq_epi32(v, _mm_setzero_si128()), _mm_set1_epi32(-1));

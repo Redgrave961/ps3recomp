@@ -756,22 +756,24 @@ static int spu_overlay_resolve_at_lazy(spu_context* ctx, uint32_t lsa);
 static spu_lifted_fn spu_lifted_lookup_full(const spu_context* ctx, uint32_t lsa, int* reloc)
 {
     if (!ctx) return (spu_lifted_fn)spu_lookup_memoized(lsa, 0);
-    for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot)
-        if (ctx->resident_code[slot].image_id &&
-            lsa >= ctx->resident_code[slot].lsa &&
-            lsa - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size) {
-            if (ctx->resident_code[slot].verify_state &&
-                !spu_overlay_resident_verified((spu_context*)ctx, slot)) return NULL;
-            const uint32_t canon = ctx->resident_code[slot].canon;
-            if (!canon)
-                return (spu_lifted_fn)spu_lookup_memoized(lsa, ctx->resident_code[slot].image_id);
-            spu_fn f = spu_lookup_memoized(lsa - ctx->resident_code[slot].lsa + canon,
-                                           ctx->resident_code[slot].image_id);
-            if (f) {
-                ((spu_context*)ctx)->reloc_delta = (int32_t)(ctx->resident_code[slot].lsa - canon);
-                if (reloc) *reloc = 1;
+    if (ctx->resident_code_mask && lsa >= ctx->resident_code_lo && lsa < ctx->resident_code_hi)
+        for (uint32_t m = ctx->resident_code_mask; m; m &= m - 1u) {
+            const unsigned slot = (unsigned)__builtin_ctz(m);
+            if (lsa >= ctx->resident_code[slot].lsa &&
+                lsa - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size) {
+                if (ctx->resident_code[slot].verify_state &&
+                    !spu_overlay_resident_verified((spu_context*)ctx, slot)) return NULL;
+                const uint32_t canon = ctx->resident_code[slot].canon;
+                if (!canon)
+                    return (spu_lifted_fn)spu_lookup_memoized(lsa, ctx->resident_code[slot].image_id);
+                spu_fn f = spu_lookup_memoized(lsa - ctx->resident_code[slot].lsa + canon,
+                                               ctx->resident_code[slot].image_id);
+                if (f) {
+                    ((spu_context*)ctx)->reloc_delta = (int32_t)(ctx->resident_code[slot].lsa - canon);
+                    if (reloc) *reloc = 1;
+                }
+                return (spu_lifted_fn)f;
             }
-            return (spu_lifted_fn)f;
         }
     const int lazy_img = spu_overlay_resolve_at_lazy((spu_context*)ctx, lsa);
     if (lazy_img > 0)
@@ -792,7 +794,23 @@ typedef struct {
 #define SPU_DCACHE_ENTRIES 512u
 static __thread spu_dcache_ent t_dcache[SPU_DCACHE_ENTRIES];
 static uint32_t s_dcache_next_id;
-static void spu_dcache_residency_changed(spu_context* ctx) { ctx->dcache_residency++; }
+static void spu_dcache_residency_changed(spu_context* ctx)
+{
+    ctx->dcache_residency++;
+    uint32_t mask = 0, lo = SPU_LS_SIZE, hi = 0;
+    for (unsigned s = 0; s < SPU_RESIDENT_CODE_SLOTS; ++s) {
+        if (ctx->resident_code[s].image_id) {
+            mask |= 1u << s;
+            const uint32_t b = ctx->resident_code[s].lsa;
+            const uint32_t e = b + ctx->resident_code[s].size;
+            if (b < lo) lo = b;
+            if (e > hi) hi = e;
+        }
+    }
+    ctx->resident_code_mask = mask;
+    ctx->resident_code_lo = mask ? lo : 0u;
+    ctx->resident_code_hi = hi;
+}
 spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
 {
     if (!ctx) return spu_lifted_lookup_full(ctx, lsa, NULL);
@@ -1212,25 +1230,29 @@ static int spu_overlay_resolve_at_lazy(spu_context* ctx, uint32_t lsa)
 void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint32_t size)
 {
     uint32_t lsa = (uint32_t)(ls - ctx->ls);
-    for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot) {
-        if (!ctx->resident_code[slot].image_id) continue;
-        uint32_t base = ctx->resident_code[slot].lsa;
-        uint32_t end = base + ctx->resident_code[slot].size;
-        if (lsa < end && lsa + size > base) {
-            if (lsa < base || ea != ctx->resident_code[slot].source_ea + (lsa - base)) {
-                if (!ctx->resident_code[slot].canon) {
-                    const uint32_t lo = lsa > base ? lsa : base;
-                    const uint32_t hi = (lsa + size) < end ? (lsa + size) : end;
-                    const uint8_t* orig = vm_base + ctx->resident_code[slot].source_ea + (lo - base);
-                    if (spu_is_all_zero(orig, hi - lo) || !spu_bytes_differ(ls + (lo - lsa), orig, hi - lo)) continue;
+    if (ctx->resident_code_mask && lsa < ctx->resident_code_hi && lsa + size > ctx->resident_code_lo) {
+        int changed = 0;
+        for (uint32_t m = ctx->resident_code_mask; m; m &= m - 1u) {
+            const unsigned slot = (unsigned)__builtin_ctz(m);
+            uint32_t base = ctx->resident_code[slot].lsa;
+            uint32_t end = base + ctx->resident_code[slot].size;
+            if (lsa < end && lsa + size > base) {
+                if (lsa < base || ea != ctx->resident_code[slot].source_ea + (lsa - base)) {
+                    if (!ctx->resident_code[slot].canon) {
+                        const uint32_t lo = lsa > base ? lsa : base;
+                        const uint32_t hi = (lsa + size) < end ? (lsa + size) : end;
+                        const uint8_t* orig = vm_base + ctx->resident_code[slot].source_ea + (lo - base);
+                        if (spu_is_all_zero(orig, hi - lo) || !spu_bytes_differ(ls + (lo - lsa), orig, hi - lo)) continue;
+                    }
+                    ctx->resident_code[slot].image_id = 0;
+                    changed = 1;
+                } else if (ctx->resident_code[slot].verify_state) {
+                    ctx->resident_code[slot].verify_state = SPU_OVERLAY_PENDING;
+                    changed = 1;
                 }
-                ctx->resident_code[slot].image_id = 0;
-                spu_dcache_residency_changed(ctx);
-            } else if (ctx->resident_code[slot].verify_state) {
-                ctx->resident_code[slot].verify_state = SPU_OVERLAY_PENDING;
-                spu_dcache_residency_changed(ctx);
             }
         }
+        if (changed) spu_dcache_residency_changed(ctx);
     }
     const int nat = __atomic_load_n(&s_ovl_at_count, __ATOMIC_ACQUIRE);
     if (nat && size && spu_ovl_at_delta_known(ea - lsa)) {
