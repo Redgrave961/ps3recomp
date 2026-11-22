@@ -155,6 +155,7 @@ def _bi_target_reg(insn):
 
 _RRR_DEST_OPS = {"selb", "shufb", "mpya", "fnms", "fma", "fms"}
 _CLEAN_FLOAT = {"fa", "fs", "fm", "fma", "fms", "fnms"}
+_ZERO_SIGN_SAFE = {"fa", "fs", "fm", "fma", "fms", "fnms", "fcgt", "fceq", "fcmgt", "fcmeq"}
 _CLEAN_MOVE = {"ori", "ai", "shlqbyi", "rotqbyi"}
 _CLOBBER_ALL = {"brsl", "brasl", "bisl", "bisled", "stop", "stopd", "iret"}
 
@@ -429,6 +430,87 @@ class SPULifter:
                         work.append(j)
         return facts
 
+    def _zero_sign_needed(self, fins, entries) -> list:
+        n = len(fins)
+        if not n:
+            return []
+        idx = {ins.addr: k for k, ins in enumerate(fins)}
+        succs = [[] for _ in range(n)]
+        preds = [[] for _ in range(n)]
+        exits = [False] * n
+        _BARRIER = {"bi", "bisl", "bisled", "biz", "binz", "bihz", "bihnz", "brsl", "brasl", "iret", "stop", "stopd"}
+        for k, ins in enumerate(fins):
+            mn = ins.mnemonic
+            if mn in _BARRIER:
+                exits[k] = True
+                continue
+            if mn in ("br", "bra"):
+                t = idx.get(self._branch_target(ins))
+                if t is not None:
+                    succs[k].append(t); preds[t].append(k)
+                else:
+                    exits[k] = True
+                continue
+            if mn in ("brz", "brnz", "brhz", "brhnz"):
+                t = idx.get(self._branch_target(ins))
+                if t is not None:
+                    succs[k].append(t); preds[t].append(k)
+                else:
+                    exits[k] = True
+            if k + 1 < n:
+                succs[k].append(k + 1); preds[k + 1].append(k)
+            else:
+                exits[k] = True
+
+        all_regs = frozenset(range(128))
+        reg_re = re.compile(r"\$r(\d+)")
+        writes = [None] * n
+        reads = [frozenset()] * n
+        is_barrier = [False] * n
+        is_safe = [False] * n
+        for k, ins in enumerate(fins):
+            mn = ins.mnemonic
+            if mn in _BARRIER or mn.startswith("wr") or mn.startswith("rd"):
+                is_barrier[k] = True
+                continue
+            o = _ops(ins.operands)
+            w = None if (mn in _NO_RT_WRITE or mn == "iohl") else _dest_reg(ins)
+            writes[k] = w
+            is_safe[k] = mn in _ZERO_SIGN_SAFE
+            rs = set()
+            for j, tok in enumerate(o):
+                if j == 0 and w is not None:
+                    continue
+                for m in reg_re.finditer(tok):
+                    rs.add(int(m.group(1)))
+            if mn == "iohl" and o:
+                for m in reg_re.finditer(o[0]):
+                    rs.add(int(m.group(1)))
+            reads[k] = frozenset(rs)
+
+        need_after = [all_regs if exits[k] else frozenset() for k in range(n)]
+        need_before = [frozenset() for _ in range(n)]
+        work = list(range(n))
+        queued = set(work)
+        while work:
+            k = work.pop()
+            queued.discard(k)
+            na = all_regs if exits[k] else frozenset().union(*(need_before[s] for s in succs[k]))
+            need_after[k] = na
+            if is_barrier[k]:
+                nb = all_regs
+            else:
+                nb = na - ({writes[k]} if writes[k] is not None else frozenset())
+                if not is_safe[k]:
+                    nb = nb | reads[k]
+            if nb != need_before[k]:
+                need_before[k] = nb
+                for p in preds[k]:
+                    if p not in queued:
+                        queued.add(p)
+                        work.append(p)
+        return need_after
+
     def _copy_loops(self, fins, labels) -> dict:
         idx = {ins.addr: k for k, ins in enumerate(fins)}
         out = {}
@@ -626,8 +708,10 @@ class SPULifter:
             for _la, _ls in self._lzf_loops(fins, copies).items():
                 copies[_la] = _ls + copies.get(_la, "")
         facts = self._known_facts(fins, merged_starts)
+        zs_need = self._zero_sign_needed(fins, merged_starts)
         for k, insn in enumerate(fins):
             self._facts = facts[k]
+            self._zs_need = zs_need[k]
             if insn.addr in internal or insn.addr in merged_starts:
                 func.body_lines.append(f"loc_{insn.addr:08X}:")
             if insn.addr in merged_starts:
@@ -1041,6 +1125,8 @@ class SPULifter:
         if mn in _CLEAN_FLOAT:
             srcs = [ra(), rb()] + ([_reg(ops[3])] if len(ops) > 3 else [])
             k = sum(1 << i for i, r in enumerate(srcs) if ("c", int(r)) in self._facts)
+            if int(rt()) not in self._zs_need:
+                k |= 8
             args = ", ".join(g(r) for r in srcs)
             return f"{g(rt())} = spu_{mn}_k({args}, {k});" if k else f"{g(rt())} = spu_{mn}({args});"
         if mn in rr_bin:

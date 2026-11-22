@@ -481,8 +481,11 @@ void renderer::retire(surface* s)
 
 ratio renderer::scale_for(u32 width, u32 height) const
 {
-    rsx_display_buffer db{};
-    return rsx_core_display_buffer(0, &db) && width >= db.width && height >= db.height ? resolution_scale : ratio{};
+    if (resolution_scale.unit()) return {};
+    if (std::max(width, height) < 128u || std::min(width, height) < 64u) return {};
+    const u32 max_dim = m_d ? m_d->props.limits.maxImageDimension2D : 4096u;
+    if (resolution_scale.edge(width) > max_dim || resolution_scale.edge(height) > max_dim) return {};
+    return resolution_scale;
 }
 
 surface* renderer::surface_for(u32 ea, u32 pitch, u32 width, u32 height, u32 format, bool depth, u32 aa_u, u32 aa_v)

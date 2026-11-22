@@ -617,6 +617,11 @@ _CS_SAVE_RE = re.compile(
     r'vm_write64\(ctx->gpr\[1\] \+ (-?0x[0-9A-Fa-f]+|-?\d+), ctx->gpr\[(1[4-9]|2[0-9]|3[01])\]\);')
 _CS_REST_RE = re.compile(
     r'ctx->gpr\[(1[4-9]|2[0-9]|3[01])\] = vm_read64\(ctx->gpr\[1\] \+ (-?0x[0-9A-Fa-f]+|-?\d+)\);')
+_CSF_ANY_DEF_RE = re.compile(r'(?:ctx->fpr\[(\d+)\]\s*=|memcpy\(&ctx->fpr\[(\d+)\])')
+_CSF_SAVE_RE = re.compile(
+    r'\{ uint64_t tmp; memcpy\(&tmp, &ctx->fpr\[(1[4-9]|2[0-9]|3[01])\], 8\); vm_write64\(ctx->gpr\[1\] \+ (-?0x[0-9A-Fa-f]+|-?\d+), tmp\); \}')
+_CSF_REST_RE = re.compile(
+    r'\{ uint64_t tmp = vm_read64\(ctx->gpr\[1\] \+ (-?0x[0-9A-Fa-f]+|-?\d+)\); memcpy\(&ctx->fpr\[(1[4-9]|2[0-9]|3[01])\], &tmp, 8\); \}')
 _CS_ANY_STORE_RE = re.compile(
     r'vm_write(?:8|16|32|64)\(ctx->gpr\[1\] \+ (-?0x[0-9A-Fa-f]+|-?\d+),')
 _FRAME_ALLOC = "ctx->gpr[1] += -0x"
@@ -1151,7 +1156,7 @@ _CS_CALLS_OK = {"ppu_call_ctr", "lv2_syscall", "ps3_hle_call", "ppu_stwcx32", "p
 
 
 def drop_callee_saves(func, body: list[str], starts: list[int], by_addr: dict, snap_bodies: set) -> list[str]:
-    if not func.cs_paired or func.fallthrough_to:
+    if not (func.cs_paired or func.csf_paired) or func.fallthrough_to:
         return body
     i = bisect.bisect_right(starts, func.start_addr)
     if i < len(starts) and starts[i] < func.end_addr:
@@ -1200,6 +1205,12 @@ def drop_callee_saves(func, body: list[str], starts: list[int], by_addr: dict, s
         hits = [x for x in offsets if o - 8 < x < o + 8 or o - frame - 8 < x < o - frame + 8]
         if all(e <= o - 8 for e in escaped) and hits.count(o) == stripped.count(save) == 1 and len(hits) == 1:
             drop.add(save)
+    for off, reg in func.csf_paired:
+        o = int(off, 0)
+        save = f"{{ uint64_t tmp; memcpy(&tmp, &ctx->fpr[{reg}], 8); vm_write64(ctx->gpr[1] + {off}, tmp); }}"
+        hits = [x for x in offsets if o - 8 < x < o + 8 or o - frame - 8 < x < o - frame + 8]
+        if all(e <= o - 8 for e in escaped) and hits.count(o) == stripped.count(save) == 1 and len(hits) == 1:
+            drop.add(save)
     if not drop:
         return body
     return [ln for ln, s in zip(body, stripped) if s not in drop]
@@ -1214,6 +1225,7 @@ class LiftedFunction:
     calls: list[int] = field(default_factory=list)
     fallthrough_to: int = 0
     cs_paired: set = field(default_factory=set)
+    csf_paired: set = field(default_factory=set)
 
 
 _MAX_MID_TAIL = 0x6000
@@ -1410,11 +1422,33 @@ class PPULifter:
                         and _is_epilogue_restore(func.body_lines, _i, _reg, _off)
                         and _mem_snap.setdefault(_reg, _off) == _off):
                     func.body_lines[_i] = f"    ctx->gpr[{_reg}] = _cs_{_reg};"
-        if _reg_snap or _mem_snap:
+        _first_fdef = {}
+        for _i, _l in enumerate(func.body_lines):
+            for _fm in _CSF_ANY_DEF_RE.finditer(_l):
+                _fr = int(_fm.group(1) or _fm.group(2))
+                if _fr not in _first_fdef:
+                    _first_fdef[_fr] = _i
+        _fsaved_slots = set()
+        for _i, _l in enumerate(func.body_lines):
+            _m = _CSF_SAVE_RE.search(_l)
+            if (_m and _write_counts[_m.group(2)] == 1
+                    and _i <= _first_fdef.get(int(_m.group(1)), 1 << 30)):
+                _fsaved_slots.add((_m.group(2), _m.group(1)))
+        _freg_snap = set()
+        for _i, _l in enumerate(func.body_lines):
+            _m = _CSF_REST_RE.search(_l)
+            if _m and (_m.group(1), _m.group(2)) in _fsaved_slots:
+                _freg = int(_m.group(2)); _foff = _m.group(1)
+                _freg_snap.add(_freg)
+                func.csf_paired.add((_foff, _m.group(2)))
+                func.body_lines[_i] = f"    ctx->fpr[{_freg}] = _csf_{_freg};"
+        if _reg_snap or _mem_snap or _freg_snap:
             _decls = [f"    uint64_t _cs_{_n} = ctx->gpr[{_n}];"
                       for _n in sorted(_reg_snap)]
             _decls += [f"    uint64_t _cs_{_n} = vm_read64(ctx->gpr[1] + {_off});"
                        for _n, _off in sorted(_mem_snap.items()) if _n not in _reg_snap]
+            _decls += [f"    double _csf_{_n} = ctx->fpr[{_n}];"
+                       for _n in sorted(_freg_snap)]
             func.body_lines = _decls + func.body_lines
 
         self.functions.append(func)

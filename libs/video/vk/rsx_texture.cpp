@@ -1080,6 +1080,8 @@ void texture_sampler(const texture_regs& regs, bool vertex_unit, const texture_d
 
         static constexpr float aniso_tab[8] = { 1.f, 2.f, 4.f, 6.f, 8.f, 10.f, 12.f, 16.f };
         float af = aniso_tab[(regs.control0 >> 4) & 7];
+        if (desc.levels > 1 && !desc.ops.depth_compare && min_filter == VK_FILTER_LINEAR && mag_filter == VK_FILTER_LINEAR)
+            af = std::max(af, 16.f);
         af = std::min(af, std::max(max_anisotropy, 1.f));
         if (af >= 2.f) {
             info.anisotropyEnable = VK_TRUE;
