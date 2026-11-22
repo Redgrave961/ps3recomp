@@ -69,6 +69,7 @@ struct surface {
     image as_color;
     u64 as_color_version = ~0ull;
     u64 version = 0;
+    u64 depth_version = 0;
     image native;
     u64 native_version = ~0ull;
     u32 bytes() const { return pitch * height * aa_v; }
@@ -84,6 +85,7 @@ struct framebuffer {
     surface* color[4] = {};
     surface* depth = nullptr;
     bool depth_write = false;
+    bool z_write = false;
     bool color_write[4] = {};
     VkFormat color_format[4] = {};
     VkFormat depth_format = VK_FORMAT_UNDEFINED;

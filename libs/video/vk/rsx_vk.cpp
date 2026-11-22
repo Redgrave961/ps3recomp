@@ -932,10 +932,7 @@ int vk_present(void*, u32, const rsx_display_buffer* db)
     char shot[48];
     if (capture && flips == std::strtoull(capture, const_cast<char**>(&capture_path), 10) && *capture_path == ':') capture_path++;
     else capture_path = nullptr;
-    if (!capture_path && g.r.tracing() && g.r.trace_frames.load(std::memory_order_relaxed) % 15u == 0) {
-        std::snprintf(shot, sizeof shot, "trace_shot_%llu.bmp", (unsigned long long)flips);
-        capture_path = shot;
-    }
+    (void)shot;
     const VkExtent2D out{ (uint32_t)(fit >> 40), (uint32_t)(fit >> 20) & 0xFFFFFu };
     const VkFormat out_format = (VkFormat)(fit & 0xFFFFFu);
     const bool fitted = fit && !capture_path && src->width == sw && src->height == sh &&

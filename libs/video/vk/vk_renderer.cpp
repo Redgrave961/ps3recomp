@@ -99,7 +99,7 @@ VkImageUsageFlags surface_usage(bool depth)
 bool framebuffer::operator==(const framebuffer& o) const
 {
     if (width != o.width || height != o.height || aa_u != o.aa_u || aa_v != o.aa_v || scale != o.scale || count != o.count || depth != o.depth ||
-        depth_write != o.depth_write)
+        depth_write != o.depth_write || z_write != o.z_write)
         return false;
     for (u32 i = 0; i < 4; i++)
         if (color[i] != o.color[i] || color_write[i] != o.color_write[i]) return false;
@@ -395,7 +395,22 @@ void renderer::flush()
 bool renderer::create_image(image& img, VkFormat format, u32 width, u32 height, VkImageUsageFlags usage, VkImageAspectFlags aspect)
 {
     VkImageCreateInfo ii{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
-    ii.flags = aspect == VK_IMAGE_ASPECT_COLOR_BIT ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
+    VkFormat view_formats[2]{};
+    VkImageFormatListCreateInfo fmt_list{ VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO };
+    if (aspect == VK_IMAGE_ASPECT_COLOR_BIT) {
+        if (format == VK_FORMAT_R16G16B16A16_SFLOAT || format == VK_FORMAT_R32G32B32A32_SFLOAT) {
+            ii.flags = 0;
+        } else if (format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_R8G8B8A8_UNORM) {
+            ii.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+            view_formats[0] = format;
+            view_formats[1] = format == VK_FORMAT_B8G8R8A8_UNORM ? VK_FORMAT_B8G8R8A8_SRGB : VK_FORMAT_R8G8B8A8_SRGB;
+            fmt_list.viewFormatCount = 2;
+            fmt_list.pViewFormats = view_formats;
+            ii.pNext = &fmt_list;
+        } else {
+            ii.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+        }
+    }
     ii.imageType = VK_IMAGE_TYPE_2D;
     ii.format = format;
     ii.extent = { width, height, 1 };
@@ -680,7 +695,8 @@ void renderer::load_surface(surface& s)
                 discard(native);
             }
             s.state = SURFACE_VALID;
-    s.version = ++m_content_clock;
+            s.version = ++m_content_clock;
+            s.depth_version = s.version;
             return;
         }
     }
@@ -695,6 +711,7 @@ void renderer::load_surface(surface& s)
     }
     s.state = SURFACE_VALID;
     s.version = ++m_content_clock;
+    s.depth_version = s.version;
 }
 
 void renderer::download_surface(surface& s)
@@ -895,6 +912,7 @@ bool renderer::bind_framebuffer(u32 context)
     fb.aa_u = aa_u;
     fb.aa_v = aa_v;
     fb.depth_write = zeta_write;
+    fb.z_write = depth_test && depth_write;
     for (u32 k = 0; k < 4; k++) {
         if (!use[k]) continue;
         const u32 ea = color_ea[k] + color_pitch[k] * woy + color_texel * wox;
@@ -1025,6 +1043,7 @@ void renderer::on_clear(u32 mask)
         if (whole) s->state = SURFACE_VALID;
         s->gpu_dirty = true;
         s->version = ++m_content_clock;
+        if (mask & CLEAR_Z) s->depth_version = s->version;
         if (d.aspectMask) count++;
     }
     if (!count) return;

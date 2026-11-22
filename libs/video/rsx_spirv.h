@@ -76,6 +76,11 @@ enum rsx_spv_fp_control_bit {
     RSX_SPV_FPCTL_FLAT_SHADING  = 0x800u
 };
 
+enum rsx_spv_fp_output_bit {
+    RSX_SPV_FPOUT_ALPHA_TEST = 1u << 4,
+    RSX_SPV_FPOUT_ALPHAKILL  = 1u << 5
+};
+
 enum rsx_spv_fp_state_flag {
     RSX_SPV_FPF_ALPHA_TEST           = 1u << 0,
     RSX_SPV_FPF_TWO_SIDED            = 1u << 1,

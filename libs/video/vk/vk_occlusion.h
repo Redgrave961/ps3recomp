@@ -62,6 +62,7 @@ private:
     uint32_t allocate();
     void enqueue(job&& j);
     void count(const job& j, uint32_t delta);
+    bool pending_locked(uint32_t ea, uint32_t size) const;
 
     vk_device* m_d = nullptr;
     VkSemaphore m_timeline = VK_NULL_HANDLE;
@@ -74,13 +75,14 @@ private:
     uint64_t m_issued = 0;
     std::unique_ptr<std::atomic<uint32_t>[]> m_pages;
 
-    std::mutex m_lock;
+    mutable std::mutex m_lock;
     std::condition_variable m_work;
     std::condition_variable m_freed;
     std::condition_variable m_drained;
     std::atomic<uint64_t> m_written{ 0 };
     std::atomic<uint32_t> m_exposed{ 0 };
     std::deque<job> m_jobs;
+    uint32_t m_flight_ea = 0, m_flight_size = 0, m_flight_src = 0, m_flight_src_size = 0;
     std::vector<uint32_t> m_free;
     bool m_stop = false;
     std::thread m_thread;

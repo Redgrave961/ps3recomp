@@ -221,7 +221,7 @@ image* renderer::depth_as_color(surface& s)
             return nullptr;
         s.as_color_version = ~0ull;
     }
-    if (s.as_color_version == s.version) return &dst;
+    if (s.as_color_version == s.depth_version) return &dst;
     const u32 w = s.img.width, h = s.img.height;
     const VkComponentMapping identity{};
     const VkImageView dv = view_for(s.img, VK_IMAGE_VIEW_TYPE_2D, s.img.format, VK_IMAGE_ASPECT_DEPTH_BIT, identity);
@@ -233,7 +233,7 @@ image* renderer::depth_as_color(surface& s)
     barrier(c, s.img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
     barrier(c, dst, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
     m_depth_pack.record(c, dv, sv, dst.view, w, h, d16, s.depth_float);
-    s.as_color_version = s.version;
+    s.as_color_version = s.depth_version;
     return &dst;
 }
 

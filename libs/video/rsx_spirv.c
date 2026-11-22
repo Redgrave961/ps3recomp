@@ -2159,8 +2159,14 @@ static u32 fp_process_texel_body(fpc* c, u32 rgba, u32 ctl, u32 bx2)
 {
     spv* s = c->s;
     u32 T4 = tv4(s);
-    u32 ak = I(s, OpLogicalAnd, tbool(s), bitset(s, ctl, 12), I(s, OpFOrdLessThan, tbool(s), exf(s, rgba, 3), cf(s, 0.000001f)));
-    demote_if(s, ak);
+    const u32 orig = rgba;
+    u32 any_op = I(s, OpINotEqual, tbool(s), uand(s, tu(s), ctl, cu(s, 0x3FFFu)), cu(s, 0));
+    u32 m, t;
+    sel_if(s, any_op, &m, &t);
+    if (c->key->output_mask & RSX_SPV_FPOUT_ALPHAKILL) {
+        u32 ak = I(s, OpLogicalAnd, tbool(s), bitset(s, ctl, 12), I(s, OpFOrdLessThan, tbool(s), exf(s, rgba, 3), cf(s, 0.000001f)));
+        demote_if(s, ak);
+    }
     u32 ren = bitset(s, ctl, 13);
     rgba = sel(s, T4, ren, fdiv(s, T4, X(s, T4, GL_Floor, fmul(s, T4, rgba, cvs(s, 255.0f))), cvs(s, 255.0f)), rgba);
     u32 is16 = bitset(s, ctl, 17);
@@ -2176,7 +2182,9 @@ static u32 fp_process_texel_body(fpc* c, u32 rgba, u32 ctl, u32 bx2)
     u32 e8 = fdiv(s, T4, fsub(s, T4, X(s, T4, GL_Floor, X(s, T4, GL_Fma, rgba, cvs(s, 255.0f), cvs(s, 0.5f))), cvs(s, 128.0f)), cvs(s, 127.0f));
     u32 eb = fsub(s, T4, fmul(s, T4, rgba, cvs(s, 2.0f)), cvs(s, 1.0f));
     u32 e = sel(s, T4, bx2, eb, sel(s, T4, is16, e16, e8));
-    return sel(s, T4, exm, e, rgba);
+    V(s, 254, sel(s, T4, exm, e, rgba));
+    label(s, m);
+    return orig;
 }
 
 static u32 fp_process_texel(fpc* c, u32 rgba, u32 ctl, u32 bx2)
@@ -2645,7 +2653,7 @@ int rsx_spv_fragment(const u32* ucode, u32 max_words, const rsx_spv_fp_key* key,
             if (k && !(key->output_mask & (1u << k))) continue;
             col[k] = fp32 ? fp_readR(c, rregs[k]) : fp_readH(c, hregs[k]);
         }
-        {
+        if (key->output_mask & RSX_SPV_FPOUT_ALPHA_TEST) {
             u32 flags = fp_state_u(c, 0);
             u32 a = exf(s, col[0], 3);
             u32 ref = fp_state_f(c, 2);

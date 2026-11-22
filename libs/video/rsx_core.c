@@ -369,11 +369,6 @@ static void rsx_sync(void)
     __atomic_add_fetch(&s.progress, 1u, __ATOMIC_RELAXED);
 }
 
-static void rsx_idle(void)
-{
-    if (s.renderer && s.renderer->sync) s.renderer->sync(s.renderer->user);
-}
-
 static void rsx_flush(void)
 {
     if (s.renderer && s.renderer->flush) s.renderer->flush(s.renderer->user);
@@ -447,6 +442,8 @@ static void rsx_watch(u32 ea)
     FlushProcessWriteBuffers();
 }
 
+static u32 s_sema_waiters = 0;
+
 static void rsx_semaphore_acquire(u32 value)
 {
     s.batch++;
@@ -458,6 +455,7 @@ static void rsx_semaphore_acquire(u32 value)
     if (rsx_load(ea) == value) return;
     rsx_publish_get();
     rsx_flush();
+    __atomic_add_fetch(&s_sema_waiters, 1u, __ATOMIC_SEQ_CST);
     rsx_watch(ea);
     const rsx_hold w = { 0, 0, ea, value };
     for (;;) {
@@ -466,13 +464,14 @@ static void rsx_semaphore_acquire(u32 value)
         rsx_await(rsx_label_over, &w, 1);
     }
     vm_unwatch(ea);
+    __atomic_sub_fetch(&s_sema_waiters, 1u, __ATOMIC_RELEASE);
 }
 
 static void rsx_label_retire(const void* arg)
 {
     const u32* label = (const u32*)arg;
     rsx_store_label(label[0], label[1]);
-    rsx_core_doorbell();
+    if (__atomic_load_n(&s_sema_waiters, __ATOMIC_SEQ_CST)) rsx_core_doorbell();
 }
 
 static void rsx_semaphore_release(u32 ctx, u32 off, u32 align, u32 value, int back_end)
@@ -525,21 +524,36 @@ static void rsx_get_report(u32 arg)
     vm_write32(ea + 12u, 0);
 }
 
+static void rsx_ref_retire(const void* arg)
+{
+    const u32 value = *(const u32*)arg;
+    rsx_sync();
+    rsx_store_control(RSX_REF_EA, value);
+}
+
+static int s_pending_wfi = 0;
+
 static void rsx_core_method(u32 reg, u32 value)
 {
     switch (reg) {
-    case 0x0050u:
-        rsx_idle();
-        rsx_sync();
-        rsx_store_control(RSX_REF_EA, value);
+    case 0x0050u: {
+        s_pending_wfi = 0;
+        const rsx_write w = { RSX_REF_EA, 4u, 0, 0, 1, rsx_ref_retire, &value, sizeof value };
+        if (!rsx_core_defer(&w)) rsx_ref_retire(&value);
         return;
+    }
     case 0x0060u: s.sema406e_ctx = value; return;
     case 0x0064u: s.sema406e_off = value; return;
     case 0x0068u: rsx_semaphore_acquire(value); return;
-    case 0x006Cu: rsx_semaphore_release(s.sema406e_ctx, s.sema406e_off, 4, value, 0); return;
-    case 0x0104u: rsx_notify(); return;
+    case 0x006Cu: {
+        const int back_end = s_pending_wfi;
+        s_pending_wfi = 0;
+        rsx_semaphore_release(s.sema406e_ctx, s.sema406e_off, 4, value, back_end);
+        return;
+    }
+    case 0x0104u: s_pending_wfi = 0; rsx_notify(); return;
     case 0x0110u:
-        rsx_idle();
+        s_pending_wfi = 1;
         rsx_sync();
         return;
     case 0x0180u: s.notify_ctx = value; return;

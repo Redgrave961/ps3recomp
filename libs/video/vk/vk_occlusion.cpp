@@ -153,19 +153,36 @@ void occlusion::count(const job& j, uint32_t delta)
     for_pages(j.src, j.src_size, add);
 }
 
+static inline bool byte_overlap(uint32_t a, uint32_t an, uint32_t b, uint32_t bn)
+{
+    return an && bn && (uint64_t)a < (uint64_t)b + bn && (uint64_t)b < (uint64_t)a + an;
+}
+
+bool occlusion::pending_locked(uint32_t ea, uint32_t size) const
+{
+    if (byte_overlap(m_flight_ea, m_flight_size, ea, size) || byte_overlap(m_flight_src, m_flight_src_size, ea, size)) return true;
+    for (const job& j : m_pending)
+        if (!j.release && (byte_overlap(j.ea, j.size, ea, size) || byte_overlap(j.src, j.src_size, ea, size))) return true;
+    for (const job& j : m_jobs)
+        if (!j.release && (byte_overlap(j.ea, j.size, ea, size) || byte_overlap(j.src, j.src_size, ea, size))) return true;
+    return false;
+}
+
 bool occlusion::pending(uint32_t ea, uint32_t size) const
 {
     const bool outside = (uint64_t)ea + size <= RSX_SEMAPHORE_EA || ea >= (uint64_t)RSX_SEMAPHORE_EA + VM_HLE_INJECT_SIZE;
     if (idle() || (outside && !m_exposed.load(std::memory_order_acquire))) return false;
     bool hit = false;
     for_pages(ea, size, [&](uint64_t p) { return hit = m_pages[p].load(std::memory_order_acquire) != 0; });
-    return hit;
+    if (!hit) return false;
+    std::lock_guard<std::mutex> hold(m_lock);
+    return pending_locked(ea, size);
 }
 
 void occlusion::settle(uint32_t ea, uint32_t size)
 {
     std::unique_lock<std::mutex> hold(m_lock);
-    m_drained.wait(hold, [&] { return !pending(ea, size); });
+    m_drained.wait(hold, [&] { return idle() || !pending_locked(ea, size); });
 }
 
 void occlusion::drain()
@@ -199,6 +216,12 @@ void occlusion::worker()
             if (m_jobs.empty()) return;
             j = std::move(m_jobs.front());
             m_jobs.pop_front();
+            if (!j.release) {
+                m_flight_ea = j.ea;
+                m_flight_size = j.size;
+                m_flight_src = j.src;
+                m_flight_src_size = j.src_size;
+            }
         }
         VkSemaphoreWaitInfo wi{ VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
         wi.semaphoreCount = 1;
@@ -230,6 +253,7 @@ void occlusion::worker()
         if (j.exposed) m_exposed.fetch_sub(1u, std::memory_order_release);
         {
             std::lock_guard<std::mutex> hold(m_lock);
+            m_flight_ea = m_flight_size = m_flight_src = m_flight_src_size = 0;
             m_written.fetch_add(1u, std::memory_order_release);
         }
         m_drained.notify_all();

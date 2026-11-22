@@ -457,7 +457,6 @@ bool renderer::draw_setup()
         if (n++ < 5) std::fprintf(stderr, "[vk] fragment program address unresolved: 0x%08X\n", sp);
         return false;
     }
-    await_writes(m_fp_ea, RSX_SPV_FP_MAX_INSTRUCTIONS * 16u);
     const u32* ucode = reinterpret_cast<const u32*>(vm_base + m_fp_ea);
     fp_seen_key seen_key{};
     seen_key.ea = m_fp_ea;
@@ -465,10 +464,14 @@ bool renderer::draw_setup()
     fk.control = r(rsx::M_SHADER_CONTROL);
     for (u32 u = 0; u < rsx::TEXTURES; u++) {
         fk.texture_dims |= texture_dims(m_units[u].desc, m_units[u].valid) << (u * 2u);
-        if (m_units[u].valid && m_units[u].desc.ops.depth_compare) fk.texture_shadow |= 1u << u;
+        if (m_units[u].valid) {
+            if (m_units[u].desc.ops.depth_compare) fk.texture_shadow |= 1u << u;
+            if ((m_units[u].regs.control0 >> 2) & 1u) fk.output_mask |= RSX_SPV_FPOUT_ALPHAKILL;
+        }
     }
     for (u32 k = 0; k < 4; k++)
         if (m_fb.color_format[k] != VK_FORMAT_UNDEFINED) fk.output_mask |= 1u << k;
+    if (r(rsx::M_ALPHA_TEST_ENABLE)) fk.output_mask |= RSX_SPV_FPOUT_ALPHA_TEST;
     if (!m_fp_last || !(seen_key == m_fp_last_key)) {
         fp_lookup*& found = m_fp_seen[seen_key];
         if (!found) found = &m_fp_pool.emplace_back();
@@ -479,11 +482,15 @@ bool renderer::draw_setup()
     const u32 count = (u32)seen.slots.size();
     for (u32 k = 1; k <= count; k++) {
         const fp_candidate& c = seen.slots[(seen.next + count - k) % count];
-        if (c.fp && program_matches(ucode, c.code.data(), c.count)) {
-            m_fp = c.fp;
-            return true;
+        if (c.fp) {
+            await_writes(m_fp_ea, c.count * 4u);
+            if (program_matches(ucode, c.code.data(), c.count)) {
+                m_fp = c.fp;
+                return true;
+            }
         }
     }
+    await_writes(m_fp_ea, RSX_SPV_FP_MAX_INSTRUCTIONS * 16u);
     m_fp = m_shaders.fragment(ucode, RSX_SPV_FP_MAX_INSTRUCTIONS * 4u, fk, true);
     if (!m_fp) return false;
     fp_candidate& c = seen.slots[seen.next];
@@ -790,6 +797,7 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
             m_fb.color[k]->version = ++m_content_clock;
         }
     if (m_fb.depth && m_fb.depth_write) m_fb.depth->gpu_dirty = true;
+    if (m_fb.depth && m_fb.z_write) m_fb.depth->depth_version = ++m_content_clock;
     m_draw_counter++;
     stats.draws++;
     if (m_trace) {
