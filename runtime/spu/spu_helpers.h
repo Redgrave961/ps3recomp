@@ -68,6 +68,10 @@ static inline uint32_t spu_pref_word(u128 a) {
 
 static inline void spu_ls_copy_fwd(uint8_t* ls, uint32_t d, uint32_t s, uint32_t n) {
     const uint32_t p = d - s;
+    if (p == 1u) {
+        memset(ls + d, ls[s], n);
+        return;
+    }
     if (p - 1u >= n - 1u) {
         memmove(ls + d, ls + s, n);
         return;
@@ -76,6 +80,53 @@ static inline void spu_ls_copy_fwd(uint8_t* ls, uint32_t d, uint32_t s, uint32_t
         c = w + p < n - w ? w + p : n - w;
         memcpy(ls + d + w, ls + s, c);
     }
+}
+
+static inline void spu_ls_lzf_decompress(uint8_t* ls, uint32_t* p_src, uint32_t src_end, uint32_t* p_dst) {
+    uint32_t src = *p_src, dst = *p_dst;
+    while (src < src_end) {
+        const uint32_t ctrl = ls[src++ & 0x3FFFFu];
+        if (ctrl < 32u) {
+            const uint32_t len = ctrl + 1u;
+            const uint32_t s = src & 0x3FFFFu, d = dst & 0x3FFFFu;
+            if (s + len <= 0x40000u && d + len <= 0x40000u) {
+                if (len <= 8u && (d - s) >= len) {
+                    uint8_t* dp = ls + d;
+                    const uint8_t* sp = ls + s;
+                    for (uint32_t i = 0; i < len; ++i) dp[i] = sp[i];
+                } else {
+                    spu_ls_copy_fwd(ls, d, s, len);
+                }
+            } else {
+                for (uint32_t i = 0; i < len; ++i)
+                    ls[(dst + i) & 0x3FFFFu] = ls[(src + i) & 0x3FFFFu];
+            }
+            src += len;
+            dst += len;
+        } else {
+            uint32_t len = ctrl >> 5;
+            uint32_t ref = dst - ((ctrl & 31u) << 8) - 1u;
+            if (len == 7u) len += ls[src++ & 0x3FFFFu];
+            ref -= ls[src++ & 0x3FFFFu];
+            len += 2u;
+            const uint32_t s = ref & 0x3FFFFu, d = dst & 0x3FFFFu;
+            if (s + len <= 0x40000u && d + len <= 0x40000u) {
+                if (len <= 16u) {
+                    uint8_t* dp = ls + d;
+                    const uint8_t* sp = ls + s;
+                    for (uint32_t i = 0; i < len; ++i) dp[i] = sp[i];
+                } else {
+                    spu_ls_copy_fwd(ls, d, s, len);
+                }
+            } else {
+                for (uint32_t i = 0; i < len; ++i)
+                    ls[(dst + i) & 0x3FFFFu] = ls[(ref + i) & 0x3FFFFu];
+            }
+            dst += len;
+        }
+    }
+    *p_src = src;
+    *p_dst = dst;
 }
 
 

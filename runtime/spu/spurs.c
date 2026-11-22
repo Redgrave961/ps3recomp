@@ -27,6 +27,14 @@ static inline void p32(uint8_t* p, uint32_t v) { const uint32_t b = __builtin_bs
 static inline void p64(uint8_t* p, uint64_t v) { const uint64_t b = __builtin_bswap64(v); memcpy(p, &b, 8); }
 static inline void psplat(uint8_t* p, uint32_t v) { _mm_storeu_si128((__m128i*)p, _mm_set1_epi32((int)__builtin_bswap32(v))); }
 static inline uint32_t bit32(uint32_t n) { return n < 32 ? 1u << n : 0u; }
+#ifdef __SSE2__
+static inline uint32_t rev16_bits(uint32_t v)
+{
+    static const uint8_t rev4[16] = {0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15};
+    return ((uint32_t)rev4[v & 15u] << 12) | ((uint32_t)rev4[(v >> 4) & 15u] << 8) |
+           ((uint32_t)rev4[(v >> 8) & 15u] << 4) | (uint32_t)rev4[(v >> 12) & 15u];
+}
+#endif
 static inline u128 pref(uint32_t v) { return spu_make_preferred_u32(v); }
 static inline u128 qsplat(uint32_t v) { u128 r; r._u32[0] = r._u32[1] = r._u32[2] = r._u32[3] = v; return r; }
 static inline u128 qwords(uint32_t a, uint32_t b, uint32_t c, uint32_t d) { u128 r; r._u32[0] = a; r._u32[1] = b; r._u32[2] = c; r._u32[3] = d; return r; }
@@ -271,26 +279,60 @@ static void kernel_select(spu_context* c, uint32_t mode, uint32_t r[4])
         uint8_t eight[16], dist[16];
         memset(eight, 8, 16);
         vsub(dist, eight, cont);
-        uint32_t wt[16], best = 0, sel16 = 16;
-        uint8_t cand[16], ps[16];
+        uint32_t best = 0, sel16 = 16;
+        uint8_t best_ps = 0;
+#ifdef __SSE2__
+        const __m128i v_ct   = _mm_loadu_si128((const __m128i*)cont);
+        const __m128i v_rc   = _mm_loadu_si128((const __m128i*)(ls + 0x100));
+        const __m128i v_idle = _mm_loadu_si128((const __m128i*)(ls + 0x110));
+        const __m128i v_mc   = _mm_loadu_si128((const __m128i*)(ls + 0x150));
+        const __m128i v_pr   = _mm_loadu_si128((const __m128i*)(ls + 0x1A0));
+        const __m128i v_z    = _mm_setzero_si128();
+        const __m128i v_ones = _mm_set1_epi8(-1);
+        const __m128i v_e8   = _mm_set1_epi8(8);
+        const __m128i v_rdy  = _mm_add_epi8(_mm_min_epu8(v_rc, v_e8), _mm_min_epu8(v_idle, v_e8));
+        const __m128i m_pr_mc = _mm_andnot_si128(_mm_or_si128(_mm_cmpeq_epi8(v_pr, v_z),
+                                                              _mm_cmpeq_epi8(_mm_max_epu8(v_mc, v_ct), v_ct)), v_ones);
+        const __m128i m_rdy_v = _mm_andnot_si128(_mm_or_si128(_mm_cmpeq_epi8(v_rc, v_z),
+                                                              _mm_cmpeq_epi8(_mm_max_epu8(v_rdy, v_ct), v_ct)), v_ones);
+        const uint32_t rev_run = rev16_bits(run);
+        const uint32_t rev_sf  = rev16_bits(sig | fm);
+        uint32_t cmask = rev_run & (uint32_t)_mm_movemask_epi8(m_pr_mc) & (rev_sf | (uint32_t)_mm_movemask_epi8(m_rdy_v));
+        for (; cmask; cmask &= cmask - 1u) {
+            const uint32_t i = (uint32_t)__builtin_ctz(cmask);
+            const uint32_t ct = cont[i], rc = ls[0x100 + i], pr = ls[0x1A0 + i];
+            const uint32_t sm = (sig >> (15 - i)) & 1, fl = (fm >> (15 - i)) & 1;
+            const uint32_t hi = (sm || fl || rc > ct ? 0x80u : 0u) | (pr & 0x7F);
+            const uint32_t lo = (i == cur ? 0x80u : 0u) | (ct > 0 && ls[0x140 + i] > ct ? 0x40u : 0u) |
+                                ((uint32_t)(dist[i] << 2) & 0x3Cu) | (ls[0x220 + i] == uid ? 2u : 0u) | 1u;
+            const uint32_t w = hi << 8 | lo;
+            if (w > best) {
+                best = w;
+                sel16 = i;
+                best_ps = (uint8_t)((rc > ct) | sm << 1 | fl << 2);
+            }
+        }
+#else
         for (uint32_t i = 0; i < 16; i++) {
             const uint32_t ct = cont[i], rc = ls[0x100 + i], idle = ls[0x110 + i], pr = ls[0x1A0 + i];
             const uint32_t sm = (sig >> (15 - i)) & 1, fl = (fm >> (15 - i)) & 1;
             const uint32_t rdy = (rc > 8 ? 8 : rc) + (idle > 8 ? 8 : idle);
             const int ready = sm || fl || (rc != 0 && rdy > ct);
-            cand[i] = ((run >> (15 - i)) & 1) && pr != 0 && ls[0x150 + i] > ct && ready;
+            if (!(((run >> (15 - i)) & 1) && pr != 0 && ls[0x150 + i] > ct && ready)) continue;
             const uint32_t hi = (sm || fl || rc > ct ? 0x80u : 0u) | (pr & 0x7F);
             const uint32_t lo = (i == cur ? 0x80u : 0u) | (ct > 0 && ls[0x140 + i] > ct ? 0x40u : 0u) |
                                 ((uint32_t)(dist[i] << 2) & 0x3Cu) | (ls[0x220 + i] == uid ? 2u : 0u) | 1u;
-            wt[i] = cand[i] ? hi << 8 | lo : 0u;
-            ps[i] = (uint8_t)((rc > ct) | sm << 1 | fl << 2);
-            if (wt[i] > best) best = wt[i];
+            const uint32_t w = hi << 8 | lo;
+            if (w > best) {
+                best = w;
+                sel16 = i;
+                best_ps = (uint8_t)((rc > ct) | sm << 1 | fl << 2);
+            }
         }
-        for (uint32_t i = 0; i < 16 && sel16 == 16; i++)
-            if (cand[i] && wt[i] == best) sel16 = i;
+#endif
         ls[0x1EB] = sel16 == 16;
         if (sel16 < 16) {
-            r[0] = sel16; r[1] = ps[sel16]; r[2] = r[3] = 16;
+            r[0] = sel16; r[1] = best_ps; r[2] = r[3] = 16;
         } else {
             r[0] = 0x20; r[1] = r[2] = r[3] = 0;
         }
@@ -536,15 +578,34 @@ static uint32_t ss_prio_mask(const uint8_t* ls)
 
 static int ss_idle_found_in(const uint8_t* l, uint32_t run, uint32_t prio)
 {
+    const uint32_t active = run & prio;
+    if (!active) return 0;
     const uint32_t sig = g16(l + 0x70), flag = g32(l + 0x6C), recv = l[0x77];
     const uint32_t fm = flag == 0 && recv < 16 ? 0x8000u >> recv : 0u;
+#ifdef __SSE2__
+    const __m128i ct   = _mm_loadu_si128((const __m128i*)(l + 0x20));
+    const __m128i rc   = _mm_loadu_si128((const __m128i*)(l + 0x00));
+    const __m128i idle = _mm_loadu_si128((const __m128i*)(l + 0x10));
+    const __m128i mc   = _mm_loadu_si128((const __m128i*)(l + 0x50));
+    const __m128i z    = _mm_setzero_si128();
+    const __m128i ones = _mm_set1_epi8(-1);
+    const __m128i e8   = _mm_set1_epi8(8);
+    const __m128i mc_gt_ct = _mm_andnot_si128(_mm_cmpeq_epi8(_mm_max_epu8(mc, ct), ct), ones);
+    const __m128i rdy = _mm_add_epi8(_mm_min_epu8(rc, e8), _mm_min_epu8(idle, e8));
+    const __m128i rc_nz = _mm_andnot_si128(_mm_cmpeq_epi8(rc, z), ones);
+    const __m128i rdy_gt_ct = _mm_andnot_si128(_mm_cmpeq_epi8(_mm_max_epu8(rdy, ct), ct), ones);
+    const uint32_t m_mc  = (uint32_t)_mm_movemask_epi8(mc_gt_ct);
+    const uint32_t m_rdy = (uint32_t)_mm_movemask_epi8(_mm_and_si128(rc_nz, rdy_gt_ct));
+    return (rev16_bits(active) & m_mc & (rev16_bits(sig | fm) | m_rdy)) != 0;
+#else
     for (uint32_t i = 0; i < 16; i++) {
         const uint32_t ct = l[0x20 + i], rc = l[i], idle = l[0x10 + i];
         const uint32_t rdy = (rc > 8 ? 8 : rc) + (idle > 8 ? 8 : idle);
         const int ready = ((sig | fm) >> (15 - i)) & 1 || (rc != 0 && rdy > ct);
-        if (((run & prio) >> (15 - i)) & 1 && l[0x50 + i] > ct && ready) return 1;
+        if ((active >> (15 - i)) & 1 && l[0x50 + i] > ct && ready) return 1;
     }
     return 0;
+#endif
 }
 
 static int ss_idle_found(spu_context* c) { return ss_idle_found_in(c->ls + 0x100, g16(c->ls + 0x1EC), ss_prio_mask(c->ls)); }

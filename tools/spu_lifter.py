@@ -515,6 +515,92 @@ class SPULifter:
                 f"if (_cn - 2u < 0x3FFFFu && _cs + _cn <= 0x40001u && _cd + _cn <= 0x40001u) {{ "
                 f"spu_ls_copy_fwd(_ls, _cd, _cs, _cn - 1u); {bump} }} }} ")
 
+    def _lzf_loops(self, fins, copies) -> dict:
+        idx = {ins.addr: k for k, ins in enumerate(fins)}
+        out = {}
+        for k, ins in enumerate(fins):
+            if ins.mnemonic != "brz":
+                continue
+            lit_addr = self._branch_target(ins)
+            if lit_addr is None or lit_addr not in idx:
+                continue
+            lit_k = idx[lit_addr]
+            if lit_k >= k or k - lit_k > 40:
+                continue
+            # Header block right before brz must test clgti ctrl, 31
+            br_reg = _reg(_ops(ins.operands)[0])
+            clgti_ins = next((fins[j] for j in range(k - 1, max(lit_k, k - 6) - 1, -1)
+                              if fins[j].mnemonic == "clgti" and _reg(_ops(fins[j].operands)[0]) == br_reg
+                              and int(_ops(fins[j].operands)[2], 0) == 31), None)
+            if clgti_ins is None:
+                continue
+            ctrl_reg = _reg(_ops(clgti_ins.operands)[1])
+            # Find literal exit: clgt r_more, r_end, r_src; brz r_more, exit_addr inside [lit_k, k)
+            lit_br_k = None
+            exit_addr = None
+            src_reg = None
+            end_reg = None
+            for j in range(lit_k, k):
+                if fins[j].mnemonic == "brz":
+                    ea = self._branch_target(fins[j])
+                    if ea is not None and ea in idx and idx[ea] > k and idx[ea] - k <= 90:
+                        mr = _reg(_ops(fins[j].operands)[0])
+                        cg = next((fins[m] for m in range(j - 1, max(lit_k, j - 4) - 1, -1)
+                                   if fins[m].mnemonic == "clgt" and _reg(_ops(fins[m].operands)[0]) == mr), None)
+                        if cg is not None:
+                            lit_br_k = j
+                            exit_addr = ea
+                            end_reg = _reg(_ops(cg.operands)[1])
+                            src_reg = _reg(_ops(cg.operands)[2])
+                            break
+            if lit_br_k is None:
+                continue
+            hdr_k = lit_br_k + 1
+            hdr_addr = fins[hdr_k].addr
+            match_k = k + 1
+            exit_k = idx[exit_addr]
+            if not any(fins[j].addr in copies for j in range(lit_k, lit_br_k)):
+                continue
+            if not any(fins[j].addr in copies for j in range(match_k, exit_k)):
+                continue
+            # Find src_cur register in header (ori r_cur, r_src, 0) or preceding ai r_src, r_cur, 1
+            src_cur = None
+            for j in range(hdr_k, k):
+                if fins[j].mnemonic == "ai" and _reg(_ops(fins[j].operands)[0]) == src_reg and int(_ops(fins[j].operands)[2], 0) == 1:
+                    src_cur = _reg(_ops(fins[j].operands)[1])
+                    break
+            if src_cur is None:
+                continue
+            # Verify match block has rotmi _, ctrl_reg, -5, andi _, ctrl_reg, 31, ceqi _, _, 7, shli _, _, 8, and back-edge brnz hdr_addr
+            m_insns = fins[match_k:exit_k]
+            if not m_insns or m_insns[-1].mnemonic != "brnz" or self._branch_target(m_insns[-1]) != hdr_addr:
+                continue
+            has_rotmi = any(i.mnemonic == "rotmi" and _reg(_ops(i.operands)[1]) == ctrl_reg and int(_ops(i.operands)[2], 0) == -5 for i in m_insns)
+            has_andi31 = any(i.mnemonic == "andi" and _reg(_ops(i.operands)[1]) == ctrl_reg and int(_ops(i.operands)[2], 0) == 31 for i in m_insns)
+            has_ceqi7 = any(i.mnemonic == "ceqi" and int(_ops(i.operands)[2], 0) == 7 for i in m_insns)
+            has_shli8 = any(i.mnemonic == "shli" and int(_ops(i.operands)[2], 0) == 8 for i in m_insns)
+            if not (has_rotmi and has_andi31 and has_ceqi7 and has_shli8):
+                continue
+            # Find dst_reg from cbd _, dst_reg, 0 in literal copy loop
+            dst_reg = None
+            for j in range(lit_k, lit_br_k):
+                if fins[j].mnemonic == "cbd":
+                    ops_cbd = _ops(fins[j].operands)
+                    if len(ops_cbd) >= 2:
+                        dst_reg = _reg(ops_cbd[1])
+                        break
+            if dst_reg is None:
+                continue
+            g = self._g
+            snip = (f"if (!ctx->int_enable) {{ uint32_t _ls_s = spu_pref_word({g(src_cur)}), "
+                    f"_ls_d = spu_pref_word({g(dst_reg)}); "
+                    f"spu_ls_lzf_decompress(_ls, &_ls_s, spu_pref_word({g(end_reg)}), &_ls_d); "
+                    f"{g(src_reg)} = spu_pref_u32(_ls_s); {g(dst_reg)} = spu_pref_u32(_ls_d); "
+                    f"goto loc_{exit_addr:08X}; }} ")
+            out[lit_addr] = snip
+            out[fins[match_k].addr] = snip
+        return out
+
     def lift_function(self, insns: list[SPUInstruction],
                       start: int, end: int) -> LiftedFunction:
         func = LiftedFunction(name=f"{self.prefix}spu_func_{start:08X}",
@@ -536,6 +622,9 @@ class SPULifter:
         texts = []
         last_insn = None
         copies = {} if self.trace else self._copy_loops(fins, internal | merged_starts)
+        if not self.trace and copies:
+            for _la, _ls in self._lzf_loops(fins, copies).items():
+                copies[_la] = _ls + copies.get(_la, "")
         facts = self._known_facts(fins, merged_starts)
         for k, insn in enumerate(fins):
             self._facts = facts[k]
