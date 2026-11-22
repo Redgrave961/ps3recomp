@@ -82,6 +82,42 @@ static inline void spu_ls_copy_fwd(uint8_t* ls, uint32_t d, uint32_t s, uint32_t
     }
 }
 
+static inline void spu_copy_exact_nonoverlap(uint8_t* dp, const uint8_t* sp, uint32_t len) {
+    if (len >= 16u) {
+        if (len <= 32u) {
+            uint8_t a[16], b[16];
+            memcpy(a, sp, 16);
+            memcpy(b, sp + len - 16, 16);
+            memcpy(dp, a, 16);
+            memcpy(dp + len - 16, b, 16);
+            return;
+        }
+        memcpy(dp, sp, len);
+        return;
+    }
+    if (len >= 8u) {
+        uint64_t a, b;
+        memcpy(&a, sp, 8);
+        memcpy(&b, sp + len - 8, 8);
+        memcpy(dp, &a, 8);
+        memcpy(dp + len - 8, &b, 8);
+        return;
+    }
+    if (len >= 4u) {
+        uint32_t a, b;
+        memcpy(&a, sp, 4);
+        memcpy(&b, sp + len - 4, 4);
+        memcpy(dp, &a, 4);
+        memcpy(dp + len - 4, &b, 4);
+        return;
+    }
+    dp[0] = sp[0];
+    if (len >= 2u) {
+        dp[1] = sp[1];
+        if (len == 3u) dp[2] = sp[2];
+    }
+}
+
 static inline void spu_ls_lzf_decompress(uint8_t* ls, uint32_t* p_src, uint32_t src_end, uint32_t* p_dst) {
     uint32_t src = *p_src, dst = *p_dst;
     while (src < src_end) {
@@ -89,14 +125,11 @@ static inline void spu_ls_lzf_decompress(uint8_t* ls, uint32_t* p_src, uint32_t 
         if (ctrl < 32u) {
             const uint32_t len = ctrl + 1u;
             const uint32_t s = src & 0x3FFFFu, d = dst & 0x3FFFFu;
-            if (s + len <= 0x40000u && d + len <= 0x40000u) {
-                if (len <= 8u && (d - s) >= len) {
-                    uint8_t* dp = ls + d;
-                    const uint8_t* sp = ls + s;
-                    for (uint32_t i = 0; i < len; ++i) dp[i] = sp[i];
-                } else {
+            if (__builtin_expect(s + len <= 0x40000u && d + len <= 0x40000u, 1)) {
+                if (__builtin_expect(d >= s + len || s >= d + len, 1))
+                    spu_copy_exact_nonoverlap(ls + d, ls + s, len);
+                else
                     spu_ls_copy_fwd(ls, d, s, len);
-                }
             } else {
                 for (uint32_t i = 0; i < len; ++i)
                     ls[(dst + i) & 0x3FFFFu] = ls[(src + i) & 0x3FFFFu];
@@ -110,13 +143,20 @@ static inline void spu_ls_lzf_decompress(uint8_t* ls, uint32_t* p_src, uint32_t 
             ref -= ls[src++ & 0x3FFFFu];
             len += 2u;
             const uint32_t s = ref & 0x3FFFFu, d = dst & 0x3FFFFu;
-            if (s + len <= 0x40000u && d + len <= 0x40000u) {
-                if (len <= 16u) {
-                    uint8_t* dp = ls + d;
-                    const uint8_t* sp = ls + s;
-                    for (uint32_t i = 0; i < len; ++i) dp[i] = sp[i];
+            if (__builtin_expect(s + len <= 0x40000u && d + len <= 0x40000u, 1)) {
+                uint8_t* dp = ls + d;
+                const uint8_t* sp = ls + s;
+                const uint32_t dist = d - s;
+                if (dist >= len) {
+                    spu_copy_exact_nonoverlap(dp, sp, len);
+                } else if (dist == 1u) {
+                    memset(dp, sp[0], len);
+                } else if (dist >= 8u) {
+                    uint32_t i = 0;
+                    for (; i + 8u <= len; i += 8u) memcpy(dp + i, sp + i, 8);
+                    for (; i < len; ++i) dp[i] = sp[i];
                 } else {
-                    spu_ls_copy_fwd(ls, d, s, len);
+                    for (uint32_t i = 0; i < len; ++i) dp[i] = sp[i];
                 }
             } else {
                 for (uint32_t i = 0; i < len; ++i)

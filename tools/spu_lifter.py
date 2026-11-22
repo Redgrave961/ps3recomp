@@ -466,8 +466,10 @@ class SPULifter:
         reg_re = re.compile(r"\$r(\d+)")
         writes = [None] * n
         reads = [frozenset()] * n
+        prop_reads = [frozenset()] * n
         is_barrier = [False] * n
         is_safe = [False] * n
+        _PROP_MOVE = {"ori", "ai", "rotqbyi", "shlqbyi"}
         for k, ins in enumerate(fins):
             mn = ins.mnemonic
             if mn in _BARRIER or mn.startswith("wr") or mn.startswith("rd"):
@@ -486,7 +488,19 @@ class SPULifter:
             if mn == "iohl" and o:
                 for m in reg_re.finditer(o[0]):
                     rs.add(int(m.group(1)))
-            reads[k] = frozenset(rs)
+            if mn in _PROP_MOVE and len(o) >= 3 and re.fullmatch(r"-?(0x[0-9A-Fa-f]+|\d+)", o[2]) and (
+                    int(o[2], 0) == 0 or (mn in ("rotqbyi", "shlqbyi") and int(o[2], 0) % 4 == 0)):
+                prop_reads[k] = frozenset(rs)
+                reads[k] = frozenset()
+            elif mn in ("shufb", "selb") and len(o) >= 4:
+                m1, m2, m3 = reg_re.search(o[1]), reg_re.search(o[2]), reg_re.search(o[3])
+                if m1 and m2 and m3:
+                    prop_reads[k] = frozenset((int(m1.group(1)), int(m2.group(1))))
+                    reads[k] = frozenset((int(m3.group(1)),))
+                else:
+                    reads[k] = frozenset(rs)
+            else:
+                reads[k] = frozenset(rs)
 
         need_after = [all_regs if exits[k] else frozenset() for k in range(n)]
         need_before = [frozenset() for _ in range(n)]
@@ -500,9 +514,12 @@ class SPULifter:
             if is_barrier[k]:
                 nb = all_regs
             else:
-                nb = na - ({writes[k]} if writes[k] is not None else frozenset())
+                w = writes[k]
+                nb = na - ({w} if w is not None else frozenset())
                 if not is_safe[k]:
                     nb = nb | reads[k]
+                    if prop_reads[k] and (w is None or w in na):
+                        nb = nb | prop_reads[k]
             if nb != need_before[k]:
                 need_before[k] = nb
                 for p in preds[k]:
