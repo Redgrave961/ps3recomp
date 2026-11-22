@@ -632,7 +632,10 @@ _CSV_REST_R_RE = re.compile(
 _CSV_REST_R1_RE = re.compile(
     r'^\{ uint64_t ea = \(\(ctx->gpr\[1\] \+ ctx->gpr\[(\d+)\]\)\) & ~0xFULL; vmx_st\(&ctx->vr\[(2[0-9]|3[01])\], vmx_revv\(vm_raw_ld128\(ea\)\)\); \}$')
 _CSV_LI_RE = re.compile(r'^ctx->gpr\[(\d+)\] = \(int64_t\)\(int32_t\)\((-?(?:0x)?[0-9A-Fa-f]+)\);$')
-_CSV_STEP_RE = re.compile(r'^\{ uint64_t _a = ctx->gpr\[(\d+)\]; uint64_t _r = _a \+ \(uint64_t\)\(int64_t\)\((-?(?:0x)?[0-9A-Fa-f]+)\); ctx->gpr\[\1\] = _r; \}$')
+_CSV_STEP_RE = re.compile(
+    r'^(?:\{ uint64_t _a = ctx->gpr\[(\d+)\]; uint64_t _r = _a \+ \(uint64_t\)\(int64_t\)\((-?(?:0x)?[0-9A-Fa-f]+)\); '
+    r'ctx->gpr\[\1\] = _r;(?: ctx->xer = \(ctx->xer & ~\(1u << 29\)\) \| [^;]*;)? \}'
+    r'|ctx->gpr\[(\d+)\] = ctx->gpr\[\3\] \+ \(int64_t\)\((-?(?:0x)?[0-9A-Fa-f]+)\);)$')
 _CS_ANY_STORE_RE = re.compile(
     r'vm_write(?:8|16|32|64)\(ctx->gpr\[1\] \+ (-?0x[0-9A-Fa-f]+|-?\d+),')
 _FRAME_ALLOC = "ctx->gpr[1] += -0x"
@@ -1167,15 +1170,18 @@ _CS_CALLS_OK = {"ppu_call_ctr", "lv2_syscall", "ps3_hle_call", "ppu_stwcx32", "p
 
 
 def drop_callee_saves(func, body: list[str], starts: list[int], by_addr: dict, snap_bodies: set) -> list[str]:
-    if not (func.cs_paired or func.csf_paired) or func.fallthrough_to:
+    if not (func.cs_paired or func.csf_paired):
+        return body
+    reach = _reachable(body)
+    if func.fallthrough_to and (len(body) - 1) in reach:
         return body
     i = bisect.bisect_right(starts, func.start_addr)
     if i < len(starts) and starts[i] < func.end_addr:
         return body
     stripped = [ln.strip() for ln in body]
     frame, pops, escaped, offsets = None, set(), [], []
-    for s in stripped:
-        if "ctx" not in s:
+    for j, s in enumerate(stripped):
+        if j not in reach or "ctx" not in s:
             continue
         m = _CS_DIRECT_CALL_RE.match(s)
         if m:
@@ -1453,7 +1459,8 @@ class PPULifter:
                 _freg_snap.add(_freg)
                 func.csf_paired.add((_foff, _m.group(2)))
                 func.body_lines[_i] = f"    ctx->fpr[{_freg}] = _csf_{_freg};"
-        # VMX callee-saved registers (vr[20..31]): track scratch ptr r = r1 + off (or imm off)
+        # VMX callee-saved registers (vr[20..31]): only track prologue saves in entry basic block
+        # using scratch regs (r0/r11/r12) and epilogue restores before return.
         _first_vdef = {}
         for _i, _l in enumerate(func.body_lines):
             for _vm in _CSV_ANY_DEF_RE.finditer(_l):
@@ -1466,27 +1473,34 @@ class PPULifter:
         _vrests = []  # (line_idx, off_int, vreg)
         _vslot_writes = Counter()
         _vsave_base_lines = set()
+        _in_entry_bb = True
+        _VMX_SCRATCH = {0, 11, 12}
         for _i, _l in enumerate(func.body_lines):
             _s = _l.strip()
-            if _s.startswith("loc_") or _CS_CALL_RE.search(_s):
+            if _s.startswith(("loc_", "if ", "goto ", "switch")) or _CS_CALL_RE.search(_s):
+                _in_entry_bb = False
                 _vptr_r1.clear(); _vptr_imm.clear(); _vptr_base_line.clear()
                 continue
             _am = _CS_ADDI_RE.match(_s)
             if _am:
                 _d, _val = int(_am.group(1)), int(_am.group(2), 0)
-                if _d != 1:
+                if _d in _VMX_SCRATCH:
                     _vptr_r1[_d] = _val; _vptr_imm.pop(_d, None); _vptr_base_line[_d] = _i
-                else:
+                elif _d == 1:
                     _vptr_r1.clear(); _vptr_imm.clear(); _vptr_base_line.clear()
+                else:
+                    _vptr_r1.pop(_d, None); _vptr_imm.pop(_d, None); _vptr_base_line.pop(_d, None)
                 continue
             _lm = _CSV_LI_RE.match(_s)
             if _lm:
                 _d, _val = int(_lm.group(1)), int(_lm.group(2), 0)
-                _vptr_imm[_d] = _val; _vptr_r1.pop(_d, None); _vptr_base_line.pop(_d, None)
+                if _d in _VMX_SCRATCH:
+                    _vptr_imm[_d] = _val; _vptr_r1.pop(_d, None); _vptr_base_line.pop(_d, None)
                 continue
             _stm = _CSV_STEP_RE.match(_s)
             if _stm:
-                _d, _val = int(_stm.group(1)), int(_stm.group(2), 0)
+                _d = int(_stm.group(1) or _stm.group(3))
+                _val = int(_stm.group(2) or _stm.group(4), 0)
                 if _d in _vptr_r1: _vptr_r1[_d] += _val
                 if _d in _vptr_imm: _vptr_imm[_d] += _val
                 continue
@@ -1496,7 +1510,7 @@ class PPULifter:
                 if _r in _vptr_r1:
                     _off = _vptr_r1[_r]
                     _vslot_writes[_off] += 1
-                    if _i <= _first_vdef.get(_vr, 1 << 30):
+                    if _in_entry_bb and _i <= _first_vdef.get(_vr, 1 << 30):
                         _vsaved[(_off, _vr)] = _i
                         if _r in _vptr_base_line:
                             _vsave_base_lines.add(_vptr_base_line[_r])
@@ -1507,7 +1521,7 @@ class PPULifter:
                 if _r in _vptr_imm:
                     _off = _vptr_imm[_r]
                     _vslot_writes[_off] += 1
-                    if _i <= _first_vdef.get(_vr, 1 << 30):
+                    if _in_entry_bb and _i <= _first_vdef.get(_vr, 1 << 30):
                         _vsaved[(_off, _vr)] = _i
                 continue
             _rv = _CSV_REST_R_RE.match(_s)
@@ -1526,24 +1540,51 @@ class PPULifter:
                 _d = int(_dm.group(1))
                 _vptr_r1.pop(_d, None); _vptr_imm.pop(_d, None); _vptr_base_line.pop(_d, None)
         _v_other_addr = set()
+        _v_r1_mem = set()
         for _i, _l in enumerate(func.body_lines):
-            if _i in _vsave_base_lines:
-                continue
-            _am = _CS_ADDR_OF_RE.search(_l)
-            if _am:
+            if _i not in _vsave_base_lines:
+                _am = _CS_ADDR_OF_RE.search(_l)
+                if _am:
+                    try:
+                        _v_other_addr.add(int(_am.group(1), 0))
+                    except ValueError:
+                        pass
+                _cam = _CS_ADDI_CA_RE.match(_l.strip())
+                if _cam and int(_cam.group(2)) != 1:
+                    try:
+                        _v_other_addr.add(int(_cam.group(1), 0))
+                    except ValueError:
+                        pass
+            for _mo in _CS_R1_MEM_RE.findall(_l):
                 try:
-                    _v_other_addr.add(int(_am.group(1), 0))
+                    _v_r1_mem.add(int(_mo, 0))
                 except ValueError:
                     pass
+        def _is_vmx_epilogue(_idx, _vr):
+            _vtok = f"ctx->vr[{_vr}]"
+            for _ln in func.body_lines[_idx + 1:]:
+                _st = _ln.strip()
+                if _st == "return;":
+                    return True
+                if _vtok in _st:
+                    return False
+                if _CS_COND_RETURN_RE.match(_st) or _st.startswith("ctx->gpr[1] ="):
+                    continue
+                if (_st.startswith(("loc_", "goto ", "if ", "switch"))
+                        or "PPU_TAIL" in _st or _CS_CALL_RE.search(_st)):
+                    return False
+            return False
         _vreg_snap = set()
         _vdrop_idx = set()
         for _i, _off, _vr in _vrests:
-            if (_off, _vr) in _vsaved and _vslot_writes[_off] == 1:
+            if (_off, _vr) in _vsaved and _vslot_writes[_off] == 1 and _is_vmx_epilogue(_i, _vr):
+                if any(_off - 8 < _mo < _off + 16 for _mo in _v_r1_mem):
+                    continue
                 _vreg_snap.add(_vr)
                 func.body_lines[_i] = f"    vmx_st(&ctx->vr[{_vr}], _csv_{_vr});"
                 if all(_eo <= _off - 16 or _eo >= _off + 16 for _eo in _v_other_addr):
                     _vdrop_idx.add(_vsaved[(_off, _vr)])
-        if _vdrop_idx and not func.fallthrough_to:
+        if _vdrop_idx and (not func.fallthrough_to or (len(func.body_lines) - 1) not in _reachable(func.body_lines)):
             for _di in _vdrop_idx:
                 func.body_lines[_di] = "    /* dead vmx callee-save dropped */"
         if _reg_snap or _mem_snap or _freg_snap or _vreg_snap:

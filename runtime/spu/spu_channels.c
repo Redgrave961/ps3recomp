@@ -900,9 +900,22 @@ static inline int spu_ovl_sig_known(uint64_t sig0)
     return 1;
 }
 
+uint32_t g_spu_ovl_ea_lo = 0xFFFFFFFFu;
+uint32_t g_spu_ovl_ea_hi = 0u;
+int g_spu_ovl_has_sig = 0;
+
+static inline void spu_ovl_note_ea_range(uint32_t lo, uint32_t hi)
+{
+    uint32_t cur = __atomic_load_n(&g_spu_ovl_ea_lo, __ATOMIC_RELAXED);
+    while (lo < cur && !__atomic_compare_exchange_n(&g_spu_ovl_ea_lo, &cur, lo, 1, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {}
+    cur = __atomic_load_n(&g_spu_ovl_ea_hi, __ATOMIC_RELAXED);
+    while (hi > cur && !__atomic_compare_exchange_n(&g_spu_ovl_ea_hi, &cur, hi, 1, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {}
+}
+
 void spu_overlay_register_source(uint32_t content_ea, int image_id)
 {
     if (s_ovl_src_count < SPU_OVL_SRC_MAX) {
+        spu_ovl_note_ea_range(content_ea, content_ea + 1u);
         spu_ovl_ea_add(content_ea);
         s_ovl_src[s_ovl_src_count].src_ea = content_ea;
         s_ovl_src[s_ovl_src_count].image_id = image_id;
@@ -915,6 +928,7 @@ void spu_overlay_register_source(uint32_t content_ea, int image_id)
 void spu_overlay_register_region(uint32_t content_ea, uint32_t span, int image_id)
 {
     if (!span || span > SPU_LS_SIZE || s_ovl_src_count >= SPU_OVL_SRC_MAX) return;
+    spu_ovl_note_ea_range(content_ea, content_ea + span);
     spu_overlay_register_source(content_ea, image_id);
     s_ovl_src[s_ovl_src_count - 1].span = span;
 }
@@ -998,6 +1012,7 @@ void spu_overlay_register_region_at(uint32_t content_ea, uint32_t lsa, uint32_t 
     s_ovl_at[n].ea = content_ea; s_ovl_at[n].lsa = lsa;
     s_ovl_at[n].span = span; s_ovl_at[n].image_id = image_id;
     s_ovl_at[n].head8 = 0;
+    spu_ovl_note_ea_range(content_ea, content_ea + span);
     spu_ovl_at_delta_add(content_ea - lsa);
     for (uint32_t b = lsa >> SPU_OVL_AT_BLOCK_SHIFT; b <= (lsa + span - 1u) >> SPU_OVL_AT_BLOCK_SHIFT; b++)
         __atomic_fetch_or(&s_ovl_at_blocks[b][n >> 6], 1ull << (n & 63), __ATOMIC_RELAXED);
@@ -1063,6 +1078,7 @@ int spu_overlay_register_reloc_content(const uint8_t* code, uint32_t span, uint3
     o->code = copy;
     o->code_count = 1;
     spu_ovl_sig_add(o->sig);
+    __atomic_store_n(&g_spu_ovl_has_sig, 1, __ATOMIC_RELEASE);
     atomic_store_explicit(&s_ovl_has_sig, 1, memory_order_release);
     __atomic_store_n(&s_ovl_src_count, s_ovl_src_count + 1, __ATOMIC_RELEASE);
     return 1;
@@ -1091,7 +1107,7 @@ static int spu_overlay_resolve_reloc(spu_context* ctx, uint32_t pc)
             const int i = cand[k];
             const spu_ovl_src* o = &s_ovl_src[i];
             if (pc - base >= o->span || base > SPU_LS_SIZE - o->span ||
-                memcmp(ctx->ls + base, o->code[0].bytes, o->code[0].size))
+                spu_bytes_differ(ctx->ls + base, o->code[0].bytes, o->code[0].size))
                 continue;
             int slot = -1;
             for (unsigned s = 0; s < SPU_RESIDENT_CODE_SLOTS && slot < 0; ++s)
@@ -1126,6 +1142,7 @@ void spu_overlay_register_sig(const uint8_t sig[16], int image_id)
         memcpy(s_ovl_src[s_ovl_src_count].sig, sig, 16);
         s_ovl_src[s_ovl_src_count].has_sig = 1;
         spu_ovl_sig_add(sig);
+        __atomic_store_n(&g_spu_ovl_has_sig, 1, __ATOMIC_RELEASE);
         atomic_store_explicit(&s_ovl_has_sig, 1, memory_order_release);
         __atomic_store_n(&s_ovl_src_count, s_ovl_src_count + 1, __ATOMIC_RELEASE);
     }
@@ -1141,12 +1158,34 @@ static inline int spu_bytes_differ(const uint8_t* a, const uint8_t* b, uint32_t 
     }
 #ifdef __AVX2__
     uint32_t i = 0;
-    for (; i + 32 <= n; i += 32) {
+    for (; i + 64 <= n; i += 64) {
+        const __m256i d0 = _mm256_xor_si256(_mm256_loadu_si256((const __m256i*)(a + i)),
+                                            _mm256_loadu_si256((const __m256i*)(b + i)));
+        const __m256i d1 = _mm256_xor_si256(_mm256_loadu_si256((const __m256i*)(a + i + 32)),
+                                            _mm256_loadu_si256((const __m256i*)(b + i + 32)));
+        const __m256i any = _mm256_or_si256(d0, d1);
+        if (!_mm256_testz_si256(any, any)) return 1;
+    }
+    if (i + 32 <= n) {
         const __m256i d = _mm256_xor_si256(_mm256_loadu_si256((const __m256i*)(a + i)),
                                            _mm256_loadu_si256((const __m256i*)(b + i)));
         if (!_mm256_testz_si256(d, d)) return 1;
+        i += 32;
     }
-    return i < n ? (memcmp(a + i, b + i, n - i) != 0) : 0;
+    if (i < n && n >= 32) {
+        const __m256i d = _mm256_xor_si256(_mm256_loadu_si256((const __m256i*)(a + n - 32)),
+                                           _mm256_loadu_si256((const __m256i*)(b + n - 32)));
+        return !_mm256_testz_si256(d, d);
+    }
+    for (; i + 8 <= n; i += 8) {
+        uint64_t x, y;
+        memcpy(&x, a + i, 8);
+        memcpy(&y, b + i, 8);
+        if (x != y) return 1;
+    }
+    for (; i < n; i++)
+        if (a[i] != b[i]) return 1;
+    return 0;
 #else
     return memcmp(a, b, n) != 0;
 #endif

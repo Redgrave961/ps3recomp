@@ -120,7 +120,74 @@ static inline void spu_copy_exact_nonoverlap(uint8_t* dp, const uint8_t* sp, uin
 
 static inline void spu_ls_lzf_decompress(uint8_t* ls, uint32_t* p_src, uint32_t src_end, uint32_t* p_dst) {
     uint32_t src = *p_src, dst = *p_dst;
+    // Fast non-wrapping path: 99.99% of SPU LZF streams stay well inside [0, 0x40000).
+    // Uses 16B/32B wild copies when there is >= 32B headroom to LS end and no overlap.
     while (src < src_end) {
+        const uint32_t s0 = src & 0x3FFFFu, d0 = dst & 0x3FFFFu;
+        if (__builtin_expect(src_end <= 0x40000u && s0 < 0x3FFE0u && d0 < 0x3FFE0u && src == s0 && dst == d0, 1)) {
+            uint8_t* sp = ls + s0;
+            uint8_t* dp = ls + d0;
+            uint8_t* const send = ls + src_end;
+            uint8_t* const dsafe = ls + (0x40000u - 32u);
+            while (sp < send && dp < dsafe) {
+                const uint32_t ctrl = *sp++;
+                if (ctrl < 32u) {
+                    const uint32_t len = ctrl + 1u;
+                    if (__builtin_expect(sp + 32 <= ls + 0x40000u && (dp >= sp + len || sp >= dp + 32), 1)) {
+                        memcpy(dp, sp, 16);
+                        if (len > 16u) memcpy(dp + 16, sp + 16, 16);
+                    } else if (sp + len <= ls + 0x40000u && dp + len <= ls + 0x40000u) {
+                        if (dp >= sp + len || sp >= dp + len)
+                            spu_copy_exact_nonoverlap(dp, sp, len);
+                        else
+                            spu_ls_copy_fwd(ls, (uint32_t)(dp - ls), (uint32_t)(sp - ls), len);
+                    } else {
+                        sp--;
+                        break;
+                    }
+                    sp += len;
+                    dp += len;
+                } else {
+                    uint32_t len = ctrl >> 5;
+                    uint32_t back = ((ctrl & 31u) << 8) + 1u;
+                    if (len == 7u) {
+                        if (__builtin_expect(sp >= send, 0)) { sp--; break; }
+                        len += *sp++;
+                    }
+                    if (__builtin_expect(sp >= send, 0)) { sp--; break; }
+                    back += *sp++;
+                    len += 2u;
+                    if (__builtin_expect((uint32_t)(dp - ls) < back || dp + len > ls + 0x40000u, 0)) {
+                        // Wrap-around ref or near LS end: hand off to exact wrapping loop.
+                        src = (uint32_t)(sp - ls);
+                        dst = (uint32_t)(dp - ls);
+                        const uint32_t ref = dst - back;
+                        for (uint32_t i = 0; i < len; ++i)
+                            ls[(dst + i) & 0x3FFFFu] = ls[(ref + i) & 0x3FFFFu];
+                        dst += len;
+                        goto next_outer;
+                    }
+                    const uint8_t* mp = dp - back;
+                    if (__builtin_expect(back >= 16u && len <= 16u, 1)) {
+                        memcpy(dp, mp, 16);
+                    } else if (back >= len) {
+                        spu_copy_exact_nonoverlap(dp, mp, len);
+                    } else if (back == 1u) {
+                        memset(dp, mp[0], len);
+                    } else if (back >= 8u) {
+                        uint32_t i = 0;
+                        for (; i + 8u <= len; i += 8u) memcpy(dp + i, mp + i, 8);
+                        for (; i < len; ++i) dp[i] = mp[i];
+                    } else {
+                        for (uint32_t i = 0; i < len; ++i) dp[i] = mp[i];
+                    }
+                    dp += len;
+                }
+            }
+            src = (uint32_t)(sp - ls);
+            dst = (uint32_t)(dp - ls);
+            if (src >= src_end) break;
+        }
         const uint32_t ctrl = ls[src++ & 0x3FFFFu];
         if (ctrl < 32u) {
             const uint32_t len = ctrl + 1u;
@@ -164,6 +231,7 @@ static inline void spu_ls_lzf_decompress(uint8_t* ls, uint32_t* p_src, uint32_t 
             }
             dst += len;
         }
+next_outer:;
     }
     *p_src = src;
     *p_dst = dst;

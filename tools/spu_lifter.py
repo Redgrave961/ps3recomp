@@ -155,7 +155,7 @@ def _bi_target_reg(insn):
 
 _RRR_DEST_OPS = {"selb", "shufb", "mpya", "fnms", "fma", "fms"}
 _CLEAN_FLOAT = {"fa", "fs", "fm", "fma", "fms", "fnms"}
-_ZERO_SIGN_SAFE = {"fa", "fs", "fm", "fma", "fms", "fnms", "fcgt", "fceq", "fcmgt", "fcmeq"}
+_ZERO_SIGN_SAFE = {"fa", "fs", "fm", "fma", "fms", "fnms", "fcgt", "fceq", "fcmgt", "fcmeq", "cflts", "cfltu"}
 _CLEAN_MOVE = {"ori", "ai", "shlqbyi", "rotqbyi"}
 _CLOBBER_ALL = {"brsl", "brasl", "bisl", "bisled", "stop", "stopd", "iret"}
 
@@ -387,7 +387,7 @@ class SPULifter:
                     new.add(("k", d, v))
                 if (v >> 23) & 0xFF != 0xFF and (mn != "iohl" or d in const or ("c", d) in s):
                     new.add(("c", d))
-            elif mn in _CLEAN_FLOAT:
+            elif mn in _CLEAN_FLOAT or mn in ("csflt", "cuflt"):
                 new.add(("c", d))
             elif mn in ("cbd", "chd", "cwd", "cdd", "cbx", "chx", "cwx", "cdx"):
                 new.add(("i", d))
@@ -877,7 +877,7 @@ class SPULifter:
             if f"@R{k}@" in t:
                 return 0
             mn = fins[k].mnemonic
-            if mn in ("rdch", "rchcnt") or (mn == "wrch" and f"@S{k}@" in t):
+            if mn in ("rdch", "rchcnt", "wrch") and f"@S{k}@" in t:
                 return mask[k]
             return d | mask[k]
 
@@ -1241,9 +1241,17 @@ class SPULifter:
             return f"spu_ls_st128(_ls, spu_pref_word({g(ra())}) + spu_pref_word({g(rb())}), {g(rt())});"
 
         if mn == "rdch":
-            return f"@SPILL@ {g(rt())} = spu_rdch(ctx, {_chan(ops[1])});"
+            ch = _chan(ops[1])
+            if ch in ("24", "MFC_RdTagStat"):
+                return f"{g(rt())} = spu_pref_u32(ctx->mfc_tag_status);"
+            if ch in ("27", "MFC_RdAtomicStat"):
+                return f"{g(rt())} = spu_pref_u32(ctx->atomic_stat);"
+            return f"@SPILL@ {g(rt())} = spu_rdch(ctx, {ch});"
         if mn == "rchcnt":
-            return f"@SPILL@ {g(rt())} = spu_pref_u32(spu_rchcnt(ctx, {_chan(ops[1])}));"
+            ch = _chan(ops[1])
+            if ch in ("24", "MFC_RdTagStat"):
+                return f"{g(rt())} = spu_pref_u32(1u);"
+            return f"@SPILL@ {g(rt())} = spu_pref_u32(spu_rchcnt(ctx, {ch}));"
         if mn == "wrch":
             ch = _chan(ops[0])
             latch = _MFC_LATCH.get(ch)

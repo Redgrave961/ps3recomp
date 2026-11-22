@@ -69,7 +69,38 @@ static inline void mfc_copy(uint8_t* d, const uint8_t* s, uint32_t n)
 {
     mfc_v16 a, b;
     mfc_v32 w, x, y, z;
-    if (n - 16u > 112u) { memcpy(d, s, n); return; }
+    if (n - 16u > 112u) {
+        if (n > 128u) {
+            uint32_t i = 0;
+            for (; i + 128u <= n; i += 128u) {
+                memcpy(&w, s + i,      32); memcpy(&x, s + i + 32, 32);
+                memcpy(&y, s + i + 64, 32); memcpy(&z, s + i + 96, 32);
+                memcpy(d + i,      &w, 32); memcpy(d + i + 32, &x, 32);
+                memcpy(d + i + 64, &y, 32); memcpy(d + i + 96, &z, 32);
+            }
+            if (i < n) {
+                if (n - i > 64u) {
+                    memcpy(&w, s + i, 32); memcpy(&x, s + i + 32, 32);
+                    memcpy(&y, s + n - 64, 32); memcpy(&z, s + n - 32, 32);
+                    memcpy(d + i, &w, 32); memcpy(d + i + 32, &x, 32);
+                    memcpy(d + n - 64, &y, 32); memcpy(d + n - 32, &z, 32);
+                } else if (n - i > 32u) {
+                    memcpy(&w, s + i, 32); memcpy(&x, s + n - 32, 32);
+                    memcpy(d + i, &w, 32); memcpy(d + n - 32, &x, 32);
+                } else {
+                    memcpy(&w, s + n - 32, 32);
+                    memcpy(d + n - 32, &w, 32);
+                }
+            }
+            return;
+        }
+        if (n == 8u) { uint64_t t; memcpy(&t, s, 8); memcpy(d, &t, 8); return; }
+        if (n == 4u) { uint32_t t; memcpy(&t, s, 4); memcpy(d, &t, 4); return; }
+        if (n == 2u) { uint16_t t; memcpy(&t, s, 2); memcpy(d, &t, 2); return; }
+        if (n == 1u) { *d = *s; return; }
+        memcpy(d, s, n);
+        return;
+    }
     if (n <= 32) { memcpy(&a, s, 16); memcpy(&b, s + n - 16, 16); memcpy(d, &a, 16); memcpy(d + n - 16, &b, 16); return; }
     if (n <= 64) { memcpy(&w, s, 32); memcpy(&x, s + n - 32, 32); memcpy(d, &w, 32); memcpy(d + n - 32, &x, 32); return; }
     memcpy(&w, s, 32); memcpy(&x, s + 32, 32); memcpy(&y, s + n - 64, 32); memcpy(&z, s + n - 32, 32);
@@ -165,8 +196,16 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
 
     if (mfc_is_get(cmd)) {
         mfc_copy(ls_ptr, ea_ptr, size);
-        { extern void spu_overlay_note_get(spu_context*, uint32_t, const uint8_t*, uint32_t);
-          spu_overlay_note_get(spu, (uint32_t)ea, (const uint8_t*)ls_ptr, size); }
+        { extern uint32_t g_spu_ovl_ea_lo, g_spu_ovl_ea_hi;
+          extern int g_spu_ovl_has_sig;
+          extern void spu_overlay_note_get(spu_context*, uint32_t, const uint8_t*, uint32_t);
+          const uint32_t ea32 = (uint32_t)ea;
+          if (__builtin_expect(
+                  (spu->resident_code_mask && lsa < spu->resident_code_hi && lsa + size > spu->resident_code_lo) ||
+                  (ea32 < __atomic_load_n(&g_spu_ovl_ea_hi, __ATOMIC_ACQUIRE) &&
+                   (uint64_t)ea32 + size > (uint64_t)__atomic_load_n(&g_spu_ovl_ea_lo, __ATOMIC_ACQUIRE)) ||
+                  (size >= 512u && __atomic_load_n(&g_spu_ovl_has_sig, __ATOMIC_ACQUIRE)), 0))
+              spu_overlay_note_get(spu, ea32, (const uint8_t*)ls_ptr, size); }
     } else if (mfc_is_put(cmd)) {
         {
             uint32_t a0 = (uint32_t)ea & ~127u;
