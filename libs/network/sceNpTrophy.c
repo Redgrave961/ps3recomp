@@ -98,8 +98,25 @@ static void trophy_push_toast(const TrophyContext* ctx, s32 trophyId)
     toast_unlock();
 }
 
+static ps3_trophy_register_cb s_on_register = NULL;
+static ps3_trophy_unlock_cb   s_on_unlock = NULL;
+static ps3_trophy_quiet_cb    s_is_quiet = NULL;
+static ps3_trophy_frame_cb    s_on_frame = NULL;
+
+void ps3_trophy_set_callbacks(ps3_trophy_register_cb on_register,
+                              ps3_trophy_unlock_cb on_unlock,
+                              ps3_trophy_quiet_cb is_quiet,
+                              ps3_trophy_frame_cb on_frame)
+{
+    s_on_register = on_register;
+    s_on_unlock = on_unlock;
+    s_is_quiet = is_quiet;
+    s_on_frame = on_frame;
+}
+
 int ps3_trophy_poll_toast(ps3_trophy_toast_event* out)
 {
+    if (s_on_frame) s_on_frame();
     if (!out) return 0;
     if (__atomic_load_n(&s_toast_head, __ATOMIC_RELAXED) == __atomic_load_n(&s_toast_tail, __ATOMIC_RELAXED))
         return 0;
@@ -439,6 +456,13 @@ s32 sceNpTrophyRegisterContext(SceNpTrophyContext context,
         return (s32)SCE_NP_TROPHY_ERROR_ILLEGAL_UPDATE;
     ctx->registered = 1;
     printf("[sceNpTrophy] RegisterContext(%s): %d trophies, \"%s\"\n", ctx->name, ctx->set.n, ctx->set.title);
+    if (s_on_register) {
+        for (int i = 0; i < ctx->set.n; i++) {
+            const trophy_def* td = &ctx->set.t[i];
+            if (td->id >= 0 && td->id < SCE_NP_TROPHY_MAX_NUM_TROPHIES)
+                s_on_register(td->id, td->name, td->detail, td->grade, ctx->unlocked[td->id] ? 1 : 0);
+        }
+    }
 
     const s32 progress = ctx->set.n - 1;
     const struct { u32 status; s32 total; } steps[] = {
@@ -601,14 +625,20 @@ s32 sceNpTrophyUnlockTrophy(SceNpTrophyContext context,
     ctx->unlocked[trophyId] = 1;
     ctx->tick[trophyId] = now;
     printf("[sceNpTrophy] trophy %d unlocked: %s\n", trophyId, t->name);
-    trophy_push_toast(ctx, trophyId);
+    if (!s_is_quiet || !s_is_quiet())
+        trophy_push_toast(ctx, trophyId);
+    if (s_on_unlock)
+        s_on_unlock(trophyId);
 
     const s32 plat = trophy_platinum_unlocked_by(ctx, trophyId);
     if (plat != SCE_NP_TROPHY_INVALID_TROPHY_ID) {
         ctx->unlocked[plat] = 1;
         ctx->tick[plat] = now;
         printf("[sceNpTrophy] platinum trophy %d unlocked\n", plat);
-        trophy_push_toast(ctx, plat);
+        if (!s_is_quiet || !s_is_quiet())
+            trophy_push_toast(ctx, plat);
+        if (s_on_unlock)
+            s_on_unlock(plat);
     }
     if (platinumId)
         vm_write32(GUEST_EA(platinumId), (u32)plat);

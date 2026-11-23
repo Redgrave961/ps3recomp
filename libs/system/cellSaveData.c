@@ -37,6 +37,12 @@
 #endif
 
 static char s_save_root[1024] = "./gamedata/dev_hdd0/home/00000001/savedata";
+static ps3_savedata_load_cb s_on_save_load = NULL;
+
+void cellSaveData_set_load_callback(ps3_savedata_load_cb cb)
+{
+    s_on_save_load = cb;
+}
 
 static void adopt_gamedata_root(void)
 {
@@ -430,6 +436,7 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
         vm_io_end(set->fileBuf, read_size);
         int failed = ferror(fp);
         if (fclose(fp) != 0) failed = 1;
+        if (!failed && got > 0 && s_on_save_load) s_on_save_load();
         return failed ? CELL_SAVEDATA_ERROR_ACCESS_ERROR : (s32)got;
     }
 

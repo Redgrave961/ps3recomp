@@ -158,6 +158,9 @@ s32 cellSaveDataUserAutoLoad(u32 version, u32 userId, const char* dirName,
                              CellSaveDataStatCallback funcStat,
                              CellSaveDataFileCallback funcFile, u32 container);
 
+typedef void (*ps3_savedata_load_cb)(void);
+void cellSaveData_set_load_callback(ps3_savedata_load_cb cb);
+
 #ifdef __cplusplus
 }
 #endif

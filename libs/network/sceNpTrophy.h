@@ -165,6 +165,15 @@ typedef struct ps3_trophy_toast_event {
 
 int ps3_trophy_poll_toast(ps3_trophy_toast_event* out);
 
+typedef void (*ps3_trophy_register_cb)(int id, const char* name, const char* detail, char grade, int unlocked);
+typedef void (*ps3_trophy_unlock_cb)(int id);
+typedef int  (*ps3_trophy_quiet_cb)(void);
+typedef void (*ps3_trophy_frame_cb)(void);
+void ps3_trophy_set_callbacks(ps3_trophy_register_cb on_register,
+                              ps3_trophy_unlock_cb on_unlock,
+                              ps3_trophy_quiet_cb is_quiet,
+                              ps3_trophy_frame_cb on_frame);
+
 #ifdef __cplusplus
 }
 #endif
