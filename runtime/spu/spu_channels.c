@@ -392,8 +392,26 @@ static int channel_is_mfc(uint32_t ch)
 
 static void spu_ch_park(spu_context* ctx, int (*ready)(void*), void* arg)
 {
+    uint32_t seq = __atomic_load_n(&ctx->ch_wake_seq, __ATOMIC_ACQUIRE);
+    __atomic_store_n(&ctx->ch_sleeping, 2, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if (ready(arg)) {
+        __atomic_store_n(&ctx->ch_sleeping, 0, __ATOMIC_RELAXED);
+        return;
+    }
+    for (int spin = 0; spin < 128; spin++) {
+        const uint32_t cur = __atomic_load_n(&ctx->ch_wake_seq, __ATOMIC_ACQUIRE);
+        if (cur != seq) {
+            seq = cur;
+            if (ready(arg)) {
+                __atomic_store_n(&ctx->ch_sleeping, 0, __ATOMIC_RELAXED);
+                return;
+            }
+        }
+        YieldProcessor();
+    }
     for (;;) {
-        const uint32_t seq = __atomic_load_n(&ctx->ch_wake_seq, __ATOMIC_ACQUIRE);
+        seq = __atomic_load_n(&ctx->ch_wake_seq, __ATOMIC_ACQUIRE);
         __atomic_store_n(&ctx->ch_sleeping, 1, __ATOMIC_RELAXED);
         __atomic_thread_fence(__ATOMIC_SEQ_CST);
         if (ready(arg)) break;
@@ -513,9 +531,10 @@ void spu_ch_wake(spu_context* ctx)
 {
     if (!ctx) return;
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    if (!__atomic_load_n(&ctx->ch_sleeping, __ATOMIC_RELAXED)) return;
+    const int sl = __atomic_load_n(&ctx->ch_sleeping, __ATOMIC_RELAXED);
+    if (!sl) return;
     __atomic_add_fetch(&ctx->ch_wake_seq, 1u, __ATOMIC_RELEASE);
-    ps3_futex_wake_all(&ctx->ch_wake_seq);
+    if (sl == 1) ps3_futex_wake_all(&ctx->ch_wake_seq);
 }
 
 static __thread uint64_t t_ft_busy0;

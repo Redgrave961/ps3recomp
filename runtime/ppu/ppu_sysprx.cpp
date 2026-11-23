@@ -94,9 +94,20 @@ static inline bool lwm_cas(uint32_t lwm, uint64_t* expected, uint64_t desired)
 {
     return __atomic_compare_exchange_n(lwm_var(lwm), expected, desired, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
 }
+static inline uint32_t lwm_u32_load(uint32_t ea)
+{
+    uint32_t v;
+    memcpy(&v, vm_base + ea, 4);
+    return __builtin_bswap32(v);
+}
+static inline void lwm_u32_store(uint32_t ea, uint32_t v)
+{
+    v = __builtin_bswap32(v);
+    memcpy(vm_base + ea, &v, 4);
+}
 static inline uint32_t lwm_protocol(uint32_t lwm)
 {
-    return (vm_read32(lwm + LWM_ATTR) & 0xFu) == 2u ? PS3_SYNC_PRIORITY : PS3_SYNC_FIFO;
+    return (lwm_u32_load(lwm + LWM_ATTR) & 0xFu) == 2u ? PS3_SYNC_PRIORITY : PS3_SYNC_FIFO;
 }
 
 static bool lwm_try_own(uint32_t lwm, uint32_t self)
@@ -149,10 +160,10 @@ static void lwm_release(uint32_t lwm, uint32_t self)
 
 static uint64_t lwm_owned_again(uint32_t lwm)
 {
-    if (vm_read32(lwm + LWM_ATTR) & 0x20u) return err(CELL_EDEADLK_V);
-    const uint32_t rc = vm_read32(lwm + LWM_RECUR);
+    if (lwm_u32_load(lwm + LWM_ATTR) & 0x20u) return err(CELL_EDEADLK_V);
+    const uint32_t rc = lwm_u32_load(lwm + LWM_RECUR);
     if (rc == 0xFFFFFFFFu) return err(CELL_EKRESOURCE_V);
-    vm_write32(lwm + LWM_RECUR, rc + 1);
+    lwm_u32_store(lwm + LWM_RECUR, rc + 1);
     return CELL_OK_V;
 }
 
@@ -198,9 +209,21 @@ static void sys_lwmutex_lock(ppu_context* ctx)
 {
     if (sys_lwmutex_lock_fast(ctx)) return;
     const uint32_t lwm = (uint32_t)ctx->gpr[3];
+    const uint32_t self = LWM_SELF(ctx);
+    for (unsigned spin = 0; spin < 256u; spin++) {
+        ps3_pause();
+        uint64_t v = lwm_load(lwm);
+        const uint32_t owner = lwm_owner(v);
+        if (owner == LWM_FREE) {
+            if (lwm_waiter(v) != 0) break;
+            if (lwm_cas(lwm, &v, lwm_pack(self, 0))) { ctx->gpr[3] = CELL_OK_V; return; }
+        } else if (owner == LWM_DEAD) {
+            ctx->gpr[3] = err(CELL_EINVAL_V); return;
+        }
+    }
     const uint64_t deadline = ps3_sync_deadline_us(ctx->gpr[4]);
     ps3_waiter w;
-    ps3_waiter_init(&w, LWM_SELF(ctx), lwm);
+    ps3_waiter_init(&w, self, lwm);
     ppu_thread_note_block(ctx->thread_id);
     ps3_park_bucket* b = ps3_park_bucket_of(lwm);
     ps3_lock_acquire(&b->lock);
@@ -231,8 +254,8 @@ static void sys_lwmutex_unlock(ppu_context* ctx)
     const uint32_t lwm = (uint32_t)ctx->gpr[3];
     const uint32_t self = LWM_SELF(ctx);
     if (lwm_owner(lwm_load(lwm)) != self) { ctx->gpr[3] = err(CELL_EPERM_V); return; }
-    const uint32_t rc = vm_read32(lwm + LWM_RECUR);
-    if (rc) vm_write32(lwm + LWM_RECUR, rc - 1);
+    const uint32_t rc = lwm_u32_load(lwm + LWM_RECUR);
+    if (rc) lwm_u32_store(lwm + LWM_RECUR, rc - 1);
     else lwm_release(lwm, self);
     ctx->gpr[3] = CELL_OK_V;
 }

@@ -427,22 +427,39 @@ bool renderer::draw_setup()
         m_epoch++;
         stats.epochs++;
     }
-    if (dirty & rsx::D_TEXTURES) describe_units(0, rsx::TEXTURES);
-    if (dirty & rsx::D_VERTEX_TEXTURES) describe_units(rsx::TEXTURES, rsx::TEXTURES + rsx::VERTEX_TEXTURES);
-    dirty &= ~(rsx::D_TEXTURES | rsx::D_VERTEX_TEXTURES);
-    u32 vdims = 0;
-    for (u32 u = 0; u < rsx::VERTEX_TEXTURES; u++)
-        vdims |= texture_dims(m_units[rsx::TEXTURES + u].desc, m_units[rsx::TEXTURES + u].valid) << (u * 2u);
-    if (vdims != m_vertex_dims) {
-        m_vertex_dims = vdims;
-        dirty |= rsx::D_VERTEX_PROGRAM;
+    const u32 tex_dirty = dirty & (rsx::D_TEXTURES | rsx::D_VERTEX_TEXTURES);
+    if (tex_dirty & rsx::D_TEXTURES) {
+        describe_units(0, rsx::TEXTURES);
+        u32 fdims = 0, fshadow = 0, fak = 0;
+        for (u32 u = 0; u < rsx::TEXTURES; u++) {
+            fdims |= texture_dims(m_units[u].desc, m_units[u].valid) << (u * 2u);
+            if (m_units[u].valid) {
+                if (m_units[u].desc.ops.depth_compare) fshadow |= 1u << u;
+                if ((m_units[u].regs.control0 >> 2) & 1u) fak = RSX_SPV_FPOUT_ALPHAKILL;
+            }
+        }
+        m_fp_tex_dims = fdims;
+        m_fp_tex_shadow = fshadow;
+        m_fp_tex_alphakill = fak;
+        m_fp_tex_valid = true;
     }
+    if (tex_dirty & rsx::D_VERTEX_TEXTURES) {
+        describe_units(rsx::TEXTURES, rsx::TEXTURES + rsx::VERTEX_TEXTURES);
+        u32 vdims = 0;
+        for (u32 u = 0; u < rsx::VERTEX_TEXTURES; u++)
+            vdims |= texture_dims(m_units[rsx::TEXTURES + u].desc, m_units[rsx::TEXTURES + u].valid) << (u * 2u);
+        if (vdims != m_vertex_dims) {
+            m_vertex_dims = vdims;
+            dirty |= rsx::D_VERTEX_PROGRAM;
+        }
+    }
+    dirty &= ~(rsx::D_TEXTURES | rsx::D_VERTEX_TEXTURES);
     if ((dirty & rsx::D_VERTEX_PROGRAM) || !m_vp) {
         rsx_spv_vp_key key{};
         key.start = r(rsx::M_TRANSFORM_PROGRAM_START);
         m_program_hash = shader_cache::program_hash(program, key.start);
         key.output_mask = r(rsx::M_VERTEX_ATTRIB_OUTPUT_MASK);
-        key.texture_dims = vdims;
+        key.texture_dims = m_vertex_dims;
 
         m_vp = m_shaders.vertex(program, key, m_program_hash, true);
         dirty &= ~rsx::D_VERTEX_PROGRAM;
@@ -462,11 +479,17 @@ bool renderer::draw_setup()
     seen_key.ea = m_fp_ea;
     rsx_spv_fp_key& fk = seen_key.key;
     fk.control = r(rsx::M_SHADER_CONTROL);
-    for (u32 u = 0; u < rsx::TEXTURES; u++) {
-        fk.texture_dims |= texture_dims(m_units[u].desc, m_units[u].valid) << (u * 2u);
-        if (m_units[u].valid) {
-            if (m_units[u].desc.ops.depth_compare) fk.texture_shadow |= 1u << u;
-            if ((m_units[u].regs.control0 >> 2) & 1u) fk.output_mask |= RSX_SPV_FPOUT_ALPHAKILL;
+    if (__builtin_expect(m_fp_tex_valid, 1)) {
+        fk.texture_dims = m_fp_tex_dims;
+        fk.texture_shadow = m_fp_tex_shadow;
+        fk.output_mask = m_fp_tex_alphakill;
+    } else {
+        for (u32 u = 0; u < rsx::TEXTURES; u++) {
+            fk.texture_dims |= texture_dims(m_units[u].desc, m_units[u].valid) << (u * 2u);
+            if (m_units[u].valid) {
+                if (m_units[u].desc.ops.depth_compare) fk.texture_shadow |= 1u << u;
+                if ((m_units[u].regs.control0 >> 2) & 1u) fk.output_mask |= RSX_SPV_FPOUT_ALPHAKILL;
+            }
         }
     }
     for (u32 k = 0; k < 4; k++)
@@ -481,13 +504,12 @@ bool renderer::draw_setup()
     fp_lookup& seen = *m_fp_last;
     const u32 count = (u32)seen.slots.size();
     for (u32 k = 1; k <= count; k++) {
-        const fp_candidate& c = seen.slots[(seen.next + count - k) % count];
-        if (c.fp) {
-            await_writes(m_fp_ea, c.count * 4u);
-            if (program_matches(ucode, c.code.data(), c.count)) {
-                m_fp = c.fp;
-                return true;
-            }
+        fp_candidate& c = seen.slots[(seen.next + count - k) % count];
+        if (!c.fp) continue;
+        await_writes(m_fp_ea, c.count * 4u);
+        if (program_matches(ucode, c.code.data(), c.count)) {
+            m_fp = c.fp;
+            return true;
         }
     }
     await_writes(m_fp_ea, RSX_SPV_FP_MAX_INSTRUCTIONS * 16u);
@@ -497,6 +519,9 @@ bool renderer::draw_setup()
     seen.next = (seen.next + 1u) % count;
     c.fp = m_fp;
     c.count = m_fp->info.ucode_words;
+    c.dirty_hits = 0;
+    c.tracked = false;
+    c.stamp = 0;
     c.code.assign(((c.count + 7u) & ~size_t(7)) * 2u, 0u);
     for (u32 i = 0; i < c.count; i++) {
         c.code[(i & ~7u) * 2u + (i & 7u)] = ucode[i];

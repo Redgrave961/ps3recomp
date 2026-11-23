@@ -445,6 +445,18 @@ void rebuild_swapchain()
     if (!swapchain_build()) std::fprintf(stderr, "[vk] swapchain rebuild failed\n");
 }
 
+bool swapchain_extent_changed()
+{
+    VkSurfaceCapabilitiesKHR caps;
+    if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g.d.gpu, g.surface, &caps) != VK_SUCCESS) return true;
+    VkExtent2D extent = caps.currentExtent;
+    if (extent.width == UINT32_MAX) {
+        extent.width = std::clamp(g.pixel_w.load(), caps.minImageExtent.width, caps.maxImageExtent.width);
+        extent.height = std::clamp(g.pixel_h.load(), caps.minImageExtent.height, caps.maxImageExtent.height);
+    }
+    return extent.width != g.sc.extent.width || extent.height != g.sc.extent.height;
+}
+
 bool present_image(slot& s)
 {
     if (!g.sc.extent.width || !g.sc.extent.height) {
@@ -464,7 +476,7 @@ bool present_image(slot& s)
         s.released = 0;
         return false;
     }
-    if (a == VK_SUBOPTIMAL_KHR) g.resized = true;
+    if (a == VK_SUBOPTIMAL_KHR && swapchain_extent_changed()) g.resized = true;
     vkResetCommandPool(g.d.dev, f.pool, 0);
     record_present(f.cmd, s, g.sc.images[index]);
 
@@ -540,7 +552,7 @@ bool present_image(slot& s)
     f.done = value;
     s.released = value;
     g.frame_index = (g.frame_index + 1u) % k_present_frames;
-    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) g.resized = true;
+    if (r == VK_ERROR_OUT_OF_DATE_KHR || (r == VK_SUBOPTIMAL_KHR && swapchain_extent_changed())) g.resized = true;
     else if (r != VK_SUCCESS) std::fprintf(stderr, "[vk] present failed: %d\n", (int)r);
 
     static bool first = true;

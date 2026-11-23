@@ -168,16 +168,55 @@ static inline void spu_ls_lzf_decompress(uint8_t* ls, uint32_t* p_src, uint32_t 
                         goto next_outer;
                     }
                     const uint8_t* mp = dp - back;
-                    if (__builtin_expect(back >= 16u && len <= 16u, 1)) {
-                        memcpy(dp, mp, 16);
-                    } else if (back >= len) {
-                        spu_copy_exact_nonoverlap(dp, mp, len);
+                    if (__builtin_expect(back >= 16u, 1)) {
+                        if (__builtin_expect(len <= 16u, 1)) {
+                            memcpy(dp, mp, 16);
+                        } else if (dp + len + 16u <= ls + 0x40000u) {
+                            uint32_t i = 0;
+                            do {
+                                memcpy(dp + i, mp + i, 16);
+                                i += 16u;
+                            } while (i < len);
+                        } else {
+                            spu_copy_exact_nonoverlap(dp, mp, len);
+                        }
                     } else if (back == 1u) {
-                        memset(dp, mp[0], len);
+                        const uint64_t pat = (uint64_t)mp[0] * 0x0101010101010101ull;
+                        if (len <= 16u) {
+                            memcpy(dp, &pat, 8);
+                            if (len > 8u) memcpy(dp + 8, &pat, 8);
+                        } else {
+                            memset(dp, mp[0], len);
+                        }
                     } else if (back >= 8u) {
                         uint32_t i = 0;
-                        for (; i + 8u <= len; i += 8u) memcpy(dp + i, mp + i, 8);
-                        for (; i < len; ++i) dp[i] = mp[i];
+                        if (dp + len + 8u <= ls + 0x40000u) {
+                            do {
+                                memcpy(dp + i, mp + i, 8);
+                                i += 8u;
+                            } while (i < len);
+                        } else {
+                            for (; i + 8u <= len; i += 8u) memcpy(dp + i, mp + i, 8);
+                            for (; i < len; ++i) dp[i] = mp[i];
+                        }
+                    } else if (back == 4u && dp + len + 8u <= ls + 0x40000u) {
+                        uint32_t p4;
+                        memcpy(&p4, mp, 4);
+                        const uint64_t p8 = (uint64_t)p4 | ((uint64_t)p4 << 32);
+                        uint32_t i = 0;
+                        do {
+                            memcpy(dp + i, &p8, 8);
+                            i += 8u;
+                        } while (i < len);
+                    } else if (back == 2u && dp + len + 8u <= ls + 0x40000u) {
+                        uint16_t p2;
+                        memcpy(&p2, mp, 2);
+                        const uint64_t p8 = (uint64_t)p2 * 0x0001000100010001ull;
+                        uint32_t i = 0;
+                        do {
+                            memcpy(dp + i, &p8, 8);
+                            i += 8u;
+                        } while (i < len);
                     } else {
                         for (uint32_t i = 0; i < len; ++i) dp[i] = mp[i];
                     }
@@ -649,12 +688,20 @@ static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
 #if defined(__SSE4_1__)
 static inline u128 spu_shufb_ins(u128 a, u128 b, u128 c) {
     __m128i A, B, C; memcpy(&A, &a, 16); memcpy(&B, &b, 16); memcpy(&C, &c, 16);
-    const __m128i out = _mm_blendv_epi8(B, _mm_shuffle_epi8(A, _mm_xor_si128(C, _mm_set1_epi8(3))),
-                                        _mm_cmpgt_epi8(_mm_set1_epi8(0x10), C));
+    const __m128i out = _mm_blendv_epi8(_mm_shuffle_epi8(A, _mm_xor_si128(C, _mm_set1_epi8(3))),
+                                        B, _mm_slli_epi16(C, 3));
     u128 o; memcpy(&o, &out, 16); return o;
+}
+static inline __attribute__((always_inline)) u128 spu_splat_w(u128 a, int lane) {
+    const __m128i A = spu__xl(a);
+    if (lane == 0) return spu__xs(_mm_shuffle_epi32(A, 0x00));
+    if (lane == 1) return spu__xs(_mm_shuffle_epi32(A, 0x55));
+    if (lane == 2) return spu__xs(_mm_shuffle_epi32(A, 0xAA));
+    return spu__xs(_mm_shuffle_epi32(A, 0xFF));
 }
 #else
 static inline u128 spu_shufb_ins(u128 a, u128 b, u128 c) { return spu_shufb(a, b, c); }
+static inline u128 spu_splat_w(u128 a, int lane) { return spu_splat_u32(a._u32[lane & 3]); }
 #endif
 
 #if SPU_X86
@@ -681,7 +728,13 @@ static inline u128 spu_shlqbyi(u128 a, int sh) {
 }
 #elif SPU_X86
 static inline u128 spu_shlqbyi(u128 a, int sh) {
-    return spu__xperm(a, spu__xshl(sh & 0x1F));
+    const int s = sh & 0x1F;
+    if (s == 0)  return a;
+    if (s >= 16) return spu_zero();
+    if (s == 4)  return spu__xs(_mm_srli_si128(spu__xl(a), 4));
+    if (s == 8)  return spu__xs(_mm_srli_si128(spu__xl(a), 8));
+    if (s == 12) return spu__xs(_mm_srli_si128(spu__xl(a), 12));
+    return spu__xperm(a, spu__xshl(s));
 }
 #else
 static inline u128 spu_shlqbyi(u128 a, int sh) { return spu_shlqbyi_ref(a, sh); }
@@ -693,7 +746,12 @@ static inline u128 spu_rotqbyi(u128 a, int sh) {
 }
 #elif SPU_X86
 static inline u128 spu_rotqbyi(u128 a, int sh) {
-    return spu__xrotl(a, (uint32_t)sh);
+    const int s = sh & 15;
+    if (s == 0)  return a;
+    if (s == 4)  return spu__xs(_mm_shuffle_epi32(spu__xl(a), _MM_SHUFFLE(0, 3, 2, 1)));
+    if (s == 8)  return spu__xs(_mm_shuffle_epi32(spu__xl(a), _MM_SHUFFLE(1, 0, 3, 2)));
+    if (s == 12) return spu__xs(_mm_shuffle_epi32(spu__xl(a), _MM_SHUFFLE(2, 1, 0, 3)));
+    return spu__xrotl(a, (uint32_t)s);
 }
 #else
 static inline u128 spu_rotqbyi(u128 a, int sh) { return spu_rotqbyi_ref(a, sh); }
@@ -731,9 +789,9 @@ static inline int spu__sf_split(uint32_t x, uint32_t* sig, int* e2) {
 #if SPU_X86
 #define SPU_MXCSR_RZ 0xFFC0u
 SPU__XI u128 spu__xf_out(__m128 s) {
-    /* SPU_MXCSR_RZ enables FTZ+DAZ so hardware already flushes subnormals to +-0;
-     * only -0.0f needs clearing to +0.0f. */
-    return spu__xs(_mm_castps_si128(_mm_andnot_ps(_mm_cmpeq_ps(s, _mm_setzero_ps()), s)));
+    /* SPU_MXCSR_RZ enables FTZ+DAZ+RZ so inputs clamped by spu__xf always yield
+     * finite results; adding +0.0f clears -0.0f -> +0.0f in a single vaddps. */
+    return spu__xs(_mm_castps_si128(_mm_add_ps(s, _mm_setzero_ps())));
 }
 SPU__XI u128 spu__xf_out_k(__m128 s, int k) {
     return (k & 8) ? spu__xs(_mm_castps_si128(s)) : spu__xf_out(s);
@@ -1499,7 +1557,13 @@ static inline u128 spu_rotqmbyi(u128 a, int i7) {
 }
 #elif SPU_X86
 static inline u128 spu_rotqmbyi(u128 a, int i7) {
-    return spu__xperm(a, spu__xshr((0 - i7) & 0x1F));
+    const int s = (0 - i7) & 0x1F;
+    if (s == 0)  return a;
+    if (s >= 16) return spu_zero();
+    if (s == 4)  return spu__xs(_mm_slli_si128(spu__xl(a), 4));
+    if (s == 8)  return spu__xs(_mm_slli_si128(spu__xl(a), 8));
+    if (s == 12) return spu__xs(_mm_slli_si128(spu__xl(a), 12));
+    return spu__xperm(a, spu__xshr(s));
 }
 #else
 static inline u128 spu_rotqmbyi(u128 a, int i7) { return spu_rotqmbyi_ref(a, i7); }

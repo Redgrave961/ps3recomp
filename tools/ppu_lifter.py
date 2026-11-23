@@ -768,31 +768,68 @@ def _ca_line(s: str) -> tuple[int, int]:
 
 _VFP_RE = re.compile(r"^vmx_(vaddfp|vsubfp|vmaddfp|vnmsubfp|vmaxfp|vminfp|vrefp|vrsqrtefp|vrfin|vrfiz|vrfip|vrfim)"
                      r"\(&ctx->vr\[(\d+)\]((?:, &ctx->vr\[\d+\])+), ctx->vscr\);$")
-_VFP_KEYS = {"vaddfp": "AB", "vsubfp": "AB", "vmaddfp": "ABC", "vnmsubfp": "ABC", "vrefp": "B", "vrsqrtefp": "B",
+_VFP_KEYS = {"vaddfp": "AB", "vsubfp": "AB", "vmulfp": "AB", "vmaddfp": "ABC", "vnmsubfp": "ABC", "vrefp": "B", "vrsqrtefp": "B",
              "vrfip": "B", "vrfim": "B"}
 _VFP_BITS = {"A": 0x10000000, "B": 0x20000000, "C": 0x40000000}
 _VFP_RESET_RE = re.compile(r"^loc_\w+:|[(,] ?ctx[,)]|PPU_TAIL|g_trampoline_fn|DRAIN_TRAMPOLINE|\breturn\b|ctx->vscr|ctx->vr\[[^\d]")
+_VFP_NEG1_RE = re.compile(r"^vmx_st\(&ctx->vr\[(\d+)\], _mm_set1_epi32\(-1\)\);$")
+_VFP_VSLW_RE = re.compile(r"^vmx_vslw\(&ctx->vr\[(\d+)\], &ctx->vr\[(\d+)\], &ctx->vr\[(\d+)\]\);$")
 
 
 def _vfp_clean(body_lines: list[str]) -> list[str]:
-    out, clean = [], set()
+    out, clean, neg1, neg0 = [], set(), set(), set()
+    neg1_idx: dict[int, int] = {}
     for ln in body_lines:
         s = ln.strip()
+        m1 = _VFP_NEG1_RE.match(s)
+        if m1:
+            d = int(m1.group(1))
+            neg1.add(d); neg0.discard(d); clean.discard(d)
+            neg1_idx[d] = len(out)
+            out.append(ln)
+            continue
+        ms = _VFP_VSLW_RE.match(s)
+        if ms:
+            d, a, b = int(ms.group(1)), int(ms.group(2)), int(ms.group(3))
+            if a in neg1 and b in neg1:
+                ind = ln[:len(ln) - len(ln.lstrip())]
+                if a == d and b == d and d in neg1_idx:
+                    out[neg1_idx[d]] = ""
+                out.append(f"{ind}vmx_st(&ctx->vr[{d}], _mm_set1_epi32(INT32_MIN));")
+                neg0.add(d); neg1.discard(d); neg1_idx.pop(d, None); clean.discard(d)
+                continue
+            neg1.discard(d); neg1_idx.pop(d, None); neg0.discard(d); clean.discard(d)
+            neg1_idx.pop(a, None); neg1_idx.pop(b, None)
+            out.append(ln)
+            continue
         m = _VFP_RE.match(s)
         if m:
+            op = m.group(1)
+            d = int(m.group(2))
             regs = [int(x) for x in re.findall(r"\[(\d+)\]", m.group(3))]
-            keys = _VFP_KEYS.get(m.group(1), "")
+            for r in regs:
+                neg1_idx.pop(r, None)
+            if op == "vmaddfp" and len(regs) == 3 and regs[1] in neg0:
+                ra, rc = regs[0], regs[2]
+                bits = (0x10000000 if ra in clean else 0) | (0x40000000 if rc in clean else 0)
+                vscr_expr = f"(ctx->vscr & 0x00010000u) | 0x{bits:08X}u" if bits else "ctx->vscr & 0x00010000u"
+                ind = ln[:len(ln) - len(ln.lstrip())]
+                out.append(f"{ind}vmx_vmulfp(&ctx->vr[{d}], &ctx->vr[{ra}], &ctx->vr[{rc}], {vscr_expr});")
+                clean.add(d); neg1.discard(d); neg1_idx.pop(d, None); neg0.discard(d)
+                continue
+            keys = _VFP_KEYS.get(op, "")
             names = "B" if len(regs) == 1 else "ABC"[:len(regs)]
             bits = sum(_VFP_BITS[k] for k, r in zip(names, regs) if k in keys and r in clean)
             ln = ln.replace("ctx->vscr);", f"(ctx->vscr & 0x00010000u) | 0x{bits:08X}u);" if bits else "ctx->vscr & 0x00010000u);")
-            clean.add(int(m.group(2)))
+            clean.add(d); neg1.discard(d); neg1_idx.pop(d, None); neg0.discard(d)
         elif _VFP_RESET_RE.search(s):
-            clean.clear()
+            clean.clear(); neg1.clear(); neg0.clear(); neg1_idx.clear()
         else:
             for x in re.findall(r"ctx->vr\[(\d+)\]", s):
-                clean.discard(int(x))
+                r = int(x)
+                clean.discard(r); neg1.discard(r); neg1_idx.pop(r, None); neg0.discard(r)
         out.append(ln)
-    return out
+    return [ln for ln in out if ln != ""]
 
 
 def _elide_ca(body_lines: list[str]) -> list[str]:
@@ -1165,12 +1202,242 @@ _CS_ADDI_RE = re.compile(r"^ctx->gpr\[(\d+)\] = ctx->gpr\[1\] \+ \(int64_t\)\((-
 _CS_ADDI_CA_RE = re.compile(r"^\{ uint64_t _a = ctx->gpr\[1\]; uint64_t _r = _a \+ \(uint64_t\)\(int64_t\)\((-?(?:0x)?[0-9A-Fa-f]+)\); "
                             r"ctx->gpr\[(\d+)\] = _r;(?: ctx->xer = \(ctx->xer & ~\(1u << 29\)\) \| [^;]*;)? \}$")
 _CS_R1_MEM_RE = re.compile(r"\(ctx->gpr\[1\] \+ (-?(?:0x)?[0-9A-Fa-f]+)[,)]")
+_CS_R1_VMX_RE = re.compile(
+    r"^\{\s*uint64_t ea = \(?\((?:ctx->gpr\[1\] \+ ctx->gpr\[(\d+)\]|ctx->gpr\[(\d+)\] \+ ctx->gpr\[1\])\)\)?"
+    r"(?:\s*&\s*~(0xF|3)ULL;|;\s*(?:ea &= ~([013])ULL;|(vmx_lv[lr]x)))")
 _CS_DIRECT_CALL_RE = re.compile(r"^ctx->lr = 0x[0-9A-Fa-f]+; \w*func_([0-9A-F]{8})\(ctx\);(?: DRAIN_TRAMPOLINE\(ctx\);)?$")
 _CS_CALLS_OK = {"ppu_call_ctr", "lv2_syscall", "ps3_hle_call", "ppu_stwcx32", "ppu_stdcx64", "DRAIN_TRAMPOLINE"}
 
 
-def drop_callee_saves(func, body: list[str], starts: list[int], by_addr: dict, snap_bodies: set) -> list[str]:
-    if not (func.cs_paired or func.csf_paired):
+def _cs_is_post_pop_tail(stripped: list[str], j: int, frame: int | None) -> bool:
+    if frame is None:
+        return False
+    s = stripped[j]
+    if not (_CS_TAIL_TRAMP_RE.match(s) or s == _JUMP_CTR):
+        return False
+    for k in range(j - 1, max(-1, j - 64), -1):
+        p = stripped[k]
+        if p.startswith(("loc_", "if ", "goto ", "switch")) or _CS_CALL_RE.search(p):
+            return False
+        am = _CS_ADDI_RE.match(p)
+        cm = _CS_ADDI_CA_RE.match(p)
+        if am or cm:
+            dst, val = (int(am.group(1)), int(am.group(2), 0)) if am else (int(cm.group(2)), int(cm.group(1), 0))
+            if dst == 1:
+                return val == frame
+    return False
+
+
+_CS_MFLR_RE = re.compile(r"^ctx->gpr\[(\d+)\] = ctx->lr;$")
+_CS_ST64_R1_RE = re.compile(r"^vm_write64\(ctx->gpr\[1\] \+ (-?(?:0x)?[0-9A-Fa-f]+), ctx->gpr\[(\d+)\]\);$")
+_CS_LD64_R1_RE = re.compile(r"^ctx->gpr\[(\d+)\] = vm_read64\(ctx->gpr\[1\] \+ (-?(?:0x)?[0-9A-Fa-f]+)\);$")
+_CS_LFD_R1_RE = re.compile(r"^\{ uint64_t tmp = vm_read64\(ctx->gpr\[1\] \+ (-?(?:0x)?[0-9A-Fa-f]+)\); memcpy\(&ctx->fpr\[(\d+)\], &tmp, 8\); \}$")
+_CS_STFS_R1_RE = re.compile(r"^\{ float ftmp = \(float\)ctx->fpr\[(\d+)\]; uint32_t tmp; memcpy\(&tmp, &ftmp, 4\); vm_write32\(ctx->gpr\[1\] \+ (-?(?:0x)?[0-9A-Fa-f]+), tmp\); \}$")
+_CS_LVX_R1_RE = re.compile(r"^\{ uint64_t ea = \(\((?:ctx->gpr\[1\] \+ ctx->gpr\[(\d+)\]|ctx->gpr\[(\d+)\] \+ ctx->gpr\[1\])\)\) & ~0xFULL; vmx_st\(&ctx->vr\[(\d+)\], vmx_revv\(vm_raw_ld128\(ea\)\)\); \}$")
+_CS_TOC_SAVE = "vm_write64(ctx->gpr[1] + 0x28, ctx->gpr[2]);"
+
+
+def _fold_stack_roundtrips(body: list[str], frame: int, norm_escaped: list[int]) -> list[str]:
+    stripped = [ln.strip() for ln in body]
+    r_imm: dict[int, int] = {}
+    st64_map: dict[int, tuple[int, int]] = {}
+    stfs_map: dict[int, tuple[int, int]] = {}
+    sr64_counter = 0
+    srf_counter = 0
+    sr64_store_var: dict[int, tuple[str, int, int]] = {}
+    srf_store_var: dict[int, tuple[str, int, int]] = {}
+    replacements: dict[int, str] = {}
+    matched_sr64_offs: set[int] = set()
+    matched_srf_bases: set[int] = set()
+    decls: list[str] = []
+
+    def clear_bb():
+        r_imm.clear(); st64_map.clear(); stfs_map.clear()
+
+    for j, s in enumerate(stripped):
+        if (s.startswith(("loc_", "if ", "goto ", "switch")) or s == "return;"
+                or "PPU_TAIL" in s or "g_trampoline_fn" in s or _CTX_CALL_RE.search(s)
+                or _CS_FRAME_RE.match(s)):
+            clear_bb()
+            continue
+        if "ctx->gpr[1]" in s:
+            am = _CS_ADDI_RE.match(s)
+            cm = _CS_ADDI_CA_RE.match(s)
+            if am or cm:
+                dst = int(am.group(1)) if am else int(cm.group(2))
+                if dst == 1:
+                    clear_bb()
+                else:
+                    r_imm.pop(dst, None)
+                continue
+            m_st64 = _CS_ST64_R1_RE.match(s)
+            if m_st64:
+                off = int(m_st64.group(1), 0)
+                reg = int(m_st64.group(2))
+                for k in [k for k in st64_map if k - 8 < off < k + 8]:
+                    del st64_map[k]
+                for k in [k for k in stfs_map if off <= k < off + 8]:
+                    del stfs_map[k]
+                if (frame > 0 and 0x30 <= off <= frame - 8) or (frame == 0 and off <= -8):
+                    st64_map[off] = (j, reg)
+                continue
+            m_lfd = _CS_LFD_R1_RE.match(s)
+            if m_lfd:
+                off = int(m_lfd.group(1), 0)
+                freg = int(m_lfd.group(2))
+                if off in st64_map:
+                    sj, reg = st64_map[off]
+                    if sj not in sr64_store_var:
+                        vname = f"_sr64_{sr64_counter}"
+                        sr64_counter += 1
+                        sr64_store_var[sj] = (vname, reg, off)
+                        decls.append(f"    uint64_t {vname};")
+                    else:
+                        vname = sr64_store_var[sj][0]
+                    replacements[j] = f"    {{ uint64_t tmp = {vname}; memcpy(&ctx->fpr[{freg}], &tmp, 8); }}"
+                    matched_sr64_offs.add(off)
+                continue
+            m_stfs = _CS_STFS_R1_RE.match(s)
+            if m_stfs:
+                freg = int(m_stfs.group(1))
+                off = int(m_stfs.group(2), 0)
+                for k in [k for k in st64_map if k <= off < k + 8]:
+                    del st64_map[k]
+                for k in [k for k in stfs_map if k - 4 < off < k + 4]:
+                    del stfs_map[k]
+                if (frame > 0 and 0x30 <= off <= frame - 4) or (frame == 0 and off <= -4):
+                    stfs_map[off] = (j, freg)
+                continue
+            m_lvx = _CS_LVX_R1_RE.match(s)
+            if m_lvx:
+                ridx = int(m_lvx.group(1) or m_lvx.group(2))
+                vd = int(m_lvx.group(3))
+                if ridx in r_imm:
+                    base = r_imm[ridx] & ~15
+                    if (base in stfs_map and (base + 4) in stfs_map
+                            and (base + 8) in stfs_map and (base + 12) in stfs_map):
+                        vnames = []
+                        for sub in (base, base + 4, base + 8, base + 12):
+                            sj, freg = stfs_map[sub]
+                            if sj not in srf_store_var:
+                                vname = f"_srf_{srf_counter}"
+                                srf_counter += 1
+                                srf_store_var[sj] = (vname, freg, sub)
+                                decls.append(f"    float {vname};")
+                            else:
+                                vname = srf_store_var[sj][0]
+                            vnames.append(vname)
+                        replacements[j] = (
+                            f"    vmx_st(&ctx->vr[{vd}], _mm_castps_si128("
+                            f"_mm_set_ps({vnames[0]}, {vnames[1]}, {vnames[2]}, {vnames[3]})));"
+                        )
+                        matched_srf_bases.add(base)
+                continue
+            if "vm_write" in s:
+                offs = [int(x, 0) for x in _CS_R1_MEM_RE.findall(s)]
+                vm = _CS_R1_VMX_RE.match(s)
+                if vm:
+                    _vr = int(vm.group(1) or vm.group(2))
+                    if _vr in r_imm:
+                        _vo = r_imm[_vr] & ~15
+                        offs += [_vo, _vo + 4, _vo + 8, _vo + 12]
+                    else:
+                        st64_map.clear(); stfs_map.clear()
+                for o in offs:
+                    for k in [k for k in st64_map if k - 8 < o < k + 8]:
+                        del st64_map[k]
+                    for k in [k for k in stfs_map if k - 4 < o < k + 4]:
+                        del stfs_map[k]
+            for _dm in _CS_ANY_DEF_RE.finditer(s):
+                r_imm.pop(int(_dm.group(1)), None)
+            continue
+        if "vm_write" in s:
+            if norm_escaped:
+                for k in [k for k in st64_map if any(e < k + 8 for e in norm_escaped)]:
+                    del st64_map[k]
+                for k in [k for k in stfs_map if any(e < k + 4 for e in norm_escaped)]:
+                    del stfs_map[k]
+        lm = _CSV_LI_RE.match(s)
+        if lm:
+            r_imm[int(lm.group(1))] = int(lm.group(2), 0)
+            continue
+        stm = _CSV_STEP_RE.match(s)
+        if stm:
+            _sd = int(stm.group(1) or stm.group(3))
+            _sv = int(stm.group(2) or stm.group(4), 0)
+            if _sd in r_imm:
+                r_imm[_sd] += _sv
+            continue
+        for _dm in _CS_ANY_DEF_RE.finditer(s):
+            r_imm.pop(int(_dm.group(1)), None)
+
+    if not replacements:
+        return body
+
+    # Check which matched offsets have zero remaining readers in the function so their dead stack stores can be dropped.
+    read_offs: set[int] = set()
+    r_imm.clear()
+    for j, s in enumerate(stripped):
+        if j in replacements:
+            continue
+        if s.startswith(("loc_", "if ", "goto ", "switch")) or _CTX_CALL_RE.search(s):
+            r_imm.clear()
+        if "ctx->gpr[1]" not in s:
+            lm = _CSV_LI_RE.match(s)
+            if lm:
+                r_imm[int(lm.group(1))] = int(lm.group(2), 0)
+            else:
+                stm = _CSV_STEP_RE.match(s)
+                if stm:
+                    _sd = int(stm.group(1) or stm.group(3))
+                    _sv = int(stm.group(2) or stm.group(4), 0)
+                    if _sd in r_imm:
+                        r_imm[_sd] += _sv
+                else:
+                    for _dm in _CS_ANY_DEF_RE.finditer(s):
+                        r_imm.pop(int(_dm.group(1)), None)
+            continue
+        if "vm_read" in s or "vm_raw_ld" in s or "VM_RAW_LD" in s:
+            for x in _CS_R1_MEM_RE.findall(s):
+                o = int(x, 0)
+                read_offs.update(range(o, o + 8))
+            vm = _CS_R1_VMX_RE.match(s)
+            if vm:
+                _vr = int(vm.group(1) or vm.group(2))
+                if _vr in r_imm:
+                    _vo = r_imm[_vr] & ~15
+                    read_offs.update(range(_vo, _vo + 16))
+                else:
+                    read_offs.add(1 << 30)  # conservative sentinel
+        for _dm in _CS_ANY_DEF_RE.finditer(s):
+            r_imm.pop(int(_dm.group(1)), None)
+
+    has_unknown_read = (1 << 30) in read_offs
+    out = list(body)
+    for j, rep in replacements.items():
+        out[j] = rep
+    for sj, (vname, reg, off) in sr64_store_var.items():
+        can_drop = (not has_unknown_read
+                    and all(e >= off + 8 for e in norm_escaped)
+                    and not any(b in read_offs for b in range(off, off + 8)))
+        if can_drop:
+            out[sj] = f"    {vname} = ctx->gpr[{reg}];"
+        else:
+            out[sj] = f"    {vname} = ctx->gpr[{reg}]; {stripped[sj]}"
+    for sj, (vname, freg, off) in srf_store_var.items():
+        base = off & ~15
+        can_drop = (not has_unknown_read
+                    and all(e >= base + 16 for e in norm_escaped)
+                    and not any(b in read_offs for b in range(base, base + 16)))
+        if can_drop:
+            out[sj] = f"    {vname} = (float)ctx->fpr[{freg}];"
+        else:
+            out[sj] = f"    {vname} = (float)ctx->fpr[{freg}]; {stripped[sj]}"
+    return decls + out
+
+
+def drop_callee_saves(func, body: list[str], starts: list[int], by_addr: dict, snap_bodies: set, toc_base: int = 0) -> list[str]:
+    if not body:
         return body
     reach = _reachable(body)
     if func.fallthrough_to and (len(body) - 1) in reach:
@@ -1179,20 +1446,83 @@ def drop_callee_saves(func, body: list[str], starts: list[int], by_addr: dict, s
     if i < len(starts) and starts[i] < func.end_addr:
         return body
     stripped = [ln.strip() for ln in body]
-    frame, pops, escaped, offsets = None, set(), [], []
+    frame, pops, escaped_raw, mem_raw = None, set(), [], []
+    stdu_idx = None
+    has_calls = False
+    has_tail = False
+    in_entry_bb = True
+    lr_written_entry = False
+    lr_reg = None
+    lr_save = None
+    toc_saves = []
+    post_pop = False
+    r_imm: dict[int, int] = {}
     for j, s in enumerate(stripped):
-        if j not in reach or "ctx" not in s:
+        if j not in reach:
+            continue
+        if s.startswith(("loc_", "if ", "goto ", "switch")):
+            r_imm.clear()
+            in_entry_bb = False
+            post_pop = False
+        if s.startswith("switch"):
+            continue
+        if "ctx" not in s:
             continue
         m = _CS_DIRECT_CALL_RE.match(s)
         if m:
+            r_imm.clear()
+            in_entry_bb = False
+            post_pop = False
+            has_calls = True
             t = by_addr.get(int(m.group(1), 16))
-            if t is None or t.name in snap_bodies or func.start_addr <= t.start_addr < func.end_addr:
+            if t is None or t.name in snap_bodies or func.start_addr < t.start_addr < func.end_addr:
                 return body
             continue
-        if ("PPU_TAIL" in s or "g_trampoline_fn" in s or s.startswith("switch")
+        if "PPU_TAIL" in s:
+            has_tail = True
+            if _cs_is_post_pop_tail(stripped, j, frame):
+                r_imm.clear()
+                in_entry_bb = False
+                post_pop = False
+                continue
+            return body
+        if ("g_trampoline_fn" in s
                 or any(m.group(0).split("(")[0] not in _CS_CALLS_OK for m in _CTX_CALL_RE.finditer(s))):
             return body
+        if _CTX_CALL_RE.search(s):
+            r_imm.clear()
+            in_entry_bb = False
+            post_pop = False
+            has_calls = True
+        if in_entry_bb:
+            if not lr_written_entry and s.startswith("ctx->lr ="):
+                lr_written_entry = True
+                lr_reg = None
+            else:
+                mlr = _CS_MFLR_RE.match(s)
+                if mlr and not lr_written_entry and lr_save is None:
+                    lr_reg = int(mlr.group(1))
         if "ctx->gpr[1]" not in s:
+            lm = _CSV_LI_RE.match(s)
+            if lm:
+                r_imm[int(lm.group(1))] = int(lm.group(2), 0)
+                if lr_reg == int(lm.group(1)):
+                    lr_reg = None
+                continue
+            stm = _CSV_STEP_RE.match(s)
+            if stm:
+                _sd = int(stm.group(1) or stm.group(3))
+                _sv = int(stm.group(2) or stm.group(4), 0)
+                if _sd in r_imm:
+                    r_imm[_sd] += _sv
+                if lr_reg == _sd:
+                    lr_reg = None
+                continue
+            for _dm in _CS_ANY_DEF_RE.finditer(s):
+                _dr = int(_dm.group(1))
+                r_imm.pop(_dr, None)
+                if lr_reg == _dr and not _CS_MFLR_RE.match(s):
+                    lr_reg = None
             continue
         fm = _CS_FRAME_RE.match(s)
         am = _CS_ADDI_RE.match(s)
@@ -1201,36 +1531,162 @@ def drop_callee_saves(func, body: list[str], starts: list[int], by_addr: dict, s
             if frame is not None:
                 return body
             frame = int(fm.group(1), 16)
+            stdu_idx = j
             continue
         if am or cm:
             dst, val = (int(am.group(1)), int(am.group(2), 0)) if am else (int(cm.group(2)), int(cm.group(1), 0))
             if dst == 1:
                 pops.add(val)
+                post_pop = (frame is not None and val == frame)
             else:
-                escaped.append(val)
+                # If this is a dead VMX callee-save base pointer (e.g. r0 = r1 + 0xA0 followed only by
+                # dropped VMX saves and self-increments before r0 is overwritten or function returns),
+                # it does not escape.
+                _dead_vmx_ptr = False
+                if am and dst == 0:
+                    _k = j + 1
+                    _saw_drop = False
+                    while _k < len(stripped):
+                        _ks = stripped[_k]
+                        if _ks == "/* dead vmx callee-save dropped */":
+                            _saw_drop = True; _k += 1; continue
+                        if _ks.startswith("{ uint64_t _a = ctx->gpr[0];") and _ks.endswith("ctx->gpr[0] = _r; }"):
+                            _k += 1; continue
+                        if _ks.startswith("ctx->gpr[0] = ") and "ctx->gpr[0]" not in _ks[len("ctx->gpr[0] = "):]:
+                            _dead_vmx_ptr = _saw_drop
+                            break
+                        if _ks == "return;":
+                            _dead_vmx_ptr = _saw_drop
+                            break
+                        if "ctx->gpr[0]" in _ks or _ks.startswith(("loc_", "if ", "goto ", "switch")) or _CTX_CALL_RE.search(_ks) or "PPU_TAIL" in _ks:
+                            break
+                        _k += 1
+                if not _dead_vmx_ptr:
+                    escaped_raw.append((val, stdu_idx is None, post_pop))
+                r_imm.pop(dst, None)
+                if lr_reg == dst:
+                    lr_reg = None
             continue
+        vm = _CS_R1_VMX_RE.match(s)
+        if vm:
+            _vr = int(vm.group(1) or vm.group(2))
+            if _vr in r_imm:
+                if vm.group(3) == "0xF" or vm.group(5):
+                    _vo = r_imm[_vr] & ~15
+                    mem_raw.append((j, _vo, stdu_idx is None, post_pop, True, s))
+                    mem_raw.append((j, _vo + 8, stdu_idx is None, post_pop, True, s))
+                else:
+                    _mask = int(vm.group(3) or vm.group(4) or "0")
+                    mem_raw.append((j, r_imm[_vr] & ~_mask, stdu_idx is None, post_pop, True, s))
+                continue
+            return body
         rest = _CS_R1_MEM_RE.sub("", s)
         if "ctx->gpr[1]" in rest:
             return body
-        offsets += [int(x, 0) for x in _CS_R1_MEM_RE.findall(s)]
-    if frame is None or pops - {frame}:
-        return body
-    drop = set()
+        if in_entry_bb and lr_reg is not None and lr_save is None:
+            mst = _CS_ST64_R1_RE.match(s)
+            if mst and int(mst.group(2)) == lr_reg:
+                lr_save = (j, mst.group(1), int(mst.group(1), 0), stdu_idx is None)
+        if s == _CS_TOC_SAVE and stdu_idx is not None and not post_pop:
+            toc_saves.append(j)
+        for x in _CS_R1_MEM_RE.findall(s):
+            mem_raw.append((j, int(x, 0), stdu_idx is None, post_pop, False, s))
+        for _dm in _CS_ANY_DEF_RE.finditer(s):
+            _dr = int(_dm.group(1))
+            r_imm.pop(_dr, None)
+            if lr_reg == _dr:
+                lr_reg = None
+
+    if frame is None:
+        if pops or has_calls or has_tail:
+            return body
+        fval = 0
+    else:
+        if pops - {frame}:
+            return body
+        fval = frame
+
+    norm_escaped = [val + (fval if (pre or post) else 0) for val, pre, post in escaped_raw]
+    norm_mem = [(j, off + (fval if (pre or post) else 0), pre, post, is_vmx, s)
+                for j, off, pre, post, is_vmx, s in mem_raw]
+    offsets = [off for _, off, _, _, _, _ in norm_mem]
+
+    drop_strs = set()
     for off, reg in func.cs_paired:
         o = int(off, 0)
         save = f"vm_write64(ctx->gpr[1] + {off}, ctx->gpr[{reg}]);"
-        hits = [x for x in offsets if o - 8 < x < o + 8 or o - frame - 8 < x < o - frame + 8]
-        if all(e <= o - 8 for e in escaped) and hits.count(o) == stripped.count(save) == 1 and len(hits) == 1:
-            drop.add(save)
+        # Compute normalized offset for save
+        save_norms = [no for _, no, _, _, _, s in norm_mem if s == save]
+        if len(save_norms) != 1 or stripped.count(save) != 1:
+            continue
+        no = save_norms[0]
+        hits = [x for x in offsets if no - 8 < x < no + 8]
+        if all(e <= no - 8 for e in norm_escaped) and len(hits) == 1:
+            drop_strs.add(save)
     for off, reg in func.csf_paired:
         o = int(off, 0)
         save = f"{{ uint64_t tmp; memcpy(&tmp, &ctx->fpr[{reg}], 8); vm_write64(ctx->gpr[1] + {off}, tmp); }}"
-        hits = [x for x in offsets if o - 8 < x < o + 8 or o - frame - 8 < x < o - frame + 8]
-        if all(e <= o - 8 for e in escaped) and hits.count(o) == stripped.count(save) == 1 and len(hits) == 1:
-            drop.add(save)
-    if not drop:
-        return body
-    return [ln for ln, s in zip(body, stripped) if s not in drop]
+        save_norms = [no for _, no, _, _, _, s in norm_mem if s == save]
+        if len(save_norms) != 1 or stripped.count(save) != 1:
+            continue
+        no = save_norms[0]
+        hits = [x for x in offsets if no - 8 < x < no + 8]
+        if all(e <= no - 8 for e in norm_escaped) and len(hits) == 1:
+            drop_strs.add(save)
+
+    drop_idx = {j for j, s in enumerate(stripped) if s in drop_strs}
+    replace_idx: dict[int, str] = {}
+    prepend: list[str] = []
+
+    # 1. Drop LR stack save & replace LR stack loads with _cs_lr
+    if frame is not None and lr_save is not None:
+        lr_j, _, lr_raw_off, lr_pre = lr_save
+        lr_norm = lr_raw_off + (fval if lr_pre else 0)
+        if lr_norm == fval + 0x10 and all(e <= lr_norm - 8 for e in norm_escaped):
+            lr_hits = [(j, no, is_vmx, s) for j, no, _, _, is_vmx, s in norm_mem if lr_norm - 8 < no < lr_norm + 8]
+            lr_loads = []
+            ok = True
+            seen_save = 0
+            for hj, hno, hvmx, hs in lr_hits:
+                if hj == lr_j:
+                    seen_save += 1
+                    continue
+                if hvmx or hno != lr_norm:
+                    ok = False; break
+                mld = _CS_LD64_R1_RE.match(hs)
+                if not mld:
+                    ok = False; break
+                lr_loads.append((hj, int(mld.group(1))))
+            if ok and seen_save == 1:
+                drop_idx.add(lr_j)
+                for lj, lreg in lr_loads:
+                    replace_idx[lj] = f"    ctx->gpr[{lreg}] = _cs_lr;"
+                prepend.append("    uint64_t _cs_lr = ctx->lr;")
+
+    # 2. Drop dead TOC save (r1 + 0x28) when TOCFIX is active
+    if toc_base and frame is not None and fval >= 0x30 and toc_saves:
+        toc_set = set(toc_saves)
+        if all(e >= 0x30 for e in norm_escaped):
+            toc_hits = [j for j, no, _, _, _, _ in norm_mem if 0x20 < no < 0x30]
+            if toc_hits and all(hj in toc_set for hj in toc_hits):
+                drop_idx.update(toc_set)
+
+    # 3. Drop dead back-chain store in pure leaf functions
+    if frame is not None and stdu_idx is not None and not has_calls and not has_tail:
+        if all(e >= 8 for e in norm_escaped) and not any(-8 < no < 8 for _, no, _, _, _, _ in norm_mem):
+            replace_idx[stdu_idx] = f"    ctx->gpr[1] += -0x{fval:X};"
+
+    out = []
+    if prepend:
+        out.extend(prepend)
+    for j, ln in enumerate(body):
+        if j in drop_idx:
+            continue
+        out.append(replace_idx.get(j, ln))
+
+    # 4. Fold GPR->FPR std->lfd and 4x stfs->lvx stack round-trips
+    out = _fold_stack_roundtrips(out, fval, norm_escaped)
+    return out
 
 
 @dataclass
@@ -2781,24 +3237,38 @@ class PPULifter:
             ra = _reg_idx(ops[1])
             rb = _reg_idx(ops[2])
             return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
-                    f"vmx_{mn[:4]}(&ctx->vr[{vd}], VM_RAW_LD(uint64_t, ea & ~0xFULL), "
-                    f"VM_RAW_LD(uint64_t, (ea & ~0xFULL) + 8), (uint32_t)(ea & 0xF)); }}")
+                    f"vmx_{mn[:4]}_v(&ctx->vr[{vd}], vm_raw_ld128(ea & ~0xFULL), (uint32_t)(ea & 0xF)); }}")
 
-        if mn == "lvebx" or mn == "lvehx" or mn == "lvewx":
+        if mn == "lvewx":
             vd = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
             ra = _reg_idx(ops[1])
             rb = _reg_idx(ops[2])
-            size = {"lvebx": 1, "lvehx": 2, "lvewx": 4}[mn]
+            return (f"{{ uint64_t ea = ({_xea(ra,rb)}) & ~3ULL; "
+                    f"vmx_st(&ctx->vr[{vd}], _mm_setzero_si128()); "
+                    f"ctx->vr[{vd}].w[3u - (((uint32_t)ea & 12u) >> 2)] = vm_read32(ea); }}")
+
+        if mn == "lvebx" or mn == "lvehx":
+            vd = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
+            ra = _reg_idx(ops[1])
+            rb = _reg_idx(ops[2])
+            size = {"lvebx": 1, "lvehx": 2}[mn]
             return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
                     f"ea &= ~{size - 1}ULL; uint8_t _t[16] = {{0}}; "
                     f"{{ uint{size*8}_t _e = VM_RAW_LD(uint{size*8}_t, ea); "
                     f"memcpy(_t + (ea & 15), &_e, {size}); }} vmx_rev(&ctx->vr[{vd}], _t); }}")
 
-        if mn == "stvebx" or mn == "stvehx" or mn == "stvewx":
+        if mn == "stvewx":
             vs = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
             ra = _reg_idx(ops[1])
             rb = _reg_idx(ops[2])
-            size = {"stvebx": 1, "stvehx": 2, "stvewx": 4}[mn]
+            return (f"{{ uint64_t ea = ({_xea(ra,rb)}) & ~3ULL; "
+                    f"vm_write32(ea, ctx->vr[{vs}].w[3u - (((uint32_t)ea & 12u) >> 2)]); }}")
+
+        if mn == "stvebx" or mn == "stvehx":
+            vs = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
+            ra = _reg_idx(ops[1])
+            rb = _reg_idx(ops[2])
+            size = {"stvebx": 1, "stvehx": 2}[mn]
             return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
                     f"ea &= ~{size - 1}ULL; "
                     f"{{ uint8_t _t[16]; vmx_rev(_t, &ctx->vr[{vs}]); uint{size*8}_t _e; memcpy(&_e, _t + (ea & 15), {size}); "
@@ -3132,7 +3602,7 @@ class PPULifter:
         clean = lambda m: m.group(1) if int(m.group(2), 16) in func_by_addr and int(m.group(2), 16) not in self.wrap \
             else m.group(0)
         body = [_CALL_DRAIN_RE.sub(clean, b) if "DRAIN" in b else b for b in func.body_lines]
-        body = _vfp_clean(_elide_ca(_fuse_cr(drop_callee_saves(func, body, self._emit_starts, func_by_addr, self._emit_snap_bodies),
+        body = _vfp_clean(_elide_ca(_fuse_cr(drop_callee_saves(func, body, self._emit_starts, func_by_addr, self._emit_snap_bodies, self.toc_base),
                                              self._cr_entry, self._cr_keep)))
 
         if func.fallthrough_to:
@@ -3596,7 +4066,7 @@ def _worker_lift(task):
         insns = disassemble_bytes(blob, start, _WORKER_STATE["be"]) if blob else []
         f = lifter.lift_function(insns, start, end)
         results.append((f.name, f.start_addr, f.end_addr, f.body_lines, f.calls,
-                        f.fallthrough_to))
+                        f.fallthrough_to, f.cs_paired, f.csf_paired))
     return idx0, results, lifter.call_targets, lifter.branch_targets
 
 
@@ -3635,10 +4105,11 @@ def _parallel_lift(lifter, func_bounds, segs, big_endian, jobs):
         raise
 
     for idx0 in sorted(results_by_idx):
-        for name, s, e, body, calls, ft in results_by_idx[idx0]:
+        for name, s, e, body, calls, ft, csp, csfp in results_by_idx[idx0]:
             lifter.functions.append(LiftedFunction(
                 name=name, start_addr=s, end_addr=e,
-                body_lines=body, calls=calls, fallthrough_to=ft))
+                body_lines=body, calls=calls, fallthrough_to=ft,
+                cs_paired=csp, csf_paired=csfp))
 
 
 def main() -> None:

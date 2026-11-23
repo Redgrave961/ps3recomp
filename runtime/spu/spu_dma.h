@@ -22,9 +22,26 @@ extern void (*g_rsx_window_write)(void);
 
 static inline void spu_rsx_window_check(uint32_t ea, uint32_t size)
 {
-    vm_track_write(ea, size);
+    if (__builtin_expect(size <= 4096u && ((ea & 4095u) + size <= 4096u), 1)) {
+        const uint32_t p = ea >> VM_SLOW_PAGE_SHIFT;
+        const unsigned char flags = __atomic_load_n(&ppu_slow_page[p], __ATOMIC_RELAXED);
+        if (__builtin_expect((flags & (VM_PAGE_TRACKED | 2u)) == 0, 1)) {
+            void (*notify)(void) = g_rsx_window_write;
+            if (__builtin_expect(notify != 0 && ea < ppu_hle_inject_base + 0xB000u && (uint64_t)ea + size > ppu_hle_inject_base, 0))
+                notify();
+            return;
+        }
+        if (__builtin_expect(flags & VM_PAGE_TRACKED, 0))
+            vm_track_dirty(p);
+    } else {
+        vm_track_write(ea, size);
+    }
     void (*notify)(void) = g_rsx_window_write;
-    if (notify && ((ea < ppu_hle_inject_base + 0xB000u && (uint64_t)ea + size > ppu_hle_inject_base) || vm_watched(ea, size))) notify();
+    if (__builtin_expect(notify != 0, 1)) {
+        if (__builtin_expect((ea < ppu_hle_inject_base + 0xB000u && (uint64_t)ea + size > ppu_hle_inject_base) ||
+                             vm_watched(ea, size), 0))
+            notify();
+    }
 }
 
 static inline const unsigned char* mfc_coh_bits(void)
@@ -41,12 +58,20 @@ static inline int mfc_line_reserved(const unsigned char* bits, uint32_t addr)
 static inline int mfc_span_reserved(const unsigned char* bits, uint32_t first, uint32_t last)
 {
     if (!bits) return 0;
+    if (__builtin_expect(first == last, 1)) return mfc_line_reserved(bits, first);
     const uint32_t l0 = first >> SPU_COH_LINE_SHIFT, l1 = last >> SPU_COH_LINE_SHIFT;
     const uint32_t b0 = l0 >> 3, b1 = l1 >> 3;
     const unsigned lo = 0xFFu << (l0 & 7u), hi = 0xFFu >> (7u - (l1 & 7u));
     if (b0 == b1) return (__atomic_load_n(&bits[b0], __ATOMIC_RELAXED) & lo & hi) != 0;
     if (__atomic_load_n(&bits[b0], __ATOMIC_RELAXED) & lo) return 1;
-    for (uint32_t b = b0 + 1u; b < b1; b++)
+    uint32_t b = b0 + 1u;
+    while (b + 8u <= b1) {
+        uint64_t w;
+        memcpy(&w, bits + b, 8);
+        if (w) return 1;
+        b += 8u;
+    }
+    for (; b < b1; b++)
         if (__atomic_load_n(&bits[b], __ATOMIC_RELAXED)) return 1;
     return (__atomic_load_n(&bits[b1], __ATOMIC_RELAXED) & hi) != 0;
 }
@@ -67,12 +92,13 @@ typedef uint8_t mfc_v32 __attribute__((vector_size(32)));
 
 static inline void mfc_copy(uint8_t* d, const uint8_t* s, uint32_t n)
 {
-    mfc_v16 a, b;
+    mfc_v16 a;
     mfc_v32 w, x, y, z;
     if (n - 16u > 112u) {
         if (n > 128u) {
             uint32_t i = 0;
             for (; i + 128u <= n; i += 128u) {
+                if (i + 256u < n) __builtin_prefetch(s + i + 256u, 0, 0);
                 memcpy(&w, s + i,      32); memcpy(&x, s + i + 32, 32);
                 memcpy(&y, s + i + 64, 32); memcpy(&z, s + i + 96, 32);
                 memcpy(d + i,      &w, 32); memcpy(d + i + 32, &x, 32);
@@ -101,8 +127,9 @@ static inline void mfc_copy(uint8_t* d, const uint8_t* s, uint32_t n)
         memcpy(d, s, n);
         return;
     }
-    if (n <= 32) { memcpy(&a, s, 16); memcpy(&b, s + n - 16, 16); memcpy(d, &a, 16); memcpy(d + n - 16, &b, 16); return; }
-    if (n <= 64) { memcpy(&w, s, 32); memcpy(&x, s + n - 32, 32); memcpy(d, &w, 32); memcpy(d + n - 32, &x, 32); return; }
+    if (n == 16u) { memcpy(&a, s, 16); memcpy(d, &a, 16); return; }
+    if (n == 32u) { memcpy(&w, s, 32); memcpy(d, &w, 32); return; }
+    if (n <= 64u) { memcpy(&w, s, 32); memcpy(&x, s + n - 32, 32); memcpy(d, &w, 32); memcpy(d + n - 32, &x, 32); return; }
     memcpy(&w, s, 32); memcpy(&x, s + 32, 32); memcpy(&y, s + n - 64, 32); memcpy(&z, s + n - 32, 32);
     memcpy(d, &w, 32); memcpy(d + 32, &x, 32); memcpy(d + n - 64, &y, 32); memcpy(d + n - 32, &z, 32);
 }

@@ -218,6 +218,10 @@ private:
     VkSampler m_dummy_sampler = VK_NULL_HANDLE;
     uint64_t m_program_hash = 0;
     u32 m_vertex_dims = 0;
+    u32 m_fp_tex_dims = 0;
+    u32 m_fp_tex_shadow = 0;
+    u32 m_fp_tex_alphakill = 0;
+    bool m_fp_tex_valid = false;
     const vertex_program* m_constants_vp = nullptr;
     VkDescriptorBufferInfo m_constants{};
     const vertex_program* m_vp = nullptr;
@@ -230,6 +234,9 @@ private:
     struct fp_candidate {
         const fragment_program* fp = nullptr;
         u32 count = 0;
+        u32 stamp = 0;
+        u8 dirty_hits = 0;
+        bool tracked = false;
         std::vector<u32> code;
     };
     struct fp_lookup {

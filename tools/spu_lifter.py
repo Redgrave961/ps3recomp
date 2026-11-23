@@ -213,15 +213,38 @@ def compute_bi_r0_jumps(insns, bounds) -> set:
     return jumps
 
 
-def merge_chunk_groups(insns, bounds, max_insns, entry_points=()) -> dict:
+def merge_chunk_groups(insns, bounds, max_insns, entry_points=(), return_entries=()) -> dict:
     call_targets = set(entry_points)
+    branch_targets = set()
+    by_addr = {ins.addr: ins for ins in insns}
     for ins in insns:
         if ins.mnemonic in ("brsl", "brasl"):
             tgt = SPULifter._branch_target(ins)
             if tgt is not None:
                 call_targets.add(tgt)
-    groups = {}
+        elif ins.mnemonic in ("br", "bra", "brz", "brnz", "brhz", "brhnz"):
+            tgt = SPULifter._branch_target(ins)
+            if tgt is not None:
+                branch_targets.add(tgt)
     ordered = sorted(bounds)
+    ret_set = set(return_entries)
+    _uncond = {"br", "bra", "bi", "iret", "stop", "stopd"}
+    for idx_b, (s, e) in enumerate(ordered):
+        for a in range(s, min(e, s + 200), 4):
+            ins = by_addr.get(a)
+            if ins is None:
+                break
+            if ins.mnemonic == "stqd" and "($r1)" in ins.operands:
+                if (ins.operands.startswith("$r1, -")
+                        or ins.operands.startswith("$r0, 0x10($r1)")
+                        or ins.operands.startswith("$r0, 16($r1)")):
+                    call_targets.add(s)
+                    break
+        if idx_b > 0 and s == ordered[idx_b - 1][1]:
+            prev_last = by_addr.get(ordered[idx_b - 1][1] - 4)
+            if prev_last and prev_last.mnemonic in _uncond and s not in branch_targets and s not in ret_set:
+                call_targets.add(s)
+    groups = {}
     i = 0
     while i < len(ordered):
         start, end = ordered[i]
@@ -330,7 +353,8 @@ class SPULifter:
         self.bi_r0_jump: set = set()
         self.link_return: set = set()
         self.promote = True
-        self.promote_regs = 2
+        self.promote_regs = 16
+        self.has_irq_enable = True
         self.defer = False
         self._pending: list = []
         self._prom = False
@@ -405,6 +429,12 @@ class SPULifter:
                 new.add(("c", d))
             elif mn == "selb" and ("c", r[1]) in s and ("c", r[2]) in s and ("m", r[3]) in s:
                 new.add(("c", d))
+            elif mn == "shufb":
+                kv = const.get(r[3])
+                if kv in (0x00010203, 0x04050607, 0x08090A0B, 0x0C0D0E0F) and ("c", r[1]) in s:
+                    new.add(("c", d))
+                elif kv in (0x10111213, 0x14151617, 0x18191A1B, 0x1C1D1E1F) and ("c", r[2]) in s:
+                    new.add(("c", d))
             return frozenset(f for f in s if f[1] != d) | new
 
         out = [None] * n
@@ -717,21 +747,32 @@ class SPULifter:
         self._prom = self.promote and not self.trace
         self._regs = set()
         fins = [i for i in insns if start <= i.addr < end]
-        self._jt_targets = [] if self.reloc else sorted(merged_starts & {i.addr for i in fins})
+        has_computed_bi = False
+        for _ins in fins:
+            if _ins.mnemonic in ("bi", "biz", "binz", "bihz", "bihnz"):
+                _tr = _bi_target_reg(_ins)
+                if _tr is not None and not ((_tr == "0" and _ins.addr not in self.bi_r0_jump)
+                                            or _ins.addr in self.link_return):
+                    has_computed_bi = True
+                    break
+        self._jt_targets = [] if (self.reloc or not has_computed_bi) else sorted(merged_starts & {i.addr for i in fins})
+        jt_set = set(self._jt_targets)
+        irq_starts = merged_starts if self.has_irq_enable else set()
+        entry_starts = jt_set | irq_starts
         texts = []
         last_insn = None
-        copies = {} if self.trace else self._copy_loops(fins, internal | merged_starts)
+        copies = {} if self.trace else self._copy_loops(fins, internal | entry_starts)
         if not self.trace and copies:
             for _la, _ls in self._lzf_loops(fins, copies).items():
                 copies[_la] = _ls + copies.get(_la, "")
-        facts = self._known_facts(fins, merged_starts)
-        zs_need = self._zero_sign_needed(fins, merged_starts)
+        facts = self._known_facts(fins, entry_starts)
+        zs_need = self._zero_sign_needed(fins, entry_starts)
         for k, insn in enumerate(fins):
             self._facts = facts[k]
             self._zs_need = zs_need[k]
-            if insn.addr in internal or insn.addr in merged_starts:
+            if insn.addr in internal or insn.addr in entry_starts:
                 func.body_lines.append(f"loc_{insn.addr:08X}:")
-            if insn.addr in merged_starts:
+            if insn.addr in irq_starts:
                 func.body_lines.append(
                     f"    if (ctx->int_enable && (ctx->event_status & ctx->event_mask)) "
                     f"{{ ctx->pc = {self._pc(insn.addr)}; @I{k}@ g_spu_trampoline_fn = "
@@ -760,7 +801,7 @@ class SPULifter:
             else:
                 func.body_lines.append(f"    @O{last_k}@")
         if any("(_ls, " in t for t in texts):
-            func.body_lines.insert(0, "    uint8_t* const _ls = ctx->ls;")
+            func.body_lines.insert(0, "    uint8_t* __restrict const _ls = ctx->ls;")
 
         body_insns = [i for i in insns if start <= i.addr < end]
         if body_insns and all(i.mnemonic in ("nop", "lnop", "br", "bra")
@@ -924,13 +965,61 @@ class SPULifter:
             return self._spill(bits(v))
 
         func.body_lines = [tok.sub(sub, b) for b in func.body_lines]
-        func.body_lines.insert(0, "    u128 " + ", ".join(f"sr{r} = ctx->gpr[{r}]" for r in sorted(regs)) + ";")
+        # Only initialize sr{r} from ctx->gpr[r] when sr{r} may be read or spilled before being written.
+        sr_ref = re.compile(r"\bsr(\d+)\b")
+        sr_use = []
+        sr_kill = []
+        for k, ins in enumerate(fins):
+            cnt: dict = {}
+            for r in sr_ref.findall(texts[k]):
+                ri = int(r)
+                if ri in regs:
+                    cnt[ri] = cnt.get(ri, 0) + 1
+            d = _dest_reg(ins)
+            own = (d in regs and ins.mnemonic not in _NO_RT_WRITE
+                   and f"@R{k}@" not in texts[k]
+                   and bool(re.match(rf"sr{d} = (?!=)", texts[k].rpartition("} ")[2])))
+            if own:
+                cnt[d] -= 1
+            u = sum(1 << r for r, v in cnt.items() if v > 0)
+            if f"@S{k}@" in texts[k]:
+                u |= d_in[k] if ins.mnemonic in ("rdch", "rchcnt") else (d_in[k] | mask[k])
+            if self.has_irq_enable and k and ins.addr in getattr(self, "func_starts", ()):
+                u |= d_in[k]
+            if k == n - 1 and f"@O{k}@" in func.body_lines[-1]:
+                u |= (d_out[k] or 0)
+            sr_use.append(u)
+            sr_kill.append(1 << d if own else 0)
+        # Check if fallthrough spill @O{n-1}@ was already substituted at end of body_lines
+        if n > 0 and (d_out[n - 1] or 0) and not succ[n - 1]:
+            sr_use[n - 1] |= (d_out[n - 1] or 0)
+        sr_live = [0] * n
+        changed_l = True
+        while changed_l:
+            changed_l = False
+            for k in range(n - 1, -1, -1):
+                lo = 0
+                for s in succ[k]:
+                    lo |= sr_live[s]
+                v = sr_use[k] | (lo & ~sr_kill[k])
+                if v != sr_live[k]:
+                    sr_live[k] = v
+                    changed_l = True
+        live_entry = sr_live[0] if n else full
+        used_sr = {int(r) for b in func.body_lines for r in sr_ref.findall(b)}
+        decl_regs = [r for r in sorted(regs) if r in used_sr]
+        if decl_regs:
+            func.body_lines.insert(
+                0, "    u128 " + ", ".join(
+                    f"sr{r} = ctx->gpr[{r}]" if (live_entry >> r) & 1 else f"sr{r}"
+                    for r in decl_regs) + ";")
 
     def _locals(self, func: LiftedFunction, fins, texts, succ, regs) -> None:
         n = len(fins)
         every = (1 << 128) - 1
         ref = re.compile(r"ctx->gpr\[(\d+)\]|\bsr(\d+)\b")
-        starts = set(getattr(self, "func_starts", ()))
+        jt = {int(a, 16) for t in texts for a in re.findall(r"case 0x([0-9A-F]+)u: goto", t)}
+        starts = (set(getattr(self, "func_starts", ())) if self.has_irq_enable else set()) | jt
         use, kill, wall = [], [], []
         for k, ins in enumerate(fins):
             cnt: dict = {}
@@ -1208,7 +1297,16 @@ class SPULifter:
             return f"{g(rt())} = spu_selb({g(ra())}, {g(rb())}, {g(rc)});"
         if mn == "shufb":
             rc = _reg(ops[3])
-            return f"{g(rt())} = spu_shufb{'_ins' if ('i', int(rc)) in self._facts else ''}({g(ra())}, {g(rb())}, {g(rc)});"
+            rc_i = int(rc)
+            for _f in self._facts:
+                if _f[0] == "k" and _f[1] == rc_i:
+                    _kv = _f[2]
+                    if _kv in (0x00010203, 0x04050607, 0x08090A0B, 0x0C0D0E0F):
+                        return f"{g(rt())} = spu_splat_w({g(ra())}, {(_kv >> 24) >> 2});"
+                    if _kv in (0x10111213, 0x14151617, 0x18191A1B, 0x1C1D1E1F):
+                        return f"{g(rt())} = spu_splat_w({g(rb())}, {((_kv >> 24) - 16) >> 2});"
+                    break
+            return f"{g(rt())} = spu_shufb{'_ins' if ('i', rc_i) in self._facts else ''}({g(ra())}, {g(rb())}, {g(rc)});"
         if mn == "mpya":
             rc = _reg(ops[3])
             return f"{g(rt())} = spu_mpya({g(ra())}, {g(rb())}, {g(rc)});"
@@ -1257,6 +1355,12 @@ class SPULifter:
             latch = _MFC_LATCH.get(ch)
             if latch:
                 return f"ctx->{latch[0]} = spu_pref_word({g(_reg(ops[1]))}){latch[1]};"
+            if ch in ("23", "MFC_WrTagUpdate"):
+                return (f"if (__builtin_expect(!(ctx->event_mask & 1u), 1)) "
+                        f"ctx->mfc_tag_status = ctx->mfc_tag_mask & ~ctx->list_stall_mask; "
+                        f"else spu_wrch(ctx, {ch}, {g(_reg(ops[1]))});")
+            if ch in ("21", "MFC_Cmd"):
+                return f"spu_wrch(ctx, {ch}, {g(_reg(ops[1]))});"
             return f"@SPILL@ spu_wrch(ctx, {ch}, {g(_reg(ops[1]))});"
 
         if mn in ("br", "bra"):
@@ -1381,7 +1485,7 @@ class SPULifter:
     def emit_source(self,header_name: str) -> str:
         lines = [SOURCE_PREAMBLE.format(header_name=header_name), ""]
         for f in self.functions:
-            lines.append(f"void {f.name}(spu_context* ctx) {{")
+            lines.append(f"void {f.name}(spu_context* __restrict ctx) {{")
             for b in f.body_lines:
                 lines.append(b if b.endswith(":") else f"    {b}")
             lines.append("}")
@@ -1394,7 +1498,7 @@ class SPULifter:
             lines.append(" * function detector did not seed (typically conditional")
             lines.append(" * branches that escape a function's range). */")
             for t in externs:
-                lines.append(f"void {self.prefix}spu_func_{t:08X}(spu_context* ctx) {{")
+                lines.append(f"void {self.prefix}spu_func_{t:08X}(spu_context* __restrict ctx) {{")
                 pc = self._pc(t) if self.reloc else f"0x{t:X}u"
                 lines.append(f"    ctx->pc = {pc}; "
                              f"g_spu_trampoline_fn = spu_indirect_branch; return;")
@@ -1526,11 +1630,13 @@ def main() -> None:
         else:
             bounds = [(base, base + len(data))]
 
+    rets_set = set()
     if args.return_entries:
         hi = args.code_end or (base + len(data))
         rets = sorted({i.addr + 4 for i in disassemble_spu(data, base)
                        if i.mnemonic in ("brsl", "brasl", "bisl", "bisled")
                        and i.addr + 4 < hi})
+        rets_set = set(rets)
         newb = []
         for (s0, e0) in sorted(set(bounds)):
             cuts = [a for a in rets if s0 < a < e0]
@@ -1583,6 +1689,11 @@ def main() -> None:
     lifter = SPULifter(trace=args.trace, prefix=args.symbol_prefix)
     lifter.reloc = args.reloc
     lifter.promote = not args.no_promote
+    _in_bounds = lambda a: any(s <= a < e for s, e in bounds)
+    lifter.has_irq_enable = any(
+        (i.raw & 0x40000) != 0 and i.mnemonic in ("bi", "bisl", "bisled", "iret", "biz", "binz", "bihz", "bihnz")
+        and _in_bounds(i.addr)
+        for i in insns)
     lifter.defer = True
     lifter.bi_r0_jump = compute_bi_r0_jumps(insns, bounds)
     if lifter.bi_r0_jump:
@@ -1600,7 +1711,7 @@ def main() -> None:
         seeds = {base}
         if args.extra_funcs:
             seeds |= {int(x, 0) for x in args.extra_funcs.split(",") if x.strip()}
-        groups = merge_chunk_groups(insns, bounds, 4000, entry_points=seeds)
+        groups = merge_chunk_groups(insns, bounds, 4000, entry_points=seeds, return_entries=rets_set)
         print(f"  {len(groups)} merged function group(s) "
               f"(--merge-chunks, max 4000 insns)")
     for s, e in bounds:

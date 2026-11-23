@@ -129,6 +129,12 @@ VMX_INL void vmx_lvlx(VMX_D, uint64_t lo, uint64_t hi, uint32_t sh) {
 VMX_INL void vmx_lvrx(VMX_D, uint64_t lo, uint64_t hi, uint32_t sh) {
     vmx_st(d_, _mm_shuffle_epi8(_mm_set_epi64x((long long)hi, (long long)lo), _mm_sub_epi8(_mm_set1_epi8((char)(sh - 1)), vmx_iota())));
 }
+VMX_INL void vmx_lvlx_v(VMX_D, __m128i raw, uint32_t sh) {
+    vmx_st(d_, _mm_shuffle_epi8(raw, _mm_sub_epi8(_mm_set1_epi8((char)(0x7F + sh)), vmx_iota())));
+}
+VMX_INL void vmx_lvrx_v(VMX_D, __m128i raw, uint32_t sh) {
+    vmx_st(d_, _mm_shuffle_epi8(raw, _mm_sub_epi8(_mm_set1_epi8((char)(sh - 1)), vmx_iota())));
+}
 
 VMX_INL void vmx_vavgub(VMX_D, VMX_A, VMX_B) { vmx_st(d_, _mm_avg_epu8(vmx_ld(a_), vmx_ld(b_))); }
 VMX_INL void vmx_vavguh(VMX_D, VMX_A, VMX_B) { vmx_st(d_, _mm_avg_epu16(vmx_ld(a_), vmx_ld(b_))); }
@@ -269,6 +275,7 @@ VMX_INL void name(VMX_D, VMX_A, VMX_B, uint32_t vscr) { (void)vscr; \
     const __m128 x = vmx_ldf(a_), y = vmx_ldf(b_); vmx_stf(d_, op); }
 VMX_FBIN(vmx_vaddfp, _mm_add_ps(x, y))
 VMX_FBIN(vmx_vsubfp, _mm_sub_ps(x, y))
+VMX_FBIN(vmx_vmulfp, _mm_mul_ps(x, y))
 
 #define VMX_FMINMAX(name, op) \
 VMX_INL void name(VMX_D, VMX_A, VMX_B, uint32_t vscr) { (void)vscr; \
@@ -312,6 +319,10 @@ VMX_INL void name(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) { \
     vmx_stf(d_, vmx_flushv(vmx_fixv(expr), vscr)); }
 VMX_FMA(vmx_vmaddfp, _mm_fmadd_ps(x, z, y))
 VMX_FMA(vmx_vnmsubfp, _mm_fnmadd_ps(x, z, y))
+VMX_INL void vmx_vmulfp(VMX_D, VMX_A, VMX_C, uint32_t vscr) {
+    const __m128i neg0 = _mm_set1_epi32(INT32_MIN);
+    vmx_vmaddfp(d_, a_, &neg0, c_, vscr);
+}
 
 #define VMX_FUN(name, expr, flush_in) \
 VMX_INL void name(VMX_D, VMX_B, uint32_t vscr) { __m128 f = vmx_ldf(b_); \

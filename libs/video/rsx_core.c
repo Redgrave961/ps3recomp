@@ -95,7 +95,7 @@ static u16 s_next_core[RSX_3D_REGS + 1u];
 
 static inline u32 rsx_load(u32 ea)
 {
-    return __builtin_bswap32(__atomic_load_n((const u32*)(vm_base + ea), __ATOMIC_SEQ_CST));
+    return __builtin_bswap32(__atomic_load_n((const u32*)(vm_base + ea), __ATOMIC_ACQUIRE));
 }
 
 static inline void rsx_store_control(u32 ea, u32 value)
@@ -733,27 +733,51 @@ static DWORD WINAPI rsx_fifo_thread(LPVOID unused)
             rsx_run_args(put);
             continue;
         }
-        const u32 ea = rsx_io_to_ea(s.get);
-        if (!ea) {
+        // Fast batched loop over commands within the same 1MB I/O page while s.get != put.
+        const u32 page_id = s.get >> 20;
+        const u32 page_base = (page_id < RSX_IO_PAGES) ? s.io_ea[page_id] : 0u;
+        if (!page_base) {
             rsx_fault("get unmapped", s.get, 0);
             rsx_wait_change(put);
             continue;
         }
-        const u32 cmd = rsx_load(ea);
-        if (cmd & 0xA0030003u) {
-            rsx_control(cmd, put);
-            continue;
+        const u32 page_end = (page_id + 1u) << 20;
+        const u32 limit = (put > s.get && put < page_end) ? put : page_end;
+        u32 cmds = 0;
+        while (s.get < limit) {
+            const u32 cmd = __builtin_bswap32(*(const u32*)(vm_base + page_base + (s.get & 0xFFFFFu)));
+            if (__builtin_expect((cmd & 0xA0030003u) != 0u, 0)) {
+                rsx_control(cmd, put);
+                break;
+            }
+            const u32 count = (cmd >> 18) & 0x7FFu;
+            s.get += 4u;
+            if (!count) continue;
+            u32 reg = cmd & 0xFFFCu;
+            const u32 inc = (cmd & 0x40000000u) ? 0u : 4u;
+            const u32 avail = (limit - s.get) >> 2;
+            if (__builtin_expect(count <= avail, 1)) {
+                const u32* be = (const u32*)(vm_base + page_base + (s.get & 0xFFFFFu));
+                u32 done = 0;
+                while (done < count) {
+                    const u32 k = rsx_dispatch(reg, inc, be + done, count - done);
+                    reg += inc * k;
+                    done += k;
+                }
+                s.get += count << 2;
+                if (++cmds >= 32u) {
+                    rsx_publish_get_fast();
+                    break;
+                }
+            } else {
+                s.method_reg = reg;
+                s.method_inc = inc;
+                s.method_left = count;
+                rsx_run_args(put);
+                break;
+            }
         }
-        const u32 count = (cmd >> 18) & 0x7FFu;
-        s.get += 4u;
-        if (!count) {
-            rsx_publish_get_fast();
-            continue;
-        }
-        s.method_reg = cmd & 0xFFFCu;
-        s.method_inc = (cmd & 0x40000000u) ? 0u : 4u;
-        s.method_left = count;
-        rsx_run_args(put);
+        rsx_publish_get_fast();
     }
 }
 

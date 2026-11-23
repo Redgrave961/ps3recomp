@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <immintrin.h>
 #include <iterator>
 
 namespace rsx {
@@ -297,11 +298,35 @@ u32 frontend::constant_methods(u32 index, u32 inc, const u32* be, u32 count)
     const u32 first = load * 4u + index;
     if (first >= limit) return count;
     const u32 w = std::min(n, limit - first);
+    const u32* src = be + skip;
+    u32* dst = constants + first;
     bool changed = false;
-    for (u32 i = 0; i < w && !changed; i++) changed = constants[first + i] != swap(be[skip + i]);
+    u32 i = 0;
+#ifdef __AVX2__
+    const __m256i shuf = _mm256_setr_epi8(
+        3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12,
+        3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
+    for (; i + 8u <= w; i += 8u) {
+        const __m256i v = _mm256_shuffle_epi8(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + i)), shuf);
+        const __m256i d = _mm256_xor_si256(v, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(dst + i)));
+        if (!_mm256_testz_si256(d, d)) { changed = true; break; }
+    }
+#endif
+    if (!changed) {
+        for (; i < w; i++) {
+            if (dst[i] != swap(src[i])) { changed = true; break; }
+        }
+    }
     if (!changed) return count;
     if (in_begin_end) flush_ranges();
-    for (u32 i = 0; i < w; i++) constants[first + i] = swap(be[skip + i]);
+    u32 j = i;
+#ifdef __AVX2__
+    for (; j + 8u <= w; j += 8u) {
+        const __m256i v = _mm256_shuffle_epi8(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + j)), shuf);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + j), v);
+    }
+#endif
+    for (; j < w; j++) dst[j] = swap(src[j]);
     dirty |= D_VERTEX_CONSTANTS;
     return count;
 }

@@ -628,7 +628,7 @@ static uint32_t ss_idle_slots(const uint8_t* l)
         const uint32_t rdy = (rc > 8 ? 8 : rc) + (idle > 8 ? 8 : idle);
         if (mc <= ct) continue;
         if (rc != 0 && rdy > ct) n += (rdy < mc ? rdy : mc) - ct;
-        else if (((sig | fm) >> (15 - i)) & 1) n++;
+        else if (!l[0x30 + i] && (((sig | fm) >> (15 - i)) & 1)) n++;
     }
     return n;
 }
@@ -2140,7 +2140,7 @@ static void jc_commit(spu_context* c, jc_state* s)
     jc_unhold(s);
 }
 
-static void jc_ready(spu_context* c, const uint32_t r[4], uint32_t m8)
+static void jc_ready(spu_context* c, const uint32_t r[4], uint32_t m8, int extra_jobs)
 {
     uint8_t* ls = c->ls;
     uint8_t* l = ls + 0x4A00;
@@ -2150,7 +2150,13 @@ static void jc_ready(spu_context* c, const uint32_t r[4], uint32_t m8)
     } else if (!l[0x24]) {
         want = l[0x28];
     } else {
-        want = (uint32_t)__builtin_popcount(l[0x25]) + 1;
+        const uint32_t active = (uint32_t)__builtin_popcount(l[0x25]);
+        if (r[0] && extra_jobs >= 0) {
+            want = active + (uint32_t)extra_jobs;
+            if (want > l[0x28]) want = l[0x28];
+        } else {
+            want = active + 1;
+        }
         if (l[0x2E] > want && r[0]) return;
     }
     if (want == l[0x2E]) return;
@@ -2162,12 +2168,52 @@ static void jc_ready(spu_context* c, const uint32_t r[4], uint32_t m8)
     l[0x2E] = (uint8_t)want;
 }
 
+static int jc_count_ahead(const uint8_t* l, uint64_t pc_after)
+{
+    const uint32_t cap = l[0x28];
+    uint32_t cnt = 0;
+    int exact = 0;
+    uint64_t cur = pc_after;
+    for (uint32_t step = 0; step < 32u; step++, cur += 8u) {
+        if (!mfc_ea_valid(cur, 8u)) break;
+        const uint64_t cmd = g64(vm_base + (uint32_t)cur);
+        if (!cmd) continue;
+        if (!(cmd & 7u)) {
+            cnt++;
+            if (cnt >= cap) { exact = 1; break; }
+            continue;
+        }
+        const uint32_t lo = (uint32_t)cmd;
+        const uint32_t op = lo & 7u;
+        if (op == 6u) {
+            const uint64_t t = cmd & ~7ull;
+            if (t && mfc_ea_valid(t, 16u)) {
+                cnt += g32(vm_base + (uint32_t)t);
+                if (cnt >= cap) { exact = 1; break; }
+                continue;
+            }
+            break;
+        }
+        if (op == 3u) {
+            const uint64_t t = cmd & ~7ull;
+            if (t && mfc_ea_valid(t, 8u)) { cur = t - 8u; continue; }
+            break;
+        }
+        const uint32_t x = lo & 0x7Fu;
+        if (op == 2u || x == 0x0Fu || x == 0x7Fu || (x == 0x77u && !(uint32_t)g64(l + 0x18)))
+            exact = 1;
+        break;
+    }
+    return (cnt > 0 || exact) ? (int)(cnt > cap ? cap : cnt) : 1;
+}
+
 static void jc_fetch(spu_context* c, jc_state* s, uint32_t busy, uint32_t lp, uint32_t r[4])
 {
     uint8_t* ls = c->ls;
     uint8_t* l = ls + 0x4A00;
     uint8_t* p = ls + 0x4A80;
     const uint32_t m8 = bit32(g32(p)) & 0xFF, tag = g32(ls + 0x4A9C);
+    int extra_jobs = -1;
     jc_lock(c, s);
     if (l[0x22] & m8) {
         l[0x22] = (uint8_t)(l[0x22] & ~m8);
@@ -2209,16 +2255,28 @@ static void jc_fetch(spu_context* c, jc_state* s, uint32_t busy, uint32_t lp, ui
         if (p[6] || (r[1] & 4)) goto tail;
         const uint32_t slot = l[0x20];
         if (g32(l + 0x50 + 16 * slot)) {
-            if (p[11]) jc_grab(c, r);
-            else r[0] = r[1] = r[2] = r[3] = 0;
+            if (p[11]) {
+                jc_grab(c, r);
+                extra_jobs = (int)g32(l + 0x50 + 16 * l[0x20]);
+            } else {
+                r[0] = r[1] = r[2] = r[3] = 0;
+            }
             goto tail;
         }
         const uint64_t pc = g64(l);
-        atomic_cmd(c, 0x3FB80, pc & ~0x7Full, MFC_GETLLAR_CMD);
+        const uint64_t pc_line = pc & ~0x7Full;
+        if (!mfc_ea_valid(pc_line, MFC_ATOMIC_LINE)) mfc_fault(c, "jc_fetch", MFC_GET_CMD, 0x3FB80, pc_line, MFC_ATOMIC_LINE);
+        memcpy(ls + 0x3FB80, vm_base + (uint32_t)pc_line, MFC_ATOMIC_LINE);
         const uint32_t i = ((uint32_t)pc & 0x7F) >> 3, max = g16(l + 0x72);
         const uint32_t n = (int32_t)(16 - i) > (int32_t)max ? max : 16 - i;
         jc_process(c, s, 0x3FB80 + 8 * i, n, 0, 0x3FB80, r);
-        if (!r[0] && g32(l + 0x50 + 16 * slot) && p[11]) jc_grab(c, r);
+        if (!r[0] && g32(l + 0x50 + 16 * slot) && p[11]) {
+            jc_grab(c, r);
+            extra_jobs = (int)g32(l + 0x50 + 16 * l[0x20]);
+        } else if (r[0] && l[0x24]) {
+            const uint32_t more_list = g32(l + 0x50 + 16 * l[0x20]);
+            extra_jobs = more_list ? (int)more_list : jc_count_ahead(l, g64(l));
+        }
     }
 tail:
     if (r[0]) l[0x25] |= (uint8_t)m8;
@@ -2226,7 +2284,7 @@ tail:
         cache_flush(c);
         l[0x21] = (uint8_t)(l[0x21] & ~m8);
     }
-    jc_ready(c, r, m8);
+    jc_ready(c, r, m8, extra_jobs);
     jc_commit(c, s);
 }
 
@@ -2337,7 +2395,8 @@ static void kernel_dispatch(spu_context* c, const uint32_t r[4])
     tag_wait(c, 0x80000000u);
     const uint64_t pm = g64(ls + 0x3FFE0);
     if (pm != g64(ls + 0x1D0)) {
-        mfc(c, 0xA00, pm, g32(ls + 0x3FFF0), 31, MFC_GET_CMD);
+        const uint32_t pm_sz = pm == s_pm_service ? 16u : g32(ls + 0x3FFF0);
+        mfc(c, 0xA00, pm, pm_sz, 31, MFC_GET_CMD);
         tag_wait(c, 0x80000000u);
         p64(ls + 0x1D0, pm);
         p32(ls + 0x1D8, ls[0x3FFF4]);

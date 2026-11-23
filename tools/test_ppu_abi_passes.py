@@ -261,7 +261,8 @@ def test_saves_dropped():
     for off, reg in ((0x58, 29), (0x60, 30), (0x68, 31)):
         assert f"vm_write64(ctx->gpr[1] + 0x{off:X}, ctx->gpr[{reg}]);" not in body, body
         assert f"ctx->gpr[{reg}] = _cs_{reg};" in body, body
-    assert "vm_write64(ctx->gpr[1] + 0x80, ctx->gpr[0]);" in body, body
+    assert "vm_write64(ctx->gpr[1] + 0x80, ctx->gpr[0]);" not in body, body
+    assert "uint64_t _cs_lr = ctx->lr;" in body and "ctx->gpr[0] = _cs_lr;" in body, body
     plain = _emit(True)[1]
     assert "vm_write64(ctx->gpr[1] + 0x68, ctx->gpr[31]);" in plain, plain
 

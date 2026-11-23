@@ -40,7 +40,7 @@ static inline void ps3_lock_acquire_spin(ps3_lock* l, unsigned spin)
         ps3_lock_slow(l, spin);
 }
 
-static inline void ps3_lock_acquire(ps3_lock* l) { ps3_lock_acquire_spin(l, 0); }
+static inline void ps3_lock_acquire(ps3_lock* l) { ps3_lock_acquire_spin(l, 64); }
 
 static inline void ps3_lock_release(ps3_lock* l)
 {
