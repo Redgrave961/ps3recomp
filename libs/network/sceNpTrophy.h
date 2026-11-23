@@ -16,6 +16,7 @@ extern "C" {
 #define SCE_NP_TROPHY_ERROR_OUT_OF_MEMORY                0x80022905
 #define SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT             0x80022906
 #define SCE_NP_TROPHY_ERROR_EXCEEDS_MAX                  0x80022907
+#define SCE_NP_TROPHY_ERROR_INSUFFICIENT_BUFFER          0x80022909
 #define SCE_NP_TROPHY_ERROR_UNKNOWN_CONTEXT              0x8002290A
 #define SCE_NP_TROPHY_ERROR_INVALID_CONTEXT              0x8002290E
 #define SCE_NP_TROPHY_ERROR_PROCESSING_ABORTED           0x8002290F
@@ -25,6 +26,7 @@ extern "C" {
 #define SCE_NP_TROPHY_ERROR_ALREADY_UNLOCKED             0x80022915
 #define SCE_NP_TROPHY_ERROR_INVALID_NP_COMM_ID           0x80022918
 #define SCE_NP_TROPHY_ERROR_CONF_DOES_NOT_EXIST          0x8002291B
+#define SCE_NP_TROPHY_ERROR_ICON_FILE_NOT_FOUND          0x8002291F
 #define SCE_NP_TROPHY_ERROR_INVALID_TROPHY_ID            0x80022920
 #define SCE_NP_TROPHY_ERROR_ILLEGAL_UPDATE               0x8002292A
 #define SCE_NP_TROPHY_ERROR_UNKNOWN                      0x800229FF
@@ -141,6 +143,27 @@ s32 sceNpTrophyGetTrophyUnlockState(SceNpTrophyContext context,
                                     SceNpTrophyHandle handle,
                                     SceNpTrophyFlagArray* flags,
                                     u32* count);
+
+s32 sceNpTrophyGetGameIcon(SceNpTrophyContext context,
+                           SceNpTrophyHandle handle,
+                           void* buffer,
+                           u32* size);
+
+s32 sceNpTrophyGetTrophyIcon(SceNpTrophyContext context,
+                             SceNpTrophyHandle handle,
+                             SceNpTrophyId trophyId,
+                             void* buffer,
+                             u32* size);
+
+typedef struct ps3_trophy_toast_event {
+    int  id;
+    char grade;
+    char name[SCE_NP_TROPHY_NAME_MAX_SIZE];
+    u8*  png;
+    u32  png_size;
+} ps3_trophy_toast_event;
+
+int ps3_trophy_poll_toast(ps3_trophy_toast_event* out);
 
 #ifdef __cplusplus
 }

@@ -353,7 +353,7 @@ class SPULifter:
         self.bi_r0_jump: set = set()
         self.link_return: set = set()
         self.promote = True
-        self.promote_regs = 16
+        self.promote_regs = 24
         self.has_irq_enable = True
         self.defer = False
         self._pending: list = []
@@ -361,6 +361,7 @@ class SPULifter:
         self._regs: set = set()
         self._jt_targets: list = []
         self._facts: frozenset = frozenset()
+        self._zs_need: set = set()
 
     def _g(self, i) -> str:
         s = str(i).strip()
@@ -908,7 +909,10 @@ class SPULifter:
                 s.append(idx_of[tgt])
             s.extend(idx_of[int(a, 16)] for a in case.findall(texts[k]) if int(a, 16) in idx_of)
             succ.append(s)
-        self._locals(func, fins, texts, succ, regs)
+        self._locals(func, fins, texts, succ, regs, wsum)
+        self._fuse_ls_rotqby(func)
+        self._fuse_ls_st32(func)
+        self._prune_unused_tr(func)
         d_in = [0] * n
         d_out = [None] * n
         mask = [sum(1 << r for r in write[k]) for k in range(n)]
@@ -1014,13 +1018,13 @@ class SPULifter:
                     f"sr{r} = ctx->gpr[{r}]" if (live_entry >> r) & 1 else f"sr{r}"
                     for r in decl_regs) + ";")
 
-    def _locals(self, func: LiftedFunction, fins, texts, succ, regs) -> None:
+    def _locals(self, func: LiftedFunction, fins, texts, succ, regs, wsum: dict) -> None:
         n = len(fins)
         every = (1 << 128) - 1
         ref = re.compile(r"ctx->gpr\[(\d+)\]|\bsr(\d+)\b")
         jt = {int(a, 16) for t in texts for a in re.findall(r"case 0x([0-9A-F]+)u: goto", t)}
         starts = (set(getattr(self, "func_starts", ())) if self.has_irq_enable else set()) | jt
-        use, kill, wall = [], [], []
+        use, kill, wall_mask = [], [], []
         for k, ins in enumerate(fins):
             cnt: dict = {}
             for a, b in ref.findall(texts[k]):
@@ -1032,35 +1036,46 @@ class SPULifter:
                 cnt[d] -= 1
             use.append(sum(1 << r for r, v in cnt.items() if v > 0))
             kill.append(1 << d if own else 0)
-            wall.append(bool(re.search(r"@|\bctx\b(?!->gpr\[|->reloc_delta\b)", texts[k]))
-                        or ins.mnemonic in ("rdch", "rchcnt", "wrch") or bool(k) and ins.addr in starts)
+            is_wall = (bool(re.search(r"@|\bctx\b(?!->gpr\[|->reloc_delta\b)", texts[k]))
+                       or ins.mnemonic in ("rdch", "rchcnt", "wrch") or bool(k) and ins.addr in starts)
+            if not is_wall:
+                wall_mask.append(0)
+            elif (ins.mnemonic in ("brsl", "brasl") and "_fast" in texts[k]
+                  and not (bool(k) and ins.addr in starts)):
+                wm = wsum.get(self._branch_target(ins), every)
+                wall_mask.append((wm | 1) if wm != every else every)
+            else:
+                wall_mask.append(every)
         succ = succ + [[]]
         if f"@O{n - 1}@" in func.body_lines[-1]:
             succ[n - 1] = succ[n - 1] + [n]
         use.append(0)
         kill.append(0)
-        wall.append(True)
-        live = [every if wall[k] else 0 for k in range(n + 1)]
+        wall_mask.append(every)
+        live = [wall_mask[k] for k in range(n + 1)]
         changed = True
         while changed:
             changed = False
             for k in range(n - 1, -1, -1):
-                o = every if not succ[k] else 0
-                for s in succ[k]:
-                    o |= live[s]
-                v = every if wall[k] else use[k] | (o & ~kill[k])
+                if wall_mask[k] == every:
+                    v = every
+                else:
+                    o = every if not succ[k] else 0
+                    for s in succ[k]:
+                        o |= live[s]
+                    v = wall_mask[k] | use[k] | (o & ~kill[k])
                 if v != live[k]:
                     live[k], changed = v, True
         defs: dict = {}
         for k in range(n):
             d = kill[k].bit_length() - 1
-            if d >= 0 and not wall[k] and d not in regs:
+            if d >= 0 and not (wall_mask[k] >> d & 1) and d not in regs:
                 defs.setdefault(d, []).append(k)
-        resident = [0] + [s for k in range(n) if wall[k] for s in succ[k] if s < n]
         new = list(texts)
         names = set()
         for d, ks in defs.items():
             g, t = f"ctx->gpr[{d}]", f"tr{d}"
+            resident = [0] + [s for k in range(n) if (wall_mask[k] >> d & 1) for s in succ[k] if s < n]
             up = {-1: -1}
 
             def find(x):
@@ -1081,7 +1096,7 @@ class SPULifter:
                     if j in seen or not live[j] >> d & 1:
                         continue
                     seen.add(j)
-                    if wall[j] or not succ[j] and not kill[j] >> d & 1:
+                    if (wall_mask[j] >> d & 1) or not succ[j] and not kill[j] >> d & 1:
                         up[find(k)] = find(-1)
                         continue
                     if use[j] >> d & 1:
@@ -1110,6 +1125,168 @@ class SPULifter:
                     i += 1
                 func.body_lines[i] = f"    {new[k]}"
         func.body_lines.insert(0, "    u128 " + ", ".join(f"tr{r}" for r in sorted(names)) + ";")
+
+    @staticmethod
+    def _fuse_ls_rotqby(func: LiftedFunction) -> None:
+        lines = func.body_lines
+        if not lines or not lines[0].startswith("    u128 tr"):
+            return
+        ld_re = re.compile(r"^    (tr\d+) = spu_ls_ld128\(_ls, ([^;]+)\);$")
+        rot_re = re.compile(r"^    ((?:tr\d+|sr\d+|ctx->gpr\[\d+\])) = spu_rotqby\((tr\d+), ((?:tr\d+|sr\d+|ctx->gpr\[\d+\]))\);$")
+        reg_re = re.compile(r"\b(?:tr|sr)\d+\b|ctx->gpr\[\d+\]")
+        def_re = re.compile(r"^    ((?:tr\d+|sr\d+|ctx->gpr\[\d+\])) = ")
+        tr_re = re.compile(r"\btr\d+\b")
+        counts: dict[str, int] = {}
+        for ln in lines[1:]:
+            for tok in tr_re.findall(ln):
+                counts[tok] = counts.get(tok, 0) + 1
+        pending: dict[str, tuple[int, str, set[str]]] = {}
+        drop: set[int] = set()
+        for idx in range(1, len(lines)):
+            ln = lines[idx]
+            s = ln.strip()
+            if (not s or s.startswith("/*") or s == "/* nop */;" or s == "/* branch hint (ignored) */;"):
+                continue
+            if (s.startswith(("loc_", "if ", "goto ", "switch", "{")) or "spu_ls_st128" in s
+                    or "spu_wrch" in s or "spu_rdch" in s or "spu_rchcnt" in s
+                    or "spu_ls_copy" in s or "spu_copy_" in s or "memcpy" in s or "memset" in s
+                    or "spu_ch_" in s or "spu_call_" in s or "SPU_" in s or "@" in s
+                    or re.search(r"ctx->(?!gpr\[)", s)):
+                pending.clear()
+                continue
+            rm = rot_re.match(ln)
+            if rm:
+                dst, src, sh = rm.group(1), rm.group(2), rm.group(3)
+                if src in pending:
+                    ld_idx, addr, addr_regs = pending.pop(src)
+                    lines[idx] = f"    {dst} = spu_ls_ld128_rotqby(_ls, {addr}, spu_pref_word({sh}));"
+                    drop.add(ld_idx)
+                    for k in [k for k, (_, _, ar) in pending.items() if dst in ar]:
+                        del pending[k]
+                    continue
+            lm = ld_re.match(ln)
+            if lm:
+                t, addr = lm.group(1), lm.group(2)
+                for k in [k for k, (_, _, ar) in pending.items() if t in ar]:
+                    del pending[k]
+                if counts.get(t, 0) == 2:
+                    addr_regs = set(reg_re.findall(addr))
+                    pending[t] = (idx, addr, addr_regs)
+                continue
+            dm = def_re.match(ln)
+            if dm:
+                w = dm.group(1)
+                for k in [k for k, (_, _, ar) in pending.items() if w in ar]:
+                    del pending[k]
+        if drop:
+            func.body_lines = [ln for idx, ln in enumerate(lines) if idx not in drop]
+
+    @staticmethod
+    def _fuse_ls_st32(func: LiftedFunction) -> None:
+        lines = func.body_lines
+        if not lines or not lines[0].startswith("    u128 tr"):
+            return
+        reg_pat = r"(?:tr\d+|sr\d+|ctx->gpr\[\d+\])"
+        ld_re = re.compile(rf"^    ({reg_pat}) = spu_ls_ld128\(_ls, ([^;]+)\);$")
+        cwd_re = re.compile(rf"^    ({reg_pat}) = spu_cwd\(({reg_pat}), (-?(?:0x)?[0-9A-Fa-f]+)\);$")
+        ins_re = re.compile(rf"^    (tr\d+) = spu_shufb_ins\(({reg_pat}), ({reg_pat}), ({reg_pat})\);$")
+        st_re = re.compile(rf"^    spu_ls_st128\(_ls, ([^,]+), (tr\d+)\);$")
+        def_re = re.compile(rf"^    ({reg_pat}) = ")
+        reg_re = re.compile(r"\b(?:tr|sr)\d+\b|ctx->gpr\[\d+\]")
+        tr_re = re.compile(r"\btr\d+\b")
+        counts: dict[str, int] = {}
+        for ln in lines[1:]:
+            for tok in tr_re.findall(ln):
+                counts[tok] = counts.get(tok, 0) + 1
+        loads: dict[str, tuple[int, str, set[str]]] = {}
+        cwds: dict[str, tuple[int, str, str]] = {}
+        ins_map: dict[str, tuple[int, str, str, str, str, str, str, set[str]]] = {}
+        drop: set[int] = set()
+
+        def invalidate(w: str) -> None:
+            loads.pop(w, None)
+            cwds.pop(w, None)
+            ins_map.pop(w, None)
+            for k in [k for k, (_, _, ar) in loads.items() if w in ar]:
+                del loads[k]
+            for k in [k for k, (_, b, _) in cwds.items() if w == b]:
+                del cwds[k]
+            for k in [k for k, v in ins_map.items() if w in v[7]]:
+                del ins_map[k]
+
+        for idx in range(1, len(lines)):
+            ln = lines[idx]
+            s = ln.strip()
+            if not s or s.startswith("/*"):
+                continue
+            sm = st_re.match(ln)
+            if sm:
+                addr, src = sm.group(1), sm.group(2)
+                if src in ins_map:
+                    ins_idx, val, old_reg, cwd_reg, old_addr, base, imm, _ = ins_map.pop(src)
+                    if addr == old_addr:
+                        lines[idx] = (f"    spu_ls_st32(_ls, ((uint32_t)({addr}) & ~15u) | "
+                                      f"(((uint32_t)spu_pref_word({base}) + (uint32_t)({imm})) & 12u), "
+                                      f"spu_pref_word({val}));")
+                        drop.add(ins_idx)
+                        if old_reg.startswith("tr") and counts.get(old_reg, 0) == 2 and old_reg in loads:
+                            drop.add(loads[old_reg][0])
+                        if cwd_reg.startswith("tr") and counts.get(cwd_reg, 0) == 2 and cwd_reg in cwds:
+                            drop.add(cwds[cwd_reg][0])
+                loads.clear()
+                ins_map.clear()
+                continue
+            if (s.startswith(("loc_", "if ", "goto ", "switch", "{")) or "spu_ls_st128" in s or "spu_ls_st32" in s
+                    or "spu_wrch" in s or "spu_rdch" in s or "spu_rchcnt" in s
+                    or "spu_ls_copy" in s or "spu_copy_" in s or "memcpy" in s or "memset" in s
+                    or "spu_ch_" in s or "spu_call_" in s or "SPU_" in s or "@" in s
+                    or re.search(r"ctx->(?!gpr\[)", s)):
+                loads.clear()
+                cwds.clear()
+                ins_map.clear()
+                continue
+            lm = ld_re.match(ln)
+            if lm:
+                dst, addr = lm.group(1), lm.group(2)
+                invalidate(dst)
+                loads[dst] = (idx, addr, set(reg_re.findall(addr)))
+                continue
+            cm = cwd_re.match(ln)
+            if cm:
+                dst, base, imm = cm.group(1), cm.group(2), cm.group(3)
+                invalidate(dst)
+                cwds[dst] = (idx, base, imm)
+                continue
+            im = ins_re.match(ln)
+            if im:
+                dst, val, old_reg, cwd_reg = im.group(1), im.group(2), im.group(3), im.group(4)
+                invalidate(dst)
+                if counts.get(dst, 0) == 2 and old_reg in loads and cwd_reg in cwds:
+                    _, old_addr, addr_regs = loads[old_reg]
+                    _, base, imm = cwds[cwd_reg]
+                    deps = addr_regs | {val, base}
+                    ins_map[dst] = (idx, val, old_reg, cwd_reg, old_addr, base, imm, deps)
+                continue
+            dm = def_re.match(ln)
+            if dm:
+                invalidate(dm.group(1))
+        if drop:
+            func.body_lines = [ln for idx, ln in enumerate(lines) if idx not in drop]
+
+    @staticmethod
+    def _prune_unused_tr(func: LiftedFunction) -> None:
+        lines = func.body_lines
+        if not lines or not lines[0].startswith("    u128 tr"):
+            return
+        tr_re = re.compile(r"\btr\d+\b")
+        used = set()
+        for ln in lines[1:]:
+            used.update(tr_re.findall(ln))
+        decls = [t for t in tr_re.findall(lines[0]) if t in used]
+        if decls:
+            lines[0] = "    u128 " + ", ".join(decls) + ";"
+        else:
+            lines.pop(0)
 
     def _pc(self, a: int) -> str:
         if self.reloc:

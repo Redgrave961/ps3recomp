@@ -229,9 +229,9 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
           const uint32_t ea32 = (uint32_t)ea;
           if (__builtin_expect(
                   (spu->resident_code_mask && lsa < spu->resident_code_hi && lsa + size > spu->resident_code_lo) ||
-                  (ea32 < __atomic_load_n(&g_spu_ovl_ea_hi, __ATOMIC_ACQUIRE) &&
-                   (uint64_t)ea32 + size > (uint64_t)__atomic_load_n(&g_spu_ovl_ea_lo, __ATOMIC_ACQUIRE)) ||
-                  (size >= 512u && __atomic_load_n(&g_spu_ovl_has_sig, __ATOMIC_ACQUIRE)), 0))
+                  (ea32 < __atomic_load_n(&g_spu_ovl_ea_hi, __ATOMIC_RELAXED) &&
+                   (uint64_t)ea32 + size > (uint64_t)__atomic_load_n(&g_spu_ovl_ea_lo, __ATOMIC_RELAXED)) ||
+                  (size >= 512u && __atomic_load_n(&g_spu_ovl_has_sig, __ATOMIC_RELAXED)), 0))
               spu_overlay_note_get(spu, ea32, (const uint8_t*)ls_ptr, size); }
     } else if (mfc_is_put(cmd)) {
         {

@@ -8,6 +8,7 @@
 #include "rsx_vk.h"
 #include "vk_device.h"
 #include "vk_renderer.h"
+#include "vk_trophy_toast.h"
 #include "../../input/pad_bindings.h"
 #include "ps3emu/thread_name.h"
 
@@ -64,6 +65,7 @@ struct swapchain {
     VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
     VkExtent2D extent{};
     std::vector<VkImage> images;
+    std::vector<VkImageView> views;
     std::vector<VkSemaphore> ready;
 };
 
@@ -87,6 +89,7 @@ struct state {
     VkSemaphore timeline = VK_NULL_HANDLE;
     uint64_t submitted = 0;
     vk::renderer r;
+    vk::trophy_toast toast;
 
     slot slots[k_slots];
     std::atomic<uint64_t> fit{ 0 };
@@ -277,6 +280,9 @@ bool swapchain_build()
         : VkCompositeAlphaFlagBitsKHR(caps.supportedCompositeAlpha & (0u - caps.supportedCompositeAlpha));
     ci.presentMode = g.sc.mode;
     ci.clipped = VK_TRUE;
+    for (VkImageView v : g.sc.views)
+        if (v) vkDestroyImageView(g.d.dev, v, nullptr);
+    g.sc.views.clear();
     if (g.sc.handle) vkDestroySwapchainKHR(g.d.dev, g.sc.handle, nullptr);
     g.sc.handle = VK_NULL_HANDLE;
     VkSwapchainKHR made;
@@ -286,6 +292,15 @@ bool swapchain_build()
     vkGetSwapchainImagesKHR(g.d.dev, made, &n, nullptr);
     g.sc.images.resize(n);
     vkGetSwapchainImagesKHR(g.d.dev, made, &n, g.sc.images.data());
+    g.sc.views.resize(n, VK_NULL_HANDLE);
+    for (uint32_t i = 0; i < n; i++) {
+        VkImageViewCreateInfo vi{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+        vi.image = g.sc.images[i];
+        vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vi.format = g.sc.format.format;
+        vi.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        vkCreateImageView(g.d.dev, &vi, nullptr, &g.sc.views[i]);
+    }
     while (g.sc.ready.size() < n) {
         VkSemaphoreCreateInfo si{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
         VkSemaphore s;
@@ -335,7 +350,9 @@ bool presenter_build()
     }
     g.r.resolution_scale = resolution_scale();
     report_scale();
-    return g.r.open(g.d, g.timeline, &g.submitted, g.cache_path.c_str());
+    if (!g.r.open(g.d, g.timeline, &g.submitted, g.cache_path.c_str())) return false;
+    g.toast.create(g.d);
+    return true;
 }
 
 bool create_surface()
@@ -410,7 +427,7 @@ void blit_fitted(VkCommandBuffer cmd, VkImage src, uint32_t sw, uint32_t sh, VkI
     vkCmdBlitImage(cmd, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, VK_FILTER_LINEAR);
 }
 
-void record_present(VkCommandBuffer cmd, const slot& s, VkImage target)
+void record_present(VkCommandBuffer cmd, const slot& s, VkImage target, VkImageView target_view)
 {
     VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -427,12 +444,14 @@ void record_present(VkCommandBuffer cmd, const slot& s, VkImage target)
     } else {
         blit_fitted(cmd, s.image, s.width, s.height, target, out);
     }
-    b.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-    b.dstStageMask = VK_PIPELINE_STAGE_2_NONE;
-    b.dstAccessMask = 0;
-    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-    barrier_one(cmd, b);
+    if (!g.toast.record(cmd, target, target_view, out, g.sc.format.format)) {
+        b.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        b.dstStageMask = VK_PIPELINE_STAGE_2_NONE;
+        b.dstAccessMask = 0;
+        b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        barrier_one(cmd, b);
+    }
     vkEndCommandBuffer(cmd);
 }
 
@@ -478,7 +497,7 @@ bool present_image(slot& s)
     }
     if (a == VK_SUBOPTIMAL_KHR && swapchain_extent_changed()) g.resized = true;
     vkResetCommandPool(g.d.dev, f.pool, 0);
-    record_present(f.cmd, s, g.sc.images[index]);
+    record_present(f.cmd, s, g.sc.images[index], g.sc.views[index]);
 
     const uint64_t value = g.presented.load() + 1u;
     VkSemaphoreSubmitInfo waits[2] = { { VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO }, { VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO } };

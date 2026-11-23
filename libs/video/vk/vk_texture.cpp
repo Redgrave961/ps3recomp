@@ -273,8 +273,9 @@ image* renderer::native_image(surface& s, image& source)
     return &low;
 }
 
-bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out, rsx_spv_texture_state& state)
+bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out, rsx_spv_texture_state& state, u8* patch_tag)
 {
+    if (patch_tag) *patch_tag = 0;
     const u32 slot = vertex ? rsx::TEXTURES + unit : unit;
     unit_binding& b = m_units[slot];
     const char*& path = m_texture_path[slot];
@@ -291,6 +292,7 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
         path = "memory";
         out = cached.info;
         state = cached.state;
+        if (patch_tag) *patch_tag = cached.patch_tag;
         return true;
     }
     cached.valid = false;
@@ -423,7 +425,7 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
         upload = true;
     } else if (e->checked != m_epoch) {
         e->checked = m_epoch;
-        upload = memory_changed(ea, d.guest_size, e->stamp) || (e->patched && e->variant != g_patch.load(std::memory_order_acquire)->variant());
+        upload = memory_changed(ea, d.guest_size, e->stamp) || (e->patch_tag != 0 && e->variant != g_patch.load(std::memory_order_acquire)->variant());
     }
 
     if (upload) {
@@ -435,10 +437,10 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
         e->stamp = m_stamp;
         e->checked = m_epoch;
         rsx::texture_convert(d, vm_base + ea, slice.ptr, m_copies);
-        e->patched = false;
+        e->patch_tag = 0;
         if (const rsx_vk_texture_patch* patch = g_patch.load(std::memory_order_acquire)) {
             e->variant = patch->variant();
-            e->patched = patch->apply(e->variant, d.gcm_format, d.width, d.height, vm_base + ea, d.guest_size, slice.ptr) != 0;
+            e->patch_tag = (u8)patch->apply(e->variant, d.gcm_format, d.width, d.height, vm_base + ea, d.guest_size, slice.ptr);
         }
         end_rendering();
         const trace_span span(*this, c, "texture upload %ux%u fmt %d %llu bytes", e->img.width, e->img.height, (int)d.format,
@@ -468,7 +470,8 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
     if (!view) return false;
     path = skipped ? skipped : "memory";
     out = { sampler, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-    if (!skipped) cached = { true, b.regs, ea, m_epoch, m_binding_gen, out, state };
+    if (patch_tag) *patch_tag = e->patch_tag;
+    if (!skipped) cached = { true, e->patch_tag, b.regs, ea, m_epoch, m_binding_gen, out, state };
     return true;
 }
 

@@ -479,10 +479,11 @@ void renderer::retire(surface* s)
     m_binding_gen++;
 }
 
-ratio renderer::scale_for(u32 width, u32 height) const
+ratio renderer::scale_for(u32 width, u32 height, bool depth) const
 {
     if (resolution_scale.unit()) return {};
     if (std::max(width, height) < 128u || std::min(width, height) < 64u) return {};
+    if (!depth && width <= 640u && height <= 360u) return {};
     const u32 max_dim = m_d ? m_d->props.limits.maxImageDimension2D : 4096u;
     if (resolution_scale.edge(width) > max_dim || resolution_scale.edge(height) > max_dim) return {};
     return resolution_scale;
@@ -490,7 +491,7 @@ ratio renderer::scale_for(u32 width, u32 height) const
 
 surface* renderer::surface_for(u32 ea, u32 pitch, u32 width, u32 height, u32 format, bool depth, u32 aa_u, u32 aa_v)
 {
-    const ratio scale = scale_for(width, height);
+    const ratio scale = scale_for(width, height, depth);
     surface* grow_from = nullptr;
     for (auto& p : m_surfaces) {
         surface* s = p.get();
@@ -1419,7 +1420,7 @@ void renderer::rescale(ratio scale)
     end_rendering();
     for (auto& p : m_surfaces) {
         surface& s = *p;
-        const ratio to = !s.scale.unit() ? scale : scale_for(s.width, s.height);
+        const ratio to = scale_for(s.width, s.height, s.depth);
         if (to == s.scale) continue;
         image img{};
         if (!create_image(img, s.img.format, to.edge(s.width * s.aa_u), to.edge(s.height * s.aa_v), surface_usage(s.depth), s.img.aspect)) {

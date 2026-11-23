@@ -129,7 +129,7 @@ bool pipelines::create(vk_device& d, const std::string& cache_path)
     const size_t slash = m_cache_path.find_last_of("/\\");
     m_db = std::fopen((m_cache_path.substr(0, slash == std::string::npos ? 0 : slash + 1) + "vk_shaders.db").c_str(), "ab+");
     const unsigned n = std::max(3u, std::thread::hardware_concurrency());
-    m_background_limit = n - 2u;
+    m_background_limit = n > 2u ? n - 2u : 1u;
     for (unsigned i = 0; i < n; i++)
         m_workers.emplace_back([this, i] {
             ps3_thread_name("vk pipeline %u", i);
@@ -144,6 +144,9 @@ bool pipelines::create(vk_device& d, const std::string& cache_path)
 
 void pipelines::worker()
 {
+#ifdef _WIN32
+    bool low_prio = true;
+#endif
     for (;;) {
         std::function<void()> task;
         bool background;
@@ -160,6 +163,12 @@ void pipelines::worker()
             q.pop_front();
             m_background_running += background;
         }
+#ifdef _WIN32
+        if (low_prio != background) {
+            SetThreadPriority(GetCurrentThread(), background ? THREAD_PRIORITY_BELOW_NORMAL : THREAD_PRIORITY_NORMAL);
+            low_prio = background;
+        }
+#endif
         task();
         m_cache_dirty.store(true, std::memory_order_relaxed);
         save_cache_periodic();
@@ -298,9 +307,9 @@ void pipelines::precompile(shader_cache& shaders)
         }
         auto pending = std::make_shared<std::atomic<size_t>>(0);
         auto done = std::make_shared<std::pair<std::mutex, std::condition_variable>>();
-        auto run_all = [&](char type, auto&& body) {
+        auto run_matching = [&](auto&& pred, auto&& body) {
             for (const rec& r : recs) {
-                if (r.type != type) continue;
+                if (!pred(r.type)) continue;
                 pending->fetch_add(1);
                 work([this, r, body, pending, done] {
                     g_replay = true;
@@ -330,9 +339,8 @@ void pipelines::precompile(shader_cache& shaders)
                 shaders.fragment(ucode.data(), (uint32_t)ucode.size(), key, false);
             }
         };
-        run_all('V', shader_body);
-        run_all('F', shader_body);
-        run_all('P', [this, &shaders](const rec& r) {
+        run_matching([](char t) { return t == 'V' || t == 'F'; }, shader_body);
+        run_matching([](char t) { return t == 'P'; }, [this, &shaders](const rec& r) {
             if (r.an != sizeof(pipeline_key)) return;
             pipeline_key k;
             std::memcpy(&k, r.a, sizeof k);
@@ -564,7 +572,7 @@ VkPipeline pipelines::get(const pipeline_key& key, const shader& vs, const shade
         }, true);
         return VK_NULL_HANDLE;
     }
-    const bool fast = m_libraries && !g_replay;
+    const bool fast = m_libraries;
     const VkPipeline p = !m_libraries ? monolithic(k, vs, fs) : link(k, vs, fs, !fast);
     if (!p) std::fprintf(stderr, "[vk] pipeline creation failed\n");
     e->fast = fast ? p : VK_NULL_HANDLE;

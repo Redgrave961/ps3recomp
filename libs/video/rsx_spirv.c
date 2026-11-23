@@ -2848,6 +2848,73 @@ int rsx_spv_box_down(rsx_spv_blob* out)
     return spv_finish(s, 5, caps, 1, mainid, NULL, 0, out);
 }
 
+int rsx_spv_overlay_vs(rsx_spv_blob* out)
+{
+    spv* s = spv_begin();
+    if (!s) return -1;
+    u32 mainid = newl(s);
+    u32 pst = intern(s, OpTypeStruct, 0, (const u32[]){ tf(s), tf(s), tf(s), tf(s), tf(s) }, 5, 1);
+    for (u32 m = 0; m < 5; m++) mdeco(s, pst, m, DEC_Offset, m * 4u);
+    deco(s, pst, DEC_Block);
+    u32 push = gvar(s, pst, SC_PushConstant, 0);
+    u32 vidx = gvar(s, tu(s), SC_Input, 0);
+    deco1(s, vidx, DEC_BuiltIn, BI_VertexIndex);
+    u32 posv = gvar(s, tv4(s), SC_Output, 0);
+    deco1(s, posv, DEC_BuiltIn, BI_Position);
+    u32 tv2 = tvec(s, tf(s), 2);
+    u32 uvv = gvar(s, tv2, SC_Output, 0);
+    deco1(s, uvv, DEC_Location, 0);
+
+    fn_begin(s, mainid);
+    u32 vid = ld(s, tu(s), vidx);
+    u32 u = I(s, OpConvertUToF, tf(s), uand(s, tu(s), vid, cu(s, 1)));
+    u32 v = I(s, OpConvertUToF, tf(s), uand(s, tu(s), ushr(s, tu(s), vid, cu(s, 1)), cu(s, 1)));
+    u32 pp = tptr(s, SC_PushConstant, tf(s));
+    u32 x0 = ld(s, tf(s), I(s, OpAccessChain, pp, push, ci(s, 0)));
+    u32 y0 = ld(s, tf(s), I(s, OpAccessChain, pp, push, ci(s, 1)));
+    u32 x1 = ld(s, tf(s), I(s, OpAccessChain, pp, push, ci(s, 2)));
+    u32 y1 = ld(s, tf(s), I(s, OpAccessChain, pp, push, ci(s, 3)));
+    u32 px = fadd(s, tf(s), x0, fmul(s, tf(s), fsub(s, tf(s), x1, x0), u));
+    u32 py = fadd(s, tf(s), y0, fmul(s, tf(s), fsub(s, tf(s), y1, y0), v));
+    st(s, posv, I(s, OpCompositeConstruct, tv4(s), px, py, cf(s, 0.f), cf(s, 1.f)));
+    st(s, uvv, I(s, OpCompositeConstruct, tv2, u, v));
+    sb_ins(s, BODY(s), OpReturn, k_none, 0);
+    fn_end(s);
+    const u32 caps[1] = { 1 };
+    return spv_finish(s, 0, caps, 1, mainid, NULL, 0, out);
+}
+
+int rsx_spv_overlay_fs(rsx_spv_blob* out)
+{
+    spv* s = spv_begin();
+    if (!s) return -1;
+    u32 mainid = newl(s);
+    u32 pst = intern(s, OpTypeStruct, 0, (const u32[]){ tf(s), tf(s), tf(s), tf(s), tf(s) }, 5, 1);
+    for (u32 m = 0; m < 5; m++) mdeco(s, pst, m, DEC_Offset, m * 4u);
+    deco(s, pst, DEC_Block);
+    u32 push = gvar(s, pst, SC_PushConstant, 0);
+    u32 tex = sampler_var(s, 1, 0, 0, 0);
+    u32 tv2 = tvec(s, tf(s), 2);
+    u32 uvv = gvar(s, tv2, SC_Input, 0);
+    deco1(s, uvv, DEC_Location, 0);
+    u32 colv = gvar(s, tv4(s), SC_Output, 0);
+    deco1(s, colv, DEC_Location, 0);
+
+    fn_begin(s, mainid);
+    u32 uv = ld(s, tv2, uvv);
+    u32 smp = I(s, OpImageSampleImplicitLod, tv4(s), ld(s, sampler_type(s, 1, 0), tex), uv);
+    u32 pp = tptr(s, SC_PushConstant, tf(s));
+    u32 alpha = ld(s, tf(s), I(s, OpAccessChain, pp, push, ci(s, 4)));
+    u32 r = ex(s, tf(s), smp, 0), g = ex(s, tf(s), smp, 1), b = ex(s, tf(s), smp, 2);
+    u32 a = fmul(s, tf(s), ex(s, tf(s), smp, 3), alpha);
+    st(s, colv, I(s, OpCompositeConstruct, tv4(s), r, g, b, a));
+    sb_ins(s, BODY(s), OpReturn, k_none, 0);
+    fn_end(s);
+    const u32 caps[1] = { 1 };
+    const u32 modes[1] = { 7 }; /* OriginUpperLeft */
+    return spv_finish(s, 4, caps, 1, mainid, modes, 1, out);
+}
+
 void rsx_spv_blob_free(rsx_spv_blob* blob)
 {
     if (!blob) return;

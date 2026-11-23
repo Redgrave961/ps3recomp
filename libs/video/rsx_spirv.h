@@ -190,6 +190,8 @@ int  rsx_spv_fragment_scan(const u32* ucode, u32 max_words, rsx_spv_fp_info* inf
 int  rsx_spv_vertex_reach(const u32* ucode, u32 start, u8* reach);
 int  rsx_spv_depth_pack(int d16, rsx_spv_blob* out);
 int  rsx_spv_box_down(rsx_spv_blob* out);
+int  rsx_spv_overlay_vs(rsx_spv_blob* out);
+int  rsx_spv_overlay_fs(rsx_spv_blob* out);
 void rsx_spv_blob_free(rsx_spv_blob* blob);
 
 #ifdef __cplusplus

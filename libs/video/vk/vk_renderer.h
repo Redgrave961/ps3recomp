@@ -141,7 +141,7 @@ private:
     void begin_rendering();
     surface* surface_at(u32 ea, u32 pitch, u32 bpp, u32& x, u32& y);
     surface* scanout_surface(u32 ea, u32 pitch) const;
-    ratio scale_for(u32 width, u32 height) const;
+    ratio scale_for(u32 width, u32 height, bool depth) const;
     surface* surface_for(u32 ea, u32 pitch, u32 width, u32 height, u32 format, bool depth, u32 aa_u, u32 aa_v);
     bool create_image(image& img, VkFormat format, u32 width, u32 height, VkImageUsageFlags usage, VkImageAspectFlags aspect);
     void destroy_image(image& img);
@@ -310,17 +310,21 @@ private:
         u32 stamp = 0;
         u64 checked = 0;
         u64 used = 0;
-        bool patched = false;
+        u8 patch_tag = 0;
         u32 variant = 0;
     };
     struct unit_resolved {
         bool valid = false;
+        u8 patch_tag = 0;
         rsx::texture_regs regs{};
         u32 ea = 0;
         u64 epoch = 0;
         u64 generation = 0;
         VkDescriptorImageInfo info{};
         rsx_spv_texture_state state{};
+    };
+    struct qte_anchor {
+        float cx, cy;
     };
     struct unit_binding {
         bool described = false;
@@ -331,7 +335,7 @@ private:
 
     void describe_units(u32 first, u32 last);
     rsx::texture_regs unit_regs(u32 u) const;
-    bool resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out, rsx_spv_texture_state& state);
+    bool resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out, rsx_spv_texture_state& state, u8* patch_tag = nullptr);
     VkImageView view_for(image& img, VkImageViewType type, VkFormat format, VkImageAspectFlags aspect, const VkComponentMapping& swizzle);
     VkSampler sampler_for(const VkSamplerCreateInfo& info, const VkSamplerCustomBorderColorCreateInfoEXT* border);
     bool memory_changed(u32 ea, u32 size, u32 stamp);
@@ -342,6 +346,9 @@ private:
 
     unit_binding m_units[rsx::TEXTURES + rsx::VERTEX_TEXTURES];
     unit_resolved m_resolved[rsx::TEXTURES + rsx::VERTEX_TEXTURES];
+    std::vector<qte_anchor> m_qte_rings_cur;
+    std::vector<qte_anchor> m_qte_rings_prev;
+    u64 m_qte_ring_epoch = 0;
     u64 m_binding_gen = 1;
     const char* m_texture_path[rsx::TEXTURES + rsx::VERTEX_TEXTURES]{};
     flat_map<uint64_t, std::unique_ptr<texture_entry>> m_textures;

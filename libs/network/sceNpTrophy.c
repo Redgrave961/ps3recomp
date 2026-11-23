@@ -59,6 +59,60 @@ typedef struct {
 static TrophyContext s_contexts[SCE_NP_TROPHY_MAX_CONTEXTS + 1];
 static TrophyHandle  s_handles[SCE_NP_TROPHY_MAX_HANDLES + 1];
 
+#define TROPHY_TOAST_CAP 16
+static ps3_trophy_toast_event s_toast_q[TROPHY_TOAST_CAP];
+static unsigned s_toast_head = 0, s_toast_tail = 0;
+static volatile int s_toast_lock = 0;
+
+static void toast_lock(void)
+{
+    while (__atomic_exchange_n(&s_toast_lock, 1, __ATOMIC_ACQUIRE)) {}
+}
+
+static void toast_unlock(void)
+{
+    __atomic_store_n(&s_toast_lock, 0, __ATOMIC_RELEASE);
+}
+
+static void trophy_push_toast(const TrophyContext* ctx, s32 trophyId)
+{
+    const trophy_def* t = trophy_set_find(&ctx->set, trophyId);
+    if (!t) return;
+    char entry_name[32];
+    snprintf(entry_name, sizeof(entry_name), "TROP%03d.PNG", trophyId);
+    size_t png_sz = 0;
+    char* png = trp_read_entry_data(&ctx->pack, entry_name, &png_sz);
+    ps3_trophy_toast_event ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.id = trophyId;
+    ev.grade = t->grade ? t->grade : 'B';
+    snprintf(ev.name, sizeof(ev.name), "%s", t->name);
+    ev.png = (u8*)png;
+    ev.png_size = (u32)png_sz;
+    toast_lock();
+    if (s_toast_tail - s_toast_head < TROPHY_TOAST_CAP) {
+        s_toast_q[s_toast_tail++ % TROPHY_TOAST_CAP] = ev;
+    } else {
+        free(ev.png);
+    }
+    toast_unlock();
+}
+
+int ps3_trophy_poll_toast(ps3_trophy_toast_event* out)
+{
+    if (!out) return 0;
+    if (__atomic_load_n(&s_toast_head, __ATOMIC_RELAXED) == __atomic_load_n(&s_toast_tail, __ATOMIC_RELAXED))
+        return 0;
+    int got = 0;
+    toast_lock();
+    if (s_toast_head != s_toast_tail) {
+        *out = s_toast_q[s_toast_head++ % TROPHY_TOAST_CAP];
+        got = 1;
+    }
+    toast_unlock();
+    return got;
+}
+
 static u64 rtc_tick_now(void)
 {
     struct timespec ts;
@@ -547,12 +601,14 @@ s32 sceNpTrophyUnlockTrophy(SceNpTrophyContext context,
     ctx->unlocked[trophyId] = 1;
     ctx->tick[trophyId] = now;
     printf("[sceNpTrophy] trophy %d unlocked: %s\n", trophyId, t->name);
+    trophy_push_toast(ctx, trophyId);
 
     const s32 plat = trophy_platinum_unlocked_by(ctx, trophyId);
     if (plat != SCE_NP_TROPHY_INVALID_TROPHY_ID) {
         ctx->unlocked[plat] = 1;
         ctx->tick[plat] = now;
         printf("[sceNpTrophy] platinum trophy %d unlocked\n", plat);
+        trophy_push_toast(ctx, plat);
     }
     if (platinumId)
         vm_write32(GUEST_EA(platinumId), (u32)plat);
@@ -585,5 +641,71 @@ s32 sceNpTrophyGetTrophyUnlockState(SceNpTrophyContext context,
     for (u32 w = 0; w < SCE_NP_TROPHY_MAX_NUM_TROPHIES / 32; w++)
         vm_write32(ea + w * 4, bits[w]);
     return CELL_OK;
+}
+
+static s32 trophy_read_icon(const TrophyContext* ctx, const char* entry_name, void* buffer, u32* size)
+{
+    if (!size)
+        return (s32)SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
+    const trp_entry* e = trp_find_entry(&ctx->pack, entry_name);
+    if (!e)
+        return (s32)SCE_NP_TROPHY_ERROR_ICON_FILE_NOT_FOUND;
+    const u32 need = (u32)e->size;
+    const u32 size_ea = GUEST_EA(size);
+    if (!buffer) {
+        vm_write32(size_ea, need);
+        return CELL_OK;
+    }
+    const u32 cap = vm_read32(size_ea);
+    vm_write32(size_ea, need);
+    if (cap < need)
+        return (s32)SCE_NP_TROPHY_ERROR_INSUFFICIENT_BUFFER;
+    size_t got = 0;
+    char* png = trp_read_entry_data(&ctx->pack, entry_name, &got);
+    if (!png || got != need) {
+        free(png);
+        return (s32)SCE_NP_TROPHY_ERROR_ICON_FILE_NOT_FOUND;
+    }
+    memcpy(vm_base + GUEST_EA(buffer), png, need);
+    free(png);
+    return CELL_OK;
+}
+
+s32 sceNpTrophyGetGameIcon(SceNpTrophyContext context,
+                           SceNpTrophyHandle handle,
+                           void* buffer,
+                           u32* size)
+{
+    if (!s_trophy_initialized)
+        return (s32)SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
+    TrophyContext* ctx;
+    s32 err = trophy_get_context(context, handle, 0, &ctx);
+    if (err) return err;
+    if (!ctx->registered)
+        return (s32)SCE_NP_TROPHY_ERROR_CONTEXT_NOT_REGISTERED;
+    return trophy_read_icon(ctx, "ICON0.PNG", buffer, size);
+}
+
+s32 sceNpTrophyGetTrophyIcon(SceNpTrophyContext context,
+                             SceNpTrophyHandle handle,
+                             SceNpTrophyId trophyId,
+                             void* buffer,
+                             u32* size)
+{
+    if (!s_trophy_initialized)
+        return (s32)SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
+    TrophyContext* ctx;
+    s32 err = trophy_get_context(context, handle, 0, &ctx);
+    if (err) return err;
+    if (!ctx->registered)
+        return (s32)SCE_NP_TROPHY_ERROR_CONTEXT_NOT_REGISTERED;
+    const trophy_def* t = trophy_def_of(ctx, trophyId);
+    if (!t || trophyId < 0 || trophyId >= SCE_NP_TROPHY_MAX_NUM_TROPHIES)
+        return (s32)SCE_NP_TROPHY_ERROR_INVALID_TROPHY_ID;
+    if (t->hidden && !ctx->unlocked[trophyId])
+        return (s32)SCE_NP_TROPHY_ERROR_HIDDEN;
+    char entry_name[32];
+    snprintf(entry_name, sizeof(entry_name), "TROP%03d.PNG", trophyId);
+    return trophy_read_icon(ctx, entry_name, buffer, size);
 }
 

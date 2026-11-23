@@ -720,6 +720,7 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
     fs.wpos_scale = (bottom ? -(float)m_fb.scale.den : (float)m_fb.scale.den) / (float)m_fb.scale.num;
     fs.wpos_bias = bottom ? (float)(window & 0xFFFu) : 0.f;
     VkDescriptorImageInfo images[rsx::TEXTURES + rsx::VERTEX_TEXTURES];
+    u8 unit0_tag = 0;
     for (u32 u = 0; u < rsx::TEXTURES + rsx::VERTEX_TEXTURES; u++) {
         const bool vertex_unit = u >= rsx::TEXTURES;
         const u32 unit = vertex_unit ? u - rsx::TEXTURES : u;
@@ -727,10 +728,52 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
         rsx_spv_texture_state scratch{};
         rsx_spv_texture_state& st = vertex_unit ? scratch : fs.texture[u];
         st.scale[0] = st.scale[1] = 1.f;
-        if ((used >> unit) & 1u && resolve_texture(unit, vertex_unit, images[u], st)) continue;
+        if ((used >> unit) & 1u && resolve_texture(unit, vertex_unit, images[u], st, u == 0 ? &unit0_tag : nullptr)) continue;
         const u32 dims = texture_dims(m_units[u].desc, m_units[u].valid);
         const image& dummy = m_dummy[dims == RSX_SPV_TEX_CUBE ? 1 : dims == RSX_SPV_TEX_3D ? 2 : 0];
         images[u] = { m_dummy_sampler, dummy.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+    }
+    if (__builtin_expect(unit0_tag >= 2u, 0)) {
+        if (m_qte_ring_epoch != m_epoch) {
+            m_qte_rings_prev = std::move(m_qte_rings_cur);
+            m_qte_rings_cur.clear();
+            m_qte_ring_epoch = m_epoch;
+        }
+        constexpr u32 k_gfx_pos_reg = 203u;
+        if ((m_vp->info.constants_used[k_gfx_pos_reg / 32u] >> (k_gfx_pos_reg % 32u)) & 1u) {
+            float c203[4];
+            std::memcpy(c203, constants + k_gfx_pos_reg * 4u, sizeof c203);
+            const float cx = c203[0], cy = c203[1];
+            if (unit0_tag == 2u) {
+                m_qte_rings_cur.push_back({ cx, cy });
+            } else if (unit0_tag == 3u) {
+                auto find_ring = [&](const std::vector<qte_anchor>& list, float& rx, float& ry) -> bool {
+                    float best = 1e9f;
+                    bool found = false;
+                    for (const qte_anchor& a : list) {
+                        const float dx = std::fabs(cx - a.cx), dy = std::fabs(cy - a.cy);
+                        if (dx < 0.18f && dy < 0.28f && dx * dx + dy * dy < best) {
+                            best = dx * dx + dy * dy;
+                            rx = a.cx;
+                            ry = a.cy;
+                            found = true;
+                        }
+                    }
+                    return found;
+                };
+                float rx = 0.f, ry = 0.f;
+                if (find_ring(m_qte_rings_cur, rx, ry) || find_ring(m_qte_rings_prev, rx, ry)) {
+                    vk_slice cs = m_ring.alloc(sizeof constants, m_ubo_align);
+                    if (cs.ptr) {
+                        std::memcpy(cs.ptr, constants, sizeof constants);
+                        std::memcpy(cs.ptr + k_gfx_pos_reg * 16u, &rx, 4);
+                        std::memcpy(cs.ptr + k_gfx_pos_reg * 16u + 4u, &ry, 4);
+                        m_constants = { cs.buffer, cs.offset, sizeof constants };
+                        m_constants_vp = nullptr;
+                    }
+                }
+            }
+        }
     }
     u32 tcc = 0;
     for (u32 i = 0; i < 10; i++)

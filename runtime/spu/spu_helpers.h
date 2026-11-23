@@ -52,10 +52,40 @@ static const _Alignas(16) uint8_t spu__xrot_tbl[16][16] = {
 SPU__XI u128 spu__xrotl(u128 a, uint32_t sh) {
     return spu__xs(_mm_shuffle_epi8(spu__xl(a), _mm_load_si128((const __m128i*)spu__xrot_tbl[sh & 15])));
 }
+#define SPU__XLR1(h, s) (uint8_t)((((h) ^ 3) + (s)) & 15)
+#define SPU__XLR(s) { SPU__XLR1(0, s), SPU__XLR1(1, s), SPU__XLR1(2, s), SPU__XLR1(3, s), SPU__XLR1(4, s), SPU__XLR1(5, s), \
+                      SPU__XLR1(6, s), SPU__XLR1(7, s), SPU__XLR1(8, s), SPU__XLR1(9, s), SPU__XLR1(10, s), SPU__XLR1(11, s), \
+                      SPU__XLR1(12, s), SPU__XLR1(13, s), SPU__XLR1(14, s), SPU__XLR1(15, s) }
+static const _Alignas(16) uint8_t spu__xls_rot_tbl[16][16] = {
+    SPU__XLR(0), SPU__XLR(1), SPU__XLR(2), SPU__XLR(3), SPU__XLR(4), SPU__XLR(5), SPU__XLR(6), SPU__XLR(7),
+    SPU__XLR(8), SPU__XLR(9), SPU__XLR(10), SPU__XLR(11), SPU__XLR(12), SPU__XLR(13), SPU__XLR(14), SPU__XLR(15) };
+#undef SPU__XLR
+#undef SPU__XLR1
+SPU__XI u128 spu_ls_ld128_rotqby(const uint8_t* __restrict ls, uint32_t lsa, uint32_t sh) {
+    lsa &= SPU_LS_MASK & ~0xFu;
+    return spu__xs(_mm_shuffle_epi8(_mm_load_si128((const __m128i*)&ls[lsa]),
+                                    _mm_load_si128((const __m128i*)spu__xls_rot_tbl[sh & 15])));
+}
+SPU__XI void spu_ls_st32(uint8_t* __restrict ls, uint32_t lsa, uint32_t val) {
+    uint32_t w = __builtin_bswap32(val);
+    memcpy(&ls[lsa & (SPU_LS_MASK & ~3u)], &w, 4);
+}
 SPU__XI __m128i spu__xshr(int sh) { return _mm_sub_epi8(spu__xiota(), _mm_set1_epi8((char)sh)); }
 SPU__XI __m128i spu__xflip(__m128i x) { return _mm_xor_si128(x, _mm_set1_epi32((int)0x80000000u)); }
 #else
 #define SPU_X86 0
+static inline u128 spu_ls_ld128_rotqby(const uint8_t* __restrict ls, uint32_t lsa, uint32_t sh) {
+    u128 v = spu_ls_ld128(ls, lsa);
+    u128 r;
+    const int s = (int)(sh & 15u);
+    for (int i = 0; i < 16; i++) r._u8[SPU_W(i)] = v._u8[SPU_W((i + s) & 15)];
+    return r;
+}
+static inline void spu_ls_st32(uint8_t* __restrict ls, uint32_t lsa, uint32_t val) {
+    uint8_t* p = &ls[lsa & (SPU_LS_MASK & ~3u)];
+    p[0] = (uint8_t)(val >> 24); p[1] = (uint8_t)(val >> 16);
+    p[2] = (uint8_t)(val >>  8); p[3] = (uint8_t)(val);
+}
 #endif
 
 static inline uint32_t spu_pref_word(u128 a) {
