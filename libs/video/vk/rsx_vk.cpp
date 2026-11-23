@@ -814,8 +814,6 @@ void window_main()
                 apply_display();
                 if (const auto listener = g.display_listener.load()) listener(next);
             }
-            else if (e.key.key == SDLK_F12)
-                g.r.trace_frames.store(90, std::memory_order_relaxed);
             break;
         default:
             break;
