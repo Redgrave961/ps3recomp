@@ -752,7 +752,7 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
                     bool found = false;
                     for (const qte_anchor& a : list) {
                         const float dx = std::fabs(cx - a.cx), dy = std::fabs(cy - a.cy);
-                        if (dx < 0.18f && dy < 0.28f && dx * dx + dy * dy < best) {
+                        if (dx < 0.28f && dy < 0.38f && dx * dx + dy * dy < best) {
                             best = dx * dx + dy * dy;
                             rx = a.cx;
                             ry = a.cy;
@@ -761,13 +761,30 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
                     }
                     return found;
                 };
-                float rx = 0.f, ry = 0.f;
-                if (find_ring(m_qte_rings_cur, rx, ry) || find_ring(m_qte_rings_prev, rx, ry)) {
+                float rx = cx, ry = cy;
+                const bool snapped = find_ring(m_qte_rings_cur, rx, ry) || find_ring(m_qte_rings_prev, rx, ry);
+                float c200[4], c201[4];
+                std::memcpy(c200, constants + 200u * 4u, sizeof c200);
+                std::memcpy(c201, constants + 201u * 4u, sizeof c201);
+                const bool rotated = std::fabs(c200[1]) > 1e-5f || std::fabs(c201[0]) > 1e-5f;
+                if (snapped || rotated) {
                     vk_slice cs = m_ring.alloc(sizeof constants, m_ubo_align);
                     if (cs.ptr) {
                         std::memcpy(cs.ptr, constants, sizeof constants);
-                        std::memcpy(cs.ptr + k_gfx_pos_reg * 16u, &rx, 4);
-                        std::memcpy(cs.ptr + k_gfx_pos_reg * 16u + 4u, &ry, 4);
+                        if (rotated) {
+                            const float sx = std::hypot(c200[0], c200[1]);
+                            const float det = c200[0] * c201[1] - c200[1] * c201[0];
+                            const float sy = (det < 0.f ? -1.f : 1.f) * std::hypot(c201[0], c201[1]);
+                            const float z = 0.f;
+                            std::memcpy(cs.ptr + 200u * 16u + 0u, &sx, 4);
+                            std::memcpy(cs.ptr + 200u * 16u + 4u, &z, 4);
+                            std::memcpy(cs.ptr + 201u * 16u + 0u, &z, 4);
+                            std::memcpy(cs.ptr + 201u * 16u + 4u, &sy, 4);
+                        }
+                        if (snapped) {
+                            std::memcpy(cs.ptr + k_gfx_pos_reg * 16u, &rx, 4);
+                            std::memcpy(cs.ptr + k_gfx_pos_reg * 16u + 4u, &ry, 4);
+                        }
                         m_constants = { cs.buffer, cs.offset, sizeof constants };
                         m_constants_vp = nullptr;
                     }
