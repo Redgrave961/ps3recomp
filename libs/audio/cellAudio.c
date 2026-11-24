@@ -33,13 +33,16 @@
   #endif
   DEFINE_AUDIO_GUID(ps3r_CLSID_MMDeviceEnumerator, 0xBCDE0395,0xE52F,0x467C,0x8E,0x3D,0xC4,0x57,0x92,0x91,0x69,0x2E);
   DEFINE_AUDIO_GUID(ps3r_IID_IMMDeviceEnumerator,  0xA95664D2,0x9614,0x4F35,0xA7,0x46,0xDE,0x8D,0xB6,0x36,0x17,0xE6);
+  DEFINE_AUDIO_GUID(ps3r_IID_IMMNotificationClient,0x7991EEC9,0x7E89,0x4D85,0x83,0x90,0x6C,0x70,0x3C,0xEC,0x60,0xC0);
+  DEFINE_AUDIO_GUID(ps3r_IID_IUnknown,             0x00000000,0x0000,0x0000,0xC0,0x00,0x00,0x00,0x00,0x00,0x00,0x46);
   DEFINE_AUDIO_GUID(ps3r_IID_IAudioClient,         0x1CB9AD4C,0xDBFA,0x4c32,0xB1,0x78,0xC2,0xF5,0x68,0xA7,0x03,0xB2);
   DEFINE_AUDIO_GUID(ps3r_IID_IAudioRenderClient,   0xF294ACFC,0x3146,0x4483,0xA7,0xBF,0xAD,0xDC,0xA7,0xC2,0x60,0xE2);
 
-  #define IID_IMMDeviceEnumerator  ps3r_IID_IMMDeviceEnumerator
-  #define CLSID_MMDeviceEnumerator ps3r_CLSID_MMDeviceEnumerator
-  #define IID_IAudioClient         ps3r_IID_IAudioClient
-  #define IID_IAudioRenderClient   ps3r_IID_IAudioRenderClient
+  #define IID_IMMDeviceEnumerator   ps3r_IID_IMMDeviceEnumerator
+  #define CLSID_MMDeviceEnumerator  ps3r_CLSID_MMDeviceEnumerator
+  #define IID_IMMNotificationClient ps3r_IID_IMMNotificationClient
+  #define IID_IAudioClient          ps3r_IID_IAudioClient
+  #define IID_IAudioRenderClient    ps3r_IID_IAudioRenderClient
 #endif
 
 #if AUDIO_BACKEND_SDL
@@ -95,39 +98,50 @@ static u32   s_out_channels = 2;
 #if AUDIO_BACKEND_SDL
 
 static SDL_AudioStream* s_sdl_audio_stream = NULL;
+static u32              s_sdl_host_channels_cache = 0;
+static volatile int     s_sdl_reopen = 0;
+static unsigned long long s_sdl_reopen_last_ns = 0;
 
-u32 ps3_audio_host_channels(void)
+static u32 sdl_query_host_channels(void)
 {
-    static u32 cached = 0;
-    if (cached) return cached;
     if (SDL_WasInit(SDL_INIT_AUDIO) == 0) {
-        if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
-            cached = 2;
-            return cached;
-        }
+        if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) return 2;
     }
     SDL_AudioSpec dev_spec;
     int frames = 0;
     if (SDL_GetAudioDeviceFormat(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &dev_spec, &frames)) {
-        if (dev_spec.channels >= 8) cached = 8;
-        else if (dev_spec.channels >= 6) cached = 6;
-        else cached = 2;
-    } else {
-        cached = 2;
+        if (dev_spec.channels >= 8) return 8;
+        if (dev_spec.channels >= 6) return 6;
     }
-    return cached;
+    return 2;
 }
 
-static int audio_backend_init(void)
+u32 ps3_audio_host_channels(void)
 {
-    if (SDL_WasInit(SDL_INIT_AUDIO) == 0) {
-        if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
-            printf("[cellAudio] SDL audio init failed: %s\n", SDL_GetError());
-            return -1;
-        }
+    u32 c = __atomic_load_n(&s_sdl_host_channels_cache, __ATOMIC_RELAXED);
+    if (!c) {
+        c = sdl_query_host_channels();
+        __atomic_store_n(&s_sdl_host_channels_cache, c, __ATOMIC_RELAXED);
     }
+    return c;
+}
 
-    s_out_channels = ps3_audio_host_channels();
+static bool SDLCALL sdl_audio_event_watch(void* userdata, SDL_Event* event)
+{
+    (void)userdata;
+    if (event->type == SDL_EVENT_AUDIO_DEVICE_REMOVED ||
+        event->type == SDL_EVENT_AUDIO_DEVICE_FORMAT_CHANGED ||
+        event->type == SDL_EVENT_AUDIO_DEVICE_ADDED) {
+        __atomic_store_n(&s_sdl_reopen, 1, __ATOMIC_RELEASE);
+    }
+    return true;
+}
+
+static int sdl_open_stream(void)
+{
+    const u32 ch = sdl_query_host_channels();
+    __atomic_store_n(&s_sdl_host_channels_cache, ch, __ATOMIC_RELAXED);
+    s_out_channels = ch;
     char frames[16];
     snprintf(frames, sizeof frames, "%d", CELL_AUDIO_BLOCK_SAMPLES);
     SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, frames);
@@ -135,6 +149,7 @@ static int audio_backend_init(void)
     s_sdl_audio_stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
     if (!s_sdl_audio_stream && s_out_channels > 2) {
         s_out_channels = 2;
+        __atomic_store_n(&s_sdl_host_channels_cache, 2, __ATOMIC_RELAXED);
         const SDL_AudioSpec fallback = { SDL_AUDIO_F32, 2, CELL_AUDIO_SAMPLE_RATE };
         s_sdl_audio_stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &fallback, NULL, NULL);
     }
@@ -148,12 +163,47 @@ static int audio_backend_init(void)
     return 0;
 }
 
+static int audio_backend_init(void)
+{
+    if (SDL_WasInit(SDL_INIT_AUDIO) == 0) {
+        if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+            printf("[cellAudio] SDL audio init failed: %s\n", SDL_GetError());
+            return -1;
+        }
+    }
+
+    __atomic_store_n(&s_sdl_reopen, 0, __ATOMIC_RELAXED);
+    SDL_AddEventWatch(sdl_audio_event_watch, NULL);
+    return sdl_open_stream();
+}
+
 static void audio_backend_shutdown(void)
 {
+    SDL_RemoveEventWatch(sdl_audio_event_watch, NULL);
     if (s_sdl_audio_stream) {
         SDL_DestroyAudioStream(s_sdl_audio_stream);
         s_sdl_audio_stream = NULL;
     }
+}
+
+static void audio_backend_poll_reopen(void)
+{
+    const int want = __atomic_exchange_n(&s_sdl_reopen, 0, __ATOMIC_ACQ_REL);
+    if (!want && s_sdl_audio_stream) return;
+
+    const unsigned long long now = ps3_sync_now_ns();
+    if (!want && now - s_sdl_reopen_last_ns < 500000000ull) return;
+    s_sdl_reopen_last_ns = now;
+
+    const u32 new_ch = sdl_query_host_channels();
+    const int unbound = !s_sdl_audio_stream || SDL_GetAudioStreamDevice(s_sdl_audio_stream) == 0;
+    if (!unbound && new_ch == s_out_channels) return;
+
+    if (s_sdl_audio_stream) {
+        SDL_DestroyAudioStream(s_sdl_audio_stream);
+        s_sdl_audio_stream = NULL;
+    }
+    sdl_open_stream();
 }
 
 static void audio_backend_submit(const float* samples, u32 num_samples)
@@ -190,22 +240,67 @@ static unsigned audio_backend_device_frames(void)
 
 #if AUDIO_BACKEND_WASAPI
 
+static IMMDeviceEnumerator* s_wasapi_enum   = NULL;
 static IAudioClient*        s_wasapi_client = NULL;
 static IAudioRenderClient*  s_wasapi_render = NULL;
 static HANDLE               s_wasapi_event  = NULL;
 static UINT32               s_wasapi_buf_frames = 0;
+static volatile LONG        s_wasapi_reopen = 0;
+static volatile LONG        s_wasapi_host_channels_cache = 0;
+static unsigned long long   s_wasapi_reopen_last_ns = 0;
 
 static const GUID k_subformat_ieee_float = {
     0x00000003, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71 }
 };
 
-u32 ps3_audio_host_channels(void)
+static void wasapi_request_reopen(void)
 {
-    static u32 cached = 0;
-    if (cached) return cached;
-    cached = 2;
+    InterlockedExchange(&s_wasapi_reopen, 1);
+    HANDLE ev = s_wasapi_event;
+    if (ev) SetEvent(ev);
+}
+
+static HRESULT STDMETHODCALLTYPE wasapi_notify_qi(IMMNotificationClient* self, REFIID riid, void** ppv)
+{
+    if (!ppv) return E_POINTER;
+    if (memcmp(riid, &ps3r_IID_IUnknown, sizeof(GUID)) == 0 ||
+        memcmp(riid, &IID_IMMNotificationClient, sizeof(GUID)) == 0) {
+        *ppv = self;
+        return S_OK;
+    }
+    *ppv = NULL;
+    return E_NOINTERFACE;
+}
+static ULONG STDMETHODCALLTYPE wasapi_notify_addref(IMMNotificationClient* self) { (void)self; return 1; }
+static ULONG STDMETHODCALLTYPE wasapi_notify_release(IMMNotificationClient* self) { (void)self; return 1; }
+static HRESULT STDMETHODCALLTYPE wasapi_notify_state(IMMNotificationClient* self, LPCWSTR id, DWORD state) { (void)self; (void)id; (void)state; return S_OK; }
+static HRESULT STDMETHODCALLTYPE wasapi_notify_added(IMMNotificationClient* self, LPCWSTR id) { (void)self; (void)id; if (!s_wasapi_client) wasapi_request_reopen(); return S_OK; }
+static HRESULT STDMETHODCALLTYPE wasapi_notify_removed(IMMNotificationClient* self, LPCWSTR id) { (void)self; (void)id; return S_OK; }
+static HRESULT STDMETHODCALLTYPE wasapi_notify_default(IMMNotificationClient* self, EDataFlow flow, ERole role, LPCWSTR id)
+{
+    (void)self; (void)id;
+    if (flow == eRender && role == eConsole) wasapi_request_reopen();
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE wasapi_notify_prop(IMMNotificationClient* self, LPCWSTR id, const PROPERTYKEY key) { (void)self; (void)id; (void)key; return S_OK; }
+
+static IMMNotificationClientVtbl s_wasapi_notify_vtbl = {
+    wasapi_notify_qi,
+    wasapi_notify_addref,
+    wasapi_notify_release,
+    wasapi_notify_state,
+    wasapi_notify_added,
+    wasapi_notify_removed,
+    wasapi_notify_default,
+    wasapi_notify_prop,
+};
+static IMMNotificationClient s_wasapi_notify = { &s_wasapi_notify_vtbl };
+
+static u32 wasapi_query_host_channels(void)
+{
+    u32 ch = 2;
     HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
-    if (FAILED(hr) && hr != S_FALSE && hr != RPC_E_CHANGED_MODE) return cached;
+    if (FAILED(hr) && hr != S_FALSE && hr != RPC_E_CHANGED_MODE) return ch;
     IMMDeviceEnumerator* en = NULL;
     if (SUCCEEDED(CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL, &IID_IMMDeviceEnumerator, (void**)&en)) && en) {
         IMMDevice* dev = NULL;
@@ -214,8 +309,8 @@ u32 ps3_audio_host_channels(void)
             if (SUCCEEDED(dev->lpVtbl->Activate(dev, &IID_IAudioClient, CLSCTX_ALL, NULL, (void**)&cli)) && cli) {
                 WAVEFORMATEX* mix = NULL;
                 if (SUCCEEDED(cli->lpVtbl->GetMixFormat(cli, &mix)) && mix) {
-                    if (mix->nChannels >= 8) cached = 8;
-                    else if (mix->nChannels >= 6) cached = 6;
+                    if (mix->nChannels >= 8) ch = 8;
+                    else if (mix->nChannels >= 6) ch = 6;
                     CoTaskMemFree(mix);
                 }
                 cli->lpVtbl->Release(cli);
@@ -224,7 +319,17 @@ u32 ps3_audio_host_channels(void)
         }
         en->lpVtbl->Release(en);
     }
-    return cached;
+    return ch;
+}
+
+u32 ps3_audio_host_channels(void)
+{
+    LONG c = InterlockedCompareExchange(&s_wasapi_host_channels_cache, 0, 0);
+    if (!c) {
+        c = (LONG)wasapi_query_host_channels();
+        InterlockedExchange(&s_wasapi_host_channels_cache, c);
+    }
+    return (u32)c;
 }
 
 static void fill_wasapi_format(WAVEFORMATEXTENSIBLE* wfxe, u32 channels)
@@ -247,28 +352,45 @@ static void fill_wasapi_format(WAVEFORMATEXTENSIBLE* wfxe, u32 channels)
     }
 }
 
-static int audio_backend_init(void)
+static void wasapi_close_stream(void)
+{
+    if (s_wasapi_client) {
+        s_wasapi_client->lpVtbl->Stop(s_wasapi_client);
+    }
+    if (s_wasapi_render) {
+        s_wasapi_render->lpVtbl->Release(s_wasapi_render);
+        s_wasapi_render = NULL;
+    }
+    if (s_wasapi_client) {
+        s_wasapi_client->lpVtbl->Release(s_wasapi_client);
+        s_wasapi_client = NULL;
+    }
+    if (s_wasapi_event) {
+        CloseHandle(s_wasapi_event);
+        s_wasapi_event = NULL;
+    }
+    s_wasapi_buf_frames = 0;
+}
+
+static int wasapi_open_stream(void)
 {
     HRESULT hr;
-
-    hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
-    if (FAILED(hr) && hr != S_FALSE && hr != RPC_E_CHANGED_MODE) {
-        printf("[cellAudio] CoInitializeEx failed: 0x%08lX\n", hr);
-        return -1;
-    }
-
-    IMMDeviceEnumerator* enumerator = NULL;
-    hr = CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL,
-                          &IID_IMMDeviceEnumerator, (void**)&enumerator);
-    if (FAILED(hr)) {
-        printf("[cellAudio] Failed to create device enumerator: 0x%08lX\n", hr);
-        return -1;
+    IMMDeviceEnumerator* enumerator = s_wasapi_enum;
+    int local_enum = 0;
+    if (!enumerator) {
+        hr = CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL,
+                              &IID_IMMDeviceEnumerator, (void**)&enumerator);
+        if (FAILED(hr)) {
+            printf("[cellAudio] Failed to create device enumerator: 0x%08lX\n", hr);
+            return -1;
+        }
+        local_enum = 1;
     }
 
     IMMDevice* device = NULL;
     hr = enumerator->lpVtbl->GetDefaultAudioEndpoint(enumerator, eRender,
                                                       eConsole, &device);
-    enumerator->lpVtbl->Release(enumerator);
+    if (local_enum) enumerator->lpVtbl->Release(enumerator);
     if (FAILED(hr)) {
         printf("[cellAudio] Failed to get default audio endpoint: 0x%08lX\n", hr);
         return -1;
@@ -282,7 +404,16 @@ static int audio_backend_init(void)
         return -1;
     }
 
-    s_out_channels = ps3_audio_host_channels();
+    u32 ch = 2;
+    WAVEFORMATEX* mix = NULL;
+    if (SUCCEEDED(s_wasapi_client->lpVtbl->GetMixFormat(s_wasapi_client, &mix)) && mix) {
+        if (mix->nChannels >= 8) ch = 8;
+        else if (mix->nChannels >= 6) ch = 6;
+        CoTaskMemFree(mix);
+    }
+    s_out_channels = ch;
+    InterlockedExchange(&s_wasapi_host_channels_cache, (LONG)ch);
+
     WAVEFORMATEXTENSIBLE wfxe;
     fill_wasapi_format(&wfxe, s_out_channels);
 
@@ -306,6 +437,7 @@ static int audio_backend_init(void)
 
     if (FAILED(hr) && s_out_channels > 2) {
         s_out_channels = 2;
+        InterlockedExchange(&s_wasapi_host_channels_cache, 2);
         fill_wasapi_format(&wfxe, 2);
         hr = s_wasapi_client->lpVtbl->Initialize(
             s_wasapi_client,
@@ -321,10 +453,7 @@ static int audio_backend_init(void)
             convert, buf_duration, 0, &wfxe.Format, NULL);
         if (FAILED(hr)) {
             printf("[cellAudio] WASAPI Initialize failed: 0x%08lX\n", hr);
-            s_wasapi_client->lpVtbl->Release(s_wasapi_client);
-            s_wasapi_client = NULL;
-            CloseHandle(s_wasapi_event);
-            s_wasapi_event = NULL;
+            wasapi_close_stream();
             return -1;
         }
         CloseHandle(s_wasapi_event);
@@ -339,8 +468,7 @@ static int audio_backend_init(void)
         s_wasapi_client, &IID_IAudioRenderClient, (void**)&s_wasapi_render);
     if (FAILED(hr)) {
         printf("[cellAudio] Failed to get render client: 0x%08lX\n", hr);
-        s_wasapi_client->lpVtbl->Release(s_wasapi_client);
-        s_wasapi_client = NULL;
+        wasapi_close_stream();
         return -1;
     }
 
@@ -349,31 +477,65 @@ static int audio_backend_init(void)
     return 0;
 }
 
+static int audio_backend_init(void)
+{
+    HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    if (FAILED(hr) && hr != S_FALSE && hr != RPC_E_CHANGED_MODE) {
+        printf("[cellAudio] CoInitializeEx failed: 0x%08lX\n", hr);
+        return -1;
+    }
+
+    InterlockedExchange(&s_wasapi_reopen, 0);
+    if (!s_wasapi_enum) {
+        hr = CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL,
+                              &IID_IMMDeviceEnumerator, (void**)&s_wasapi_enum);
+        if (SUCCEEDED(hr) && s_wasapi_enum) {
+            s_wasapi_enum->lpVtbl->RegisterEndpointNotificationCallback(s_wasapi_enum, &s_wasapi_notify);
+        }
+    }
+    return wasapi_open_stream();
+}
+
 static void audio_backend_shutdown(void)
 {
-    if (s_wasapi_client) {
-        s_wasapi_client->lpVtbl->Stop(s_wasapi_client);
+    wasapi_close_stream();
+    if (s_wasapi_enum) {
+        s_wasapi_enum->lpVtbl->UnregisterEndpointNotificationCallback(s_wasapi_enum, &s_wasapi_notify);
+        s_wasapi_enum->lpVtbl->Release(s_wasapi_enum);
+        s_wasapi_enum = NULL;
     }
-    if (s_wasapi_render) {
-        s_wasapi_render->lpVtbl->Release(s_wasapi_render);
-        s_wasapi_render = NULL;
-    }
-    if (s_wasapi_client) {
-        s_wasapi_client->lpVtbl->Release(s_wasapi_client);
-        s_wasapi_client = NULL;
-    }
-    if (s_wasapi_event) {
-        CloseHandle(s_wasapi_event);
-        s_wasapi_event = NULL;
-    }
+}
+
+static void audio_backend_poll_reopen(void)
+{
+    const LONG want = InterlockedExchange(&s_wasapi_reopen, 0);
+    if (!want && s_wasapi_client) return;
+
+    const unsigned long long now = ps3_sync_now_ns();
+    if (!want && now - s_wasapi_reopen_last_ns < 500000000ull) return;
+    s_wasapi_reopen_last_ns = now;
+
+    wasapi_close_stream();
+    wasapi_open_stream();
+}
+
+static int wasapi_device_lost(HRESULT hr)
+{
+    return hr == AUDCLNT_E_DEVICE_INVALIDATED ||
+           hr == AUDCLNT_E_SERVICE_NOT_RUNNING ||
+           hr == AUDCLNT_E_ENDPOINT_CREATE_FAILED;
 }
 
 static void audio_backend_submit(const float* samples, u32 num_samples)
 {
-    if (!s_wasapi_render) return;
+    if (!s_wasapi_render || !s_wasapi_client) return;
 
     UINT32 padding = 0;
-    s_wasapi_client->lpVtbl->GetCurrentPadding(s_wasapi_client, &padding);
+    HRESULT hr = s_wasapi_client->lpVtbl->GetCurrentPadding(s_wasapi_client, &padding);
+    if (FAILED(hr)) {
+        if (wasapi_device_lost(hr)) wasapi_request_reopen();
+        return;
+    }
 
     UINT32 available = s_wasapi_buf_frames - padding;
     if (num_samples > available) {
@@ -383,13 +545,16 @@ static void audio_backend_submit(const float* samples, u32 num_samples)
     if (num_samples == 0) return;
 
     BYTE* buf = NULL;
-    HRESULT hr = s_wasapi_render->lpVtbl->GetBuffer(s_wasapi_render, num_samples, &buf);
+    hr = s_wasapi_render->lpVtbl->GetBuffer(s_wasapi_render, num_samples, &buf);
     if (SUCCEEDED(hr) && buf) {
         static int mute = -1;
         if (mute < 0) mute = getenv("PS3_MUTE") ? 1 : 0;
         memcpy(buf, samples, num_samples * s_out_channels * sizeof(float));
-        s_wasapi_render->lpVtbl->ReleaseBuffer(s_wasapi_render, num_samples,
-                                               mute ? AUDCLNT_BUFFERFLAGS_SILENT : 0);
+        hr = s_wasapi_render->lpVtbl->ReleaseBuffer(s_wasapi_render, num_samples,
+                                                    mute ? AUDCLNT_BUFFERFLAGS_SILENT : 0);
+        if (wasapi_device_lost(hr)) wasapi_request_reopen();
+    } else if (wasapi_device_lost(hr)) {
+        wasapi_request_reopen();
     }
 }
 
@@ -399,6 +564,10 @@ static int audio_backend_room(void)
     UINT32 padding = 0;
     const HRESULT hr = s_wasapi_client->lpVtbl->GetCurrentPadding(s_wasapi_client, &padding);
     if (FAILED(hr)) {
+        if (wasapi_device_lost(hr)) {
+            wasapi_request_reopen();
+            return -1;
+        }
         static int _n = 0; if (PS3_LOG_FIRST(_n, 4))
             fprintf(stderr, "[cellAudio] GetCurrentPadding failed 0x%08lX -- clock pacing%c", (unsigned long)hr, 10);
         return -1;
@@ -577,6 +746,7 @@ static void audio_mix_loop(void)
     printf("[cellAudio] Mixing thread started\n");
 
 #ifdef _WIN32
+    const HRESULT co_hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
     { HMODULE avrt = LoadLibraryW(L"avrt.dll");
       typedef HANDLE (WINAPI *set_mm_fn)(LPCWSTR, LPDWORD);
@@ -592,6 +762,7 @@ static void audio_mix_loop(void)
     unsigned long long t_start = ps3_sync_now_ns();
     unsigned long long blocks = 0;
     while (s_mix_thread_running) {
+        audio_backend_poll_reopen();
         const int room = audio_backend_room();
         if (room >= 0 && room < CELL_AUDIO_BLOCK_SAMPLES) { audio_backend_wait(); continue; }
 #if AUDIO_BACKEND_WASAPI
@@ -616,7 +787,7 @@ static void audio_mix_loop(void)
         { static int on = -1; if (on < 0) on = getenv("AUDIO_RATE") ? 1 : 0;
           if (on) { static unsigned long long t0; static unsigned n, z; static unsigned long long d0, u0;
             const unsigned long long now = ps3_sync_now_ns() / 1000000ull; if (!t0) t0 = now; n++;
-            { int nz = 0; for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) if (s_mix_buffer[i] != 0.0f) { nz = 1; break; }
+            { int nz = 0; for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * s_out_channels; i++) if (s_mix_buffer[i] != 0.0f) { nz = 1; break; }
               if (!nz) z++; }
             if (now - t0 >= 5000) {
                 fprintf(stderr, "[audio-rate] %.1f blocks/s (real time 187.5), silent %.1f%%, dropped %.0f frames/s, underruns %llu, device buf %u, holes %u+%u%c",
@@ -631,6 +802,9 @@ static void audio_mix_loop(void)
                 n = z = 0; d0 = g_audio_dropped; u0 = g_audio_underruns; t0 = now; } } }
     }
 
+#ifdef _WIN32
+    if (SUCCEEDED(co_hr)) CoUninitialize();
+#endif
     printf("[cellAudio] Mixing thread stopped\n");
 }
 
