@@ -5,18 +5,29 @@
 #include <stdio.h>
 #include <string.h>
 
+extern u32 ps3_audio_host_channels(void);
+
+static u8 active_audio_channels(void)
+{
+    const u32 ch = ps3_audio_host_channels();
+    if (ch >= 8) return CELL_AUDIO_OUT_CHNUM_8;
+    if (ch >= 6) return CELL_AUDIO_OUT_CHNUM_6;
+    return CELL_AUDIO_OUT_CHNUM_2;
+}
+
 s32 cellAudioOutGetSoundAvailability(u32 audioOut, u32 type, u32 fs, u32 option)
 {
     (void)audioOut;
     (void)option;
 
+    const u8 ch = active_audio_channels();
     if (type == CELL_AUDIO_OUT_CODING_TYPE_LPCM) {
-        if (fs & CELL_AUDIO_OUT_FS_48KHZ) return CELL_AUDIO_OUT_CHNUM_6;
+        if (fs & CELL_AUDIO_OUT_FS_48KHZ) return ch;
         return CELL_AUDIO_OUT_CHNUM_2;
     }
 
     if (type == CELL_AUDIO_OUT_CODING_TYPE_AC3 || type == CELL_AUDIO_OUT_CODING_TYPE_DTS)
-        return CELL_AUDIO_OUT_CHNUM_6;
+        return ch >= CELL_AUDIO_OUT_CHNUM_6 ? CELL_AUDIO_OUT_CHNUM_6 : CELL_AUDIO_OUT_CHNUM_2;
 
     return 0;
 }
@@ -67,7 +78,7 @@ s32 cellAudioOutGetConfiguration(u32 audioOut,
     config = GUEST_PTR(config, CellAudioOutConfiguration*);
 
     memset(config, 0, sizeof(CellAudioOutConfiguration));
-    config->channel = CELL_AUDIO_OUT_CHNUM_2;
+    config->channel = active_audio_channels();
     config->encoder = CELL_AUDIO_OUT_CODING_TYPE_LPCM;
 
     return CELL_OK;
@@ -87,7 +98,7 @@ s32 cellAudioOutGetState(u32 audioOut, u32 deviceIndex, void* state)
     vm_write8(ea + 3, 0);
     vm_write32(ea + 4, 0);
     vm_write8(ea + 8, CELL_AUDIO_OUT_CODING_TYPE_LPCM);
-    vm_write8(ea + 9, CELL_AUDIO_OUT_CHNUM_2);
+    vm_write8(ea + 9, active_audio_channels());
     vm_write8(ea + 10, CELL_AUDIO_OUT_FS_48KHZ);
     vm_write8(ea + 11, 0);
     vm_write32(ea + 12, 0);

@@ -89,11 +89,34 @@ static int           s_mix_thread_live = 0;
 #endif
 static mutex_t       s_audio_mutex;
 
-static float s_mix_buffer[CELL_AUDIO_BLOCK_SAMPLES * 2];
+static float s_mix_buffer[CELL_AUDIO_BLOCK_SAMPLES * 8];
+static u32   s_out_channels = 2;
 
 #if AUDIO_BACKEND_SDL
 
 static SDL_AudioStream* s_sdl_audio_stream = NULL;
+
+u32 ps3_audio_host_channels(void)
+{
+    static u32 cached = 0;
+    if (cached) return cached;
+    if (SDL_WasInit(SDL_INIT_AUDIO) == 0) {
+        if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+            cached = 2;
+            return cached;
+        }
+    }
+    SDL_AudioSpec dev_spec;
+    int frames = 0;
+    if (SDL_GetAudioDeviceFormat(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &dev_spec, &frames)) {
+        if (dev_spec.channels >= 8) cached = 8;
+        else if (dev_spec.channels >= 6) cached = 6;
+        else cached = 2;
+    } else {
+        cached = 2;
+    }
+    return cached;
+}
 
 static int audio_backend_init(void)
 {
@@ -104,16 +127,23 @@ static int audio_backend_init(void)
         }
     }
 
+    s_out_channels = ps3_audio_host_channels();
     char frames[16];
     snprintf(frames, sizeof frames, "%d", CELL_AUDIO_BLOCK_SAMPLES);
     SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, frames);
-    const SDL_AudioSpec spec = { SDL_AUDIO_F32, 2, CELL_AUDIO_SAMPLE_RATE };
+    const SDL_AudioSpec spec = { SDL_AUDIO_F32, (int)s_out_channels, CELL_AUDIO_SAMPLE_RATE };
     s_sdl_audio_stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
+    if (!s_sdl_audio_stream && s_out_channels > 2) {
+        s_out_channels = 2;
+        const SDL_AudioSpec fallback = { SDL_AUDIO_F32, 2, CELL_AUDIO_SAMPLE_RATE };
+        s_sdl_audio_stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &fallback, NULL, NULL);
+    }
     if (!s_sdl_audio_stream) {
         printf("[cellAudio] SDL_OpenAudioDeviceStream failed: %s\n", SDL_GetError());
         return -1;
     }
 
+    printf("[cellAudio] Output: %u channels @ %d Hz\n", s_out_channels, CELL_AUDIO_SAMPLE_RATE);
     SDL_ResumeAudioStreamDevice(s_sdl_audio_stream);
     return 0;
 }
@@ -126,18 +156,18 @@ static void audio_backend_shutdown(void)
     }
 }
 
-static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
+static void audio_backend_submit(const float* samples, u32 num_samples)
 {
     if (s_sdl_audio_stream)
-        SDL_PutAudioStreamData(s_sdl_audio_stream, stereo_samples,
-                               (int)(num_samples * 2 * sizeof(float)));
+        SDL_PutAudioStreamData(s_sdl_audio_stream, samples,
+                               (int)(num_samples * s_out_channels * sizeof(float)));
 }
 
 static u32 audio_backend_queued_samples(void)
 {
     if (!s_sdl_audio_stream) return 0;
     const int queued = SDL_GetAudioStreamQueued(s_sdl_audio_stream);
-    return queued > 0 ? (u32)queued / (2 * sizeof(float)) : 0;
+    return queued > 0 ? (u32)queued / (s_out_channels * sizeof(float)) : 0;
 }
 
 static int audio_backend_room(void)
@@ -164,6 +194,58 @@ static IAudioClient*        s_wasapi_client = NULL;
 static IAudioRenderClient*  s_wasapi_render = NULL;
 static HANDLE               s_wasapi_event  = NULL;
 static UINT32               s_wasapi_buf_frames = 0;
+
+static const GUID k_subformat_ieee_float = {
+    0x00000003, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71 }
+};
+
+u32 ps3_audio_host_channels(void)
+{
+    static u32 cached = 0;
+    if (cached) return cached;
+    cached = 2;
+    HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    if (FAILED(hr) && hr != S_FALSE && hr != RPC_E_CHANGED_MODE) return cached;
+    IMMDeviceEnumerator* en = NULL;
+    if (SUCCEEDED(CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL, &IID_IMMDeviceEnumerator, (void**)&en)) && en) {
+        IMMDevice* dev = NULL;
+        if (SUCCEEDED(en->lpVtbl->GetDefaultAudioEndpoint(en, eRender, eConsole, &dev)) && dev) {
+            IAudioClient* cli = NULL;
+            if (SUCCEEDED(dev->lpVtbl->Activate(dev, &IID_IAudioClient, CLSCTX_ALL, NULL, (void**)&cli)) && cli) {
+                WAVEFORMATEX* mix = NULL;
+                if (SUCCEEDED(cli->lpVtbl->GetMixFormat(cli, &mix)) && mix) {
+                    if (mix->nChannels >= 8) cached = 8;
+                    else if (mix->nChannels >= 6) cached = 6;
+                    CoTaskMemFree(mix);
+                }
+                cli->lpVtbl->Release(cli);
+            }
+            dev->lpVtbl->Release(dev);
+        }
+        en->lpVtbl->Release(en);
+    }
+    return cached;
+}
+
+static void fill_wasapi_format(WAVEFORMATEXTENSIBLE* wfxe, u32 channels)
+{
+    memset(wfxe, 0, sizeof(*wfxe));
+    wfxe->Format.nChannels       = (WORD)channels;
+    wfxe->Format.nSamplesPerSec  = CELL_AUDIO_SAMPLE_RATE;
+    wfxe->Format.wBitsPerSample  = 32;
+    wfxe->Format.nBlockAlign     = (WORD)(channels * 4u);
+    wfxe->Format.nAvgBytesPerSec = CELL_AUDIO_SAMPLE_RATE * wfxe->Format.nBlockAlign;
+    if (channels > 2) {
+        wfxe->Format.wFormatTag          = WAVE_FORMAT_EXTENSIBLE;
+        wfxe->Format.cbSize              = 22;
+        wfxe->Samples.wValidBitsPerSample = 32;
+        wfxe->dwChannelMask              = (channels >= 8) ? 0x63Fu : 0x3Fu;
+        wfxe->SubFormat                  = k_subformat_ieee_float;
+    } else {
+        wfxe->Format.wFormatTag          = WAVE_FORMAT_IEEE_FLOAT;
+        wfxe->Format.cbSize              = 0;
+    }
+}
 
 static int audio_backend_init(void)
 {
@@ -200,14 +282,9 @@ static int audio_backend_init(void)
         return -1;
     }
 
-    WAVEFORMATEX wfx;
-    wfx.wFormatTag      = WAVE_FORMAT_IEEE_FLOAT;
-    wfx.nChannels       = 2;
-    wfx.nSamplesPerSec  = CELL_AUDIO_SAMPLE_RATE;
-    wfx.wBitsPerSample  = 32;
-    wfx.nBlockAlign     = wfx.nChannels * (wfx.wBitsPerSample / 8);
-    wfx.nAvgBytesPerSec = wfx.nSamplesPerSec * wfx.nBlockAlign;
-    wfx.cbSize          = 0;
+    s_out_channels = ps3_audio_host_channels();
+    WAVEFORMATEXTENSIBLE wfxe;
+    fill_wasapi_format(&wfxe, s_out_channels);
 
     REFERENCE_TIME buf_duration = 600000;
     { const char* e = getenv("PS3_AUDIO_BUF_MS"); const int ms = e ? atoi(e) : 0;
@@ -225,13 +302,23 @@ static int audio_backend_init(void)
         s_wasapi_client,
         AUDCLNT_SHAREMODE_SHARED,
         AUDCLNT_STREAMFLAGS_EVENTCALLBACK | convert,
-        buf_duration, 0, &wfx, NULL);
+        buf_duration, 0, &wfxe.Format, NULL);
+
+    if (FAILED(hr) && s_out_channels > 2) {
+        s_out_channels = 2;
+        fill_wasapi_format(&wfxe, 2);
+        hr = s_wasapi_client->lpVtbl->Initialize(
+            s_wasapi_client,
+            AUDCLNT_SHAREMODE_SHARED,
+            AUDCLNT_STREAMFLAGS_EVENTCALLBACK | convert,
+            buf_duration, 0, &wfxe.Format, NULL);
+    }
 
     if (FAILED(hr)) {
         hr = s_wasapi_client->lpVtbl->Initialize(
             s_wasapi_client,
             AUDCLNT_SHAREMODE_SHARED,
-            convert, buf_duration, 0, &wfx, NULL);
+            convert, buf_duration, 0, &wfxe.Format, NULL);
         if (FAILED(hr)) {
             printf("[cellAudio] WASAPI Initialize failed: 0x%08lX\n", hr);
             s_wasapi_client->lpVtbl->Release(s_wasapi_client);
@@ -257,6 +344,7 @@ static int audio_backend_init(void)
         return -1;
     }
 
+    printf("[cellAudio] WASAPI output: %u channels @ %d Hz\n", s_out_channels, CELL_AUDIO_SAMPLE_RATE);
     s_wasapi_client->lpVtbl->Start(s_wasapi_client);
     return 0;
 }
@@ -280,7 +368,7 @@ static void audio_backend_shutdown(void)
     }
 }
 
-static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
+static void audio_backend_submit(const float* samples, u32 num_samples)
 {
     if (!s_wasapi_render) return;
 
@@ -299,7 +387,7 @@ static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
     if (SUCCEEDED(hr) && buf) {
         static int mute = -1;
         if (mute < 0) mute = getenv("PS3_MUTE") ? 1 : 0;
-        memcpy(buf, stereo_samples, num_samples * 2 * sizeof(float));
+        memcpy(buf, samples, num_samples * s_out_channels * sizeof(float));
         s_wasapi_render->lpVtbl->ReleaseBuffer(s_wasapi_render, num_samples,
                                                mute ? AUDCLNT_BUFFERFLAGS_SILENT : 0);
     }
@@ -394,28 +482,57 @@ static void audio_mix_one_block(void)
             if (!nz && prev_nz[p]) g_audio_holes[p]++;
             prev_nz[p] = nz; } }
 
+        const u32 out_ch = s_out_channels;
         for (u32 s = 0; s < CELL_AUDIO_BLOCK_SAMPLES; s++) {
-            float left, right;
-            if (nch >= 2) {
-                left  = ld_be_f32(&src[s * nch + 0]) * level;
-                right = ld_be_f32(&src[s * nch + 1]) * level;
+            float* dst = &s_mix_buffer[s * out_ch];
+            if (out_ch == 8) {
+                if (nch == 8) {
+                    for (u32 c = 0; c < 8; c++) dst[c] += ld_be_f32(&src[s * 8 + c]) * level;
+                } else if (nch >= 2) {
+                    dst[0] += ld_be_f32(&src[s * nch + 0]) * level;
+                    dst[1] += ld_be_f32(&src[s * nch + 1]) * level;
+                } else {
+                    const float m = ld_be_f32(&src[s]) * level;
+                    dst[0] += m;
+                    dst[1] += m;
+                }
+            } else if (out_ch == 6) {
+                if (nch == 8) {
+                    dst[0] += ld_be_f32(&src[s * 8 + 0]) * level;
+                    dst[1] += ld_be_f32(&src[s * 8 + 1]) * level;
+                    dst[2] += ld_be_f32(&src[s * 8 + 2]) * level;
+                    dst[3] += ld_be_f32(&src[s * 8 + 3]) * level;
+                    dst[4] += (ld_be_f32(&src[s * 8 + 4]) + ld_be_f32(&src[s * 8 + 6]) * 0.707f) * level;
+                    dst[5] += (ld_be_f32(&src[s * 8 + 5]) + ld_be_f32(&src[s * 8 + 7]) * 0.707f) * level;
+                } else if (nch >= 2) {
+                    dst[0] += ld_be_f32(&src[s * nch + 0]) * level;
+                    dst[1] += ld_be_f32(&src[s * nch + 1]) * level;
+                } else {
+                    const float m = ld_be_f32(&src[s]) * level;
+                    dst[0] += m;
+                    dst[1] += m;
+                }
             } else {
-                left = right = ld_be_f32(&src[s]) * level;
+                float left, right;
+                if (nch >= 2) {
+                    left  = ld_be_f32(&src[s * nch + 0]) * level;
+                    right = ld_be_f32(&src[s * nch + 1]) * level;
+                } else {
+                    left = right = ld_be_f32(&src[s]) * level;
+                }
+                if (nch == 8) {
+                    float center = ld_be_f32(&src[s * 8 + 2]) * level * 0.707f;
+                    float lfe    = ld_be_f32(&src[s * 8 + 3]) * level * 0.5f;
+                    float rl     = ld_be_f32(&src[s * 8 + 4]) * level * 0.5f;
+                    float rr     = ld_be_f32(&src[s * 8 + 5]) * level * 0.5f;
+                    float sl     = ld_be_f32(&src[s * 8 + 6]) * level * 0.3f;
+                    float sr     = ld_be_f32(&src[s * 8 + 7]) * level * 0.3f;
+                    left  += center + lfe + rl + sl;
+                    right += center + lfe + rr + sr;
+                }
+                dst[0] += left;
+                dst[1] += right;
             }
-
-            if (nch == 8) {
-                float center = ld_be_f32(&src[s * 8 + 2]) * level * 0.707f;
-                float lfe    = ld_be_f32(&src[s * 8 + 3]) * level * 0.5f;
-                float rl     = ld_be_f32(&src[s * 8 + 4]) * level * 0.5f;
-                float rr     = ld_be_f32(&src[s * 8 + 5]) * level * 0.5f;
-                float sl     = ld_be_f32(&src[s * 8 + 6]) * level * 0.3f;
-                float sr     = ld_be_f32(&src[s * 8 + 7]) * level * 0.3f;
-                left  += center + lfe + rl + sl;
-                right += center + lfe + rr + sr;
-            }
-
-            s_mix_buffer[s * 2 + 0] += left;
-            s_mix_buffer[s * 2 + 1] += right;
         }
 
         memset(src, 0, CELL_AUDIO_BLOCK_SAMPLES * nch * sizeof(float));
@@ -427,7 +544,8 @@ static void audio_mix_one_block(void)
 
     mutex_unlock(&s_audio_mutex);
 
-    for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) {
+    const u32 total_samples = CELL_AUDIO_BLOCK_SAMPLES * s_out_channels;
+    for (u32 i = 0; i < total_samples; i++) {
         if (s_mix_buffer[i] > 1.0f) s_mix_buffer[i] = 1.0f;
         if (s_mix_buffer[i] < -1.0f) s_mix_buffer[i] = -1.0f;
     }
@@ -436,7 +554,8 @@ static void audio_mix_one_block(void)
 static float audio_mix_peak(void)
 {
     float pk = 0.0f;
-    for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) {
+    const u32 total_samples = CELL_AUDIO_BLOCK_SAMPLES * s_out_channels;
+    for (u32 i = 0; i < total_samples; i++) {
         const float a = s_mix_buffer[i] < 0 ? -s_mix_buffer[i] : s_mix_buffer[i];
         if (a > pk) pk = a;
     }
@@ -447,7 +566,7 @@ static void audio_dump_mix(void)
 {
     static FILE* wf = (FILE*)-1;
     if (wf == (FILE*)-1) { const char* e = getenv("AUDIO_WAV"); wf = e ? fopen(e, "wb") : NULL; }
-    if (wf) fwrite(s_mix_buffer, sizeof(float), CELL_AUDIO_BLOCK_SAMPLES * 2, wf);
+    if (wf) fwrite(s_mix_buffer, sizeof(float), CELL_AUDIO_BLOCK_SAMPLES * s_out_channels, wf);
 }
 
 static unsigned long long g_audio_underruns;
