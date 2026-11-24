@@ -129,6 +129,13 @@ static ps3_vdir* fd_dir(int fd)
     return fd >= 0 && fd < FS_MAX ? __atomic_load_n(&g_dirs[fd], __ATOMIC_ACQUIRE) : nullptr;
 }
 
+static void (*g_fs_open_cb)(const char*) = nullptr;
+
+extern "C" void ppu_fs_set_open_callback(void (*cb)(const char*))
+{
+    g_fs_open_cb = cb;
+}
+
 static void cellFsOpen(ppu_context* ctx)
 {
     char gpath[1024], hpath[1100];
@@ -170,6 +177,7 @@ static void cellFsOpen(ppu_context* ctx)
         fprintf(stderr, "[fs] open FAIL '%s' -> '%s' (flags=0x%X)\n", gpath, hpath, flags);
         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return;
     }
+    if (g_fs_open_cb) g_fs_open_cb(gpath);
     npdrm_file* drm = nullptr;
     if (acc != CELL_FS_O_WRONLY && acc != CELL_FS_O_RDWR && fs_open_npd(f, &drm) < 0) {
         ps3_vfile_close(f);
