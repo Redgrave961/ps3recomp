@@ -8,6 +8,7 @@
 #include "rsx_vk.h"
 #include "vk_device.h"
 #include "vk_renderer.h"
+#include "vk_smaa.h"
 #include "vk_trophy_toast.h"
 #include "../../input/pad_bindings.h"
 #include "ps3emu/thread_name.h"
@@ -89,6 +90,7 @@ struct state {
     VkSemaphore timeline = VK_NULL_HANDLE;
     uint64_t submitted = 0;
     vk::renderer r;
+    vk::smaa smaa;
     vk::trophy_toast toast;
 
     slot slots[k_slots];
@@ -113,6 +115,7 @@ struct state {
     std::atomic<void (*)(rsx_vk_display)> display_listener{ nullptr };
     std::atomic<uint32_t> display_event{ 0 };
     std::atomic<uint64_t> scale{ (3ull << 32) | 1u };
+    std::atomic<rsx_vk_aa> aa{ RSX_VK_AA_SMAA };
     std::mutex modes_lock;
     std::vector<rsx_vk_mode> modes;
     std::atomic<void (*)()> modes_listener{ nullptr };
@@ -351,6 +354,7 @@ bool presenter_build()
     g.r.resolution_scale = resolution_scale();
     report_scale();
     if (!g.r.open(g.d, g.timeline, &g.submitted, g.cache_path.c_str())) return false;
+    g.smaa.create(g.d);
     g.toast.create(g.d);
     return true;
 }
@@ -929,9 +933,11 @@ int vk_present(void*, u32, const rsx_display_buffer* db)
     }
     const u32 ea = (w && h && pitch >= w * 4u) ? rsx_address(RSX_DMA_LOCAL, db->offset, pitch * h) : 0u;
     static u64 shown, shown_fit;
+    static rsx_vk_aa shown_aa = RSX_VK_AA_OFF;
     const u64 content = ea ? g.r.content(ea, pitch) : 0;
     const uint64_t fit = g.fit.load(std::memory_order_acquire);
-    if (!ea || (content && content == shown && fit == shown_fit)) {
+    const rsx_vk_aa aa_mode = g.aa.load(std::memory_order_relaxed);
+    if (!ea || (content && content == shown && fit == shown_fit && aa_mode == shown_aa)) {
         g.r.flush();
         return 0;
     }
@@ -949,6 +955,7 @@ int vk_present(void*, u32, const rsx_display_buffer* db)
     g.r.present_source(ea, w, h, pitch, src, scale, cmd);
     shown = content;
     shown_fit = fit;
+    shown_aa = aa_mode;
     const uint32_t sw = std::min(scale.edge(w), src ? src->width : 0u), sh = std::min(scale.edge(h), src ? src->height : 0u);
     if (!src) {
         g.r.flush();
@@ -976,18 +983,30 @@ int vk_present(void*, u32, const rsx_display_buffer* db)
         if (fitted) span.emplace(g.r, cmd, "present scale %ux%u to %ux%u", sw, sh, out.width, out.height);
         else span.emplace(g.r, cmd, "present copy %ux%u", sw, sh);
     }
-    vk::renderer::barrier(cmd, *src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+    VkImage blit_src = src->handle;
+    if (aa_mode == RSX_VK_AA_SMAA && src->width == sw && src->height == sh && src->view &&
+        (src->format == VK_FORMAT_B8G8R8A8_UNORM || src->format == VK_FORMAT_R8G8B8A8_UNORM)) {
+        vk::renderer::barrier(cmd, *src, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                              VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+        if (const VkImage aa_img = g.smaa.record(cmd, src->view, src->format, sw, sh)) {
+            blit_src = aa_img;
+        } else {
+            vk::renderer::barrier(cmd, *src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+        }
+    } else {
+        vk::renderer::barrier(cmd, *src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+    }
     VkImageMemoryBarrier2 b = to_transfer_dst(s.image, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT);
     barrier_one(cmd, b);
     if (fitted) {
-        blit_fitted(cmd, src->handle, sw, sh, s.image, out);
+        blit_fitted(cmd, blit_src, sw, sh, s.image, out);
     } else {
         VkImageBlit region{};
         region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
         region.srcOffsets[1] = { (int32_t)sw, (int32_t)sh, 1 };
         region.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
         region.dstOffsets[1] = { (int32_t)sw, (int32_t)sh, 1 };
-        vkCmdBlitImage(cmd, src->handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region,
+        vkCmdBlitImage(cmd, blit_src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region,
                        VK_FILTER_NEAREST);
     }
     b.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
@@ -1102,6 +1121,11 @@ extern "C" const rsx_renderer* rsx_vk_renderer(const char* title, const char* ca
 extern "C" void rsx_vk_set_resolution_scale(u32 num, u32 den)
 {
     if (num && den) g.scale.store(((uint64_t)num << 32) | den, std::memory_order_relaxed);
+}
+
+extern "C" void rsx_vk_set_aa(enum rsx_vk_aa aa)
+{
+    g.aa.store(aa, std::memory_order_relaxed);
 }
 
 extern "C" void rsx_vk_set_display(rsx_vk_display display)

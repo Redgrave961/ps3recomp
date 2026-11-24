@@ -1,0 +1,66 @@
+#pragma once
+
+#include "vk_device.h"
+
+namespace vk {
+
+struct image;
+
+class smaa {
+public:
+    bool create(vk_device& d);
+    void destroy();
+
+    // Runs SMAA 1x Ultra (Color Edge Detection + Stencil Mask + Blend Weights + Neighborhood Blend)
+    // on `src` (already in SHADER_READ_ONLY_OPTIMAL) and returns an output VkImage of size
+    // `width x height` transitioned to TRANSFER_SRC_OPTIMAL, or VK_NULL_HANDLE on failure.
+    VkImage record(VkCommandBuffer cmd, VkImageView src_view, VkFormat src_format, uint32_t width, uint32_t height);
+
+private:
+    struct tex {
+        VkImage handle = VK_NULL_HANDLE;
+        VmaAllocation mem = nullptr;
+        VkImageView view = VK_NULL_HANDLE;
+    };
+
+    bool create_image(tex& out, VkFormat format, uint32_t w, uint32_t h, VkImageUsageFlags usage, VkImageAspectFlags view_aspect);
+    void destroy_image(tex& t);
+    bool ensure_targets(uint32_t w, uint32_t h, VkFormat out_format);
+    void destroy_targets();
+    bool ensure_blend_pipeline(VkFormat out_format);
+    bool upload_luts(VkCommandBuffer cmd);
+
+    vk_device* m_d = nullptr;
+    VkSampler m_sampler = VK_NULL_HANDLE;
+    VkDescriptorSetLayout m_set = VK_NULL_HANDLE;
+    VkPipelineLayout m_layout = VK_NULL_HANDLE;
+    VkShaderModule m_edge_vs = VK_NULL_HANDLE;
+    VkShaderModule m_edge_fs = VK_NULL_HANDLE;
+    VkShaderModule m_weight_vs = VK_NULL_HANDLE;
+    VkShaderModule m_weight_fs = VK_NULL_HANDLE;
+    VkShaderModule m_blend_vs = VK_NULL_HANDLE;
+    VkShaderModule m_blend_fs = VK_NULL_HANDLE;
+    VkPipeline m_pipe_edge = VK_NULL_HANDLE;
+    VkPipeline m_pipe_weight = VK_NULL_HANDLE;
+    VkPipeline m_pipe_blend = VK_NULL_HANDLE;
+    VkFormat m_blend_format = VK_FORMAT_UNDEFINED;
+
+    VkFormat m_stencil_format = VK_FORMAT_UNDEFINED;
+    VkImageAspectFlags m_stencil_aspect = VK_IMAGE_ASPECT_STENCIL_BIT;
+
+    tex m_area;
+    tex m_search;
+    VkBuffer m_lut_stage = VK_NULL_HANDLE;
+    VmaAllocation m_lut_stage_mem = nullptr;
+    bool m_luts_uploaded = false;
+
+    uint32_t m_width = 0;
+    uint32_t m_height = 0;
+    VkFormat m_out_format = VK_FORMAT_UNDEFINED;
+    tex m_edges;
+    tex m_blend;
+    tex m_stencil;
+    tex m_out;
+};
+
+} // namespace vk
