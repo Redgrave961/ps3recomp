@@ -44,6 +44,7 @@ int64_t now_ns()
 
 struct slot {
     VkImage image = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
     VmaAllocation mem = nullptr;
     VkFormat format = VK_FORMAT_UNDEFINED;
     uint32_t width = 0;
@@ -647,6 +648,8 @@ bool slot_reserve(slot& s, uint32_t w, uint32_t h, VkFormat format)
 {
     if (s.image && s.width == w && s.height == h && s.format == format) return true;
     timeline_wait(g.present_timeline, g.presented.load());
+    if (s.view) vkDestroyImageView(g.d.dev, s.view, nullptr);
+    s.view = VK_NULL_HANDLE;
     if (s.image) vmaDestroyImage(g.d.vma, s.image, s.mem);
     s.image = VK_NULL_HANDLE;
     VkImageCreateInfo ii{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
@@ -656,10 +659,16 @@ bool slot_reserve(slot& s, uint32_t w, uint32_t h, VkFormat format)
     ii.mipLevels = 1;
     ii.arrayLayers = 1;
     ii.samples = VK_SAMPLE_COUNT_1_BIT;
-    ii.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    ii.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     VmaAllocationCreateInfo ai{};
     ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
     VK_TRY(vmaCreateImage(g.d.vma, &ii, &ai, &s.image, &s.mem, nullptr));
+    VkImageViewCreateInfo vi{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+    vi.image = s.image;
+    vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vi.format = format;
+    vi.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    if (vkCreateImageView(g.d.dev, &vi, nullptr, &s.view) != VK_SUCCESS) s.view = VK_NULL_HANDLE;
     s.format = format;
     s.width = w;
     s.height = h;
@@ -965,10 +974,8 @@ int vk_present(void*, u32, const rsx_display_buffer* db)
     static uint64_t flips;
     ++flips;
     const char* capture_path = nullptr;
-    char shot[48];
     if (capture && flips == std::strtoull(capture, const_cast<char**>(&capture_path), 10) && *capture_path == ':') capture_path++;
     else capture_path = nullptr;
-    (void)shot;
     const VkExtent2D out{ (uint32_t)(fit >> 40), (uint32_t)(fit >> 20) & 0xFFFFFu };
     const VkFormat out_format = (VkFormat)(fit & 0xFFFFFu);
     const bool fitted = fit && !capture_path && src->width == sw && src->height == sh &&
@@ -983,39 +990,74 @@ int vk_present(void*, u32, const rsx_display_buffer* db)
         if (fitted) span.emplace(g.r, cmd, "present scale %ux%u to %ux%u", sw, sh, out.width, out.height);
         else span.emplace(g.r, cmd, "present copy %ux%u", sw, sh);
     }
+    if (g.smaa.has_staging()) {
+        uint64_t done = 0;
+        if (vkGetSemaphoreCounterValue(g.d.dev, g.timeline, &done) == VK_SUCCESS) g.smaa.retire_staging(done);
+    }
+    const bool aa_ok = aa_mode == RSX_VK_AA_SMAA && src->width == sw && src->height == sh && src->view &&
+                       (src->format == VK_FORMAT_B8G8R8A8_UNORM || src->format == VK_FORMAT_R8G8B8A8_UNORM);
+    if (aa_mode == RSX_VK_AA_OFF) g.smaa.release_targets();
+    const float fit_scale = fitted ? std::min((float)out.width / (float)sw, (float)out.height / (float)sh) : 1.f;
+    const bool want_downscale = fitted && fit_scale < 0.999f && s.view && src->view &&
+                                (s.format == VK_FORMAT_B8G8R8A8_UNORM || s.format == VK_FORMAT_R8G8B8A8_UNORM);
+
     VkImage blit_src = src->handle;
-    if (aa_mode == RSX_VK_AA_SMAA && src->width == sw && src->height == sh && src->view &&
-        (src->format == VK_FORMAT_B8G8R8A8_UNORM || src->format == VK_FORMAT_R8G8B8A8_UNORM)) {
+    VkImageView sample_src = VK_NULL_HANDLE;
+    if (aa_ok) {
         vk::renderer::barrier(cmd, *src, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
                               VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
-        if (const VkImage aa_img = g.smaa.record(cmd, src->view, src->format, sw, sh)) {
-            blit_src = aa_img;
-        } else {
-            vk::renderer::barrier(cmd, *src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+        const vk::smaa::output res = g.smaa.record(cmd, src->view, src->format, sw, sh, want_downscale, g.submitted + 1u);
+        if (res.image) {
+            blit_src = res.image;
+            sample_src = res.view;
         }
-    } else {
-        vk::renderer::barrier(cmd, *src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
     }
-    VkImageMemoryBarrier2 b = to_transfer_dst(s.image, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT);
-    barrier_one(cmd, b);
-    if (fitted) {
-        blit_fitted(cmd, blit_src, sw, sh, s.image, out);
-    } else {
-        VkImageBlit region{};
-        region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-        region.srcOffsets[1] = { (int32_t)sw, (int32_t)sh, 1 };
-        region.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-        region.dstOffsets[1] = { (int32_t)sw, (int32_t)sh, 1 };
-        vkCmdBlitImage(cmd, blit_src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region,
-                       VK_FILTER_NEAREST);
+    bool downscaled = false;
+    if (want_downscale) {
+        if (!sample_src) {
+            vk::renderer::barrier(cmd, *src, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                                  VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+            sample_src = src->view;
+        }
+        downscaled = g.smaa.downscale(cmd, sample_src, sw, sh, s.image, s.view, s.format, out);
     }
-    b.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
-    b.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-    b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
-    b.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
-    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    barrier_one(cmd, b);
+    if (!downscaled) {
+        if (blit_src == src->handle)
+            vk::renderer::barrier(cmd, *src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+        else if (want_downscale) {
+            VkImageMemoryBarrier2 mb{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+            mb.srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+            mb.dstStageMask = VK_PIPELINE_STAGE_2_BLIT_BIT;
+            mb.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+            mb.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            mb.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            mb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            mb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            mb.image = blit_src;
+            mb.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+            barrier_one(cmd, mb);
+        }
+        VkImageMemoryBarrier2 b = to_transfer_dst(s.image, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT);
+        barrier_one(cmd, b);
+        if (fitted) {
+            blit_fitted(cmd, blit_src, sw, sh, s.image, out);
+        } else {
+            VkImageBlit region{};
+            region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            region.srcOffsets[1] = { (int32_t)sw, (int32_t)sh, 1 };
+            region.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            region.dstOffsets[1] = { (int32_t)sw, (int32_t)sh, 1 };
+            vkCmdBlitImage(cmd, blit_src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region,
+                           VK_FILTER_NEAREST);
+        }
+        b.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+        b.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+        b.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+        b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        barrier_one(cmd, b);
+    }
     span.reset();
     VkBuffer cap_buf = VK_NULL_HANDLE;
     VmaAllocation cap_mem = nullptr;
@@ -1098,6 +1140,11 @@ void vk_close(void*)
 {
     if (!g.d.dev) return;
     g.r.flush();
+    {
+        std::lock_guard<std::mutex> hold(g.d.queue_lock);
+        vkDeviceWaitIdle(g.d.dev);
+    }
+    g.smaa.destroy();
     g.r.close();
 }
 

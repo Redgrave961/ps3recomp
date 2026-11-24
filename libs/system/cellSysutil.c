@@ -198,6 +198,7 @@ static int sysutil_ieq(const char* a, const char* b)
     return *a == *b;
 }
 
+#ifndef _WIN32
 static void sysutil_locale_code(const char* loc, char* out, size_t n)
 {
     out[0] = 0;
@@ -226,6 +227,7 @@ static void sysutil_locale_code(const char* loc, char* out, size_t n)
         snprintf(out, n, "%s", ll);
     }
 }
+#endif
 
 static void sysutil_host_language(char* out, size_t n)
 {

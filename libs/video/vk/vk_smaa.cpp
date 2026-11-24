@@ -1,6 +1,8 @@
 #include "vk_smaa.h"
 #include "vk_smaa_data.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstring>
 
 namespace vk {
@@ -215,13 +217,15 @@ bool smaa::create(vk_device& d)
     pi.pPushConstantRanges = &pc;
     VK_TRY(vkCreatePipelineLayout(d.dev, &pi, nullptr, &m_layout));
 
-    m_edge_vs   = make_module(d.dev, smaa_data::k_smaa_edge_vs,   std::size(smaa_data::k_smaa_edge_vs));
-    m_edge_fs   = make_module(d.dev, smaa_data::k_smaa_edge_fs,   std::size(smaa_data::k_smaa_edge_fs));
-    m_weight_vs = make_module(d.dev, smaa_data::k_smaa_weight_vs, std::size(smaa_data::k_smaa_weight_vs));
-    m_weight_fs = make_module(d.dev, smaa_data::k_smaa_weight_fs, std::size(smaa_data::k_smaa_weight_fs));
-    m_blend_vs  = make_module(d.dev, smaa_data::k_smaa_blend_vs,  std::size(smaa_data::k_smaa_blend_vs));
-    m_blend_fs  = make_module(d.dev, smaa_data::k_smaa_blend_fs,  std::size(smaa_data::k_smaa_blend_fs));
-    if (!m_edge_vs || !m_edge_fs || !m_weight_vs || !m_weight_fs || !m_blend_vs || !m_blend_fs) {
+    m_edge_vs   = make_module(d.dev, smaa_data::k_smaa_edge_vs,      std::size(smaa_data::k_smaa_edge_vs));
+    m_edge_fs   = make_module(d.dev, smaa_data::k_smaa_edge_fs,      std::size(smaa_data::k_smaa_edge_fs));
+    m_weight_vs = make_module(d.dev, smaa_data::k_smaa_weight_vs,    std::size(smaa_data::k_smaa_weight_vs));
+    m_weight_fs = make_module(d.dev, smaa_data::k_smaa_weight_fs,    std::size(smaa_data::k_smaa_weight_fs));
+    m_blend_vs  = make_module(d.dev, smaa_data::k_smaa_blend_vs,     std::size(smaa_data::k_smaa_blend_vs));
+    m_blend_fs  = make_module(d.dev, smaa_data::k_smaa_blend_fs,     std::size(smaa_data::k_smaa_blend_fs));
+    m_down_vs   = make_module(d.dev, smaa_data::k_smaa_downscale_vs, std::size(smaa_data::k_smaa_downscale_vs));
+    m_down_fs   = make_module(d.dev, smaa_data::k_smaa_downscale_fs, std::size(smaa_data::k_smaa_downscale_fs));
+    if (!m_edge_vs || !m_edge_fs || !m_weight_vs || !m_weight_fs || !m_blend_vs || !m_blend_fs || !m_down_vs || !m_down_fs) {
         destroy();
         return false;
     }
@@ -273,6 +277,24 @@ void smaa::destroy_targets()
     m_out_format = VK_FORMAT_UNDEFINED;
 }
 
+void smaa::release_targets()
+{
+    if (!m_d || !m_out.handle) return;
+    {
+        std::lock_guard<std::mutex> hold(m_d->queue_lock);
+        vkDeviceWaitIdle(m_d->dev);
+    }
+    destroy_targets();
+}
+
+void smaa::retire_staging(uint64_t completed)
+{
+    if (!m_d || !m_lut_stage || !m_luts_uploaded || completed < m_lut_upload_ticket) return;
+    vmaDestroyBuffer(m_d->vma, m_lut_stage, m_lut_stage_mem);
+    m_lut_stage = VK_NULL_HANDLE;
+    m_lut_stage_mem = nullptr;
+}
+
 void smaa::destroy()
 {
     if (!m_d) return;
@@ -282,10 +304,14 @@ void smaa::destroy()
     if (m_lut_stage) vmaDestroyBuffer(m_d->vma, m_lut_stage, m_lut_stage_mem);
     m_lut_stage = VK_NULL_HANDLE;
     m_lut_stage_mem = nullptr;
+    m_lut_upload_ticket = 0;
     m_luts_uploaded = false;
+    if (m_pipe_down) vkDestroyPipeline(m_d->dev, m_pipe_down, nullptr);
     if (m_pipe_blend) vkDestroyPipeline(m_d->dev, m_pipe_blend, nullptr);
     if (m_pipe_weight) vkDestroyPipeline(m_d->dev, m_pipe_weight, nullptr);
     if (m_pipe_edge) vkDestroyPipeline(m_d->dev, m_pipe_edge, nullptr);
+    if (m_down_fs) vkDestroyShaderModule(m_d->dev, m_down_fs, nullptr);
+    if (m_down_vs) vkDestroyShaderModule(m_d->dev, m_down_vs, nullptr);
     if (m_blend_fs) vkDestroyShaderModule(m_d->dev, m_blend_fs, nullptr);
     if (m_blend_vs) vkDestroyShaderModule(m_d->dev, m_blend_vs, nullptr);
     if (m_weight_fs) vkDestroyShaderModule(m_d->dev, m_weight_fs, nullptr);
@@ -295,12 +321,12 @@ void smaa::destroy()
     if (m_layout) vkDestroyPipelineLayout(m_d->dev, m_layout, nullptr);
     if (m_set) vkDestroyDescriptorSetLayout(m_d->dev, m_set, nullptr);
     if (m_sampler) vkDestroySampler(m_d->dev, m_sampler, nullptr);
-    m_pipe_blend = m_pipe_weight = m_pipe_edge = VK_NULL_HANDLE;
-    m_blend_fs = m_blend_vs = m_weight_fs = m_weight_vs = m_edge_fs = m_edge_vs = VK_NULL_HANDLE;
+    m_pipe_down = m_pipe_blend = m_pipe_weight = m_pipe_edge = VK_NULL_HANDLE;
+    m_down_fs = m_down_vs = m_blend_fs = m_blend_vs = m_weight_fs = m_weight_vs = m_edge_fs = m_edge_vs = VK_NULL_HANDLE;
     m_layout = VK_NULL_HANDLE;
     m_set = VK_NULL_HANDLE;
     m_sampler = VK_NULL_HANDLE;
-    m_blend_format = VK_FORMAT_UNDEFINED;
+    m_blend_format = m_down_format = VK_FORMAT_UNDEFINED;
     m_d = nullptr;
 }
 
@@ -315,6 +341,20 @@ bool smaa::ensure_blend_pipeline(VkFormat out_format)
                                  out_format, VK_FORMAT_UNDEFINED, false, false);
     if (!m_pipe_blend) return false;
     m_blend_format = out_format;
+    return true;
+}
+
+bool smaa::ensure_downscale_pipeline(VkFormat dst_format)
+{
+    if (m_pipe_down && m_down_format == dst_format) return true;
+    if (m_pipe_down) {
+        vkDestroyPipeline(m_d->dev, m_pipe_down, nullptr);
+        m_pipe_down = VK_NULL_HANDLE;
+    }
+    m_pipe_down = make_pipeline(m_d->dev, m_layout, m_down_vs, m_down_fs,
+                                dst_format, VK_FORMAT_UNDEFINED, false, false);
+    if (!m_pipe_down) return false;
+    m_down_format = dst_format;
     return true;
 }
 
@@ -333,7 +373,8 @@ bool smaa::ensure_targets(uint32_t w, uint32_t h, VkFormat out_format)
         !create_image(m_stencil, m_stencil_format, w, h,
                       VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_STENCIL_BIT) ||
         !create_image(m_out, out_format, w, h,
-                      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) {
+                      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                      VK_IMAGE_ASPECT_COLOR_BIT)) {
         destroy_targets();
         return false;
     }
@@ -343,7 +384,7 @@ bool smaa::ensure_targets(uint32_t w, uint32_t h, VkFormat out_format)
     return true;
 }
 
-bool smaa::upload_luts(VkCommandBuffer cmd)
+bool smaa::upload_luts(VkCommandBuffer cmd, uint64_t submit_ticket)
 {
     if (m_luts_uploaded) return true;
     img_barrier(cmd, m_area.handle, VK_IMAGE_ASPECT_COLOR_BIT,
@@ -376,15 +417,17 @@ bool smaa::upload_luts(VkCommandBuffer cmd)
                 VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
                 VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
 
+    m_lut_upload_ticket = submit_ticket;
     m_luts_uploaded = true;
     return true;
 }
 
-VkImage smaa::record(VkCommandBuffer cmd, VkImageView src_view, VkFormat src_format, uint32_t width, uint32_t height)
+smaa::output smaa::record(VkCommandBuffer cmd, VkImageView src_view, VkFormat src_format, uint32_t width, uint32_t height,
+                          bool for_sample, uint64_t submit_ticket)
 {
-    if (!m_d || !m_pipe_edge || !width || !height || !src_view) return VK_NULL_HANDLE;
-    if (!ensure_blend_pipeline(src_format) || !ensure_targets(width, height, src_format)) return VK_NULL_HANDLE;
-    upload_luts(cmd);
+    if (!m_d || !m_pipe_edge || !width || !height || !src_view) return {};
+    if (!ensure_blend_pipeline(src_format) || !ensure_targets(width, height, src_format)) return {};
+    upload_luts(cmd, submit_ticket);
 
     const float rt_metrics[4] = { 1.f / (float)width, 1.f / (float)height, (float)width, (float)height };
     const VkViewport vp{ 0.f, 0.f, (float)width, (float)height, 0.f, 1.f };
@@ -494,14 +537,14 @@ VkImage smaa::record(VkCommandBuffer cmd, VkImageView src_view, VkFormat src_for
         vkCmdEndRendering(cmd);
     }
 
-    // Pass 3: Neighborhood Blending
+    // Pass 3: Linear-Space Neighborhood Blending
     img_barrier(cmd, m_blend.handle, VK_IMAGE_ASPECT_COLOR_BIT,
                 VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                 VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
                 VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
     img_barrier(cmd, m_out.handle, VK_IMAGE_ASPECT_COLOR_BIT,
                 VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                VK_PIPELINE_STAGE_2_BLIT_BIT | VK_PIPELINE_STAGE_2_COPY_BIT, 0,
+                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_BLIT_BIT | VK_PIPELINE_STAGE_2_COPY_BIT, 0,
                 VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
 
     {
@@ -539,11 +582,74 @@ VkImage smaa::record(VkCommandBuffer cmd, VkImageView src_view, VkFormat src_for
         vkCmdEndRendering(cmd);
     }
 
-    img_barrier(cmd, m_out.handle, VK_IMAGE_ASPECT_COLOR_BIT,
+    if (for_sample) {
+        img_barrier(cmd, m_out.handle, VK_IMAGE_ASPECT_COLOR_BIT,
+                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                    VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    } else {
+        img_barrier(cmd, m_out.handle, VK_IMAGE_ASPECT_COLOR_BIT,
+                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                    VK_PIPELINE_STAGE_2_BLIT_BIT | VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+    }
+    return { m_out.handle, m_out.view };
+}
+
+bool smaa::downscale(VkCommandBuffer cmd, VkImageView src_view, uint32_t sw, uint32_t sh,
+                     VkImage dst_img, VkImageView dst_view, VkFormat dst_format, VkExtent2D out)
+{
+    if (!m_d || !m_down_vs || !src_view || !dst_img || !dst_view || !sw || !sh || !out.width || !out.height) return false;
+    if (!ensure_downscale_pipeline(dst_format)) return false;
+
+    const float scale = std::min((float)out.width / (float)sw, (float)out.height / (float)sh);
+    const uint32_t dw = (uint32_t)std::max(1, (int32_t)std::lround((float)sw * scale));
+    const uint32_t dh = (uint32_t)std::max(1, (int32_t)std::lround((float)sh * scale));
+    const int32_t x0 = ((int32_t)out.width - (int32_t)dw) / 2;
+    const int32_t y0 = ((int32_t)out.height - (int32_t)dh) / 2;
+    const bool letterboxed = (dw != out.width || dh != out.height);
+
+    img_barrier(cmd, dst_img, VK_IMAGE_ASPECT_COLOR_BIT,
+                VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, 0,
+                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+
+    VkRenderingAttachmentInfo ca{ VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
+    ca.imageView = dst_view;
+    ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    ca.loadOp = letterboxed ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+
+    VkRenderingInfo ri{ VK_STRUCTURE_TYPE_RENDERING_INFO };
+    ri.renderArea = { { 0, 0 }, out };
+    ri.layerCount = 1;
+    ri.colorAttachmentCount = 1;
+    ri.pColorAttachments = &ca;
+
+    const float params[4] = { 1.f / (float)sw, 1.f / (float)sh, (float)sw / (float)dw, (float)sh / (float)dh };
+    const VkViewport vp{ (float)x0, (float)y0, (float)dw, (float)dh, 0.f, 1.f };
+    const VkRect2D scissor{ { x0, y0 }, { dw, dh } };
+
+    vkCmdBeginRendering(cmd, &ri);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipe_down);
+    vkCmdSetViewport(cmd, 0, 1, &vp);
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+    vkCmdPushConstants(cmd, m_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(params), params);
+    const VkDescriptorImageInfo img0{ m_sampler, src_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+    VkWriteDescriptorSet w{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+    w.dstBinding = 0;
+    w.descriptorCount = 1;
+    w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    w.pImageInfo = &img0;
+    vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_layout, 0, 1, &w);
+    vkCmdDraw(cmd, 3, 1, 0, 0);
+    vkCmdEndRendering(cmd);
+
+    img_barrier(cmd, dst_img, VK_IMAGE_ASPECT_COLOR_BIT,
                 VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                 VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-                VK_PIPELINE_STAGE_2_BLIT_BIT | VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
-    return m_out.handle;
+                VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+    return true;
 }
 
 } // namespace vk
