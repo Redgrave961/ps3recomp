@@ -175,8 +175,11 @@ void set_dynamic_state(VkCommandBuffer cmd, const frontend& f, const vk_device& 
     const uint32_t bias_reg = cls == 0 ? rsx::M_POLY_OFFSET_POINT : cls == 1 ? rsx::M_POLY_OFFSET_LINE : rsx::M_POLY_OFFSET_FILL;
     s.bias_enable = t.depth && f.r(bias_reg) != 0;
     if (s.bias_enable) {
-        s.bias[0] = f.f(rsx::M_POLY_OFFSET_BIAS);
-        s.bias[2] = f.f(rsx::M_POLY_OFFSET_SCALE);
+        // UNORM depth targets (Z16/Z24S8) are backed by D32_SFLOAT, so constant polygon offset is applied
+        // directly to viewport Z offset in upload_vertices() in exact UNORM units on all GPUs.
+        s.bias[0] = t.depth_float ? f.f(rsx::M_POLY_OFFSET_BIAS) : 0.f;
+        s.bias[1] = 0.f;
+        s.bias[2] = f.f(rsx::M_POLY_OFFSET_SCALE) * t.scale.value();
     }
 
     const uint32_t c1 = f.r(rsx::M_BLEND_COLOR);

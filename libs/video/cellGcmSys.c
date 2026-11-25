@@ -50,7 +50,7 @@ static struct {
 
 static u32 gcm_local_size(u32 sdk)
 {
-    if (sdk >= 0x00220000u) return 0x0F900000u;
+    if (sdk >= 0x00220000u) return 0x1F900000u;
     if (sdk >= 0x00200000u) return 0x0F200000u;
     if (sdk >= 0x00190000u) return 0x0EA00000u;
     if (sdk >= 0x00180000u) return 0x0E800000u;

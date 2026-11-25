@@ -1060,6 +1060,9 @@ void texture_sampler(const texture_regs& regs, bool vertex_unit, const texture_d
             mip_mode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
         }
 
+        if (sample_mips && desc.levels > 1 && !desc.ops.depth_compare && min_filter == VK_FILTER_LINEAR && mag_filter == VK_FILTER_LINEAR)
+            mip_mode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+
         float min_lod = 0.f, max_lod = 0.f, bias = 0.f;
         if (sample_mips && desc.levels > 1) {
             const float top = static_cast<float>(desc.levels - 1);

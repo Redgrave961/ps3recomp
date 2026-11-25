@@ -313,8 +313,8 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
     if (d.ops.unnormalized) control |= RSX_SPV_TEXC_UNNORMALIZED;
     state.control = control;
     state.remap = 0;
-    state.scale[0] = d.ops.unnormalized ? 1.0f / (float)std::max(d.width, 1u) : 1.0f;
-    state.scale[1] = d.ops.unnormalized ? 1.0f / (float)std::max(d.height, 1u) : 1.0f;
+    state.scale[0] = (d.ops.unnormalized || d.ops.depth_compare) ? 1.0f / (float)std::max(d.width, 1u) : 1.0f;
+    state.scale[1] = (d.ops.unnormalized || d.ops.depth_compare) ? 1.0f / (float)std::max(d.height, 1u) : 1.0f;
 
     const VkImageViewType type = d.cube ? VK_IMAGE_VIEW_TYPE_CUBE : d.dimension == 3 ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D;
     VkCommandBuffer c = cmd();
@@ -386,6 +386,11 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
         const VkImageView view = view_for(*source, VK_IMAGE_VIEW_TYPE_2D, s->depth ? s->img.format : d.format, aspect, d.swizzle);
         path = "dummy: surface view failed";
         if (!view) return false;
+        if (s->depth && d.ops.depth_compare) {
+            const float sc = std::max(s->scale.value(), 1.0f);
+            const float pcf_rad = std::max(1.0f, 1.0f / sc);
+            std::memcpy(&state.remap, &pcf_rad, sizeof pcf_rad);
+        }
         path = source == &s->native ? "surface rescaled" : bound ? "surface snapshot" : "surface";
         out = { sampler, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
         return true;

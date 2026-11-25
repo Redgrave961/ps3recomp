@@ -997,34 +997,35 @@ int vk_present(void*, u32, const rsx_display_buffer* db)
     const bool aa_ok = aa_mode == RSX_VK_AA_SMAA && src->width == sw && src->height == sh && src->view &&
                        (src->format == VK_FORMAT_B8G8R8A8_UNORM || src->format == VK_FORMAT_R8G8B8A8_UNORM);
     if (aa_mode == RSX_VK_AA_OFF) g.smaa.release_targets();
-    const float fit_scale = fitted ? std::min((float)out.width / (float)sw, (float)out.height / (float)sh) : 1.f;
-    const bool want_downscale = fitted && fit_scale < 0.999f && s.view && src->view &&
-                                (s.format == VK_FORMAT_B8G8R8A8_UNORM || s.format == VK_FORMAT_R8G8B8A8_UNORM);
+    const VkExtent2D present_out = fitted ? out : VkExtent2D{ sw, sh };
+    const bool want_present_filter = s.view && src->view && src->width == sw && src->height == sh &&
+                                     (src->format == VK_FORMAT_B8G8R8A8_UNORM || src->format == VK_FORMAT_R8G8B8A8_UNORM) &&
+                                     (s.format == VK_FORMAT_B8G8R8A8_UNORM || s.format == VK_FORMAT_R8G8B8A8_UNORM);
 
     VkImage blit_src = src->handle;
     VkImageView sample_src = VK_NULL_HANDLE;
     if (aa_ok) {
         vk::renderer::barrier(cmd, *src, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
                               VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
-        const vk::smaa::output res = g.smaa.record(cmd, src->view, src->format, sw, sh, want_downscale, g.submitted + 1u);
+        const vk::smaa::output res = g.smaa.record(cmd, src->view, src->format, sw, sh, want_present_filter, g.submitted + 1u);
         if (res.image) {
             blit_src = res.image;
             sample_src = res.view;
         }
     }
-    bool downscaled = false;
-    if (want_downscale) {
+    bool filtered = false;
+    if (want_present_filter) {
         if (!sample_src) {
             vk::renderer::barrier(cmd, *src, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
                                   VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
             sample_src = src->view;
         }
-        downscaled = g.smaa.downscale(cmd, sample_src, sw, sh, s.image, s.view, s.format, out);
+        filtered = g.smaa.downscale(cmd, sample_src, sw, sh, s.image, s.view, s.format, present_out);
     }
-    if (!downscaled) {
+    if (!filtered) {
         if (blit_src == src->handle)
             vk::renderer::barrier(cmd, *src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
-        else if (want_downscale) {
+        else if (want_present_filter) {
             VkImageMemoryBarrier2 mb{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
             mb.srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
             mb.dstStageMask = VK_PIPELINE_STAGE_2_BLIT_BIT;

@@ -313,10 +313,19 @@ bool renderer::upload_vertices(const rsx::draw_clause& clause, u32 first, u32 co
     const float ox = (f(rsx::M_VIEWPORT_OFFSET) - clip_w / 2.f) / (clip_w / 2.f);
     const float sy = f(rsx::M_VIEWPORT_SCALE + 4u) / (clip_h / 2.f);
     const float oy = (f(rsx::M_VIEWPORT_OFFSET + 4u) - clip_h / 2.f) / (clip_h / 2.f);
+    float z_bias = 0.f;
+    if (m_fb.depth && !m_fb.depth->depth_float) {
+        const u32 cls = topology_class(clause.primitive);
+        const u32 bias_reg = cls == 0 ? rsx::M_POLY_OFFSET_POINT : cls == 1 ? rsx::M_POLY_OFFSET_LINE : rsx::M_POLY_OFFSET_FILL;
+        if (r(bias_reg) != 0) {
+            const float unorm_div = m_fb.depth->gcm_format == 1 ? 65535.f : 16777215.f;
+            z_bias = f(rsx::M_POLY_OFFSET_BIAS) / unorm_div;
+        }
+    }
     const float m[4][4] = {
         { sx, 0.f, 0.f, ox },
         { 0.f, sy, 0.f, oy },
-        { 0.f, 0.f, f(rsx::M_VIEWPORT_SCALE + 8u), f(rsx::M_VIEWPORT_OFFSET + 8u) },
+        { 0.f, 0.f, f(rsx::M_VIEWPORT_SCALE + 8u), f(rsx::M_VIEWPORT_OFFSET + 8u) + z_bias },
         { 0.f, 0.f, 0.f, 1.f },
     };
     std::memcpy(layout.scale_offset, m, sizeof m);
@@ -813,6 +822,7 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
         t.scale = m_fb.scale;
         t.depth = m_fb.depth != nullptr;
         t.stencil = m_fb.depth && (m_fb.depth->img.aspect & VK_IMAGE_ASPECT_STENCIL_BIT);
+        t.depth_float = m_fb.depth && m_fb.depth->depth_float;
         for (u32 k = 0; k < 4; k++) t.color_format[k] = m_fb.color_format[k];
         m_last_pipe_key = {};
         fill_pipeline_state(*this, *m_d, t, prim, m_last_pipe_key);

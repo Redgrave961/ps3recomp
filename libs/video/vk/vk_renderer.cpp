@@ -519,7 +519,7 @@ surface* renderer::surface_for(u32 ea, u32 pitch, u32 width, u32 height, u32 for
     VkFormat vf;
     VkImageAspectFlags aspect;
     if (depth) {
-        vf = format == 1 ? (depth_float ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_D16_UNORM) : VK_FORMAT_D32_SFLOAT_S8_UINT;
+        vf = format == 1 ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_D32_SFLOAT_S8_UINT;
         aspect = format == 1 ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
     } else {
         vf = color_format(format);

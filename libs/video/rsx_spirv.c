@@ -1520,6 +1520,7 @@ typedef struct fpc {
     u32 r[64];
     u32 h[128];
     u8 width[64];
+    int fp32_half;
     u32 cc[2];
     u32 vin[RSX_SPV_VAR_COUNT];
     u32 fragcoord, frontfacing, pointcoord;
@@ -1670,23 +1671,72 @@ static void fp_mark(fpc* c, u32 reg, int fp16)
 
 static void fp_widths(fpc* c, const rsx_spv_fp_key* key, int depth)
 {
+    int can_fp32_half = key->texture_shadow != 0;
+    u8 lane[256];
+    if (can_fp32_half) memset(lane, 0, sizeof lane);
     for (u32 pc = 0; pc < c->nprog;) {
         fpi i;
         fp_decode(c, pc, &i);
-        if (!fp_is_flow(i.op) && i.op != FP_NOP) {
+        if (fp_is_flow(i.op)) {
+            if (i.op != FP_FENCT && i.op != FP_FENCB) can_fp32_half = 0;
+        } else if (i.op != FP_NOP) {
+            if (i.op == FP_PK2 || i.op == FP_UP2 || i.op == FP_PK4 || i.op == FP_UP4 || i.op == FP_PKB || i.op == FP_UPB ||
+                i.op == FP_PK16 || i.op == FP_UP16 || i.op == FP_PKG || i.op == FP_UPG)
+                can_fp32_half = 0;
             const u32 srcs[3] = { i.s0, i.s1, i.s2 };
-            for (u32 n = 0; n < fp_nsrc(i.op); n++)
-                if ((srcs[n] & 3u) == 0u) fp_mark(c, bf(srcs[n], 2, 6), (int)bf(srcs[n], 8, 1));
-            if (!bf(i.d, 30, 1)) fp_mark(c, bf(i.d, 1, 6), (int)bf(i.d, 7, 1));
+            const u32 ns = fp_nsrc(i.op);
+            const u32 dmask = bf(i.d, 9, 4);
+            for (u32 n = 0; n < ns; n++) {
+                if ((srcs[n] & 3u) != 0u) continue;
+                const u32 reg = bf(srcs[n], 2, 6);
+                const int fp16 = (int)bf(srcs[n], 8, 1);
+                fp_mark(c, reg, fp16);
+                if (!can_fp32_half) continue;
+                u32 umask = dmask;
+                if (i.op == FP_DP3) umask = 0x7u;
+                else if (i.op == FP_DP4 || fp_is_tex(i.op)) umask = 0xFu;
+                else if ((i.op == FP_DIV || i.op == FP_DIVSQ) && n == 1u) umask = 0x1u;
+                for (u32 k = 0; k < 4u; k++) {
+                    if (!(umask & (1u << k))) continue;
+                    const u32 sc = bf(srcs[n], 9u + k * 2u, 2);
+                    const u32 wid = fp16 ? ((reg >> 1) * 4u + (reg & 1u) * 2u + (sc >> 1)) : (reg * 4u + sc);
+                    if (wid < 256u && lane[wid] && lane[wid] != (fp16 ? 2u : 1u)) can_fp32_half = 0;
+                }
+            }
+            if (!bf(i.d, 30, 1)) {
+                const u32 reg = bf(i.d, 1, 6);
+                const int fp16 = (int)bf(i.d, 7, 1);
+                fp_mark(c, reg, fp16);
+                if (can_fp32_half) {
+                    for (u32 k = 0; k < 4u; k++) {
+                        if (!(dmask & (1u << k))) continue;
+                        const u32 wid = fp16 ? ((reg >> 1) * 4u + (reg & 1u) * 2u + (k >> 1)) : (reg * 4u + k);
+                        if (wid < 256u) lane[wid] = fp16 ? 2u : 1u;
+                    }
+                }
+            }
         }
         pc += fp_has_const(&i) ? 2u : 1u;
     }
     static const u32 rregs[4] = { 0, 2, 3, 4 };
     static const u32 hregs[4] = { 0, 4, 6, 8 };
     const int fp32 = (key->control & RSX_SPV_FPCTL_32BIT_EXPORTS) != 0;
-    for (u32 k = 0; k < 4; k++)
-        if (!k || (key->output_mask & (1u << k))) fp_mark(c, fp32 ? rregs[k] : hregs[k], !fp32);
-    if (depth) fp_mark(c, 1, 0);
+    for (u32 k = 0; k < 4; k++) {
+        if (k && !(key->output_mask & (1u << k))) continue;
+        const u32 reg = fp32 ? rregs[k] : hregs[k];
+        fp_mark(c, reg, !fp32);
+        if (can_fp32_half) {
+            for (u32 j = 0; j < 4u; j++) {
+                const u32 wid = fp32 ? (reg * 4u + j) : ((reg >> 1) * 4u + (reg & 1u) * 2u + (j >> 1));
+                if (wid < 256u && lane[wid] && lane[wid] != (fp32 ? 1u : 2u)) can_fp32_half = 0;
+            }
+        }
+    }
+    if (depth) {
+        fp_mark(c, 1, 0);
+        if (can_fp32_half && lane[6] && lane[6] != 1u) can_fp32_half = 0;
+    }
+    c->fp32_half = can_fp32_half;
 }
 
 static void fp_fill_info(const fpc* c, rsx_spv_fp_info* info, int depth_export)
@@ -1765,7 +1815,7 @@ static u32 fp_readR(fpc* c, u32 n)
     return bc(s, tv4(s), ld(s, tu4(s), fp_rvar(c, n)));
 }
 
-static int fp_split(const fpc* c, u32 m) { return c->width[m >> 1] == FP_WIDTH_H; }
+static int fp_split(const fpc* c, u32 m) { return c->fp32_half || c->width[m >> 1] == FP_WIDTH_H; }
 
 static u32 fp_hvar(fpc* c, u32 m)
 {
@@ -1838,7 +1888,7 @@ static void fp_writeR(fpc* c, u32 n, u32 v, u32 mask, u32 condv)
 static void fp_writeH(fpc* c, u32 m, u32 v, u32 mask, u32 condv)
 {
     spv* s = c->s;
-    u32 q = f16_quantize(s, v);
+    u32 q = c->fp32_half ? v : f16_quantize(s, v);
     if (fp_split(c, m)) {
         u32 var = fp_hvar(c, m);
         if (mask == 0xFu && !condv) {
@@ -2121,6 +2171,7 @@ static u32 fp_src(fpc* c, const fpi* i, u32 n, u32 pc)
     u32 sx = bf(sr, 9, 2), sy = bf(sr, 11, 2), sz = bf(sr, 13, 2), sw = bf(sr, 15, 2);
     if (sx != 0 || sy != 1 || sz != 2 || sw != 3) v = shuf(s, tv4(s), v, v, sx, sy, sz, sw);
     u32 ab = n == 0 ? bf(sr, 29, 1) : bf(sr, 18, 1);
+    if (c->fp32_half && prec == 1u) prec = 0;
     if (prec == 4u) v = clamp_prec(s, v, prec);
     if (ab) v = X(s, tv4(s), GL_FAbs, v);
     if (prec && prec != 4u) v = clamp_prec(s, v, prec);
@@ -2239,8 +2290,30 @@ static u32 fp_tex(fpc* c, const fpi* i, u32 op, u32 s0, u32 s1, u32 s2)
         if (dim == 1) {
             u32 xy = fmul(s, tv2(s), I(s, OpVectorShuffle, tv2(s), coord, coord, 0, 1), fct);
             u32 ref = proj ? fmul(s, TF, exf(s, s0, 2), fdiv(s, TF, cf(s, 1.0f), w)) : exf(s, coord, 2);
-            ref = sel(s, TF, bitset(s, ctl, 14), ref, X(s, TF, GL_FMin, ref, cf(s, 1.0f)));
-            res = I(s, OpImageSampleDrefImplicitLod, TF, img, xy, ref);
+            u32 is_df = bitset(s, ctl, 14);
+            ref = sel(s, TF, is_df, ref, X(s, TF, GL_FMin, ref, cf(s, 1.0f)));
+
+            /* Per-pixel IGN-rotated 8-tap Vogel-disk hardware PCF */
+            u32 tex_x = exf(s, sc, 0), tex_y = exf(s, sc, 1);
+            u32 pcf_rad = bc(s, TF, ex(s, tu(s), ts, 1));
+            u32 sx = fmul(s, TF, tex_x, pcf_rad), sy = fmul(s, TF, tex_y, pcf_rad);
+            u32 fc = fp_fragcoord(c);
+            u32 ign_dot = fadd(s, TF, fmul(s, TF, exf(s, fc, 0), cf(s, 0.06711056f)), fmul(s, TF, exf(s, fc, 1), cf(s, 0.00583715f)));
+            u32 ign = X(s, TF, GL_Fract, fmul(s, TF, cf(s, 52.9829189f), X(s, TF, GL_Fract, ign_dot)));
+            u32 ang = fmul(s, TF, ign, cf(s, 6.2831853f));
+            u32 ca = X(s, TF, GL_Cos, ang), sa = X(s, TF, GL_Sin, ang);
+            static const float k_vx[8] = {  0.250000f, -0.319290f,  0.048836f,  0.402406f, -0.738525f,  0.699710f, -0.236700f, -0.459819f };
+            static const float k_vy[8] = {  0.000000f,  0.292496f, -0.556862f,  0.524943f, -0.130694f, -0.444935f,  0.869766f, -0.852066f };
+            u32 acc = cf(s, 0.0f);
+            for (int k = 0; k < 8; k++) {
+                u32 vx = cf(s, k_vx[k]), vy = cf(s, k_vy[k]);
+                u32 rx = fsub(s, TF, fmul(s, TF, vx, ca), fmul(s, TF, vy, sa));
+                u32 ry = fadd(s, TF, fmul(s, TF, vx, sa), fmul(s, TF, vy, ca));
+                u32 dk = I(s, OpCompositeConstruct, tv2(s), fmul(s, TF, rx, sx), fmul(s, TF, ry, sy));
+                u32 tap = I(s, OpImageSampleDrefImplicitLod, TF, img, fadd(s, tv2(s), xy, dk), ref);
+                acc = k == 0 ? tap : fadd(s, TF, acc, tap);
+            }
+            res = fmul(s, TF, acc, cf(s, 0.125f));
         } else {
             u32 xyz = I(s, OpVectorShuffle, tv3(s), coord, coord, 0, 1, 2);
             u32 ref = exf(s, coord, 3);
@@ -2335,7 +2408,7 @@ static void fp_setdst(fpc* c, const fpi* i, u32 v)
             int ex_ = fp_exempt(op);
             if (op == FP_MOV && fp16 && bf(i->s0, 8, 1) && (i->s0 & 3u) == 0u) ex_ = 1;
             if (!ex_) {
-                if (outp == 1u && op == FP_UP2) {
+                if (outp == 1u && (op == FP_UP2 || c->fp32_half)) {
                 } else if (outp == 1u && !fp16) {
                     v = f16_32_clamp(s, v);
                 } else if (outp != 1u) {

@@ -26,7 +26,7 @@ extern "C" {
 #define VM_TOTAL_SIZE       0x100000000ull
 #define VM_MAIN_MEM_BASE    0x00010000u
 #define VM_MAIN_MEM_SIZE    0x10000000u
-#define VM_STACK_BASE       0xD0000000u
+#define VM_STACK_BASE       0x90000000u
 #define VM_STACK_REGION     0x10000000u
 
 #define VM_PPU_STACK_SIZE   0x00100000u

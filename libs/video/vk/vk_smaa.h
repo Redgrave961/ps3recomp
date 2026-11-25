@@ -24,8 +24,9 @@ public:
     output record(VkCommandBuffer cmd, VkImageView src_view, VkFormat src_format, uint32_t width, uint32_t height,
                   bool for_sample, uint64_t submit_ticket);
 
-    // High-quality linear-space adaptive Lanczos2 / 4x4 area downscale from `src_view` (SHADER_READ_ONLY_OPTIMAL)
-    // into aspect-fitted `dst_img`/`dst_view`, transitioning `dst_img` to TRANSFER_SRC_OPTIMAL.
+    // Present filter: ring-free linear-space SSAA downscale (2x2 area / anti-ringed Mitchell-Netravali / 4x4 area) +
+    // 2-stage adaptive debanding + triangular-PDF dithering into aspect-fitted `dst_img`/`dst_view`,
+    // transitioning `dst_img` to TRANSFER_SRC_OPTIMAL.
     bool downscale(VkCommandBuffer cmd, VkImageView src_view, uint32_t sw, uint32_t sh,
                    VkImage dst_img, VkImageView dst_view, VkFormat dst_format, VkExtent2D out);
 

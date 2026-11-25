@@ -812,8 +812,9 @@ static void test_sampler()
             r.control0 = 0x80000000u | (0x180u << 19) | (0x500u << 7);
             r.filter = (mg << 24) | (mn << 16) | 0x100u;
             sample(r, false, 16.f, info, bc, d);
+            const bool trilinear = mins[mn].mips && mins[mn].f == VK_FILTER_LINEAR && (mg == 2 || mg == 4);
             CHECK(info.minFilter == mins[mn].f);
-            CHECK(info.mipmapMode == mins[mn].m);
+            CHECK(info.mipmapMode == (trilinear ? VK_SAMPLER_MIPMAP_MODE_LINEAR : mins[mn].m));
             CHECK(info.magFilter == ((mg == 2 || mg == 4) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST));
             if (mins[mn].mips) {
                 CHECK(info.minLod == 1.5f && info.maxLod == 5.f && info.mipLodBias == 1.f);
@@ -852,7 +853,7 @@ static void test_sampler()
             r.filter = 0x02060000u | b.bits;
             sample(r, false, 16.f, info, bc, d);
             CHECK(info.mipLodBias == b.lin);
-            r.filter = 0x02040000u | b.bits;
+            r.filter = 0x01030000u | b.bits;
             sample(r, false, 16.f, info, bc, d);
             CHECK(info.mipLodBias == b.nearest);
         }

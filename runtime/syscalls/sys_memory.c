@@ -14,7 +14,7 @@ uint32_t g_sys_mem_bump_ptr = 0;
 #define SYS_MEM_ALLOC_BASE  0x10000000u
 #define SYS_MEM_ALLOC_END   0x20000000u
 #define SYS_MAPPER_BASE     0x40000000u
-#define SYS_MAPPER_END      0xC0000000u
+#define SYS_MAPPER_END      0x90000000u
 static uint32_t s_mapper_bump_ptr = SYS_MAPPER_BASE;
 typedef struct mapper_reservation {
     uint32_t start, end, next;
