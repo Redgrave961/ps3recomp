@@ -45,6 +45,8 @@ struct dynamic_state {
 struct dynamic_cache {
     dynamic_state last;
     bool valid = false;
+    bool bias_set = false;
+    bool bounds_set = false;
 };
 
 void fill_pipeline_state(const rsx::frontend& f, const vk_device& d, const draw_target& t, uint32_t prim, pipeline_key& key);

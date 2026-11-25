@@ -74,7 +74,7 @@ bool stencil_writes(const rsx::frontend& f, bool back)
 
 bool ranges_overlap(u32 a, u32 an, u32 b, u32 bn)
 {
-    return a < b + bn && b < a + an;
+    return an && bn && (uint64_t)a < (uint64_t)b + bn && (uint64_t)b < (uint64_t)a + an;
 }
 
 bool scaled_edge(float x, const ratio& s, int32_t& out)
@@ -138,6 +138,10 @@ void renderer::close()
         std::lock_guard<std::mutex> hold(m_d->queue_lock);
         vkQueueWaitIdle(m_d->queue);
     }
+    if (m_trace) {
+        std::fclose(m_trace);
+        m_trace = nullptr;
+    }
     if (m_trace_pool) vkDestroyQueryPool(m_d->dev, m_trace_pool, nullptr);
     m_trace_pool = VK_NULL_HANDLE;
     m_occlusion.destroy();
@@ -150,6 +154,7 @@ void renderer::close()
         destroy_image(s->img);
         destroy_image(s->snapshot);
         destroy_image(s->as_color);
+        destroy_image(s->native);
     }
     for (auto& g : m_garbage) destroy_image(g.second);
     destroy_image(m_display);
@@ -161,9 +166,11 @@ void renderer::close()
         return true;
     });
     m_samplers.erase_if([this](uint64_t, VkSampler s) {
-        vkDestroySampler(m_d->dev, s, nullptr);
+        if (s) vkDestroySampler(m_d->dev, s, nullptr);
         return true;
     });
+    m_sampler_count = 0;
+    m_custom_border_count = 0;
     if (m_dummy_sampler) vkDestroySampler(m_d->dev, m_dummy_sampler, nullptr);
     if (m_buffer_pool) vkDestroyDescriptorPool(m_d->dev, std::exchange(m_buffer_pool, VK_NULL_HANDLE), nullptr);
     m_pipelines.destroy();
@@ -368,6 +375,7 @@ void renderer::submit(VkSemaphore wait, VkPipelineStageFlags2 wait_stage, VkSema
     m_dynamic.valid = false;
     m_bound.valid = false;
     m_bound.pipeline = VK_NULL_HANDLE;
+    m_constants_vp = nullptr;
     m_ring.close(value);
     m_occlusion.submitted(value);
 
@@ -429,7 +437,11 @@ bool renderer::create_image(image& img, VkFormat format, u32 width, u32 height, 
         vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
         vi.format = format;
         vi.subresourceRange = { aspect, 0, 1, 0, 1 };
-        VK_TRY(vkCreateImageView(m_d->dev, &vi, nullptr, &img.view));
+        if (vkCreateImageView(m_d->dev, &vi, nullptr, &img.view) != VK_SUCCESS) {
+            vmaDestroyImage(m_d->vma, img.handle, img.mem);
+            img = image{};
+            return false;
+        }
     }
     img.format = format;
     img.aspect = aspect;
@@ -464,12 +476,27 @@ void renderer::destroy_image(image& img)
 
 void renderer::discard(image& img)
 {
-    if (img.handle) m_garbage.emplace_back(*m_submitted + 1u, img);
+    if (img.handle) m_garbage.emplace_back(*m_submitted + 1u, std::move(img));
     img = image{};
 }
 
 void renderer::retire(surface* s)
 {
+    bool was_bound = false;
+    if (m_fb.depth == s) {
+        m_fb.depth = nullptr;
+        was_bound = true;
+    }
+    for (surface*& b : m_fb.color) {
+        if (b == s) {
+            b = nullptr;
+            was_bound = true;
+        }
+    }
+    if (was_bound) {
+        m_fb_valid = false;
+        m_fb_dirty = true;
+    }
     discard(s->img);
     discard(s->snapshot);
     discard(s->as_color);
@@ -489,7 +516,8 @@ ratio renderer::scale_for(u32 width, u32 height, bool depth) const
     return resolution_scale;
 }
 
-surface* renderer::surface_for(u32 ea, u32 pitch, u32 width, u32 height, u32 format, bool depth, u32 aa_u, u32 aa_v)
+surface* renderer::surface_for(u32 ea, u32 pitch, u32 width, u32 height, u32 format, bool depth, u32 aa_u, u32 aa_v,
+                               const surface* const* keep, u32 keep_count)
 {
     const ratio scale = scale_for(width, height, depth);
     surface* grow_from = nullptr;
@@ -550,6 +578,7 @@ surface* renderer::surface_for(u32 ea, u32 pitch, u32 width, u32 height, u32 for
         surface* o = m_surfaces[i].get();
         bool bound = o == m_fb.depth;
         for (surface* b : m_fb.color) bound |= o == b;
+        for (u32 k = 0; k < keep_count; k++) bound |= o == keep[k];
         if (!bound && ranges_overlap(o->ea, o->bytes(), ea, bytes)) {
             retire(o);
             continue;
@@ -746,6 +775,7 @@ void renderer::download_surface(surface& s)
     wi.pSemaphores = &m_timeline;
     wi.pValues = &value;
     vkWaitSemaphores(m_d->dev, &wi, UINT64_MAX);
+    m_ring.invalidate(slice.offset, (VkDeviceSize)row * h);
     await_writes(s.ea, s.pitch * h);
     uint8_t* dst = vm_base + s.ea;
     mark_written(s.ea, s.pitch * h);
@@ -917,18 +947,21 @@ bool renderer::bind_framebuffer(u32 context)
     fb.aa_v = aa_v;
     fb.depth_write = zeta_write;
     fb.z_write = depth_test && depth_write;
+    const surface* kept[4]{};
+    u32 nkept = 0;
     for (u32 k = 0; k < 4; k++) {
         if (!use[k]) continue;
         const u32 ea = color_ea[k] + color_pitch[k] * woy + color_texel * wox;
-        fb.color[k] = surface_for(ea, color_pitch[k], width, height, color_fmt, false, aa_u, aa_v);
+        fb.color[k] = surface_for(ea, color_pitch[k], width, height, color_fmt, false, aa_u, aa_v, kept, nkept);
         if (!fb.color[k]) continue;
+        kept[nkept++] = fb.color[k];
         fb.color_format[k] = fb.color[k]->img.format;
         fb.scale = fb.color[k]->scale;
         fb.count = k + 1u;
     }
     if (zeta_ea) {
         const u32 ea = zeta_ea + zeta_pitch * woy + depth_texel * wox;
-        fb.depth = surface_for(ea, zeta_pitch, width, height, depth_fmt ? depth_fmt : 2u, true, aa_u, aa_v);
+        fb.depth = surface_for(ea, zeta_pitch, width, height, depth_fmt ? depth_fmt : 2u, true, aa_u, aa_v, kept, nkept);
         if (fb.depth) {
             fb.depth_format = fb.depth->img.format;
             fb.scale = fb.depth->scale;
@@ -1383,7 +1416,7 @@ void renderer::flip_reset()
         std::snprintf(name, sizeof name, "trace_%llu.txt", (unsigned long long)m_flips);
         m_trace = std::fopen(name, "w");
         if (m_trace) {
-            std::setvbuf(m_trace, nullptr, _IOFBF, 1u << 28);
+            std::setvbuf(m_trace, nullptr, _IOFBF, 4u << 20);
             std::fprintf(m_trace, "[trace] frame %llu\n", (unsigned long long)m_flips);
             std::fprintf(stderr, "[vk] F12 trace -> %s\n", name);
             m_trace_timed = true;

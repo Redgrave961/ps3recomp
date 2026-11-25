@@ -1,8 +1,14 @@
 #include "npdrm.h"
 
+#include <ctype.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "ps3_aes.h"
+#include "../../runtime/platform/win32_dirent.h"
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 #define FLAG_COMPRESSED    0x00000001u
 #define FLAG_PLAIN         0x00000002u
@@ -26,13 +32,6 @@ static const uint8_t KLIC_BUILTIN[4][16] = {
     { 0x52,0xC0,0xB5,0xCA,0x76,0xD6,0x13,0x4B,0xB4,0x5F,0xC6,0x6C,0xA6,0x37,0xF2,0xC1 },
     { 0x2A,0x6A,0xFB,0xCF,0x43,0xD1,0x57,0x9F,0x7D,0x73,0x87,0x41,0xA1,0x3B,0xD4,0x2E },
     { 0x0D,0xB8,0x57,0x32,0x36,0x6C,0xD7,0x34,0xFC,0x87,0x9E,0x74,0x33,0x43,0xBB,0x4F } };
-
-PS3_AES_TARGET static void aes_ecb(const uint8_t key[16], const uint8_t in[16], uint8_t out[16])
-{
-    ps3_aes_key k;
-    ps3_aes128_init(&k, key);
-    ps3_aes_ecb_enc(&k, in, out);
-}
 
 PS3_AES_TARGET static void aes_cbc_dec(const uint8_t key[16], const uint8_t iv[16], const uint8_t* in, uint8_t* out, size_t n)
 {
@@ -139,11 +138,22 @@ static void hmac_sha1(const uint8_t* key, size_t key_len, const uint8_t* m, size
 
 static uint8_t s_klic[16][16];
 static volatile int s_klic_n;
+static volatile int s_klic_lock;
+
+static void spin_lock(volatile int* l) { while (__atomic_exchange_n(l, 1, __ATOMIC_ACQUIRE)) {} }
+static void spin_unlock(volatile int* l) { __atomic_store_n(l, 0, __ATOMIC_RELEASE); }
 
 void npdrm_add_klicensee(const uint8_t k[16])
 {
-    for (int i = 0; i < s_klic_n; i++) if (!memcmp(s_klic[i], k, 16)) return;
-    if (s_klic_n < 16) { memcpy(s_klic[s_klic_n], k, 16); __atomic_add_fetch(&s_klic_n, 1, __ATOMIC_RELEASE); }
+    spin_lock(&s_klic_lock);
+    const int n = s_klic_n;
+    for (int i = 0; i < n; i++)
+        if (!memcmp(s_klic[i], k, 16)) { spin_unlock(&s_klic_lock); return; }
+    if (n < 16) {
+        memcpy(s_klic[n], k, 16);
+        __atomic_store_n(&s_klic_n, n + 1, __ATOMIC_RELEASE);
+    }
+    spin_unlock(&s_klic_lock);
 }
 
 static void rap_to_rif(const uint8_t rap[16], uint8_t key[16])
@@ -165,20 +175,113 @@ static void rap_to_rif(const uint8_t rap[16], uint8_t key[16])
 
 void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size);
 
-static int rap_key(const uint8_t* content_id, uint8_t key[16])
+static FILE* npdrm_fopen_utf8(const char* path)
 {
-    char cid[49], guest[96], path[1100];
-    memcpy(cid, content_id, 48);
-    cid[48] = 0;
-    snprintf(guest, sizeof guest, "/dev_hdd0/home/00000001/exdata/%s.rap", cid);
-    sys_fs_translate_path(guest, path, (int)sizeof path);
-    FILE* f = fopen(path, "rb");
+#ifdef _WIN32
+    wchar_t wp[1100];
+    if (!MultiByteToWideChar(CP_UTF8, 0, path, -1, wp, 1100)) return NULL;
+    return _wfopen(wp, L"rb");
+#else
+    return fopen(path, "rb");
+#endif
+}
+
+static int hex_val(int c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static int read_rap_file(const char* path, uint8_t rap[16])
+{
+    FILE* f = npdrm_fopen_utf8(path);
     if (!f) return 0;
-    uint8_t rap[16];
-    const int ok = fread(rap, 1, 16, f) == 16;
+    uint8_t buf[96];
+    const size_t n = fread(buf, 1, sizeof buf, f);
     fclose(f);
-    if (ok) rap_to_rif(rap, key);
-    return ok;
+    if (n == 16) {
+        memcpy(rap, buf, 16);
+        return 1;
+    }
+    /* Also accept ASCII hex-encoded 32-char .rap files (ignoring UTF-8 BOM, 0x prefix, whitespace) */
+    size_t start = (n >= 3 && buf[0] == 0xEF && buf[1] == 0xBB && buf[2] == 0xBF) ? 3 : 0;
+    while (start < n && isspace(buf[start])) start++;
+    if (start + 2 <= n && buf[start] == '0' && (buf[start + 1] == 'x' || buf[start + 1] == 'X')) start += 2;
+    uint8_t hex[32];
+    size_t hn = 0;
+    for (size_t i = start; i < n; i++) {
+        if (isspace(buf[i])) continue;
+        if (hn >= 32 || hex_val(buf[i]) < 0) return 0;
+        hex[hn++] = buf[i];
+    }
+    if (hn != 32) return 0;
+    for (size_t i = 0; i < 16; i++)
+        rap[i] = (uint8_t)((hex_val(hex[i * 2]) << 4) | hex_val(hex[i * 2 + 1]));
+    return 1;
+}
+
+static int ci_ends_with_rap(const char* name)
+{
+    const size_t n = strlen(name);
+    return n >= 4 && name[n - 4] == '.' && tolower((unsigned char)name[n - 3]) == 'r' &&
+           tolower((unsigned char)name[n - 2]) == 'a' && tolower((unsigned char)name[n - 1]) == 'p';
+}
+
+static int ci_contains(const char* hay, const char* needle)
+{
+    const size_t nl = strlen(needle);
+    if (!nl) return 0;
+    for (const char* p = hay; *p; p++) {
+        size_t i = 0;
+        while (i < nl && p[i] && tolower((unsigned char)p[i]) == tolower((unsigned char)needle[i])) i++;
+        if (i == nl) return 1;
+    }
+    return 0;
+}
+
+typedef struct {
+    char cid[49];
+    uint8_t key[16];
+} rap_cache_entry;
+
+static rap_cache_entry s_rap_cache[64];
+static volatile int s_rap_cache_n;
+static volatile int s_rap_cache_lock;
+
+static int rap_cache_get(const char* cid, uint8_t key[16])
+{
+    spin_lock(&s_rap_cache_lock);
+    const int n = s_rap_cache_n;
+    for (int i = 0; i < n; i++) {
+        if (!strcmp(s_rap_cache[i].cid, cid)) {
+            memcpy(key, s_rap_cache[i].key, 16);
+            spin_unlock(&s_rap_cache_lock);
+            return 1;
+        }
+    }
+    spin_unlock(&s_rap_cache_lock);
+    return 0;
+}
+
+static void rap_cache_put(const char* cid, const uint8_t key[16])
+{
+    spin_lock(&s_rap_cache_lock);
+    const int n = s_rap_cache_n;
+    for (int i = 0; i < n; i++) {
+        if (!strcmp(s_rap_cache[i].cid, cid)) {
+            memcpy(s_rap_cache[i].key, key, 16);
+            spin_unlock(&s_rap_cache_lock);
+            return;
+        }
+    }
+    if (n < 64) {
+        memcpy(s_rap_cache[n].cid, cid, 49);
+        memcpy(s_rap_cache[n].key, key, 16);
+        __atomic_store_n(&s_rap_cache_n, n + 1, __ATOMIC_RELEASE);
+    }
+    spin_unlock(&s_rap_cache_lock);
 }
 
 static int klic_matches(const uint8_t* hdr, const uint8_t k[16])
@@ -193,6 +296,8 @@ struct npdrm_file {
     ps3_vfile* f;
     uint8_t hdr[0x100];
     uint8_t key[16];
+    ps3_aes_key ek_main;
+    ps3_aes_key ek_edat;
     uint32_t flags, block_size, blocks, version;
     uint64_t size;
     int64_t cached;
@@ -201,7 +306,7 @@ struct npdrm_file {
     uint8_t* enc;
 };
 
-static int64_t load_block(npdrm_file* d, uint32_t b)
+PS3_AES_TARGET static int64_t load_block(npdrm_file* d, uint32_t b)
 {
     if (d->cached == b) return d->cached_len;
     const int lead = (d->flags & FLAG_0x20) != 0;
@@ -222,14 +327,13 @@ static int64_t load_block(npdrm_file* d, uint32_t b)
         uint8_t bk[16] = { 0 }, ck[16], hk[20] = { 0 }, mac[20];
         if (d->version > 1) memcpy(bk, d->hdr + 0x60, 12);
         bk[12] = (uint8_t)(b >> 24); bk[13] = (uint8_t)(b >> 16); bk[14] = (uint8_t)(b >> 8); bk[15] = (uint8_t)b;
-        aes_ecb(d->key, bk, ck);
-        if (d->flags & FLAG_0x10) aes_ecb(d->key, ck, hk); else memcpy(hk, ck, 16);
+        ps3_aes_ecb_enc(&d->ek_main, bk, ck);
+        if (d->flags & FLAG_0x10) ps3_aes_ecb_enc(&d->ek_main, ck, hk); else memcpy(hk, ck, 16);
         if (d->flags & FLAG_ENCRYPTED_KEY) {
             static const uint8_t zero[16];
-            const uint8_t* erk = EDAT_KEY[d->version == 4];
             uint8_t t[16];
-            memcpy(t, ck, 16); aes_cbc_dec(erk, zero, t, ck, 16);
-            memcpy(t, hk, 16); aes_cbc_dec(erk, zero, t, hk, 16);
+            memcpy(t, ck, 16); ps3_aes_cbc_dec(&d->ek_edat, zero, t, ck, 16);
+            memcpy(t, hk, 16); ps3_aes_cbc_dec(&d->ek_edat, zero, t, hk, 16);
         }
         if (!(d->flags & FLAG_0x10)) aes_cmac(hk, d->enc, padded, mac);
         else hmac_sha1(hk, (d->flags & FLAG_0x20) ? 20 : 16, d->enc, padded, mac);
@@ -243,6 +347,57 @@ static int64_t load_block(npdrm_file* d, uint32_t b)
     return len;
 }
 
+PS3_AES_TARGET static int try_rif_key(npdrm_file* d, const uint8_t key[16])
+{
+    memcpy(d->key, key, 16);
+    ps3_aes128_init(&d->ek_main, d->key);
+    d->cached = -1;
+    return !d->blocks || load_block(d, 0) >= 0;
+}
+
+static int unlock_with_exdata(npdrm_file* d, const char* exdata_dir, uint8_t* rap_out)
+{
+    char cid[49];
+    memcpy(cid, d->hdr + 0x10, 48);
+    cid[48] = 0;
+
+    uint8_t cand_rap[16], cand_key[16];
+    if (!rap_out && rap_cache_get(cid, cand_key) && try_rif_key(d, cand_key)) return 1;
+
+    char path[1400];
+    snprintf(path, sizeof path, "%s/%s.rap", exdata_dir, cid);
+    if (read_rap_file(path, cand_rap)) {
+        rap_to_rif(cand_rap, cand_key);
+        if (try_rif_key(d, cand_key)) {
+            rap_cache_put(cid, cand_key);
+            if (rap_out) memcpy(rap_out, cand_rap, 16);
+            return 1;
+        }
+    }
+
+    /* Pass 1: case-insensitive filename match or embedded Content ID; Pass 2: ANY .rap file in exdata */
+    for (int pass = 0; pass < 2; pass++) {
+        DIR* dir = opendir(exdata_dir);
+        if (!dir) break;
+        for (struct dirent* e; (e = readdir(dir));) {
+            if (!ci_ends_with_rap(e->d_name)) continue;
+            const int name_match = ci_contains(e->d_name, cid);
+            if ((pass == 0) != name_match) continue;
+            snprintf(path, sizeof path, "%s/%s", exdata_dir, e->d_name);
+            if (!read_rap_file(path, cand_rap)) continue;
+            rap_to_rif(cand_rap, cand_key);
+            if (try_rif_key(d, cand_key)) {
+                closedir(dir);
+                rap_cache_put(cid, cand_key);
+                if (rap_out) memcpy(rap_out, cand_rap, 16);
+                return 1;
+            }
+        }
+        closedir(dir);
+    }
+    return 0;
+}
+
 int npdrm_is_npd(ps3_vfile* f)
 {
     uint8_t m[4];
@@ -252,7 +407,7 @@ int npdrm_is_npd(ps3_vfile* f)
     return npd;
 }
 
-npdrm_file* npdrm_open(ps3_vfile* f)
+PS3_AES_TARGET static npdrm_file* npdrm_open_ex(ps3_vfile* f, const char* exdata_override, uint8_t* rap_out)
 {
     npdrm_file* d = (npdrm_file*)calloc(1, sizeof *d);
     if (!d) return NULL;
@@ -265,26 +420,92 @@ npdrm_file* npdrm_open(ps3_vfile* f)
     d->block_size = ps3_be32(d->hdr + 0x84);
     d->size = (uint64_t)ps3_be32(d->hdr + 0x88) << 32 | ps3_be32(d->hdr + 0x8C);
     if ((d->flags & FLAG_COMPRESSED) || !d->block_size || d->block_size > (1u << 24)) goto fail;
-    d->blocks = (uint32_t)((d->size + d->block_size - 1) / d->block_size);
-    if (d->flags & FLAG_SDAT) {
-        for (int i = 0; i < 16; i++) d->key[i] = d->hdr[0x60 + i] ^ SDAT_KEY[i];
-    } else if ((license & 3) == 3) {
-        int found = 0;
-        for (int i = 0; i < s_klic_n && !found; i++) if (klic_matches(d->hdr, s_klic[i])) { memcpy(d->key, s_klic[i], 16); found = 1; }
-        for (int i = 0; i < 4 && !found; i++) if (klic_matches(d->hdr, KLIC_BUILTIN[i])) { memcpy(d->key, KLIC_BUILTIN[i], 16); found = 1; }
-        if (!found) goto fail;
-    } else if (!rap_key(d->hdr + 0x10, d->key)) {
-        goto fail;
-    }
+    if (d->size > UINT64_MAX - d->block_size) goto fail;
+    const uint64_t blocks64 = (d->size + d->block_size - 1) / d->block_size;
+    if (blocks64 > UINT32_MAX) goto fail;
+    d->blocks = (uint32_t)blocks64;
+    ps3_aes128_init(&d->ek_edat, EDAT_KEY[d->version == 4]);
     d->plain = (uint8_t*)malloc(d->block_size + 16u);
     d->enc = (uint8_t*)malloc(d->block_size + 16u);
-    if (!d->plain || !d->enc || (d->blocks && load_block(d, 0) < 0)) goto fail;
+    if (!d->plain || !d->enc) goto fail;
+
+    if (d->flags & FLAG_DEBUG) {
+        if (d->blocks && load_block(d, 0) < 0) goto fail;
+        return d;
+    }
+    if (d->flags & FLAG_SDAT) {
+        for (int i = 0; i < 16; i++) d->key[i] = d->hdr[0x60 + i] ^ SDAT_KEY[i];
+        if (!try_rif_key(d, d->key)) goto fail;
+        return d;
+    }
+    if ((license & 3) == 3) {
+        int found = 0;
+        const int kn = __atomic_load_n(&s_klic_n, __ATOMIC_ACQUIRE);
+        for (int i = 0; i < kn && !found; i++) if (klic_matches(d->hdr, s_klic[i])) { memcpy(d->key, s_klic[i], 16); found = 1; }
+        for (int i = 0; i < 4 && !found; i++) if (klic_matches(d->hdr, KLIC_BUILTIN[i])) { memcpy(d->key, KLIC_BUILTIN[i], 16); found = 1; }
+        if (!found || !try_rif_key(d, d->key)) goto fail;
+        return d;
+    }
+    char exdata_buf[1100];
+    const char* exdata = exdata_override;
+    if (!exdata || !*exdata) {
+        sys_fs_translate_path("/dev_hdd0/home/00000001/exdata", exdata_buf, (int)sizeof exdata_buf);
+        exdata = exdata_buf;
+    }
+    if (!unlock_with_exdata(d, exdata, rap_out)) goto fail;
     return d;
 fail:
     free(d->plain);
     free(d->enc);
     free(d);
     return NULL;
+}
+
+npdrm_file* npdrm_open(ps3_vfile* f)
+{
+    return npdrm_open_ex(f, NULL, NULL);
+}
+
+int npdrm_check_vfile(ps3_vfile* f, const char* exdata_host_dir, char cid_out[49])
+{
+    if (cid_out) cid_out[0] = 0;
+    if (!f || !npdrm_is_npd(f)) return 0;
+    uint8_t hdr[0x90];
+    if (ps3_vfile_seek(f, 0, SEEK_SET) || ps3_vfile_read(hdr, sizeof hdr, f) != sizeof hdr) return 0;
+    const uint32_t license = ps3_be32(hdr + 8);
+    const uint32_t flags = ps3_be32(hdr + 0x80);
+    if ((flags & (FLAG_DEBUG | FLAG_SDAT)) || (license & 3) == 3) return 0;
+    if (cid_out) {
+        memcpy(cid_out, hdr + 0x10, 48);
+        cid_out[48] = 0;
+    }
+    npdrm_file* d = npdrm_open_ex(f, exdata_host_dir, NULL);
+    if (!d) return 1;
+    free(d->plain);
+    free(d->enc);
+    free(d);
+    return 0;
+}
+
+int npdrm_find_rap_in_dir(ps3_vfile* f, const char* dir, uint8_t rap_out[16], char cid_out[49])
+{
+    if (cid_out) cid_out[0] = 0;
+    if (!f || !dir || !*dir || !rap_out || !npdrm_is_npd(f)) return 0;
+    uint8_t hdr[0x90];
+    if (ps3_vfile_seek(f, 0, SEEK_SET) || ps3_vfile_read(hdr, sizeof hdr, f) != sizeof hdr) return 0;
+    const uint32_t license = ps3_be32(hdr + 8);
+    const uint32_t flags = ps3_be32(hdr + 0x80);
+    if ((flags & (FLAG_DEBUG | FLAG_SDAT)) || (license & 3) == 3) return 0;
+    if (cid_out) {
+        memcpy(cid_out, hdr + 0x10, 48);
+        cid_out[48] = 0;
+    }
+    npdrm_file* d = npdrm_open_ex(f, dir, rap_out);
+    if (!d) return 0;
+    free(d->plain);
+    free(d->enc);
+    free(d);
+    return 1;
 }
 
 int64_t npdrm_read(npdrm_file* d, uint64_t offset, void* dst, uint64_t size)

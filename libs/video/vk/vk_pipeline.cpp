@@ -18,9 +18,40 @@ thread_local bool g_replay = false;
 constexpr VkPipelineCreateFlags k_library_flags =
     VK_PIPELINE_CREATE_LIBRARY_BIT_KHR | VK_PIPELINE_CREATE_RETAIN_LINK_TIME_OPTIMIZATION_INFO_BIT_EXT;
 
+FILE* open_utf8(const std::string& path, const char* mode)
+{
+#ifdef _WIN32
+    int nw = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
+    if (nw <= 0) return nullptr;
+    std::vector<wchar_t> wp((size_t)nw);
+    MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wp.data(), nw);
+    wchar_t wm[16] = {};
+    for (size_t i = 0; mode[i] && i < 15; i++) wm[i] = (wchar_t)(unsigned char)mode[i];
+    return _wfopen(wp.data(), wm);
+#else
+    return std::fopen(path.c_str(), mode);
+#endif
+}
+
+bool replace_file_utf8(const std::string& src, const std::string& dst)
+{
+#ifdef _WIN32
+    auto to_wide = [](const std::string& s) {
+        int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
+        std::vector<wchar_t> w(n > 0 ? (size_t)n : 1u, 0);
+        if (n > 0) MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, w.data(), n);
+        return w;
+    };
+    auto ws = to_wide(src), wd = to_wide(dst);
+    return MoveFileExW(ws.data(), wd.data(), MOVEFILE_REPLACE_EXISTING) != 0;
+#else
+    return std::rename(src.c_str(), dst.c_str()) == 0;
+#endif
+}
+
 bool read_file(const std::string& path, std::vector<uint8_t>& out)
 {
-    FILE* f = std::fopen(path.c_str(), "rb");
+    FILE* f = open_utf8(path, "rb");
     if (!f) return false;
     std::fseek(f, 0, SEEK_END);
     const long n = std::ftell(f);
@@ -127,9 +158,9 @@ bool pipelines::create(vk_device& d, const std::string& cache_path)
             if (!(m_input[c] = input_library(c))) m_libraries = false;
 
     const size_t slash = m_cache_path.find_last_of("/\\");
-    m_db = std::fopen((m_cache_path.substr(0, slash == std::string::npos ? 0 : slash + 1) + "vk_shaders.db").c_str(), "ab+");
+    m_db = open_utf8(m_cache_path.substr(0, slash == std::string::npos ? 0 : slash + 1) + "vk_shaders.db", "ab+");
     const unsigned n = std::max(3u, std::thread::hardware_concurrency());
-    m_background_limit = n > 2u ? n - 2u : 1u;
+    m_background_limit = std::max(2u, n > 2u ? n - 2u : 2u);
     for (unsigned i = 0; i < n; i++)
         m_workers.emplace_back([this, i] {
             ps3_thread_name("vk pipeline %u", i);
@@ -235,19 +266,39 @@ void pipelines::save_cache_periodic()
 void pipelines::save_cache()
 {
     std::lock_guard<std::mutex> hold(m_save_lock);
+    if (m_db) {
+        std::lock_guard<std::mutex> db_hold(m_db_lock);
+        std::fflush(m_db);
+    }
     if (!m_cache_dirty.exchange(false, std::memory_order_relaxed)) return;
     m_saved = std::chrono::steady_clock::now();
-    size_t n = 0;
-    if (vkGetPipelineCacheData(m_d->dev, m_cache, &n, nullptr) != VK_SUCCESS || !n) return;
-    std::vector<uint8_t> blob(n);
-    if (vkGetPipelineCacheData(m_d->dev, m_cache, &n, blob.data()) != VK_SUCCESS) return;
-    FILE* f = std::fopen((m_cache_path + ".tmp").c_str(), "wb");
-    if (!f) return;
-    const bool ok = std::fwrite(blob.data(), 1, n, f) == n;
+    std::vector<uint8_t> blob;
+    VkResult res = VK_INCOMPLETE;
+    for (int tries = 0; tries < 4 && res == VK_INCOMPLETE; tries++) {
+        size_t n = 0;
+        if (vkGetPipelineCacheData(m_d->dev, m_cache, &n, nullptr) != VK_SUCCESS || !n) {
+            m_cache_dirty.store(true, std::memory_order_relaxed);
+            return;
+        }
+        blob.resize(n);
+        res = vkGetPipelineCacheData(m_d->dev, m_cache, &n, blob.data());
+        if (res == VK_SUCCESS) blob.resize(n);
+    }
+    if (res != VK_SUCCESS || blob.empty()) {
+        m_cache_dirty.store(true, std::memory_order_relaxed);
+        return;
+    }
+    const std::string tmp = m_cache_path + ".tmp";
+    FILE* f = open_utf8(tmp, "wb");
+    if (!f) {
+        m_cache_dirty.store(true, std::memory_order_relaxed);
+        return;
+    }
+    const bool ok = std::fwrite(blob.data(), 1, blob.size(), f) == blob.size();
     std::fclose(f);
-    if (!ok) return;
-    std::remove(m_cache_path.c_str());
-    std::rename((m_cache_path + ".tmp").c_str(), m_cache_path.c_str());
+    if (!ok || !replace_file_utf8(tmp, m_cache_path)) {
+        m_cache_dirty.store(true, std::memory_order_relaxed);
+    }
 }
 
 pipeline_key pipelines::normalize(const pipeline_key& key) const{
@@ -269,7 +320,6 @@ void pipelines::record(char type, const void* a, size_t an, const void* b, size_
     std::fwrite(sizes, sizeof sizes, 1, m_db);
     std::fwrite(a, 1, an, m_db);
     if (bn) std::fwrite(b, 1, bn, m_db);
-    std::fflush(m_db);
 }
 
 void pipelines::record_vertex(const uint32_t* program, const rsx_spv_vp_key& key)

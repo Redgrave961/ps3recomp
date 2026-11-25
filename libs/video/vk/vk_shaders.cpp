@@ -46,7 +46,12 @@ bool shader_cache::make_module(shader& s, const rsx_spv_blob& blob, VkShaderStag
     ci.codeSize = (size_t)blob.count * 4u;
     ci.pCode = blob.words;
     VK_TRY(vkCreateShaderModule(m_d->dev, &ci, nullptr, &s.module));
-    return m_pipes->shader_library(s, stage);
+    if (!m_pipes->shader_library(s, stage)) {
+        vkDestroyShaderModule(m_d->dev, s.module, nullptr);
+        s.module = VK_NULL_HANDLE;
+        return false;
+    }
+    return true;
 }
 
 template <typename T, typename Job>
@@ -99,7 +104,7 @@ const fragment_program* shader_cache::fragment(const uint32_t* ucode, uint32_t m
     const uint32_t end = rsx_spv_fragment_scan(ucode, max_words, &scan) == 0 ? std::min(scan.ucode_words, max_words) : 0;
     if (!end) {
         static std::atomic<int> reported{ 0 };
-        if (reported.fetch_add(1) < 8)
+        if (reported.fetch_add(1) < 8 && max_words >= 4)
             std::fprintf(stderr, "[vk] fragment program scan failed: %08X %08X %08X %08X\n", ucode[0], ucode[1], ucode[2], ucode[3]);
         return nullptr;
     }

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 
 namespace vk {
@@ -69,7 +70,10 @@ uint64_t swizzle_key(VkImageViewType type, VkFormat format, VkImageAspectFlags a
 
 void renderer::mark_written(u32 ea, u32 size)
 {
-    if (m_page_stamp.empty() || !size) return;
+    if (!size) return;
+    m_epoch++;
+    m_binding_gen++;
+    if (m_page_stamp.empty()) return;
     const u32 stamp = ++m_stamp;
     for (uint64_t p = ea >> k_page_shift; p <= ((uint64_t)ea + size - 1u) >> k_page_shift && p < m_page_stamp.size(); p++)
         m_page_stamp[p] = stamp;
@@ -101,20 +105,23 @@ void renderer::prescan(u64 batch)
 
 bool renderer::memory_changed(u32 ea, u32 size, u32 stamp)
 {
+    if (!size) return false;
     watch(ea, size);
-    for (uint64_t p = ea >> k_page_shift; p <= ((uint64_t)ea + size - 1u) >> k_page_shift; p++)
+    const uint64_t last = std::min<uint64_t>(((uint64_t)ea + size - 1u) >> k_page_shift, m_page_stamp.size() - 1u);
+    for (uint64_t p = ea >> k_page_shift; p <= last; p++)
         if (m_page_stamp[p] > stamp) return true;
     return false;
 }
 
 u32 renderer::refresh(u32 ea, u32 size, u32 stamp, uint8_t* dst)
 {
+    if (!size) return 0;
     if (!stamp) {
         std::memcpy(dst, vm_base + ea, size);
         return size;
     }
     u32 copied = 0;
-    const u32 last = (u32)(((uint64_t)ea + size - 1u) >> k_page_shift);
+    const u32 last = (u32)std::min<uint64_t>(((uint64_t)ea + size - 1u) >> k_page_shift, m_page_stamp.size() - 1u);
     for (u32 p = ea >> k_page_shift; p <= last; p++) {
         if (m_page_stamp[p] <= stamp) continue;
         u32 q = p;
@@ -148,30 +155,83 @@ VkImageView renderer::view_for(image& img, VkImageViewType type, VkFormat format
 
 VkSampler renderer::sampler_for(const VkSamplerCreateInfo& info, const VkSamplerCustomBorderColorCreateInfoEXT* border)
 {
-    uint64_t h = 0;
-    h = mix(h, (uint64_t)info.magFilter | ((uint64_t)info.minFilter << 4) | ((uint64_t)info.mipmapMode << 8) |
-                   ((uint64_t)info.addressModeU << 12) | ((uint64_t)info.addressModeV << 16) | ((uint64_t)info.addressModeW << 20) |
-                   ((uint64_t)info.anisotropyEnable << 24) | ((uint64_t)info.compareEnable << 25) | ((uint64_t)info.compareOp << 26) |
-                   ((uint64_t)info.borderColor << 32) | ((uint64_t)info.unnormalizedCoordinates << 40));
-    uint32_t f[4];
-    std::memcpy(&f[0], &info.mipLodBias, 4);
-    std::memcpy(&f[1], &info.maxAnisotropy, 4);
-    std::memcpy(&f[2], &info.minLod, 4);
-    std::memcpy(&f[3], &info.maxLod, 4);
-    h = mix(h, ((uint64_t)f[0] << 32) | f[1]);
-    h = mix(h, ((uint64_t)f[2] << 32) | f[3]);
-    if (border) {
-        uint64_t b[2];
-        std::memcpy(b, border->customBorderColor.uint32, 16);
-        h = mix(mix(h, b[0]), b[1]);
-    }
-    if (const VkSampler* found = m_samplers.find(h)) return *found;
     VkSamplerCreateInfo ci = info;
+    if (!m_d->caps.mirror_clamp_to_edge) {
+        if (ci.addressModeU == VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE) ci.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        if (ci.addressModeV == VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE) ci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        if (ci.addressModeW == VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE) ci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    }
+    if (ci.anisotropyEnable && !m_d->features.features.samplerAnisotropy) {
+        ci.anisotropyEnable = VK_FALSE;
+        ci.maxAnisotropy = 1.f;
+    } else if (ci.anisotropyEnable) {
+        ci.maxAnisotropy = std::clamp(ci.maxAnisotropy, 1.f, std::max(m_d->props.limits.maxSamplerAnisotropy, 1.f));
+    }
+    const float max_bias = m_d->props.limits.maxSamplerLodBias;
+    ci.mipLodBias = std::clamp(std::floor(ci.mipLodBias * 16.f + 0.5f) * 0.0625f, -max_bias, max_bias);
+    if (ci.mipLodBias == 0.f) ci.mipLodBias = 0.f;
+
+    const u32 max_custom = m_d->caps.max_custom_border_samplers > 16u ? m_d->caps.max_custom_border_samplers - 16u : 0u;
+    if (border && (!m_d->caps.custom_border_color || m_custom_border_count >= max_custom)) {
+        border = nullptr;
+        ci.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+    }
+
+    auto hash_sampler = [](const VkSamplerCreateInfo& s, const VkSamplerCustomBorderColorCreateInfoEXT* bc) {
+        uint64_t h = 0;
+        h = mix(h, (uint64_t)s.magFilter | ((uint64_t)s.minFilter << 4) | ((uint64_t)s.mipmapMode << 8) |
+                       ((uint64_t)s.addressModeU << 12) | ((uint64_t)s.addressModeV << 16) | ((uint64_t)s.addressModeW << 20) |
+                       ((uint64_t)s.anisotropyEnable << 24) | ((uint64_t)s.compareEnable << 25) | ((uint64_t)s.compareOp << 26) |
+                       ((uint64_t)s.borderColor << 32) | ((uint64_t)s.unnormalizedCoordinates << 40));
+        uint32_t f[4];
+        std::memcpy(&f[0], &s.mipLodBias, 4);
+        std::memcpy(&f[1], &s.maxAnisotropy, 4);
+        std::memcpy(&f[2], &s.minLod, 4);
+        std::memcpy(&f[3], &s.maxLod, 4);
+        h = mix(h, ((uint64_t)f[0] << 32) | f[1]);
+        h = mix(h, ((uint64_t)f[2] << 32) | f[3]);
+        if (bc) {
+            uint64_t b[2];
+            std::memcpy(b, bc->customBorderColor.uint32, 16);
+            h = mix(mix(mix(h, b[0]), b[1]), (uint64_t)bc->format);
+        }
+        return h;
+    };
+
+    const uint64_t h = hash_sampler(ci, border);
+    if (const VkSampler* found = m_samplers.find(h)) return *found;
+
+    const u32 limit = m_d->props.limits.maxSamplerAllocationCount > 64u ? m_d->props.limits.maxSamplerAllocationCount - 64u : 64u;
+    if (m_sampler_count >= limit) {
+        ci.mipLodBias = 0.f;
+        border = nullptr;
+        if (ci.borderColor == VK_BORDER_COLOR_FLOAT_CUSTOM_EXT || ci.borderColor == VK_BORDER_COLOR_INT_CUSTOM_EXT)
+            ci.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+        const uint64_t fh = hash_sampler(ci, nullptr);
+        if (const VkSampler* found = m_samplers.find(fh)) return *found;
+        return m_dummy_sampler;
+    }
+
     ci.pNext = border;
-    if (ci.anisotropyEnable && !m_d->features.features.samplerAnisotropy) ci.anisotropyEnable = VK_FALSE;
     VkSampler s = VK_NULL_HANDLE;
-    vkCreateSampler(m_d->dev, &ci, nullptr, &s);
+    if (vkCreateSampler(m_d->dev, &ci, nullptr, &s) != VK_SUCCESS || !s) {
+        if (border) {
+            border = nullptr;
+            ci.pNext = nullptr;
+            ci.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+            const uint64_t fh = hash_sampler(ci, nullptr);
+            if (const VkSampler* found = m_samplers.find(fh)) return *found;
+            if (vkCreateSampler(m_d->dev, &ci, nullptr, &s) == VK_SUCCESS && s) {
+                m_samplers[fh] = s;
+                m_sampler_count++;
+                return s;
+            }
+        }
+        return m_dummy_sampler;
+    }
     m_samplers[h] = s;
+    m_sampler_count++;
+    if (border) m_custom_border_count++;
     return s;
 }
 
@@ -250,8 +310,9 @@ image* renderer::native_image(surface& s, image& source)
     }
     if (s.native_version == s.version) return &low;
     if (m_box.width < w || m_box.height < h) {
+        const u32 bw = std::max(m_box.width, w), bh = std::max(m_box.height, h);
         discard(m_box);
-        if (!create_image(m_box, VK_FORMAT_R32G32B32A32_SFLOAT, w, h, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+        if (!create_image(m_box, VK_FORMAT_R32G32B32A32_SFLOAT, bw, bh, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
                           VK_IMAGE_ASPECT_COLOR_BIT))
             return nullptr;
     }
@@ -286,9 +347,11 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
     path = "dummy: address out of range";
     if (!ea) return false;
 
+    const rsx_vk_texture_patch* const patch = g_patch.load(std::memory_order_acquire);
+    const u32 cur_variant = patch ? patch->variant() : 0u;
     unit_resolved& cached = m_resolved[slot];
     if (!m_trace && cached.valid && cached.ea == ea && cached.epoch == m_epoch && cached.generation == m_binding_gen &&
-        !std::memcmp(&cached.regs, &b.regs, sizeof b.regs)) {
+        (cached.patch_tag == 0 || cached.variant == cur_variant) && !std::memcmp(&cached.regs, &b.regs, sizeof b.regs)) {
         path = "memory";
         out = cached.info;
         state = cached.state;
@@ -299,10 +362,11 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
 
     VkSamplerCustomBorderColorCreateInfoEXT border{ VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT };
     VkSamplerCreateInfo si{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
-    rsx::texture_sampler(b.regs, vertex, d, 16.0f, si, border);
+    rsx::texture_sampler(b.regs, vertex, d, m_d->props.limits.maxSamplerAnisotropy, si, border);
     const bool custom = si.borderColor == VK_BORDER_COLOR_FLOAT_CUSTOM_EXT || si.borderColor == VK_BORDER_COLOR_INT_CUSTOM_EXT;
     if (custom && !m_d->caps.custom_border_color) si.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
     const VkSampler sampler = sampler_for(si, custom && m_d->caps.custom_border_color ? &border : nullptr);
+    if (!sampler) return false;
 
     u32 control = (u32)(d.ops.gamma_mask & 0xFu) << RSX_SPV_TEXC_GAMMA_SHIFT;
     control |= (u32)(d.ops.bx2_mask & 0xFu) << RSX_SPV_TEXC_EXPAND_SHIFT;
@@ -428,9 +492,11 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
         m_textures[key] = std::move(made);
         watch(ea, d.guest_size);
         upload = true;
+    } else if (e->img.layout == VK_IMAGE_LAYOUT_UNDEFINED) {
+        upload = true;
     } else if (e->checked != m_epoch) {
         e->checked = m_epoch;
-        upload = memory_changed(ea, d.guest_size, e->stamp) || (e->patch_tag != 0 && e->variant != g_patch.load(std::memory_order_acquire)->variant());
+        upload = memory_changed(ea, d.guest_size, e->stamp) || (e->patch_tag != 0 && patch && e->variant != cur_variant);
     }
 
     if (upload) {
@@ -443,8 +509,8 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
         e->checked = m_epoch;
         rsx::texture_convert(d, vm_base + ea, slice.ptr, m_copies);
         e->patch_tag = 0;
-        if (const rsx_vk_texture_patch* patch = g_patch.load(std::memory_order_acquire)) {
-            e->variant = patch->variant();
+        if (patch) {
+            e->variant = cur_variant;
             e->patch_tag = (u8)patch->apply(e->variant, d.gcm_format, d.width, d.height, vm_base + ea, d.guest_size, slice.ptr);
         }
         end_rendering();
@@ -476,7 +542,7 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
     path = skipped ? skipped : "memory";
     out = { sampler, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
     if (patch_tag) *patch_tag = e->patch_tag;
-    if (!skipped) cached = { true, e->patch_tag, b.regs, ea, m_epoch, m_binding_gen, out, state };
+    if (!skipped) cached = { true, e->patch_tag, e->variant, b.regs, ea, m_epoch, m_binding_gen, out, state };
     return true;
 }
 

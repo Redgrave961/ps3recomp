@@ -249,7 +249,7 @@ void occlusion::worker()
             uint64_t sum = 0;
             for (const segment& g : j.queries) {
                 uint64_t n = 0;
-                vkGetQueryPoolResults(m_d->dev, m_pool, g.query, 1, sizeof n, &n, sizeof n, VK_QUERY_RESULT_64_BIT);
+                vkGetQueryPoolResults(m_d->dev, m_pool, g.query, 1, sizeof n, &n, sizeof n, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
                 const uint64_t area = (uint64_t)g.scale.num * g.scale.num, unit = (uint64_t)g.scale.den * g.scale.den;
                 sum += n ? std::max<uint64_t>((n * unit + area / 2u) / area, 1u) : 0u;
             }

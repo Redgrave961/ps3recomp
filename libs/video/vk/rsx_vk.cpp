@@ -262,9 +262,11 @@ bool swapchain_build()
         extent.width = std::clamp(g.pixel_w.load(), caps.minImageExtent.width, caps.maxImageExtent.width);
         extent.height = std::clamp(g.pixel_h.load(), caps.minImageExtent.height, caps.maxImageExtent.height);
     }
-    g.sc.extent = extent;
     g.fit.store(0, std::memory_order_release);
-    if (!extent.width || !extent.height) return true;
+    if (!extent.width || !extent.height) {
+        g.sc.extent = extent;
+        return true;
+    }
     if (g.sc.format.format == VK_FORMAT_UNDEFINED) g.sc.format = pick_format();
     g.sc.mode = pick_mode();
     uint32_t count = std::max(caps.minImageCount + 1u, 3u);
@@ -289,9 +291,11 @@ bool swapchain_build()
     g.sc.views.clear();
     if (g.sc.handle) vkDestroySwapchainKHR(g.d.dev, g.sc.handle, nullptr);
     g.sc.handle = VK_NULL_HANDLE;
+    g.sc.extent = { 0, 0 };
     VkSwapchainKHR made;
     VK_TRY(vkCreateSwapchainKHR(g.d.dev, &ci, nullptr, &made));
     g.sc.handle = made;
+    g.sc.extent = extent;
     uint32_t n = 0;
     vkGetSwapchainImagesKHR(g.d.dev, made, &n, nullptr);
     g.sc.images.resize(n);
@@ -303,7 +307,7 @@ bool swapchain_build()
         vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
         vi.format = g.sc.format.format;
         vi.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-        vkCreateImageView(g.d.dev, &vi, nullptr, &g.sc.views[i]);
+        VK_TRY(vkCreateImageView(g.d.dev, &vi, nullptr, &g.sc.views[i]));
     }
     while (g.sc.ready.size() < n) {
         VkSemaphoreCreateInfo si{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
@@ -483,7 +487,7 @@ bool swapchain_extent_changed()
 
 bool present_image(slot& s)
 {
-    if (!g.sc.extent.width || !g.sc.extent.height) {
+    if (!g.sc.handle || !g.sc.extent.width || !g.sc.extent.height) {
         s.released = 0;
         return false;
     }
@@ -648,6 +652,7 @@ bool slot_reserve(slot& s, uint32_t w, uint32_t h, VkFormat format)
 {
     if (s.image && s.width == w && s.height == h && s.format == format) return true;
     timeline_wait(g.present_timeline, g.presented.load());
+    timeline_wait(g.timeline, s.rendered);
     if (s.view) vkDestroyImageView(g.d.dev, s.view, nullptr);
     s.view = VK_NULL_HANDLE;
     if (s.image) vmaDestroyImage(g.d.vma, s.image, s.mem);
@@ -1159,8 +1164,8 @@ extern "C" const rsx_renderer* rsx_vk_renderer(const char* title, const char* ca
     static std::once_flag started;
     std::call_once(started, [title, cache_path, icon_path] {
         g.title = title && *title ? title : "ps3recomp";
-        g.cache_path = cache_path;
-        g.icon_path = icon_path;
+        g.cache_path = cache_path ? cache_path : "";
+        g.icon_path = icon_path ? icon_path : "";
         std::thread(window_main).detach();
     });
     return &renderer;

@@ -72,20 +72,26 @@ PS3_AES_TARGET int ps3_self_decrypt(const uint8_t* s, size_t size, uint8_t** elf
     const uint8_t* ehdr = s + elf_off;
     const uint64_t e_phoff = ps3_be64(ehdr + 0x20), e_shoff = ps3_be64(ehdr + 0x28);
     const uint16_t e_phnum = ps3_be16(ehdr + 0x38), e_shentsize = ps3_be16(ehdr + 0x3A), e_shnum = ps3_be16(ehdr + 0x3C);
-    int rc = !sections || !in_range(key_base, (uint64_t)keys * 16, hlen) || !in_range(phdr_off, (uint64_t)e_phnum * 0x38, size) ||
-             (e_shnum && !in_range(shdr_off, (uint64_t)e_shnum * e_shentsize, size)) ? PS3_SELF_EFORMAT : PS3_SELF_OK;
-    uint64_t out_size = e_shnum ? e_shoff + (uint64_t)e_shnum * e_shentsize : 0;
-    if (e_phoff + (uint64_t)e_phnum * 0x38 > out_size) out_size = e_phoff + (uint64_t)e_phnum * 0x38;
+    const uint64_t ph_bytes = (uint64_t)e_phnum * 0x38;
+    const uint64_t sh_bytes = (uint64_t)e_shnum * e_shentsize;
+    int rc = !sections || !in_range(key_base, (uint64_t)keys * 16, hlen) || !in_range(phdr_off, ph_bytes, size) ||
+             (e_shnum && !in_range(shdr_off, sh_bytes, size)) ||
+             e_phoff > UINT64_MAX - ph_bytes || (e_shnum && e_shoff > UINT64_MAX - sh_bytes) ? PS3_SELF_EFORMAT : PS3_SELF_OK;
+    uint64_t out_size = 0x40;
+    if (!rc && e_shnum && e_shoff + sh_bytes > out_size) out_size = e_shoff + sh_bytes;
+    if (!rc && e_phoff + ph_bytes > out_size) out_size = e_phoff + ph_bytes;
     for (uint16_t i = 0; !rc && i < e_phnum; i++) {
         const uint8_t* ph = s + phdr_off + (uint64_t)i * 0x38;
-        if (ps3_be64(ph + 8) + ps3_be64(ph + 32) > out_size) out_size = ps3_be64(ph + 8) + ps3_be64(ph + 32);
+        const uint64_t po = ps3_be64(ph + 8), pf = ps3_be64(ph + 32);
+        if (po > UINT64_MAX - pf) { rc = PS3_SELF_EFORMAT; break; }
+        if (po + pf > out_size) out_size = po + pf;
     }
     uint8_t* out = !rc && out_size <= ((uint64_t)1 << 32) ? (uint8_t*)calloc(1, (size_t)out_size) : NULL;
     if (!out) rc = PS3_SELF_EFORMAT;
     if (!rc) {
         memcpy(out, ehdr, 0x40);
-        memcpy(out + e_phoff, s + phdr_off, (size_t)e_phnum * 0x38);
-        if (e_shnum) memcpy(out + e_shoff, s + shdr_off, (size_t)e_shnum * e_shentsize);
+        if (ph_bytes) memcpy(out + e_phoff, s + phdr_off, (size_t)ph_bytes);
+        if (sh_bytes) memcpy(out + e_shoff, s + shdr_off, (size_t)sh_bytes);
     }
     for (uint32_t i = 0; !rc && i < sections; i++) {
         const uint8_t* sec = h + 0x20 + (uint64_t)i * 0x30;

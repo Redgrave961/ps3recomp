@@ -223,8 +223,8 @@ int64_t sys_fs_open(ppu_context* ctx)
     }
 
     if ((flags & CELL_FS_O_CREAT) && (flags & CELL_FS_O_EXCL)) {
-        struct stat _sx;
-        if (stat(host_path, &_sx) == 0)
+        ps3_vstat _sx;
+        if (ps3_vfs_stat(host_path, &_sx) == 0)
             return (int64_t)(int32_t)CELL_EEXIST;
     }
 
@@ -572,18 +572,15 @@ int64_t sys_fs_mkdir(ppu_context* ctx)
     sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
 
 #ifdef _WIN32
-    int rc = _mkdir(host_path);
+    wchar_t whost[1100];
+    int rc = MultiByteToWideChar(CP_UTF8, 0, host_path, -1, whost, 1100) ? _wmkdir(whost) : -1;
 #else
     int rc = mkdir(host_path, 0755);
 #endif
 
     if (rc != 0) {
-        struct stat st;
-#ifdef _WIN32
-        if (_stat64(host_path, (struct _stat64*)&st) == 0)
-#else
-        if (stat(host_path, &st) == 0)
-#endif
+        ps3_vstat st;
+        if (ps3_vfs_stat(host_path, &st) == 0)
             return (int64_t)(int32_t)CELL_EEXIST;
         return (int64_t)(int32_t)CELL_ENOENT;
     }
@@ -606,8 +603,16 @@ int64_t sys_fs_rename(ppu_context* ctx)
     sys_fs_translate_path(old_ps3, old_host, sizeof(old_host));
     sys_fs_translate_path(new_ps3, new_host, sizeof(new_host));
 
+#ifdef _WIN32
+    wchar_t wold[1100], wnew[1100];
+    if (!MultiByteToWideChar(CP_UTF8, 0, old_host, -1, wold, 1100) ||
+        !MultiByteToWideChar(CP_UTF8, 0, new_host, -1, wnew, 1100) ||
+        _wrename(wold, wnew) != 0)
+        return (int64_t)(int32_t)CELL_ENOENT;
+#else
     if (rename(old_host, new_host) != 0)
         return (int64_t)(int32_t)CELL_ENOENT;
+#endif
 
     return CELL_OK;
 }
@@ -624,16 +629,17 @@ int64_t sys_fs_unlink(ppu_context* ctx)
     sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
 
 #ifdef _WIN32
-    if (_unlink(host_path) != 0)
+    wchar_t whost[1100];
+    if (!MultiByteToWideChar(CP_UTF8, 0, host_path, -1, whost, 1100) || _wunlink(whost) != 0)
 #else
     if (unlink(host_path) != 0)
 #endif
     {
         const int e = errno;
-        struct stat st;
-        if (stat(host_path, &st) != 0)
+        ps3_vstat st;
+        if (ps3_vfs_stat(host_path, &st) != 0)
             return (int64_t)(int32_t)CELL_ENOENT;
-        if (S_ISDIR(st.st_mode))
+        if (st.is_dir)
             return (int64_t)(int32_t)CELL_EISDIR;
         fprintf(stderr, "[sys_fs] unlink '%s' failed (host errno %d) -> EIO\n", host_path, e);
         return (int64_t)(int32_t)CELL_EIO;
@@ -654,16 +660,17 @@ int64_t sys_fs_rmdir(ppu_context* ctx)
     sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
 
 #ifdef _WIN32
-    if (_rmdir(host_path) != 0)
+    wchar_t whost[1100];
+    if (!MultiByteToWideChar(CP_UTF8, 0, host_path, -1, whost, 1100) || _wrmdir(whost) != 0)
 #else
     if (rmdir(host_path) != 0)
 #endif
     {
         const int e = errno;
-        struct stat st;
-        if (stat(host_path, &st) != 0)
+        ps3_vstat st;
+        if (ps3_vfs_stat(host_path, &st) != 0)
             return (int64_t)(int32_t)CELL_ENOENT;
-        if (!S_ISDIR(st.st_mode))
+        if (!st.is_dir)
             return (int64_t)(int32_t)CELL_ENOTDIR;
         if (e == ENOTEMPTY || e == EEXIST)
             return (int64_t)(int32_t)CELL_ENOTEMPTY;

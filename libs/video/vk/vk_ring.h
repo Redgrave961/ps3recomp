@@ -18,6 +18,7 @@ public:
     bool hold(VkDeviceSize size, VmaVirtualAllocation& a, VkDeviceSize& offset);
     void release(VmaVirtualAllocation a) { vmaVirtualFree(m_heap, a); }
     void close(uint64_t value);
+    void invalidate(VkDeviceSize offset, VkDeviceSize size);
     VkBuffer buffer() const { return m_buffer; }
     uint8_t* data() const { return m_ptr; }
     VkDeviceSize capacity() const { return m_size + m_persistent; }

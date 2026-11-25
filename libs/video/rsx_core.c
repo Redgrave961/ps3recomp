@@ -265,7 +265,8 @@ static void rsx_sleep_os(HANDLE timer, u64 left)
 
 static HANDLE rsx_timer_create(void)
 {
-    return CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    HANDLE h = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    return h ? h : CreateWaitableTimerW(NULL, FALSE, NULL);
 }
 #else
 static u64 rsx_ticks(void)
@@ -953,14 +954,14 @@ u32 rsx_address(u32 location, u32 offset, u32 size)
     case 1: case RSX_DMA_MAIN: {
         const u32 ea = rsx_io_to_ea(offset);
         if (!ea) return 0;
-        for (u32 next = 0x100000u - (offset & 0xFFFFFu); next < size; next += 0x100000u)
-            if (rsx_io_to_ea(offset + next) != ea + next) return 0;
+        for (u64 next = 0x100000ull - (offset & 0xFFFFFu); next < size; next += 0x100000ull)
+            if (rsx_io_to_ea(offset + (u32)next) != ea + (u32)next) return 0;
         return ea;
     }
     case RSX_DMA_REPORT_LOCAL:
         return (offset < RSX_REPORT_SIZE && RSX_REPORT_SIZE - offset >= size) ? RSX_REPORT_EA + offset : 0;
     case RSX_DMA_REPORT_MAIN:
-        return offset < 0x1000000u ? rsx_io_to_ea(0x0E000000u + offset) : 0;
+        return (offset < 0x1000000u && 0x1000000u - offset >= size) ? rsx_io_to_ea(0x0E000000u + offset) : 0;
     case RSX_DMA_SEMAPHORE_RW: case RSX_DMA_SEMAPHORE_R:
         return (offset < RSX_SEMAPHORE_SIZE && RSX_SEMAPHORE_SIZE - offset >= size) ? RSX_SEMAPHORE_EA + offset : 0;
     }

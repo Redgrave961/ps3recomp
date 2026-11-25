@@ -237,20 +237,29 @@ void set_dynamic_state(VkCommandBuffer cmd, const frontend& f, const vk_device& 
     }
 
     const bool all = !cache.valid;
+    if (all) cache.bias_set = cache.bounds_set = false;
     const dynamic_state& o = cache.last;
+    if (!s.bias_enable && cache.bias_set) std::memcpy(s.bias, o.bias, sizeof s.bias);
+    if (!s.bounds_enable && cache.bounds_set) std::memcpy(s.bounds, o.bounds, sizeof s.bounds);
     const auto changed = [all](const auto& a, const auto& b) { return all || std::memcmp(&a, &b, sizeof a) != 0; };
     if (all) vkCmdSetRasterizerDiscardEnable(cmd, VK_FALSE);
     if (changed(s.viewport, o.viewport)) vkCmdSetViewportWithCount(cmd, 1, &s.viewport);
     if (changed(s.scissor, o.scissor)) vkCmdSetScissorWithCount(cmd, 1, &s.scissor);
     if (changed(s.line_width, o.line_width)) vkCmdSetLineWidth(cmd, s.line_width);
     if (changed(s.bias_enable, o.bias_enable)) vkCmdSetDepthBiasEnable(cmd, s.bias_enable);
-    if (s.bias_enable && changed(s.bias, o.bias)) vkCmdSetDepthBias(cmd, s.bias[0], s.bias[1], s.bias[2]);
+    if (s.bias_enable && (!cache.bias_set || changed(s.bias, o.bias))) {
+        vkCmdSetDepthBias(cmd, s.bias[0], s.bias[1], s.bias[2]);
+        cache.bias_set = true;
+    }
     if (changed(s.blend_constants, o.blend_constants)) vkCmdSetBlendConstants(cmd, s.blend_constants);
     if (changed(s.depth_test, o.depth_test)) vkCmdSetDepthTestEnable(cmd, s.depth_test);
     if (changed(s.depth_write, o.depth_write)) vkCmdSetDepthWriteEnable(cmd, s.depth_write);
     if (changed(s.depth_op, o.depth_op)) vkCmdSetDepthCompareOp(cmd, (VkCompareOp)s.depth_op);
     if (changed(s.bounds_enable, o.bounds_enable)) vkCmdSetDepthBoundsTestEnable(cmd, s.bounds_enable);
-    if (s.bounds_enable && changed(s.bounds, o.bounds)) vkCmdSetDepthBounds(cmd, s.bounds[0], s.bounds[1]);
+    if (s.bounds_enable && (!cache.bounds_set || changed(s.bounds, o.bounds))) {
+        vkCmdSetDepthBounds(cmd, s.bounds[0], s.bounds[1]);
+        cache.bounds_set = true;
+    }
     if (changed(s.stencil_test, o.stencil_test)) vkCmdSetStencilTestEnable(cmd, s.stencil_test);
     for (int side = 0; side < 2; side++) {
         const dynamic_state::face& n = s.faces[side];

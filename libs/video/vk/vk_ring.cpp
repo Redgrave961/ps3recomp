@@ -15,17 +15,28 @@ bool vk_ring::create(vk_device& d, VkDeviceSize size, VkDeviceSize persistent, V
                VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
     VmaAllocationCreateInfo ai{};
     ai.usage = VMA_MEMORY_USAGE_AUTO;
-    ai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT |
-               VMA_ALLOCATION_CREATE_HOST_ACCESS_ALLOW_TRANSFER_INSTEAD_BIT;
+    ai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    ai.requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
     ai.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-    VmaAllocationInfo info;
-    VK_TRY(vmaCreateBuffer(d.vma, &bi, &ai, &m_buffer, &m_mem, &info));
+    VmaAllocationInfo info{};
+    VkResult r = vmaCreateBuffer(d.vma, &bi, &ai, &m_buffer, &m_mem, &info);
+    if (r != VK_SUCCESS) {
+        ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+        ai.preferredFlags = 0;
+        r = vmaCreateBuffer(d.vma, &bi, &ai, &m_buffer, &m_mem, &info);
+    }
+    if (r != VK_SUCCESS) {
+        std::fprintf(stderr, "[vk] vmaCreateBuffer(upload ring, %llu bytes) failed: %d\n", (unsigned long long)bi.size, (int)r);
+        destroy();
+        return false;
+    }
     m_ptr = static_cast<uint8_t*>(info.pMappedData);
     VkMemoryPropertyFlags flags = 0;
     vmaGetAllocationMemoryProperties(d.vma, m_mem, &flags);
     m_coherent = (flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
     if (!m_ptr || !(flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
         std::fprintf(stderr, "[vk] upload ring is not host visible\n");
+        destroy();
         return false;
     }
     return true;
@@ -65,7 +76,7 @@ void vk_ring::wait_for(VkDeviceSize need)
             wi.semaphoreCount = 1;
             wi.pSemaphores = &m_timeline;
             wi.pValues = &f.value;
-            vkWaitSemaphores(m_d->dev, &wi, UINT64_MAX);
+            if (vkWaitSemaphores(m_d->dev, &wi, UINT64_MAX) != VK_SUCCESS) return;
             reached = f.value;
         }
         m_fences.pop_front();
@@ -95,4 +106,9 @@ void vk_ring::close(uint64_t value)
         return;
     }
     m_fences.push_back({ m_head, value });
+}
+
+void vk_ring::invalidate(VkDeviceSize offset, VkDeviceSize size)
+{
+    if (!m_coherent && m_mem) vmaInvalidateAllocation(m_d->vma, m_mem, offset, size);
 }

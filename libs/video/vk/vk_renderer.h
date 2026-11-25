@@ -142,7 +142,8 @@ private:
     surface* surface_at(u32 ea, u32 pitch, u32 bpp, u32& x, u32& y);
     surface* scanout_surface(u32 ea, u32 pitch) const;
     ratio scale_for(u32 width, u32 height, bool depth) const;
-    surface* surface_for(u32 ea, u32 pitch, u32 width, u32 height, u32 format, bool depth, u32 aa_u, u32 aa_v);
+    surface* surface_for(u32 ea, u32 pitch, u32 width, u32 height, u32 format, bool depth, u32 aa_u, u32 aa_v,
+                         const surface* const* keep = nullptr, u32 keep_count = 0);
     bool create_image(image& img, VkFormat format, u32 width, u32 height, VkImageUsageFlags usage, VkImageAspectFlags aspect);
     void destroy_image(image& img);
     void discard(image& img);
@@ -216,7 +217,6 @@ private:
     shader_cache m_shaders;
     image m_dummy[3];
     VkSampler m_dummy_sampler = VK_NULL_HANDLE;
-    uint64_t m_program_hash = 0;
     u32 m_vertex_dims = 0;
     u32 m_fp_tex_dims = 0;
     u32 m_fp_tex_shadow = 0;
@@ -234,9 +234,6 @@ private:
     struct fp_candidate {
         const fragment_program* fp = nullptr;
         u32 count = 0;
-        u32 stamp = 0;
-        u8 dirty_hits = 0;
-        bool tracked = false;
         std::vector<u32> code;
     };
     struct fp_lookup {
@@ -316,6 +313,7 @@ private:
     struct unit_resolved {
         bool valid = false;
         u8 patch_tag = 0;
+        u32 variant = 0;
         rsx::texture_regs regs{};
         u32 ea = 0;
         u64 epoch = 0;
@@ -353,6 +351,8 @@ private:
     const char* m_texture_path[rsx::TEXTURES + rsx::VERTEX_TEXTURES]{};
     flat_map<uint64_t, std::unique_ptr<texture_entry>> m_textures;
     flat_map<uint64_t, VkSampler> m_samplers;
+    u32 m_sampler_count = 0;
+    u32 m_custom_border_count = 0;
     std::vector<u32> m_page_stamp;
     u64 m_scan_batch = ~0ull;
     u32 m_stamp = 1;

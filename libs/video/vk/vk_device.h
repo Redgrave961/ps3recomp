@@ -18,18 +18,16 @@ struct vk_caps {
     bool validation;
     bool push_descriptor;
     bool dynamic_state3;
-    bool vertex_input;
     bool pipeline_library;
-    bool shader_object;
-    bool local_read;
     bool custom_border_color;
     bool depth_clip_enable;
     bool provoking_vertex;
     bool maintenance5;
-    bool host_memory;
     bool memory_budget;
     bool buffer_address;
     bool fifo_latest_ready;
+    bool mirror_clamp_to_edge;
+    uint32_t max_custom_border_samplers;
 };
 
 struct vk_device {

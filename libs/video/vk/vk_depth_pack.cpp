@@ -37,13 +37,18 @@ bool depth_pack::create(vk_device& d)
         VkShaderModuleCreateInfo mi{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
         mi.codeSize = (size_t)blob.count * 4u;
         mi.pCode = blob.words;
+        VkShaderModule mod = VK_NULL_HANDLE;
+        VkResult r = vkCreateShaderModule(d.dev, &mi, nullptr, &mod);
+        rsx_spv_blob_free(&blob);
+        VK_TRY(r);
         VkComputePipelineCreateInfo ci{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-        ci.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, &mi };
+        ci.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
         ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        ci.stage.module = mod;
         ci.stage.pName = "main";
         ci.layout = m_layout;
-        const VkResult r = vkCreateComputePipelines(d.dev, VK_NULL_HANDLE, 1, &ci, nullptr, &m_pipe[v]);
-        rsx_spv_blob_free(&blob);
+        r = vkCreateComputePipelines(d.dev, VK_NULL_HANDLE, 1, &ci, nullptr, &m_pipe[v]);
+        vkDestroyShaderModule(d.dev, mod, nullptr);
         VK_TRY(r);
     }
     return true;
@@ -52,11 +57,16 @@ bool depth_pack::create(vk_device& d)
 void depth_pack::destroy()
 {
     if (!m_d) return;
-    for (VkPipeline p : m_pipe)
+    for (VkPipeline& p : m_pipe) {
         if (p) vkDestroyPipeline(m_d->dev, p, nullptr);
+        p = VK_NULL_HANDLE;
+    }
     if (m_layout) vkDestroyPipelineLayout(m_d->dev, m_layout, nullptr);
     if (m_set) vkDestroyDescriptorSetLayout(m_d->dev, m_set, nullptr);
     if (m_sampler) vkDestroySampler(m_d->dev, m_sampler, nullptr);
+    m_layout = VK_NULL_HANDLE;
+    m_set = VK_NULL_HANDLE;
+    m_sampler = VK_NULL_HANDLE;
     m_d = nullptr;
 }
 

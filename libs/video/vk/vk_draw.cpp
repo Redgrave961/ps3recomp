@@ -41,6 +41,7 @@ u32 texture_dims(const rsx::texture_desc& d, bool valid)
 bool program_matches(const u32* ucode, const u32* code, u32 count)
 {
     u32 i = 0;
+#ifdef __AVX2__
     for (; i + 8u <= count; i += 8u, code += 16) {
         const __m256i u = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ucode + i));
         const __m256i m = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(code + 8));
@@ -53,6 +54,13 @@ bool program_matches(const u32* ucode, const u32* code, u32 count)
     const __m256i m = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(code + 8));
     const __m256i x = _mm256_xor_si256(_mm256_and_si256(u, m), _mm256_loadu_si256(reinterpret_cast<const __m256i*>(code)));
     return _mm256_testz_si256(x, x);
+#else
+    for (; i < count; i++) {
+        const u32 base = (i & ~7u) * 2u + (i & 7u);
+        if ((ucode[i] & code[base + 8u]) != code[base]) return false;
+    }
+    return true;
+#endif
 }
 
 float half_bits(uint16_t h)
@@ -205,7 +213,7 @@ bool renderer::upload_vertices(const rsx::draw_clause& clause, u32 first, u32 co
         if (immediate_arrays) {
             const rsx::push_attribute& p = push[k];
             if (p.vertices > 1 && p.size) {
-                const u32 words = p.type == rsx::VT_F ? p.size : (p.type == rsx::VT_UB || p.type == rsx::VT_UB256) ? 1u : p.size / 2u;
+                const u32 words = p.type == rsx::VT_F ? p.size : (p.type == rsx::VT_UB || p.type == rsx::VT_UB256) ? 1u : (p.size + 1u) / 2u;
                 const u32 need = push[0].vertices;
                 const size_t at = regbytes.size();
                 regbytes.resize(at + (p.data.size() + (size_t)(need > p.vertices ? need - p.vertices : 0) * words) * 4u);
@@ -466,11 +474,11 @@ bool renderer::draw_setup()
     if ((dirty & rsx::D_VERTEX_PROGRAM) || !m_vp) {
         rsx_spv_vp_key key{};
         key.start = r(rsx::M_TRANSFORM_PROGRAM_START);
-        m_program_hash = shader_cache::program_hash(program, key.start);
+        const uint64_t program_hash = shader_cache::program_hash(program, key.start);
         key.output_mask = r(rsx::M_VERTEX_ATTRIB_OUTPUT_MASK);
         key.texture_dims = m_vertex_dims;
 
-        m_vp = m_shaders.vertex(program, key, m_program_hash, true);
+        m_vp = m_shaders.vertex(program, key, program_hash, true);
         dirty &= ~rsx::D_VERTEX_PROGRAM;
     }
     if (!m_vp) return false;
@@ -528,9 +536,6 @@ bool renderer::draw_setup()
     seen.next = (seen.next + 1u) % count;
     c.fp = m_fp;
     c.count = m_fp->info.ucode_words;
-    c.dirty_hits = 0;
-    c.tracked = false;
-    c.stamp = 0;
     c.code.assign(((c.count + 7u) & ~size_t(7)) * 2u, 0u);
     for (u32 i = 0; i < c.count; i++) {
         c.code[(i & ~7u) * 2u + (i & 7u)] = ucode[i];
@@ -700,11 +705,19 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
     if (fi.constant_count) {
         m_fp_constants.resize((size_t)fi.constant_count * 4u);
         const u32* ucode = reinterpret_cast<const u32*>(vm_base + m_fp_ea);
+#ifdef __SSSE3__
         const __m128i swap16 = _mm_setr_epi8(1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14);
         for (u32 i = 0; i < fi.constant_count; i++) {
             const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(ucode + fi.constant_word[i]));
             _mm_storeu_si128(reinterpret_cast<__m128i*>(m_fp_constants.data() + i * 4u), _mm_shuffle_epi8(v, swap16));
         }
+#else
+        for (u32 i = 0; i < fi.constant_count; i++)
+            for (u32 w = 0; w < 4u; w++) {
+                const u32 v = ucode[fi.constant_word[i] + w];
+                m_fp_constants[i * 4u + w] = ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu);
+            }
+#endif
         if (!upload(m_fp_constant_upload, m_fp_constants.data(), fi.constant_count * 16u, fp_consts)) return;
     } else {
         static constexpr u32 k_zero_const[4] = {};
@@ -737,7 +750,12 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
         rsx_spv_texture_state scratch{};
         rsx_spv_texture_state& st = vertex_unit ? scratch : fs.texture[u];
         st.scale[0] = st.scale[1] = 1.f;
-        if ((used >> unit) & 1u && resolve_texture(unit, vertex_unit, images[u], st, u == 0 ? &unit0_tag : nullptr)) continue;
+        if ((used >> unit) & 1u) {
+            if (resolve_texture(unit, vertex_unit, images[u], st, u == 0 ? &unit0_tag : nullptr)) continue;
+        } else if (m_bound.valid && m_bound.images[u].sampler && m_bound.images[u].imageView) {
+            images[u] = m_bound.images[u];
+            continue;
+        }
         const u32 dims = texture_dims(m_units[u].desc, m_units[u].valid);
         const image& dummy = m_dummy[dims == RSX_SPV_TEX_CUBE ? 1 : dims == RSX_SPV_TEX_3D ? 2 : 0];
         images[u] = { m_dummy_sampler, dummy.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
@@ -862,6 +880,8 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
     VkWriteDescriptorSet w[rsx::TEXTURES + rsx::VERTEX_TEXTURES]{};
     u32 nw = 0;
     for (u32 u = 0; u < rsx::TEXTURES + rsx::VERTEX_TEXTURES; u++) {
+        if (!images[u].sampler || !images[u].imageView)
+            images[u] = { m_dummy_sampler, m_dummy[0].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
         VkDescriptorImageInfo& last = m_bound.images[u];
         if (!all && last.sampler == images[u].sampler && last.imageView == images[u].imageView && last.imageLayout == images[u].imageLayout) continue;
         last = images[u];

@@ -110,6 +110,7 @@ typedef struct spv {
     u32 id;
     u32 glsl;
     int err;
+    int used_demote;
     u32 tvoid, tbool, tf, tu, ti, tv2, tv3, tv4, tu2, tu4, ti4, tb4, tfn;
     hent ht[SPV_HT];
     u32 scratch[16384];
@@ -194,14 +195,17 @@ static u32 intern(spv* s, u32 op, u32 ty, const u32* a, u32 n, int unique)
     u32 kn = n + 2u;
     u32 h = hash_words(key, kn);
     u32 slot = h & (SPV_HT - 1u);
+    int ht_full = 0;
     if (!unique) {
-        for (;;) {
+        u32 probes = 0;
+        for (; probes < SPV_HT; probes++) {
             hent* e = &s->ht[slot];
             if (e->gen != s->gen) break;
             if (e->hash == h && e->len == kn && !memcmp(s->keys.w + e->off, key, (size_t)kn * sizeof(u32)))
                 return e->id;
             slot = (slot + 1u) & (SPV_HT - 1u);
         }
+        if (probes == SPV_HT) ht_full = 1;
     }
     u32 r = s->id++;
     u32 has_ty = (op >= OpConstantTrue && op <= OpConstantComposite) ? 1u : 0u;
@@ -214,15 +218,17 @@ static u32 intern(spv* s, u32 op, u32 ty, const u32* a, u32 n, int unique)
         p[1] = r;
     }
     for (u32 i = 0; i < n; i++) p[2 + has_ty + i] = a[i];
-    if (!unique) {
+    if (!unique && !ht_full) {
         u32* kp = sb_grow(s, &s->keys, kn);
-        memcpy(kp, key, (size_t)kn * sizeof(u32));
-        hent* e = &s->ht[slot];
-        e->hash = h;
-        e->gen = s->gen;
-        e->off = s->keys.n - kn;
-        e->len = kn;
-        e->id = r;
+        if (!s->err && kp != s->scratch) {
+            memcpy(kp, key, (size_t)kn * sizeof(u32));
+            hent* e = &s->ht[slot];
+            e->hash = h;
+            e->gen = s->gen;
+            e->off = s->keys.n - kn;
+            e->len = kn;
+            e->id = r;
+        }
     }
     return r;
 }
@@ -380,6 +386,7 @@ static spv* spv_begin(void)
     }
     s->id = 1;
     s->err = 0;
+    s->used_demote = 0;
     s->tvoid = s->tbool = s->tf = s->tu = s->ti = s->tv2 = s->tv3 = s->tv4 = 0;
     s->tu2 = s->tu4 = s->ti4 = s->tb4 = s->tfn = 0;
     s->glsl = s->id++;
@@ -503,6 +510,7 @@ static void sel_end(spv* s, u32 merge)
 
 static void demote_if(spv* s, u32 cond)
 {
+    s->used_demote = 1;
     u32 m, t;
     sel_if(s, cond, &m, &t);
     sb_ins(s, BODY(s), OpDemoteToHelperInvocation, k_none, 0);
@@ -709,14 +717,12 @@ static void vp_walk(vpc* c, u32 start)
 int rsx_spv_vertex_reach(const u32* ucode, u32 start, u8* reach)
 {
     if (start >= VP_SLOTS) return -1;
-    vpc* c = (vpc*)calloc(1, sizeof(vpc));
-    if (!c) return -1;
-    c->uc = ucode;
-    vp_walk(c, start);
-    memcpy(reach, c->reach, VP_SLOTS);
-    const int dynamic = c->has_bra;
-    free(c);
-    return dynamic;
+    vpc c;
+    memset(&c, 0, sizeof c);
+    c.uc = ucode;
+    vp_walk(&c, start);
+    memcpy(reach, c.reach, VP_SLOTS);
+    return c.has_bra;
 }
 
 static void vp_prescan(vpc* c)
@@ -1641,7 +1647,7 @@ static int fp_scan(fpc* c, const u32* ucode, u32 max_words)
         u32 step = 1;
         if (fp_has_const(&i)) {
             if (i.op != FP_NOP) {
-                if (c->nconst >= RSX_SPV_FP_MAX_CONSTANTS) return -1;
+                if (c->nconst >= RSX_SPV_FP_MAX_CONSTANTS || pc + 1u >= lim) return -1;
                 c->cword[c->nconst] = (c->start + pc + 1u) * 4u;
                 c->cmap[pc] = (u16)(c->nconst + 1u);
                 c->nconst++;
@@ -2587,15 +2593,17 @@ static void fp_range(fpc* c, u32 pc, u32 end, int* ended)
             u32 merge = newl(s), lt = newl(s), lf = has_else ? newl(s) : merge;
             V(s, OpSelectionMerge, merge, 0);
             V(s, OpBranchConditional, cond, lt, lf);
+            int t_ended = 0, e_ended = 0;
             label(s, lt);
-            fp_range(c, pc + 1u, te, ended);
+            fp_range(c, pc + 1u, te, &t_ended);
             V(s, OpBranch, merge);
             if (has_else) {
                 label(s, lf);
-                fp_range(c, el, e, ended);
+                fp_range(c, el, e, &e_ended);
                 V(s, OpBranch, merge);
             }
             label(s, merge);
+            if (has_else && t_ended && e_ended) *ended = 1;
             next = e;
             break;
         }
@@ -2756,7 +2764,7 @@ int rsx_spv_fragment(const u32* ucode, u32 max_words, const rsx_spv_fp_key* key,
     u32 caps[3];
     u32 ncaps = 0;
     caps[ncaps++] = 1;
-    caps[ncaps++] = 5379;
+    if (s->used_demote) caps[ncaps++] = 5379;
     for (u32 u = 0; u < 16; u++)
         if (c->tex[u] && ((key->texture_dims >> (u * 2u)) & 3u) == 0) {
             caps[ncaps++] = 43;

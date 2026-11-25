@@ -17,21 +17,11 @@ const ext_entry k_extensions[] = {
     { VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, VkStructureType(0), 0, &vk_caps::push_descriptor },
     { VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT,
       sizeof(VkPhysicalDeviceExtendedDynamicState3FeaturesEXT), &vk_caps::dynamic_state3 },
-    { VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT,
-      sizeof(VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT), &vk_caps::vertex_input },
     { VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME, VkStructureType(0), 0, nullptr },
     { VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT,
       sizeof(VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT), &vk_caps::pipeline_library },
-    { VK_EXT_SHADER_OBJECT_EXTENSION_NAME, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_OBJECT_FEATURES_EXT,
-      sizeof(VkPhysicalDeviceShaderObjectFeaturesEXT), &vk_caps::shader_object },
-    { VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR,
-      sizeof(VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR), &vk_caps::local_read },
-    { VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT,
-      sizeof(VkPhysicalDeviceConditionalRenderingFeaturesEXT), nullptr },
     { VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT,
       sizeof(VkPhysicalDeviceCustomBorderColorFeaturesEXT), &vk_caps::custom_border_color },
-    { VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT,
-      sizeof(VkPhysicalDeviceDepthClipControlFeaturesEXT), nullptr },
     { VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT,
       sizeof(VkPhysicalDeviceDepthClipEnableFeaturesEXT), &vk_caps::depth_clip_enable },
     { VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT,
@@ -46,7 +36,6 @@ const ext_entry k_extensions[] = {
       sizeof(VkPhysicalDevicePresentModeFifoLatestReadyFeaturesKHR), &vk_caps::fifo_latest_ready },
     { VK_EXT_PRESENT_MODE_FIFO_LATEST_READY_EXTENSION_NAME, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_MODE_FIFO_LATEST_READY_FEATURES_KHR,
       sizeof(VkPhysicalDevicePresentModeFifoLatestReadyFeaturesKHR), &vk_caps::fifo_latest_ready },
-    { VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME, VkStructureType(0), 0, &vk_caps::host_memory },
     { VK_EXT_MEMORY_BUDGET_EXTENSION_NAME, VkStructureType(0), 0, &vk_caps::memory_budget },
 };
 
@@ -92,12 +81,14 @@ bool suitable(VkPhysicalDevice gpu, VkSurfaceKHR surface)
     VkPhysicalDeviceProperties props;
     vkGetPhysicalDeviceProperties(gpu, &props);
     if (props.apiVersion < VK_API_VERSION_1_3) return false;
-    if (!has_extension(device_extensions(gpu), VK_KHR_SWAPCHAIN_EXTENSION_NAME)) return false;
+    const std::vector<VkExtensionProperties> exts = device_extensions(gpu);
+    if (!has_extension(exts, VK_KHR_SWAPCHAIN_EXTENSION_NAME) || !has_extension(exts, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME)) return false;
     VkPhysicalDeviceVulkan12Features f12{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
     VkPhysicalDeviceVulkan13Features f13{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, &f12 };
     VkPhysicalDeviceFeatures2 f{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f13 };
     vkGetPhysicalDeviceFeatures2(gpu, &f);
-    if (!f13.dynamicRendering || !f13.synchronization2 || !f12.timelineSemaphore || !f12.hostQueryReset) return false;
+    if (!f13.dynamicRendering || !f13.synchronization2 || !f13.shaderDemoteToHelperInvocation || !f12.timelineSemaphore || !f12.hostQueryReset)
+        return false;
     return find_family(gpu, surface) >= 0;
 }
 
@@ -227,6 +218,13 @@ bool vk_device_create(vk_device& d, VkSurfaceKHR surface)
         if (cap) d.caps.*cap = first_feature(s);
     if (d.dynamic_state3 && !d.caps.dynamic_state3) d.caps.dynamic_state3 = d.dynamic_state3->extendedDynamicState3PolygonMode != VK_FALSE;
     d.caps.buffer_address = f12->bufferDeviceAddress != VK_FALSE;
+    d.caps.mirror_clamp_to_edge = f12->samplerMirrorClampToEdge != VK_FALSE;
+    if (d.caps.custom_border_color) {
+        VkPhysicalDeviceCustomBorderColorPropertiesEXT cb{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_PROPERTIES_EXT };
+        VkPhysicalDeviceProperties2 p2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &cb };
+        vkGetPhysicalDeviceProperties2(d.gpu, &p2);
+        d.caps.max_custom_border_samplers = cb.maxCustomBorderColorSamplers;
+    }
 
     const float priority = 1.0f;
     VkDeviceQueueCreateInfo qi{ VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO };
@@ -256,10 +254,9 @@ bool vk_device_create(vk_device& d, VkSurfaceKHR surface)
     if (d.caps.maintenance5) ai.flags |= VMA_ALLOCATOR_CREATE_KHR_MAINTENANCE5_BIT;
     VK_TRY(vmaCreateAllocator(&ai, &d.vma));
 
-    std::fprintf(stderr, "[vk] %s, Vulkan %u.%u.%u: push descriptors %d, dynamic state 3 %d, vertex input %d, "
-                         "pipeline library %d, shader object %d, local read %d, host memory %d, fifo latest ready %d\n",
+    std::fprintf(stderr, "[vk] %s, Vulkan %u.%u.%u: push descriptors %d, dynamic state 3 %d, pipeline library %d, custom border %d (%u), fifo latest ready %d\n",
                  d.props.deviceName, VK_API_VERSION_MAJOR(d.props.apiVersion), VK_API_VERSION_MINOR(d.props.apiVersion),
-                 VK_API_VERSION_PATCH(d.props.apiVersion), d.caps.push_descriptor, d.caps.dynamic_state3, d.caps.vertex_input,
-                 d.caps.pipeline_library, d.caps.shader_object, d.caps.local_read, d.caps.host_memory, d.caps.fifo_latest_ready);
+                 VK_API_VERSION_PATCH(d.props.apiVersion), d.caps.push_descriptor, d.caps.dynamic_state3, d.caps.pipeline_library,
+                 d.caps.custom_border_color, d.caps.max_custom_border_samplers, d.caps.fifo_latest_ready);
     return true;
 }

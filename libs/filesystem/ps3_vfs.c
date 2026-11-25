@@ -43,13 +43,15 @@ typedef struct {
     int pkg;
     ps3_aes_key key;
     uint8_t riv[16];
+    uint8_t dbg_key[64];
     uint64_t data_offset;
+    uint64_t data_size;
     vfs_entry* entries;
     size_t count, cap;
     vfs_entry root;
 } vfs_mount;
 
-static vfs_mount* g_mounts[16];
+static vfs_mount* g_mounts[64];
 static int g_mount_count;
 
 struct ps3_vfile {
@@ -98,18 +100,71 @@ static int image_read(const vfs_mount* m, uint64_t off, void* dst, size_t n)
 #endif
 }
 
+static uint32_t vfs_rol(uint32_t v, int c) { return v << c | v >> (32 - c); }
+
+static void vfs_sha1_64(const uint8_t in[64], uint8_t out[20])
+{
+    static const uint32_t iv[5] = { 0x67452301u, 0xEFCDAB89u, 0x98BADCFEu, 0x10325476u, 0xC3D2E1F0u };
+    uint32_t h[5];
+    memcpy(h, iv, sizeof h);
+    uint8_t pad[64] = { 0x80 };
+    pad[62] = 0x02; /* 512 bits = 0x200 */
+    const uint8_t* blocks[2] = { in, pad };
+    for (int blk = 0; blk < 2; blk++) {
+        uint32_t w[80];
+        const uint8_t* p = blocks[blk];
+        for (int i = 0; i < 16; i++)
+            w[i] = (uint32_t)p[i * 4] << 24 | (uint32_t)p[i * 4 + 1] << 16 | (uint32_t)p[i * 4 + 2] << 8 | p[i * 4 + 3];
+        for (int i = 16; i < 80; i++) w[i] = vfs_rol(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+        uint32_t a = h[0], b = h[1], d = h[2], e = h[3], f = h[4];
+        for (int i = 0; i < 80; i++) {
+            const uint32_t t = i < 20 ? ((b & d) | (~b & e)) + 0x5A827999u
+                             : i < 40 ? (b ^ d ^ e) + 0x6ED9EBA1u
+                             : i < 60 ? ((b & d) | (b & e) | (d & e)) + 0x8F1BBCDCu
+                                      : (b ^ d ^ e) + 0xCA62C1D6u;
+            const uint32_t tmp = vfs_rol(a, 5) + t + f + w[i];
+            f = e; e = d; d = vfs_rol(b, 30); b = a; a = tmp;
+        }
+        h[0] += a; h[1] += b; h[2] += d; h[3] += e; h[4] += f;
+    }
+    for (int i = 0; i < 5; i++) {
+        out[i * 4]     = (uint8_t)(h[i] >> 24);
+        out[i * 4 + 1] = (uint8_t)(h[i] >> 16);
+        out[i * 4 + 2] = (uint8_t)(h[i] >> 8);
+        out[i * 4 + 3] = (uint8_t)h[i];
+    }
+}
+
+static void debug_pkg_xor(const vfs_mount* m, uint64_t blk_index, uint8_t* buf, size_t n)
+{
+    uint8_t kbuf[64], digest[20];
+    memcpy(kbuf, m->dbg_key, 64);
+    for (size_t done = 0; done < n; done += 16, blk_index++) {
+        for (int b = 0; b < 8; b++) kbuf[0x38 + b] = (uint8_t)(blk_index >> (56 - b * 8));
+        vfs_sha1_64(kbuf, digest);
+        const size_t chunk = n - done < 16 ? n - done : 16;
+        for (size_t i = 0; i < chunk; i++) buf[done + i] ^= digest[i];
+    }
+}
+
 static int pkg_read(const vfs_mount* m, uint64_t off, void* dst, size_t n)
 {
     uint8_t* out = (uint8_t*)dst;
-    uint8_t block[4096];
+    uint8_t block[65536];
     while (n) {
         const uint64_t base = off & ~(uint64_t)15;
         const size_t lead = (size_t)(off - base);
         size_t span = lead + n;
         if (span > sizeof block) span = sizeof block;
         const size_t padded = (span + 15) & ~(size_t)15;
-        if (image_read(m, m->data_offset + base, block, padded)) return -1;
-        ps3_aes_ctr(&m->key, m->riv, base / 16, block, block, padded);
+        size_t to_read = padded;
+        if (m->data_size && base < m->data_size && base + to_read > m->data_size)
+            to_read = (size_t)(m->data_size - base);
+        if (to_read < span) to_read = span;
+        if (image_read(m, m->data_offset + base, block, to_read)) return -1;
+        if (to_read < padded) memset(block + to_read, 0, padded - to_read);
+        if (m->pkg == 2) debug_pkg_xor(m, base / 16, block, padded);
+        else ps3_aes_ctr(&m->key, m->riv, base / 16, block, block, padded);
         const size_t take = span - lead;
         memcpy(out, block + lead, take);
         out += take;
@@ -124,11 +179,10 @@ static int entry_read(const vfs_mount* m, const vfs_entry* e, uint64_t off, void
     return m->pkg ? pkg_read(m, e->offset + off, dst, n) : image_read(m, e->offset + off, dst, n);
 }
 
-static char* normalize(const char* path)
+static size_t normalize_into(const char* path, char* out, size_t cap)
 {
     const size_t n = strlen(path);
-    char* out = (char*)malloc(n + 1);
-    if (!out) return NULL;
+    if (n + 1 > cap) return 0;
     size_t o = 0;
     for (size_t i = 0; i < n; i++) {
         char c = path[i] == '\\' ? '/' : (char)tolower((unsigned char)path[i]);
@@ -137,6 +191,15 @@ static char* normalize(const char* path)
     }
     while (o > 1 && out[o - 1] == '/') o--;
     out[o] = 0;
+    return o + 1;
+}
+
+static char* normalize(const char* path)
+{
+    const size_t n = strlen(path);
+    char* out = (char*)malloc(n + 1);
+    if (!out) return NULL;
+    normalize_into(path, out, n + 1);
     return out;
 }
 
@@ -191,17 +254,23 @@ static int finish_mount(vfs_mount* m)
             if (m->entries[i].is_dir) {
                 free(m->entries[i].key);
                 free(m->entries[i].path);
+                m->entries[i].key = NULL;
+                m->entries[i].path = NULL;
                 continue;
             }
-            if (m->entries[kept - 1].is_dir) {
-                free(m->entries[kept - 1].key);
-                free(m->entries[kept - 1].path);
-                m->entries[kept - 1] = m->entries[i];
-                continue;
-            }
-            return -1;
+            free(m->entries[kept - 1].key);
+            free(m->entries[kept - 1].path);
+            m->entries[kept - 1] = m->entries[i];
+            m->entries[i].key = NULL;
+            m->entries[i].path = NULL;
+            continue;
         }
-        m->entries[kept++] = m->entries[i];
+        if (kept != i) {
+            m->entries[kept] = m->entries[i];
+            m->entries[i].key = NULL;
+            m->entries[i].path = NULL;
+        }
+        kept++;
     }
     m->count = kept;
     for (size_t i = 0; i < m->count; i++) {
@@ -353,16 +422,25 @@ static vfs_mount* open_pkg(const char* game_dir, const char* pkg_path, char cont
     if (!m) return NULL;
     *err = PS3_VFS_EFORMAT;
     uint8_t h[0x80];
-    if (image_read(m, 0, h, sizeof h) || memcmp(h, "\x7FPKG", 4) || h[4] != 0x80) {
+    if (image_read(m, 0, h, sizeof h) || memcmp(h, "\x7FPKG", 4) || (h[4] != 0x80 && h[4] != 0x00)) {
         close_image(m);
         return NULL;
     }
     const uint32_t items = ps3_be32(h + 0x14);
-    m->pkg = 1;
+    m->pkg = h[4] == 0x80 ? 1 : 2;
     m->data_offset = ps3_be64(h + 0x20);
     const uint64_t data_size = ps3_be64(h + 0x28);
-    memcpy(m->riv, h + 0x70, 16);
-    ps3_aes128_init(&m->key, PKG_KEY);
+    m->data_size = data_size;
+    if (m->pkg == 1) {
+        memcpy(m->riv, h + 0x70, 16);
+        ps3_aes128_init(&m->key, PKG_KEY);
+    } else {
+        memset(m->dbg_key, 0, 64);
+        memcpy(m->dbg_key + 0x00, h + 0x60, 8);
+        memcpy(m->dbg_key + 0x08, h + 0x60, 8);
+        memcpy(m->dbg_key + 0x10, h + 0x68, 8);
+        memcpy(m->dbg_key + 0x18, h + 0x68, 8);
+    }
     char cid[37];
     memcpy(cid, h + 0x30, 36);
     cid[36] = 0;
@@ -373,20 +451,28 @@ static vfs_mount* open_pkg(const char* game_dir, const char* pkg_path, char cont
     m->prefix = normalize(prefix);
     m->prefix_len = m->prefix ? strlen(m->prefix) : 0;
     const uint64_t table = (uint64_t)items * 0x20;
-    uint8_t* t = table <= data_size && items < 100000 ? (uint8_t*)malloc((size_t)table) : NULL;
-    int rc = m->prefix && t && !pkg_read(m, 0, t, (size_t)table) ? 0 : -1;
+    uint8_t* t = table <= data_size && items < 100000 ? (uint8_t*)malloc(table ? (size_t)table : 1) : NULL;
+    int rc = m->prefix && t && (!table || !pkg_read(m, 0, t, (size_t)table)) ? 0 : -1;
     for (uint32_t i = 0; i < items && !rc; i++) {
         const uint8_t* e = t + i * 0x20;
         const uint32_t name_off = ps3_be32(e), name_len = ps3_be32(e + 4);
         const uint64_t off = ps3_be64(e + 8), size = ps3_be64(e + 16);
+        const uint8_t ftype = e[0x1B] & 0x1F;
+        const int is_dir = (ftype == 4 || ftype == 0x12);
         char name[512];
-        if (!name_len || name_len >= sizeof name || name_off + (uint64_t)name_len > data_size ||
-            off + size > data_size || pkg_read(m, name_off, name, name_len)) {
+        if (!name_len || name_len >= sizeof name || name_off > data_size || (uint64_t)name_len > data_size - name_off ||
+            (!is_dir && size > 0 && (off > data_size || size > data_size - off)) ||
+            pkg_read(m, name_off, name, name_len)) {
             rc = -1;
             break;
         }
         name[name_len] = 0;
-        rc = add_entry(m, name, off, (e[0x1B] & 0xFF) == 4 ? 0 : size, (e[0x1B] & 0xFF) == 4);
+        char* p = name;
+        while (*p == '/' || *p == '\\') p++;
+        size_t nl = strlen(p);
+        while (nl && (p[nl - 1] == '/' || p[nl - 1] == '\\')) p[--nl] = 0;
+        if (!nl) continue;
+        rc = add_entry(m, p, is_dir ? 0 : off, is_dir ? 0 : size, is_dir);
     }
     free(t);
     if (rc) {
@@ -419,9 +505,24 @@ int ps3_vfs_pkg_info(const char* pkg_path, char content_id[37], int* has_eboot)
     return PS3_VFS_OK;
 }
 
+int ps3_vfs_enum_last_mount(void (*cb)(const char* full_path, void* user), void* user)
+{
+    if (!cb || g_mount_count <= 0) return -1;
+    const vfs_mount* m = g_mounts[g_mount_count - 1];
+    char full[1400];
+    for (size_t i = 0; i < m->count; i++) {
+        if (m->entries[i].is_dir) continue;
+        snprintf(full, sizeof full, "%s/%s", m->prefix, m->entries[i].path);
+        cb(full, user);
+    }
+    return 0;
+}
+
 static const vfs_entry* lookup(const char* path, const vfs_mount** owner)
 {
-    char* key = normalize(path);
+    char stack_buf[1024];
+    char* heap_key = NULL;
+    char* key = normalize_into(path, stack_buf, sizeof stack_buf) ? stack_buf : (heap_key = normalize(path));
     if (!key) return NULL;
     const vfs_entry* found = NULL;
     for (int i = g_mount_count - 1; i >= 0 && !found; i--) {
@@ -436,19 +537,31 @@ static const vfs_entry* lookup(const char* path, const vfs_mount** owner)
         }
         if (found) *owner = m;
     }
-    free(key);
+    free(heap_key);
     return found;
 }
+
+#ifdef _WIN32
+static FILE* host_fopen(const char* path, const char* mode)
+{
+    wchar_t wp[1100], wm[16];
+    if (!MultiByteToWideChar(CP_UTF8, 0, path, -1, wp, 1100)) return NULL;
+    size_t i = 0;
+    for (; mode[i] && i < 15; i++) wm[i] = (wchar_t)(unsigned char)mode[i];
+    wm[i] = 0;
+    return _wfopen(wp, wm);
+}
+#endif
 
 static int host_stat(const char* path, host_stat_t* st)
 {
 #ifdef _WIN32
-    char t[1100];
-    size_t n = strlen(path);
-    if (n >= sizeof t) return -1;
-    memcpy(t, path, n + 1);
-    while (n > 1 && (t[n - 1] == '/' || t[n - 1] == '\\') && t[n - 2] != ':') t[--n] = 0;
-    return _stat64(t, st);
+    wchar_t t[1100];
+    int wn = MultiByteToWideChar(CP_UTF8, 0, path, -1, t, 1100);
+    if (wn <= 1) return -1;
+    size_t n = (size_t)(wn - 1);
+    while (n > 1 && (t[n - 1] == L'/' || t[n - 1] == L'\\') && t[n - 2] != L':') t[--n] = 0;
+    return _wstat64(t, st);
 #else
     return stat(path, st);
 #endif
@@ -488,7 +601,11 @@ ps3_vfile* ps3_vfile_adopt(FILE* f)
 
 ps3_vfile* ps3_vfile_open(const char* path, const char* mode)
 {
+#ifdef _WIN32
+    FILE* f = host_fopen(path, mode);
+#else
     FILE* f = fopen(path, mode);
+#endif
     if (f) return ps3_vfile_adopt(f);
     if (strpbrk(mode, "wa+")) return NULL;
     const vfs_mount* m = NULL;
@@ -630,10 +747,22 @@ ps3_vdir* ps3_vdir_open(const char* path)
             vdir_add(d, "..", 1, &cap);
         }
         exists = 1;
-        for (size_t j = 0; j < m->count; j++) {
+        size_t j = 0;
+        if (rl) {
+            size_t lo = 0, hi = m->count;
+            while (lo < hi) {
+                const size_t mid = lo + (hi - lo) / 2;
+                const int cmp = strncmp(m->entries[mid].key, rel, rl);
+                if (cmp < 0 || (cmp == 0 && (unsigned char)m->entries[mid].key[rl] < (unsigned char)'/')) lo = mid + 1;
+                else hi = mid;
+            }
+            j = lo;
+        }
+        for (; j < m->count; j++) {
             const vfs_entry* e = &m->entries[j];
+            if (rl && (strncmp(e->key, rel, rl) || e->key[rl] != '/')) break;
             const char* tail = e->key + (rl ? rl + 1 : 0);
-            if ((rl && (strncmp(e->key, rel, rl) || e->key[rl] != '/')) || !*tail || strchr(tail, '/')) continue;
+            if (!*tail || strchr(tail, '/')) continue;
             vdir_add(d, e->name, e->is_dir, &cap);
         }
     }
