@@ -320,9 +320,10 @@ image* renderer::depth_as_color(surface& s)
     VkCommandBuffer c = cmd();
     end_rendering();
     const trace_span span(*this, c, "depth pack %ux%u", w, h);
-    barrier(c, s.img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    barrier(c, s.img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, k_shader_read_stages, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
     barrier(c, dst, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
     m_depth_pack.record(c, dv, sv, dst.view, w, h, d16, s.depth_float);
+    invalidate_graphics_state();
     s.as_color_version = s.depth_version;
     return &dst;
 }
@@ -347,12 +348,24 @@ image* renderer::native_image(surface& s, image& source)
     end_rendering();
     if (direct_ok) {
         const trace_span span(*this, c, "box downscale %ux%u to %ux%u", source.width, source.height, w, h);
-        barrier(c, source, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+        barrier(c, source, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, k_shader_read_stages,
                 VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
         barrier(c, low, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
                 VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
         if (m_downscale.record_direct(c, source.view, low.view, low.format, w, h, source.width, source.height)) {
             invalidate_graphics_state();
+            s.native_version = s.version;
+            return &low;
+        }
+    }
+    if (!direct_ok && source.width <= w * 2u && source.height <= h * 2u) {
+        VkFormatProperties fp{};
+        vkGetPhysicalDeviceFormatProperties(m_d->gpu, source.format, &fp);
+        constexpr VkFormatFeatureFlags need = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT |
+                                              VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+        if ((fp.optimalTilingFeatures & need) == need) {
+            const trace_span span(*this, c, "linear downscale %ux%u to %ux%u", source.width, source.height, w, h);
+            scale_blit(c, source, low, VK_FILTER_LINEAR);
             s.native_version = s.version;
             return &low;
         }
@@ -365,9 +378,10 @@ image* renderer::native_image(surface& s, image& source)
             return nullptr;
     }
     const trace_span span(*this, c, "box downscale %ux%u to %ux%u", source.width, source.height, w, h);
-    barrier(c, source, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    barrier(c, source, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, k_shader_read_stages, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
     barrier(c, m_box, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
     m_downscale.record(c, source.view, m_box.view, w, h, source.width, source.height);
+    invalidate_graphics_state();
     barrier(c, m_box, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
     barrier(c, low, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
     VkImageBlit region{};
@@ -446,8 +460,8 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
     VkCommandBuffer c = cmd();
 
     const char* skipped = nullptr;
-    for (auto& p : m_surfaces) {
-        surface* s = p.get();
+    for (size_t si = m_surfaces.size(); si-- > 0;) {
+        surface* s = m_surfaces[si].get();
         if (s->ea != ea) continue;
         if (s->state != SURFACE_VALID) { skipped = "memory: surface not valid"; continue; }
         if (d.cube || d.dimension == 3) { skipped = "memory: surface sampled as cube/3D"; continue; }
@@ -460,7 +474,7 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
             path = "dummy: depth pack failed";
             if (!packed) return false;
             barrier(c, *packed, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                    VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+                    k_shader_read_stages, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
             const VkImageView view = view_for(*packed, VK_IMAGE_VIEW_TYPE_2D, d.format, VK_IMAGE_ASPECT_COLOR_BIT, d.swizzle);
             if (!view) return false;
             path = "depth packed as color";
@@ -510,9 +524,9 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
             source = native_image(*s, *source);
             if (!source) return false;
         }
-        if (!readable(*source)) end_rendering();
+        if (!readable(*source, k_shader_read_stages)) end_rendering();
         barrier(c, *source, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+                k_shader_read_stages, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
         const VkImageView view = view_for(*source, VK_IMAGE_VIEW_TYPE_2D, (s->depth || promoted) ? s->img.format : d.format, aspect, d.swizzle);
         path = "dummy: surface view failed";
         if (!view) return false;
@@ -605,10 +619,10 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
             vkCmdCopyBufferToImage(c, slice.buffer, e->img.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, (u32)m_copy_regions.size(),
                                    m_copy_regions.data());
     }
-    if (!readable(e->img)) {
+    if (!readable(e->img, k_shader_read_stages)) {
         end_rendering();
         barrier(c, e->img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+                k_shader_read_stages, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
     }
     const VkImageView view = view_for(e->img, type, d.format, d.aspect & VK_IMAGE_ASPECT_DEPTH_BIT ? VK_IMAGE_ASPECT_DEPTH_BIT : d.aspect, d.swizzle);
     if (!view) return false;

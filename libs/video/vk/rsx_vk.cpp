@@ -1042,13 +1042,14 @@ int vk_present(void*, u32, const rsx_display_buffer* db)
     const bool aa_ok = aa_mode == RSX_VK_AA_SMAA && src->width == sw && src->height == sh && src->view && is_smaa_source_format(src->format);
     if (aa_mode == RSX_VK_AA_OFF) g.smaa.release_targets();
     const VkExtent2D present_out = fitted ? out : VkExtent2D{ sw, sh };
-    const bool want_present_filter = s.view && src->view && src->width == sw && src->height == sh &&
+    const bool same_size_fmt = sw == present_out.width && sh == present_out.height && src->format == s.format;
+    const bool want_present_filter = !same_size_fmt && s.view && src->view && src->width == sw && src->height == sh &&
                                      is_smaa_source_format(src->format) && is_present_format(s.format);
 
     VkImage blit_src = src->handle;
     VkImageView sample_src = VK_NULL_HANDLE;
     if (aa_ok) {
-        vk::renderer::barrier(cmd, *src, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+        vk::renderer::barrier(cmd, *src, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, vk::k_shader_read_stages,
                               VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
         const vk::smaa::output res = g.smaa.record(cmd, src->view, src->format, sw, sh, want_present_filter, g.submitted + 1u);
         g.r.invalidate_graphics_state();
@@ -1060,7 +1061,7 @@ int vk_present(void*, u32, const rsx_display_buffer* db)
     bool filtered = false;
     if (want_present_filter) {
         if (!sample_src) {
-            vk::renderer::barrier(cmd, *src, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+            vk::renderer::barrier(cmd, *src, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, vk::k_shader_read_stages,
                                   VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
             sample_src = src->view;
         }
@@ -1069,11 +1070,12 @@ int vk_present(void*, u32, const rsx_display_buffer* db)
     }
     if (!filtered) {
         if (blit_src == src->handle)
-            vk::renderer::barrier(cmd, *src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+            vk::renderer::barrier(cmd, *src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                  VK_PIPELINE_STAGE_2_BLIT_BIT | VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
         else if (want_present_filter) {
             VkImageMemoryBarrier2 mb{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
             mb.srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-            mb.dstStageMask = VK_PIPELINE_STAGE_2_BLIT_BIT;
+            mb.dstStageMask = VK_PIPELINE_STAGE_2_BLIT_BIT | VK_PIPELINE_STAGE_2_COPY_BIT;
             mb.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
             mb.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
             mb.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
@@ -1085,7 +1087,13 @@ int vk_present(void*, u32, const rsx_display_buffer* db)
         }
         VkImageMemoryBarrier2 b = to_transfer_dst(s.image, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT);
         barrier_one(cmd, b);
-        if (fitted) {
+        if (same_size_fmt) {
+            VkImageCopy region{};
+            region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            region.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            region.extent = { sw, sh, 1 };
+            vkCmdCopyImage(cmd, blit_src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        } else if (fitted) {
             blit_fitted(cmd, blit_src, sw, sh, s.image, out);
         } else {
             VkImageBlit region{};

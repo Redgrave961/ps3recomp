@@ -107,7 +107,8 @@ const vertex_program* shader_cache::vertex(const uint32_t* program_in, const rsx
     }; });
 }
 
-const fragment_program* shader_cache::fragment(const uint32_t* ucode, uint32_t max_words, const rsx_spv_fp_key& key, bool async)
+const fragment_program* shader_cache::fragment(const uint32_t* ucode, uint32_t max_words, const rsx_spv_fp_key& key, bool async,
+                                               uint32_t alphakill_units)
 {
     rsx_spv_fp_info scan{};
     const uint32_t end = rsx_spv_fragment_scan(ucode, max_words, &scan) == 0 ? std::min(scan.ucode_words, max_words) : 0;
@@ -117,23 +118,32 @@ const fragment_program* shader_cache::fragment(const uint32_t* ucode, uint32_t m
             std::fprintf(stderr, "[vk] fragment program scan failed: %08X %08X %08X %08X\n", ucode[0], ucode[1], ucode[2], ucode[3]);
         return nullptr;
     }
+    rsx_spv_fp_key mk = key;
+    uint32_t dim_mask = 0u;
+    for (uint32_t u = 0; u < 16u; u++)
+        if (scan.texture_mask & (1u << u)) dim_mask |= 3u << (u * 2u);
+    mk.texture_dims &= dim_mask;
+    mk.texture_shadow &= scan.texture_mask | (scan.texture_mask << 16u);
+    if ((mk.output_mask & RSX_SPV_FPOUT_ALPHAKILL) && !(alphakill_units & scan.texture_mask))
+        mk.output_mask &= ~RSX_SPV_FPOUT_ALPHAKILL;
+
     thread_local std::vector<uint32_t> scratch;
     scratch.assign(ucode, ucode + end);
     for (uint32_t i = 0; i < scan.constant_count; i++)
         for (uint32_t w = 0; w < 4 && scan.constant_word[i] + w < end; w++) scratch[scan.constant_word[i] + w] = 0;
-    const uint64_t h = hash(scratch.data(), scratch.size() * 4u, hash(&key, sizeof key, 0x46504650u));
-    return resolve(m_fragment, h, async, [&] { return [this, h, key, words = scratch]() -> std::unique_ptr<fragment_program> {
+    const uint64_t h = hash(scratch.data(), scratch.size() * 4u, hash(&mk, sizeof mk, 0x46504650u));
+    return resolve(m_fragment, h, async, [&] { return [this, h, mk, words = scratch]() -> std::unique_ptr<fragment_program> {
         const uint32_t end = (uint32_t)words.size();
         auto fp = std::make_unique<fragment_program>();
         fp->hash = h;
         rsx_spv_blob blob{};
-        const bool ok = rsx_spv_fragment(words.data(), end, &key, &blob, &fp->info) == 0 && make_module(fp->code, blob, VK_SHADER_STAGE_FRAGMENT_BIT);
+        const bool ok = rsx_spv_fragment(words.data(), end, &mk, &blob, &fp->info) == 0 && make_module(fp->code, blob, VK_SHADER_STAGE_FRAGMENT_BIT);
         rsx_spv_blob_free(&blob);
         if (!ok) {
             std::fprintf(stderr, "[vk] fragment program failed to translate\n");
             return nullptr;
         }
-        m_pipes->record_fragment(words.data(), end, key);
+        m_pipes->record_fragment(words.data(), end, mk);
         return fp;
     }; });
 }

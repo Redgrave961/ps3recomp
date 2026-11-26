@@ -219,7 +219,7 @@ bool vk_device_create(vk_device& d, VkSurfaceKHR surface)
     if (d.dynamic_state3 && !d.caps.dynamic_state3) d.caps.dynamic_state3 = d.dynamic_state3->extendedDynamicState3PolygonMode != VK_FALSE;
     d.caps.buffer_address = f12->bufferDeviceAddress != VK_FALSE;
     d.caps.mirror_clamp_to_edge = f12->samplerMirrorClampToEdge != VK_FALSE;
-    {
+    if (d.props.deviceType != VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
         VkFormatProperties fp{};
         vkGetPhysicalDeviceFormatProperties(d.gpu, VK_FORMAT_R16G16B16A16_UNORM, &fp);
         constexpr VkFormatFeatureFlags need = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT |

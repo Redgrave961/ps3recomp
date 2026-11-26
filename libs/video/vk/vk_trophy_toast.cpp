@@ -31,7 +31,7 @@ uint64_t toast_now_ns()
 const char* toast_heading()
 {
     switch (ps3_sysutil_language()) {
-    case 0:  return "Trophy unlocked"; // JP (Latin fallback if no CJK glyph in UI font)
+    case 0:  return "Trophy unlocked";
     case 2:  return "Vous avez gagn\xC3\xA9 un troph\xC3\xA9" "e.";
     case 3:
     case 20:
@@ -99,8 +99,8 @@ float sd_round_rect(float px, float py, float cx, float cy, float hx, float hy, 
 
 void draw_trophy_cup(std::vector<uint8_t>& buf, int bw, int bh, int ox, int oy, int sz, char grade)
 {
-    uint8_t cr = 205, cg = 136, cb = 76;     // Bronze
-    uint8_t hr = 240, hg = 190, hb = 135;    // Highlight
+    uint8_t cr = 205, cg = 136, cb = 76;
+    uint8_t hr = 240, hg = 190, hb = 135;
     if (grade == 'S') { cr = 198; cg = 206; cb = 218; hr = 246; hg = 250; hb = 255; }
     else if (grade == 'G') { cr = 236; cg = 194; cb = 68; hr = 255; hg = 242; hb = 165; }
     else if (grade == 'P') { cr = 182; cg = 214; cb = 248; hr = 248; hg = 252; hb = 255; }
@@ -109,22 +109,20 @@ void draw_trophy_cup(std::vector<uint8_t>& buf, int bw, int bh, int ox, int oy, 
     for (int py = 0; py < sz; py++) {
         const int dy = oy + py;
         if (dy < 0 || dy >= bh) continue;
-        const float v = (py + 0.5f) * inv; // 0..1 top..bottom
+        const float v = (py + 0.5f) * inv;
         for (int px = 0; px < sz; px++) {
             const int dx = ox + px;
             if (dx < 0 || dx >= bw) continue;
-            const float u = (px + 0.5f) * inv; // 0..1 left..right
+            const float u = (px + 0.5f) * inv;
             const float ax = std::fabs(u - 0.5f);
 
             float cov = 0.f;
-            // Cup bowl: v in [0.08, 0.58], narrows smoothly toward bottom
             if (v >= 0.08f && v <= 0.60f) {
                 const float t = (v - 0.08f) / 0.52f;
                 const float hw = 0.30f - 0.16f * t * t;
                 const float edge = (hw - ax) * sz;
                 cov = std::max(cov, std::clamp(edge + 0.5f, 0.f, 1.f));
             }
-            // Side handles: two small arcs on left/right of bowl
             if (v >= 0.14f && v <= 0.44f) {
                 const float hy = (v - 0.28f) / 0.14f;
                 const float hx = (ax - 0.31f) / 0.13f;
@@ -132,12 +130,10 @@ void draw_trophy_cup(std::vector<uint8_t>& buf, int bw, int bh, int ox, int oy, 
                 const float hcov = std::clamp((0.36f - d) * 3.5f, 0.f, 1.f);
                 if (ax > 0.24f) cov = std::max(cov, hcov);
             }
-            // Stem: v in [0.58, 0.78]
             if (v >= 0.56f && v <= 0.80f) {
                 const float edge = (0.075f - ax) * sz;
                 cov = std::max(cov, std::clamp(edge + 0.5f, 0.f, 1.f));
             }
-            // Base: v in [0.78, 0.92]
             if (v >= 0.77f && v <= 0.93f) {
                 const float t = (v - 0.77f) / 0.16f;
                 const float hw = 0.18f + 0.10f * t;
@@ -146,7 +142,6 @@ void draw_trophy_cup(std::vector<uint8_t>& buf, int bw, int bh, int ox, int oy, 
             }
             if (cov <= 0.01f) continue;
 
-            // Metallic specular highlight on upper-left of cup
             const float shine = std::clamp(1.f - ((u - 0.36f) * (u - 0.36f) * 8.f + (v - 0.26f) * (v - 0.26f) * 3.5f), 0.f, 1.f);
             const float shade = 0.82f + 0.18f * (1.f - v);
             const uint8_t r = clamp_u8(cr * shade + (hr - cr * shade) * shine * 0.75f);
@@ -182,7 +177,6 @@ void draw_text(std::vector<uint8_t>& buf, int bw, int bh, const stbtt_fontinfo* 
     if (max_w > 0.f && measure_text(font, scale, clipped.c_str()) > max_w) {
         const float dots = measure_text(font, scale, "...");
         while (!clipped.empty() && measure_text(font, scale, clipped.c_str()) + dots > max_w) {
-            // pop UTF-8 codepoint
             clipped.pop_back();
             while (!clipped.empty() && (((unsigned char)clipped.back() & 0xC0) == 0x80)) clipped.pop_back();
         }
@@ -205,7 +199,6 @@ void draw_text(std::vector<uint8_t>& buf, int bw, int bh, const stbtt_fontinfo* 
             stbtt_MakeCodepointBitmap(font, glyph.data(), gw, gh, gw, scale, scale, (int)cp);
             const int gx = (int)std::floor(cur_x) + x0;
             const int gy = (int)std::floor(y) + ascent_px + y0;
-            // subtle 1px drop shadow for crisp readability
             for (int row = 0; row < gh; row++) {
                 const int dy = gy + row + 1;
                 if (dy < 0 || dy >= bh) continue;
@@ -271,14 +264,13 @@ void blit_icon_rounded(std::vector<uint8_t>& buf, int bw, int bh, const uint8_t*
                          clamp_u8(sr * inv), clamp_u8(sg * inv), clamp_u8(sb * inv),
                          (sa * inv / 255.f) * mask);
             }
-            // subtle 1px frame around icon
             if (d > -1.2f && d < 0.2f)
                 blend_px(&buf[((size_t)dy * bw + dx) * 4], 180, 190, 205, 0.22f * mask);
         }
     }
 }
 
-} // namespace
+}
 
 bool trophy_toast::create(vk_device& d)
 {
@@ -510,23 +502,19 @@ void trophy_toast::render_card(const pending_item& item, uint32_t screen_h)
     const float hy = card_h * 0.5f;
     const float radius = 8.f * k;
 
-    // Draw PS3 XMB dark frosted glass card + soft outer drop shadow + metallic border
     for (int y = 0; y < tex_h; y++) {
         const float vy = std::clamp(((float)(y - shadow) / (float)card_h), 0.f, 1.f);
         for (int x = 0; x < tex_w; x++) {
             uint8_t* dst = &m_pixels[((size_t)y * tex_w + x) * 4];
-            // Soft outer drop shadow (offset slightly downward)
             const float ds = sd_round_rect(x + 0.5f, y + 0.5f - 2.f * k, cx, cy, hx, hy, radius);
             if (ds > -1.f && ds < (float)shadow) {
                 const float t = 1.f - std::clamp(ds / (float)shadow, 0.f, 1.f);
                 blend_px(dst, 0, 0, 0, t * t * 0.48f);
             }
-            // Card body
             const float d = sd_round_rect(x + 0.5f, y + 0.5f, cx, cy, hx, hy, radius);
             const float body = std::clamp(0.5f - d, 0.f, 1.f);
             if (body <= 0.005f) continue;
 
-            // Classic XMB glossy two-band dark charcoal gradient
             float sheen = vy < 0.48f ? (1.f - vy / 0.48f) * 0.55f + 0.15f : 0.f;
             const uint8_t br = clamp_u8(20.f + 26.f * sheen);
             const uint8_t bg = clamp_u8(23.f + 28.f * sheen);
@@ -534,17 +522,14 @@ void trophy_toast::render_card(const pending_item& item, uint32_t screen_h)
             const float ba = 0.90f + 0.03f * vy;
             blend_px(dst, br, bg, bb, ba * body);
 
-            // Subtle inner top highlight
             if (d > -2.2f * k && d < -0.6f * k && vy < 0.15f)
                 blend_px(dst, 255, 255, 255, 0.14f * body);
-            // Crisp 1px metallic rim border
             const float border = std::clamp(1.25f - std::fabs(d + 0.6f), 0.f, 1.f);
             if (border > 0.01f)
                 blend_px(dst, 148, 158, 174, 0.45f * border * body);
         }
     }
 
-    // Left: decoded TROP###.PNG icon
     const int icon_x = shadow + pad;
     const int icon_y = shadow + pad;
     int sw = 0, sh = 0, comp = 0;
@@ -553,7 +538,6 @@ void trophy_toast::render_card(const pending_item& item, uint32_t screen_h)
         blit_icon_rounded(m_pixels, tex_w, tex_h, decoded, sw, sh, icon_x, icon_y, icon_sz, 4.f * k);
         stbi_image_free(decoded);
     } else {
-        // Fallback: dark badge with large trophy cup
         for (int py = 0; py < icon_sz; py++)
             for (int px = 0; px < icon_sz; px++) {
                 const float d = sd_round_rect(px + 0.5f, py + 0.5f, icon_sz * 0.5f, icon_sz * 0.5f, icon_sz * 0.5f, icon_sz * 0.5f, 4.f * k);
@@ -562,7 +546,6 @@ void trophy_toast::render_card(const pending_item& item, uint32_t screen_h)
         draw_trophy_cup(m_pixels, tex_w, tex_h, icon_x + icon_sz / 6, icon_y + icon_sz / 6, icon_sz * 2 / 3, item.grade);
     }
 
-    // Right: heading + grade cup + trophy title
     const int text_x = icon_x + icon_sz + text_gap;
     const float max_text_w = (float)(shadow + card_w - right_pad - text_x);
     const float line1_y = shadow + 12.f * k;
@@ -691,20 +674,17 @@ void trophy_toast::play_chime()
     m_chime_stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
     if (!m_chime_stream) return;
 
-    // Classic PS3-inspired crystalline chime: soft dual harmonic bell (B5 -> E6 shimmer)
     constexpr int sr = 48000;
-    constexpr int frames = sr * 75 / 100; // 0.75s
+    constexpr int frames = sr * 75 / 100;
     std::vector<float> pcm((size_t)frames * 2u, 0.f);
     constexpr float pi2 = 6.283185307f;
     for (int i = 0; i < frames; i++) {
         const float t = (float)i / (float)sr;
-        // Note 1 at t=0.00s: B5 (987.77 Hz) + 2nd harmonic
         float s1 = 0.f;
         {
             const float env = std::min(1.f, t / 0.004f) * std::exp(-t * 7.5f);
             s1 = (std::sin(pi2 * 987.77f * t) * 0.72f + std::sin(pi2 * 1975.53f * t) * 0.28f) * env;
         }
-        // Note 2 at t=0.095s: E6 (1318.51 Hz) + 2nd harmonic
         float s2 = 0.f;
         if (t >= 0.095f) {
             const float t2 = t - 0.095f;
@@ -735,7 +715,6 @@ bool trophy_toast::record(VkCommandBuffer cmd, VkImage target, VkImageView targe
     if (!m_retired.empty()) gc_retired();
     if (m_chime_stream) poll_chime();
 
-    // Drain any newly unlocked trophy events (lock-free fast check when empty)
     ps3_trophy_toast_event ev{};
     while (ps3_trophy_poll_toast(&ev)) {
         pending_item item;

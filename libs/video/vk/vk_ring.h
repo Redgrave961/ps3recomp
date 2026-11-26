@@ -17,6 +17,7 @@ public:
     vk_slice alloc(VkDeviceSize size, VkDeviceSize align);
     bool hold(VkDeviceSize size, VmaVirtualAllocation& a, VkDeviceSize& offset);
     void release(VmaVirtualAllocation a) { vmaVirtualFree(m_heap, a); }
+    void flush();
     void close(uint64_t value);
     void invalidate(VkDeviceSize offset, VkDeviceSize size);
     VkBuffer buffer() const { return m_buffer; }

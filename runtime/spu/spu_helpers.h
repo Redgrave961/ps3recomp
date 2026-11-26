@@ -150,8 +150,6 @@ static inline void spu_copy_exact_nonoverlap(uint8_t* dp, const uint8_t* sp, uin
 
 static inline void spu_ls_lzf_decompress(uint8_t* ls, uint32_t* p_src, uint32_t src_end, uint32_t* p_dst) {
     uint32_t src = *p_src, dst = *p_dst;
-    // Fast non-wrapping path: 99.99% of SPU LZF streams stay well inside [0, 0x40000).
-    // Uses 16B/32B wild copies when there is >= 32B headroom to LS end and no overlap.
     while (src < src_end) {
         const uint32_t s0 = src & 0x3FFFFu, d0 = dst & 0x3FFFFu;
         if (__builtin_expect(src_end <= 0x40000u && s0 < 0x3FFE0u && d0 < 0x3FFE0u && src == s0 && dst == d0, 1)) {
@@ -200,7 +198,6 @@ static inline void spu_ls_lzf_decompress(uint8_t* ls, uint32_t* p_src, uint32_t 
                     back += *sp++;
                     len += 2u;
                     if (__builtin_expect((uint32_t)(dp - ls) < back || dp + len > ls + 0x40000u, 0)) {
-                        // Wrap-around ref or near LS end: hand off to exact wrapping loop.
                         src = (uint32_t)(sp - ls);
                         dst = (uint32_t)(dp - ls);
                         const uint32_t ref = dst - back;
@@ -317,7 +314,6 @@ next_outer:;
     *p_src = src;
     *p_dst = dst;
 }
-
 
 static inline u128 spu_absdb(u128 a, u128 b);
 static inline u128 spu_avgb(u128 a, u128 b);
@@ -831,8 +827,6 @@ static inline int spu__sf_split(uint32_t x, uint32_t* sig, int* e2) {
 #if SPU_X86
 #define SPU_MXCSR_RZ 0xFFC0u
 SPU__XI u128 spu__xf_out(__m128 s) {
-    /* SPU_MXCSR_RZ enables FTZ+DAZ+RZ so inputs clamped by spu__xf always yield
-     * finite results; adding +0.0f clears -0.0f -> +0.0f in a single vaddps. */
     return spu__xs(_mm_castps_si128(_mm_add_ps(s, _mm_setzero_ps())));
 }
 SPU__XI u128 spu__xf_out_k(__m128 s, int k) {
@@ -1016,7 +1010,6 @@ static inline u128 spu_frds_h_(u128 a) { u128 r;
         r._u32[2*i] = w; r._u32[2*i+1] = 0;
     }
     return r; }
-
 
 static inline double spu__dget(u128 r, int i) {
     uint64_t u = ((uint64_t)r._u32[i*2] << 32) | r._u32[i*2+1];

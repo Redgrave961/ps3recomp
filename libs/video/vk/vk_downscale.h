@@ -33,7 +33,7 @@ private:
     VkDescriptorSetLayout m_gfx_set = VK_NULL_HANDLE;
     VkPipelineLayout m_gfx_layout = VK_NULL_HANDLE;
     VkShaderModule m_vs = VK_NULL_HANDLE;
-    VkShaderModule m_fs[3]{}; // 0=2x, 1=3x, 2=4x
+    VkShaderModule m_fs[3]{};
     std::vector<gfx_pipe> m_gfx_pipes;
 };
 

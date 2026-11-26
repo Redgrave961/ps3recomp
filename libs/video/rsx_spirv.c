@@ -64,7 +64,7 @@ enum {
     GL_SMin = 39, GL_FMax = 40, GL_UMax = 41, GL_SMax = 42, GL_FClamp = 43, GL_FMix = 46, GL_Fma = 50,
     GL_PackSnorm4x8 = 54, GL_PackUnorm4x8 = 55, GL_PackUnorm2x16 = 57, GL_PackHalf2x16 = 58,
     GL_UnpackUnorm2x16 = 61, GL_UnpackHalf2x16 = 62, GL_UnpackSnorm4x8 = 63, GL_UnpackUnorm4x8 = 64,
-    GL_Length = 66, GL_Normalize = 69, GL_Reflect = 71
+    GL_Length = 66, GL_Normalize = 69, GL_Reflect = 71, GL_NMin = 79, GL_NMax = 80, GL_NClamp = 81
 };
 
 enum { IMG_Bias = 1, IMG_Lod = 2, IMG_Grad = 4 };
@@ -559,13 +559,22 @@ static u32 set_op(spv* s, u32 opc, u32 a, u32 b)
     return sel(s, tv4(s), c, cvs(s, 1.0f), cvs(s, 0.0f));
 }
 
+static u32 safe_denom_f(spv* s, u32 x)
+{
+    u32 TF = tf(s);
+    u32 ok = I(s, OpFOrdGreaterThanEqual, tbool(s), X(s, TF, GL_FAbs, x), cf(s, 1e-10f));
+    u32 neg = I(s, OpFOrdLessThan, tbool(s), x, cf(s, 0.0f));
+    return sel(s, TF, ok, x, sel(s, TF, neg, cf(s, -1e-10f), cf(s, 1e-10f)));
+}
+
 static u32 lit_op(spv* s, u32 v)
 {
-    u32 x = X(s, tf(s), GL_FMax, exf(s, v, 0), cf(s, 0.0f));
-    u32 y = X(s, tf(s), GL_FMax, exf(s, v, 1), cf(s, 1e-10f));
+    u32 TF = tf(s);
+    u32 x = X(s, TF, GL_NMax, exf(s, v, 0), cf(s, 0.0f));
+    u32 y = X(s, TF, GL_NMax, exf(s, v, 1), cf(s, 1e-10f));
     u32 w = exf(s, v, 3);
-    u32 p = X(s, tf(s), GL_Exp2, fmul(s, tf(s), w, X(s, tf(s), GL_Log2, y)));
-    u32 z = sel(s, tf(s), I(s, OpFOrdGreaterThan, tbool(s), x, cf(s, 0.0f)), p, cf(s, 0.0f));
+    u32 p = X(s, TF, GL_Exp2, X(s, TF, GL_NClamp, fmul(s, TF, w, X(s, TF, GL_Log2, y)), cf(s, -126.0f), cf(s, 126.0f)));
+    u32 z = sel(s, TF, I(s, OpFOrdGreaterThan, tbool(s), x, cf(s, 0.0f)), p, cf(s, 0.0f));
     return vec4c(s, cf(s, 1.0f), x, z, cf(s, 1.0f));
 }
 
@@ -1138,7 +1147,7 @@ static void vp_write(vpc* c, const vpi* i, int is_sca, u32 val, u32 condv)
     spv* s = c->s;
     u32 mask = is_sca ? vp_smask(i) : vp_vmask(i);
     if (!mask) return;
-    if (bf(i->d0, 26, 1)) val = X(s, tv4(s), GL_FClamp, val, cvs(s, 0.0f), cvs(s, 1.0f));
+    if (bf(i->d0, 26, 1)) val = X(s, tv4(s), GL_NClamp, val, cvs(s, 0.0f), cvs(s, 1.0f));
     u32 dst = bf(i->d3, 2, 5);
     int vr = (int)bf(i->d0, 30, 1);
     int is_result = is_sca ? !vr : vr;
@@ -1197,8 +1206,8 @@ static u32 vp_ins(vpc* c, u32 pc)
     case VEC_DST:
         vv = vec4c(s, cf(s, 1.0f), fmul(s, TF, exf(s, sv[0], 1), exf(s, sv[1], 1)), exf(s, sv[0], 2), exf(s, sv[1], 3));
         break;
-    case VEC_MIN: vv = X(s, T4, GL_FMin, sv[0], sv[1]); break;
-    case VEC_MAX: vv = X(s, T4, GL_FMax, sv[0], sv[1]); break;
+    case VEC_MIN: vv = X(s, T4, GL_NMin, sv[0], sv[1]); break;
+    case VEC_MAX: vv = X(s, T4, GL_NMax, sv[0], sv[1]); break;
     case VEC_SLT: vv = set_op(s, OpFOrdLessThan, sv[0], sv[1]); break;
     case VEC_SGE: vv = set_op(s, OpFOrdGreaterThanEqual, sv[0], sv[1]); break;
     case VEC_SEQ: vv = set_op(s, OpFOrdEqual, sv[0], sv[1]); break;
@@ -1229,23 +1238,23 @@ static u32 vp_ins(vpc* c, u32 pc)
         case SCA_RCP: sres = fdiv(s, T4, cvs(s, 1.0f), x); break;
         case SCA_RCC: {
             u32 r = fdiv(s, T4, cvs(s, 1.0f), x);
-            u32 m = X(s, T4, GL_FClamp, X(s, T4, GL_FAbs, r), cvs(s, 5.42101086e-20f), cvs(s, 1.84467441e19f));
+            u32 m = X(s, T4, GL_NClamp, X(s, T4, GL_FAbs, r), cvs(s, 5.42101086e-20f), cvs(s, 1.84467441e19f));
             u32 sign = uand(s, tu4(s), bc(s, tu4(s), r), cus(s, 0x80000000u));
             sres = bc(s, T4, uor(s, tu4(s), bc(s, tu4(s), m), sign));
             break;
         }
         case SCA_RSQ:
-            sres = splat(s, fdiv(s, TF, cf(s, 1.0f), X(s, TF, GL_Sqrt, X(s, TF, GL_FMax, exf(s, x, 0), cf(s, 1e-10f)))));
+            sres = splat(s, fdiv(s, TF, cf(s, 1.0f), X(s, TF, GL_Sqrt, X(s, TF, GL_NMax, X(s, TF, GL_FAbs, exf(s, x, 0)), cf(s, 1e-10f)))));
             break;
         case SCA_EXP: {
-            u32 t = exf(s, x, 0);
+            u32 t = X(s, TF, GL_NClamp, exf(s, x, 0), cf(s, -126.0f), cf(s, 126.0f));
             u32 fl = X(s, TF, GL_Floor, t);
             sres = vec4c(s, X(s, TF, GL_Exp2, fl), fsub(s, TF, t, fl), X(s, TF, GL_Exp2, t), cf(s, 1.0f));
             break;
         }
         case SCA_LOG: {
             u32 t = X(s, TF, GL_FAbs, exf(s, x, 0));
-            u32 l = X(s, TF, GL_Log2, t);
+            u32 l = X(s, TF, GL_Log2, X(s, TF, GL_NMax, t, cf(s, 1e-10f)));
             u32 e = X(s, TF, GL_Floor, l);
             u32 m = fdiv(s, TF, t, X(s, TF, GL_Exp2, e));
             u32 z = I(s, OpFOrdEqual, tbool(s), t, cf(s, 0.0f));
@@ -1253,8 +1262,8 @@ static u32 vp_ins(vpc* c, u32 pc)
             break;
         }
         case SCA_LIT: sres = lit_op(s, x); break;
-        case SCA_LG2: sres = X(s, T4, GL_Log2, X(s, T4, GL_FMax, x, cvs(s, 1e-10f))); break;
-        case SCA_EX2: sres = X(s, T4, GL_Exp2, x); break;
+        case SCA_LG2: sres = X(s, T4, GL_Log2, X(s, T4, GL_NMax, X(s, T4, GL_FAbs, x), cvs(s, 1e-10f))); break;
+        case SCA_EX2: sres = X(s, T4, GL_Exp2, X(s, T4, GL_NClamp, x, cvs(s, -126.0f), cvs(s, 126.0f))); break;
         case SCA_SIN: sres = X(s, T4, GL_Sin, x); break;
         case SCA_COS: sres = X(s, T4, GL_Cos, x); break;
         default: break;
@@ -1588,6 +1597,7 @@ typedef struct fpc {
     u32 h[128];
     u8 width[64];
     int fp32_half;
+    int has_pack;
     u32 cc[2];
     u32 vin[RSX_SPV_VAR_COUNT];
     u32 fragcoord, frontfacing, pointcoord;
@@ -1743,8 +1753,10 @@ static void fp_widths(fpc* c, const rsx_spv_fp_key* key, int depth)
             if (i.op != FP_FENCT && i.op != FP_FENCB) can_fp32_half = 0;
         } else if (i.op != FP_NOP) {
             if (i.op == FP_PK2 || i.op == FP_UP2 || i.op == FP_PK4 || i.op == FP_UP4 || i.op == FP_PKB || i.op == FP_UPB ||
-                i.op == FP_PK16 || i.op == FP_UP16 || i.op == FP_PKG || i.op == FP_UPG)
+                i.op == FP_PK16 || i.op == FP_UP16 || i.op == FP_PKG || i.op == FP_UPG) {
                 can_fp32_half = 0;
+                c->has_pack = 1;
+            }
             const u32 srcs[3] = { i.s0, i.s1, i.s2 };
             const u32 ns = fp_nsrc(i.op);
             const u32 dmask = bf(i.d, 9, 4);
@@ -1755,8 +1767,12 @@ static void fp_widths(fpc* c, const rsx_spv_fp_key* key, int depth)
                 fp_mark(c, reg, fp16);
                 if (!can_fp32_half) continue;
                 u32 umask = dmask;
-                if (i.op == FP_DP3) umask = 0x7u;
-                else if (i.op == FP_DP4 || fp_is_tex(i.op)) umask = 0xFu;
+                if (i.op == FP_DP3 || i.op == FP_NRM) umask = 0x7u;
+                else if (i.op == FP_DP4 || fp_is_tex(i.op) || i.op == FP_REFL || i.op == FP_DST || i.op == FP_BEM) umask = 0xFu;
+                else if (i.op == FP_DP2 || i.op == FP_DP2A) umask = n < 2u ? 0x3u : 0x1u;
+                else if (i.op == FP_LIT || i.op == FP_LIF) umask = 0xBu;
+                else if (i.op == FP_RCP || i.op == FP_RSQ || i.op == FP_EX2 || i.op == FP_LG2 || i.op == FP_COS || i.op == FP_SIN || i.op == FP_POW)
+                    umask = 0x1u;
                 else if ((i.op == FP_DIV || i.op == FP_DIVSQ) && n == 1u) umask = 0x1u;
                 for (u32 k = 0; k < 4u; k++) {
                     if (!(umask & (1u << k))) continue;
@@ -1898,20 +1914,17 @@ static u32 fp_readH(fpc* c, u32 m)
 
 static u32 f16_quantize(spv* s, u32 v)
 {
-    u32 raw = bc(s, tu4(s), v);
-    u32 normal = bc(s, tv4(s), uand(s, tu4(s), raw, cus(s, 0xFFFFE000u)));
-    u32 tr = fmul(s, tv4(s), X(s, tv4(s), GL_Trunc, fmul(s, tv4(s), normal, cvs(s, 16777216.0f))), cvs(s, 1.0f / 16777216.0f));
-    u32 ovf = I(s, OpUGreaterThanEqual, tb4(s), uand(s, tu4(s), raw, cus(s, 0x7FFFFFFFu)), cus(s, 0x47800000u));
-    return sel(s, tv4(s), ovf, fmul(s, tv4(s), v, cvs(s, 1e35f)), tr);
+    u32 cl = X(s, tv4(s), GL_NClamp, v, cvs(s, -65504.0f), cvs(s, 65504.0f));
+    u32 p0 = X(s, tu(s), GL_PackHalf2x16, I(s, OpVectorShuffle, tv2(s), cl, cl, 0, 1));
+    u32 p1 = X(s, tu(s), GL_PackHalf2x16, I(s, OpVectorShuffle, tv2(s), cl, cl, 2, 3));
+    u32 u0 = X(s, tv2(s), GL_UnpackHalf2x16, p0);
+    u32 u1 = X(s, tv2(s), GL_UnpackHalf2x16, p1);
+    return shuf(s, tv4(s), u0, u1, 0, 1, 2, 3);
 }
 
 static u32 f16_32_clamp(spv* s, u32 v)
 {
-    u32 raw = bc(s, tu4(s), v);
-    u32 den = I(s, OpIEqual, tb4(s), uand(s, tu4(s), raw, cus(s, 0x7F800000u)), cu4z(s));
-    u32 fl = sel(s, tv4(s), den, cvs(s, 0.0f), v);
-    u32 ovf = I(s, OpFOrdGreaterThanEqual, tb4(s), X(s, tv4(s), GL_FAbs, v), cvs(s, 65536.0f));
-    return sel(s, tv4(s), ovf, fmul(s, tv4(s), v, cvs(s, 1e35f)), fl);
+    return X(s, tv4(s), GL_NClamp, v, cvs(s, -65504.0f), cvs(s, 65504.0f));
 }
 
 static u32 precision_clamp(spv* s, u32 v, float lo, float hi)
@@ -1919,7 +1932,7 @@ static u32 precision_clamp(spv* s, u32 v, float lo, float hi)
     u32 m = uand(s, tu4(s), bc(s, tu4(s), v), cus(s, 0x7FFFFFFFu));
     u32 bad = I(s, OpUGreaterThan, tb4(s), I(s, OpISub, tu4(s), m, cus(s, 0x00800000u)), cus(s, 0x7F000000u));
     u32 f = sel(s, tv4(s), bad, cvs(s, 0.0f), v);
-    return X(s, tv4(s), GL_FClamp, f, cvs(s, lo), cvs(s, hi));
+    return X(s, tv4(s), GL_NClamp, f, cvs(s, lo), cvs(s, hi));
 }
 
 static u32 clamp_prec(spv* s, u32 v, u32 prec)
@@ -1950,7 +1963,7 @@ static void fp_writeR(fpc* c, u32 n, u32 v, u32 mask, u32 condv)
 static void fp_writeH(fpc* c, u32 m, u32 v, u32 mask, u32 condv)
 {
     spv* s = c->s;
-    u32 q = c->fp32_half ? v : f16_quantize(s, v);
+    u32 q = (c->fp32_half || (!c->has_pack && c->width[m >> 1] == FP_WIDTH_H)) ? v : f16_quantize(s, v);
     if (fp_split(c, m)) {
         u32 var = fp_hvar(c, m);
         if (mask == 0xFu && !condv) {
@@ -2067,7 +2080,7 @@ static u32 fp_color(fpc* c, u32 n)
     u32 two = bitset(s, fp_state_u(c, 0), 1);
     u32 pick = band(s, two, bnot(s, fp_front(c)));
     u32 v = sel(s, tv4(s), pick, back, front);
-    return X(s, tv4(s), GL_FClamp, v, cvs(s, 0.0f), cvs(s, 1.0f));
+    return X(s, tv4(s), GL_NClamp, v, cvs(s, 0.0f), cvs(s, 1.0f));
 }
 
 static u32 fp_wpos(fpc* c)
@@ -2099,38 +2112,38 @@ static u32 fp_fog_compute(fpc* c)
       RSX_SPV_FOG_EXP, le1, RSX_SPV_FOG_EXP_ABS, le1a,
       RSX_SPV_FOG_EXP2, le2, RSX_SPV_FOG_EXP2_ABS, le2a);
     label(s, llin);
-    st(s, yv, X(s, TF, GL_FClamp, fadd(s, TF, fmul(s, TF, p1, x), fsub(s, TF, p0, cf(s, 1.0f))), cf(s, 0.0f), cf(s, 1.0f)));
+    st(s, yv, X(s, TF, GL_NClamp, fadd(s, TF, fmul(s, TF, p1, x), fsub(s, TF, p0, cf(s, 1.0f))), cf(s, 0.0f), cf(s, 1.0f)));
     V(s, OpBranch, merge);
     label(s, llina);
     {
         u32 ax = X(s, TF, GL_FAbs, x);
-        st(s, yv, X(s, TF, GL_FClamp, fadd(s, TF, fmul(s, TF, p1, ax), fsub(s, TF, p0, cf(s, 1.0f))), cf(s, 0.0f), cf(s, 1.0f)));
+        st(s, yv, X(s, TF, GL_NClamp, fadd(s, TF, fmul(s, TF, p1, ax), fsub(s, TF, p0, cf(s, 1.0f))), cf(s, 0.0f), cf(s, 1.0f)));
         V(s, OpBranch, merge);
     }
     label(s, le1);
     {
         u32 e1 = fsub(s, TF, fadd(s, TF, fmul(s, TF, p1, x), p0), cf(s, 1.5f));
-        st(s, yv, X(s, TF, GL_FClamp, X(s, TF, GL_Exp, fmul(s, TF, cf(s, 11.084f), e1)), cf(s, 0.0f), cf(s, 1.0f)));
+        st(s, yv, X(s, TF, GL_NClamp, X(s, TF, GL_Exp, X(s, TF, GL_NClamp, fmul(s, TF, cf(s, 11.084f), e1), cf(s, -80.0f), cf(s, 80.0f))), cf(s, 0.0f), cf(s, 1.0f)));
         V(s, OpBranch, merge);
     }
     label(s, le1a);
     {
         u32 e1a = fsub(s, TF, fadd(s, TF, fmul(s, TF, p1, X(s, TF, GL_FAbs, x)), p0), cf(s, 1.5f));
-        st(s, yv, X(s, TF, GL_FClamp, X(s, TF, GL_Exp, fmul(s, TF, cf(s, 11.084f), e1a)), cf(s, 0.0f), cf(s, 1.0f)));
+        st(s, yv, X(s, TF, GL_NClamp, X(s, TF, GL_Exp, X(s, TF, GL_NClamp, fmul(s, TF, cf(s, 11.084f), e1a), cf(s, -80.0f), cf(s, 80.0f))), cf(s, 0.0f), cf(s, 1.0f)));
         V(s, OpBranch, merge);
     }
     label(s, le2);
     {
         u32 e1 = fsub(s, TF, fadd(s, TF, fmul(s, TF, p1, x), p0), cf(s, 1.5f));
         u32 t2 = fmul(s, TF, cf(s, 4.709f), e1);
-        st(s, yv, X(s, TF, GL_FClamp, X(s, TF, GL_Exp, I(s, OpFNegate, TF, fmul(s, TF, t2, t2))), cf(s, 0.0f), cf(s, 1.0f)));
+        st(s, yv, X(s, TF, GL_NClamp, X(s, TF, GL_Exp, I(s, OpFNegate, TF, X(s, TF, GL_NClamp, fmul(s, TF, t2, t2), cf(s, 0.0f), cf(s, 80.0f)))), cf(s, 0.0f), cf(s, 1.0f)));
         V(s, OpBranch, merge);
     }
     label(s, le2a);
     {
         u32 e1a = fsub(s, TF, fadd(s, TF, fmul(s, TF, p1, X(s, TF, GL_FAbs, x)), p0), cf(s, 1.5f));
         u32 t2a = fmul(s, TF, cf(s, 4.709f), e1a);
-        st(s, yv, X(s, TF, GL_FClamp, X(s, TF, GL_Exp, I(s, OpFNegate, TF, fmul(s, TF, t2a, t2a))), cf(s, 0.0f), cf(s, 1.0f)));
+        st(s, yv, X(s, TF, GL_NClamp, X(s, TF, GL_Exp, I(s, OpFNegate, TF, X(s, TF, GL_NClamp, fmul(s, TF, t2a, t2a), cf(s, 0.0f), cf(s, 80.0f)))), cf(s, 0.0f), cf(s, 1.0f)));
         V(s, OpBranch, merge);
     }
     label(s, merge);
@@ -2273,7 +2286,8 @@ static u32 srgb_to_linear(spv* s, u32 cs)
 {
     u32 T4 = tv4(s);
     u32 a = fdiv(s, T4, cs, cvs(s, 12.92f));
-    u32 b = X(s, T4, GL_Pow, fdiv(s, T4, fadd(s, T4, cs, cvs(s, 0.055f)), cvs(s, 1.055f)), cvs(s, 2.4f));
+    u32 base = X(s, T4, GL_NMax, fdiv(s, T4, fadd(s, T4, cs, cvs(s, 0.055f)), cvs(s, 1.055f)), cvs(s, 1e-10f));
+    u32 b = X(s, T4, GL_Pow, base, cvs(s, 2.4f));
     return sel(s, T4, I(s, OpFOrdGreaterThan, tb4(s), cs, cvs(s, 0.04045f)), b, a);
 }
 
@@ -2281,9 +2295,9 @@ static u32 linear_to_srgb(spv* s, u32 cl)
 {
     u32 T4 = tv4(s);
     u32 low = fmul(s, T4, cl, cvs(s, 12.92f));
-    u32 high = fsub(s, T4, fmul(s, T4, cvs(s, 1.055f), X(s, T4, GL_Pow, cl, cvs(s, 1.0f / 2.4f))), cvs(s, 0.055f));
+    u32 high = fsub(s, T4, fmul(s, T4, cvs(s, 1.055f), X(s, T4, GL_Pow, X(s, T4, GL_NMax, cl, cvs(s, 1e-10f)), cvs(s, 1.0f / 2.4f))), cvs(s, 0.055f));
     u32 lt = I(s, OpFOrdLessThan, tb4(s), cl, cvs(s, 0.0031308f));
-    return X(s, T4, GL_FClamp, sel(s, T4, lt, low, high), cvs(s, 0.0f), cvs(s, 1.0f));
+    return X(s, T4, GL_NClamp, sel(s, T4, lt, low, high), cvs(s, 0.0f), cvs(s, 1.0f));
 }
 
 static u32 sext_norm(spv* s, u32 x, int bits16)
@@ -2420,7 +2434,7 @@ static u32 fp_tex(fpc* c, const fpi* i, u32 op, u32 s0, u32 s1, u32 s2)
     u32 ts = fp_texstate(c, unit);
     u32 ctl = ex(s, tu(s), ts, 0);
     u32 w = exf(s, coord, 3);
-    if (proj) coord = I(s, OpVectorTimesScalar, T4, coord, fdiv(s, TF, cf(s, 1.0f), w));
+    if (proj) coord = I(s, OpVectorTimesScalar, T4, coord, fdiv(s, TF, cf(s, 1.0f), safe_denom_f(s, w)));
     u32 unn = bitset(s, ctl, 15);
     u32 sc = bc(s, tv2(s), I(s, OpVectorShuffle, tu2(s), ts, ts, 2, 3));
     u32 fct = sel(s, tv2(s), unn, sc, cv2(s, 1.0f, 1.0f));
@@ -2430,15 +2444,12 @@ static u32 fp_tex(fpc* c, const fpi* i, u32 op, u32 s0, u32 s1, u32 s2)
             u32 xy = fmul(s, tv2(s), I(s, OpVectorShuffle, tv2(s), coord, coord, 0, 1), fct);
             u32 ref = exf(s, coord, 2);
             u32 is_df = bitset(s, ctl, 14);
-            ref = sel(s, TF, is_df, ref, X(s, TF, GL_FMin, ref, cf(s, 1.0f)));
+            ref = sel(s, TF, is_df, ref, X(s, TF, GL_NMin, ref, cf(s, 1.0f)));
 
             int shadow_scaled = (int)((c->key->texture_shadow >> (16u + unit)) & 1u);
             if (!shadow_scaled) {
-                /* Native 1:1 shadow map: UE3's rotated 4x4 PCF taps already sit 1.000 physical texel apart,
-                   so a single hardware 2x2 PCF fetch per tap gives gapless, zero-grain filtering at 4x lower GPU cost. */
                 res = I(s, OpImageSampleDrefImplicitLod, TF, img, xy, ref);
             } else {
-                /* Fallback for upscaled shadow maps: deterministic warp-coherent 4-tap RGSS hardware PCF. */
                 u32 pcf_rad = bc(s, TF, ex(s, tu(s), ts, 1));
                 u32 sx = fmul(s, TF, exf(s, sc, 0), pcf_rad);
                 u32 sy = fmul(s, TF, exf(s, sc, 1), pcf_rad);
@@ -2455,7 +2466,7 @@ static u32 fp_tex(fpc* c, const fpi* i, u32 op, u32 s0, u32 s1, u32 s2)
         } else {
             u32 xyz = I(s, OpVectorShuffle, tv3(s), coord, coord, 0, 1, 2);
             u32 ref = exf(s, coord, 3);
-            ref = sel(s, TF, bitset(s, ctl, 14), ref, X(s, TF, GL_FMin, ref, cf(s, 1.0f)));
+            ref = sel(s, TF, bitset(s, ctl, 14), ref, X(s, TF, GL_NMin, ref, cf(s, 1.0f)));
             res = I(s, OpImageSampleDrefImplicitLod, TF, img, xyz, ref);
         }
         return splat(s, res);
@@ -2602,8 +2613,8 @@ static void fp_alu(fpc* c, const fpi* i, u32 pc)
         break;
     }
     case FP_DST: v = vec4c(s, cf(s, 1.0f), fmul(s, TF, exf(s, a, 1), exf(s, b, 1)), exf(s, a, 2), exf(s, b, 3)); break;
-    case FP_MIN: v = X(s, T4, GL_FMin, a, b); break;
-    case FP_MAX: v = X(s, T4, GL_FMax, a, b); break;
+    case FP_MIN: v = X(s, T4, GL_NMin, a, b); break;
+    case FP_MAX: v = X(s, T4, GL_NMax, a, b); break;
     case FP_SLT: v = set_op(s, OpFOrdLessThan, a, b); break;
     case FP_SGE: v = set_op(s, OpFOrdGreaterThanEqual, a, b); break;
     case FP_SLE: v = set_op(s, OpFOrdLessThanEqual, a, b); break;
@@ -2619,14 +2630,15 @@ static void fp_alu(fpc* c, const fpi* i, u32 pc)
     case FP_TEX: case FP_TXP: case FP_TXD: case FP_TXB: case FP_TXL: case FP_TEXBEM: case FP_TXPBEM:
         v = fp_tex(c, i, op, a, b, d);
         break;
-    case FP_RCP: v = splat(s, fdiv(s, TF, cf(s, 1.0f), exf(s, a, 0))); break;
-    case FP_RSQ: v = splat(s, fdiv(s, TF, cf(s, 1.0f), X(s, TF, GL_Sqrt, X(s, TF, GL_FAbs, exf(s, a, 0))))); break;
-    case FP_EX2: v = splat(s, X(s, TF, GL_Exp2, exf(s, a, 0))); break;
-    case FP_LG2: v = splat(s, X(s, TF, GL_Log2, exf(s, a, 0))); break;
+    case FP_RCP: v = splat(s, fdiv(s, TF, cf(s, 1.0f), safe_denom_f(s, exf(s, a, 0)))); break;
+    case FP_RSQ: v = splat(s, fdiv(s, TF, cf(s, 1.0f), X(s, TF, GL_Sqrt, X(s, TF, GL_NMax, X(s, TF, GL_FAbs, exf(s, a, 0)), cf(s, 1e-10f))))); break;
+    case FP_EX2: v = splat(s, X(s, TF, GL_Exp2, X(s, TF, GL_NClamp, exf(s, a, 0), cf(s, -126.0f), cf(s, 126.0f)))); break;
+    case FP_LG2: v = splat(s, X(s, TF, GL_Log2, X(s, TF, GL_NMax, X(s, TF, GL_FAbs, exf(s, a, 0)), cf(s, 1e-10f)))); break;
     case FP_LIT: v = lit_op(s, a); break;
     case FP_LIF: {
         u32 y = exf(s, a, 1);
-        u32 z = sel(s, TF, I(s, OpFOrdGreaterThan, tbool(s), y, cf(s, 0.0f)), X(s, TF, GL_Exp2, exf(s, a, 3)), cf(s, 0.0f));
+        u32 z = sel(s, TF, I(s, OpFOrdGreaterThan, tbool(s), y, cf(s, 0.0f)),
+                    X(s, TF, GL_Exp2, X(s, TF, GL_NClamp, exf(s, a, 3), cf(s, -126.0f), cf(s, 126.0f))), cf(s, 0.0f));
         v = vec4c(s, cf(s, 1.0f), y, z, cf(s, 1.0f));
         break;
     }
@@ -2645,7 +2657,14 @@ static void fp_alu(fpc* c, const fpi* i, u32 pc)
         v = shuf(s, T4, h, h, 0, 1, 0, 1);
         break;
     }
-    case FP_POW: v = splat(s, X(s, TF, GL_Pow, exf(s, a, 0), exf(s, b, 0))); break;
+    case FP_POW: {
+        u32 bx = exf(s, a, 0), ex = exf(s, b, 0);
+        u32 p = X(s, TF, GL_Exp2, X(s, TF, GL_NClamp, fmul(s, TF, ex, X(s, TF, GL_Log2, X(s, TF, GL_NMax, bx, cf(s, 1e-10f)))), cf(s, -126.0f), cf(s, 126.0f)));
+        u32 ez = I(s, OpFOrdEqual, tbool(s), ex, cf(s, 0.0f));
+        u32 bpos = I(s, OpFOrdGreaterThan, tbool(s), bx, cf(s, 0.0f));
+        v = splat(s, sel(s, TF, ez, cf(s, 1.0f), sel(s, TF, bpos, p, cf(s, 0.0f))));
+        break;
+    }
     case FP_PKB: v = splat(s, bc(s, TF, X(s, tu(s), GL_PackUnorm4x8, a))); break;
     case FP_UPB: v = X(s, T4, GL_UnpackUnorm4x8, fp_bits_x(s, a)); break;
     case FP_PK16: v = splat(s, bc(s, TF, X(s, tu(s), GL_PackUnorm2x16, I(s, OpVectorShuffle, tv2(s), a, a, 0, 1)))); break;
@@ -2660,15 +2679,16 @@ static void fp_alu(fpc* c, const fpi* i, u32 pc)
     case FP_REFL: v = X(s, T4, GL_Reflect, a, b); break;
     case FP_NRM: {
         u32 x = I(s, OpVectorShuffle, tv3(s), a, a, 0, 1, 2);
-        u32 len = X(s, TF, GL_Length, x);
-        u32 nz = I(s, OpFOrdGreaterThan, tbool(s), len, cf(s, 0.0f));
-        u32 n = sel(s, tv3(s), nz, X(s, tv3(s), GL_Normalize, x), x);
+        u32 d2 = I(s, OpDot, TF, x, x);
+        u32 ok = I(s, OpFOrdGreaterThan, tbool(s), d2, cf(s, 1e-20f));
+        u32 inv = fdiv(s, TF, cf(s, 1.0f), X(s, TF, GL_Sqrt, X(s, TF, GL_NMax, d2, cf(s, 1e-20f))));
+        u32 n = sel(s, tv3(s), ok, I(s, OpVectorTimesScalar, tv3(s), x, inv), x);
         v = shuf(s, T4, n, n, 0, 1, 2, 2);
         break;
     }
-    case FP_DIV: v = fdiv(s, T4, a, splat(s, exf(s, b, 0))); break;
+    case FP_DIV: v = fdiv(s, T4, a, splat(s, safe_denom_f(s, exf(s, b, 0)))); break;
     case FP_DIVSQ: {
-        u32 q = fdiv(s, T4, a, splat(s, X(s, TF, GL_Sqrt, X(s, TF, GL_FAbs, exf(s, b, 0)))));
+        u32 q = fdiv(s, T4, a, splat(s, X(s, TF, GL_Sqrt, X(s, TF, GL_NMax, X(s, TF, GL_FAbs, exf(s, b, 0)), cf(s, 1e-10f)))));
         v = sel(s, T4, I(s, OpFOrdGreaterThan, tb4(s), X(s, T4, GL_FAbs, a), cvs(s, 0.0f)), q, a);
         break;
     }
@@ -2881,7 +2901,7 @@ int rsx_spv_fragment(const u32* ucode, u32 max_words, const rsx_spv_fp_key* key,
             if (!(key->output_mask & (1u << k))) continue;
             u32 ov = gvar(s, tv4(s), SC_Output, 0);
             deco1(s, ov, DEC_Location, k);
-            st(s, ov, col[k]);
+            st(s, ov, X(s, tv4(s), GL_NClamp, col[k], cvs(s, -65504.0f), cvs(s, 65504.0f)));
         }
         if (depth) {
             u32 fd = gvar(s, tf(s), SC_Output, 0);
@@ -2916,7 +2936,7 @@ static u32 depth_fetch(spv* s, u32 img, u32 x, u32 y)
 
 static u32 depth_unorm(spv* s, u32 z, float scale)
 {
-    u32 c = X(s, tf(s), GL_FClamp, z, cf(s, 0.f), cf(s, 1.f));
+    u32 c = X(s, tf(s), GL_NClamp, z, cf(s, 0.f), cf(s, 1.f));
     return I(s, OpConvertFToU, tu(s), fadd(s, tf(s), fmul(s, tf(s), c, cf(s, scale)), cf(s, 0.5f)));
 }
 
@@ -3157,7 +3177,7 @@ int rsx_spv_box_down_fs(int scale, rsx_spv_blob* out)
     sb_ins(s, BODY(s), OpReturn, k_none, 0);
     fn_end(s);
     const u32 caps[1] = { 1 };
-    const u32 modes[1] = { 7 }; /* OriginUpperLeft */
+    const u32 modes[1] = { 7 };
     return spv_finish(s, 4, caps, 1, mainid, modes, 1, out);
 }
 
@@ -3224,7 +3244,7 @@ int rsx_spv_overlay_fs(rsx_spv_blob* out)
     sb_ins(s, BODY(s), OpReturn, k_none, 0);
     fn_end(s);
     const u32 caps[1] = { 1 };
-    const u32 modes[1] = { 7 }; /* OriginUpperLeft */
+    const u32 modes[1] = { 7 };
     return spv_finish(s, 4, caps, 1, mainid, modes, 1, out);
 }
 

@@ -398,7 +398,6 @@ static int sdl_open_stream(void)
     __atomic_store_n(&s_sdl_host_channels_cache, ch, __ATOMIC_RELAXED);
     s_out_channels = ch;
 
-    /* Scale the requested device quantum to ~5.33 ms at any host rate (44.1-384 kHz). */
     u32 want_frames = (u32)(((u64)dev_rate * CELL_AUDIO_BLOCK_SAMPLES + CELL_AUDIO_SAMPLE_RATE / 2u) / CELL_AUDIO_SAMPLE_RATE);
     if (want_frames < 128u) want_frames = 128u;
     char frames_hint[16];
@@ -520,7 +519,7 @@ static void audio_mix_loop(void)
     printf("[cellAudio] Audio monitor thread stopped\n");
 }
 
-#endif /* AUDIO_BACKEND_SDL */
+#endif
 
 #if AUDIO_BACKEND_WASAPI
 
@@ -663,8 +662,6 @@ static void fill_wasapi_format(WAVEFORMATEXTENSIBLE* wfxe, u32 channels)
 
 static int wasapi_mix_is_native_f32(const WAVEFORMATEX* mix, u32 out_ch)
 {
-    /* Use native IAudioClient3 + Catmull-Rom for 44.1-384 kHz; below 44.1 kHz
-       (e.g. Bluetooth HFP 16/22/32 kHz), let Windows AUTOCONVERTPCM low-pass. */
     if (!mix || mix->nSamplesPerSec < 44100u || mix->nSamplesPerSec > 384000u ||
         mix->nChannels != out_ch || mix->wBitsPerSample != 32)
         return 0;
@@ -722,8 +719,6 @@ static int wasapi_try_low_latency(IMMDevice* device, const WAVEFORMATEX* mix, HA
         return 0;
     }
 
-    /* Pick the smallest valid period >= ~4 ms at any host rate (44.1-384 kHz)
-       to match PS3's 5.33 ms cadence while leaving headroom on loaded CPUs. */
     const UINT32 min_want = (UINT32)(((u64)mix->nSamplesPerSec * 4ull) / 1000ull);
     UINT32 period = min_p;
     if (fund_p > 0 && period < min_want) {
@@ -736,7 +731,6 @@ static int wasapi_try_low_latency(IMMDevice* device, const WAVEFORMATEX* mix, HA
         ac3, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, period, mix, NULL);
     ac3->lpVtbl->Release(ac3);
     if (FAILED(hr)) {
-        /* Activate a clean IAudioClient for the fallback path. */
         s_wasapi_client->lpVtbl->Release(s_wasapi_client);
         s_wasapi_client = NULL;
         device->lpVtbl->Activate(device, &IID_IAudioClient, CLSCTX_ALL, NULL, (void**)&s_wasapi_client);
@@ -864,7 +858,7 @@ static int wasapi_open_stream(void)
         }
 
         s_wasapi_client->lpVtbl->GetBufferSize(s_wasapi_client, &s_wasapi_buf_frames);
-        REFERENCE_TIME def_hns = 100000; /* 10 ms fallback */
+        REFERENCE_TIME def_hns = 100000;
         s_wasapi_client->lpVtbl->GetDevicePeriod(s_wasapi_client, &def_hns, NULL);
         s_wasapi_period_frames = (UINT32)((def_hns * CELL_AUDIO_SAMPLE_RATE + 9999999ll) / 10000000ll);
         if (s_wasapi_period_frames < CELL_AUDIO_BLOCK_SAMPLES)
@@ -873,8 +867,6 @@ static int wasapi_open_stream(void)
         if (env_ms) {
             s_wasapi_target_frames = s_wasapi_buf_frames;
         } else {
-            /* Keep ~1 period + 1 PS3 block (~15 ms) queued inside the 60 ms ring;
-               if a saturated CPU ever underruns, target auto-widens inside the ring. */
             UINT32 target = s_wasapi_period_frames + CELL_AUDIO_BLOCK_SAMPLES;
             if (target > s_wasapi_buf_frames) target = s_wasapi_buf_frames;
             s_wasapi_target_frames = target;
@@ -1111,7 +1103,7 @@ static void audio_mix_loop(void)
     printf("[cellAudio] Mixing thread stopped\n");
 }
 
-#endif /* AUDIO_BACKEND_WASAPI */
+#endif
 
 #ifdef _WIN32
 static unsigned __stdcall audio_mix_thread_func(void* arg)
@@ -1225,7 +1217,7 @@ s32 cellAudioPortOpen(const CellAudioPortParam* param, u32* portNum)
     const u64 nblk = vm_read64(param_ea + 8);
     const u64 attr = vm_read64(param_ea + 16);
     float init_level = 1.0f;
-    if (attr & 0x1000ull) { /* CELL_AUDIO_PORTATTR_INITLEVEL */
+    if (attr & 0x1000ull) {
         const u32 lv_bits = vm_read32(param_ea + 24);
         memcpy(&init_level, &lv_bits, 4);
         if (!(init_level > 0.0f && init_level <= 1.0f)) init_level = 1.0f;

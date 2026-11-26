@@ -16,9 +16,6 @@ public:
     bool create(vk_device& d);
     void destroy();
 
-    // Returns true if the toast was composited onto target (and target was
-    // transitioned from TRANSFER_DST_OPTIMAL -> COLOR_ATTACHMENT_OPTIMAL -> PRESENT_SRC_KHR).
-    // Returns false if no toast is active (target remains in TRANSFER_DST_OPTIMAL).
     bool record(VkCommandBuffer cmd, VkImage target, VkImageView target_view, VkExtent2D extent, VkFormat format);
 
 private:
@@ -58,7 +55,6 @@ private:
     VkPipeline m_pipe = VK_NULL_HANDLE;
     VkFormat m_pipe_format = VK_FORMAT_UNDEFINED;
 
-    // Active card GPU resources
     VkImage m_img = VK_NULL_HANDLE;
     VmaAllocation m_mem = VK_NULL_HANDLE;
     VkImageView m_view = VK_NULL_HANDLE;

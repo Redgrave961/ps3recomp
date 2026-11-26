@@ -29,6 +29,9 @@ namespace vk {
 using rsx::u32;
 using rsx::u64;
 
+constexpr VkPipelineStageFlags2 k_shader_read_stages =
+    VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+
 struct image {
     VkImage handle = VK_NULL_HANDLE;
     VmaAllocation mem = nullptr;
@@ -127,7 +130,7 @@ public:
     void trace_end(VkCommandBuffer c, const char* fmt, ...);
 
     static void barrier(VkCommandBuffer cmd, image& img, VkImageLayout layout, VkPipelineStageFlags2 stage, VkAccessFlags2 access);
-    static bool readable(const image& img);
+    static bool readable(const image& img, VkPipelineStageFlags2 stage = k_shader_read_stages);
     static void memory_barrier(VkCommandBuffer cmd, VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access, VkPipelineStageFlags2 dst_stage,
                                VkAccessFlags2 dst_access);
 
@@ -194,7 +197,7 @@ private:
     image m_box;
     image* depth_as_color(surface& s);
 
-    bool draw_setup();
+    bool draw_setup(bool sync_hint);
     void draw_execute(const rsx::draw_clause& clause, u32 id);
     void trace_draw(u32 id, u32 prim, u32 count, bool indexed) const;
     std::FILE* m_trace = nullptr;
@@ -224,6 +227,7 @@ private:
     u32 m_fp_tex_dims = 0;
     u32 m_fp_tex_shadow = 0;
     u32 m_fp_tex_alphakill = 0;
+    u32 m_fp_tex_alphakill_mask = 0;
     bool m_fp_tex_valid = false;
     const vertex_program* m_constants_vp = nullptr;
     VkDescriptorBufferInfo m_constants{};

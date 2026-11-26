@@ -160,7 +160,8 @@ bool pipelines::create(vk_device& d, const std::string& cache_path)
     const size_t slash = m_cache_path.find_last_of("/\\");
     m_db = open_utf8(m_cache_path.substr(0, slash == std::string::npos ? 0 : slash + 1) + "vk_shaders.db", "ab+");
     const unsigned n = std::max(3u, std::thread::hardware_concurrency());
-    m_background_limit = std::max(2u, n > 2u ? n - 2u : 2u);
+    const unsigned bg_base = std::max(2u, n > 2u ? n - 2u : 2u);
+    m_background_limit = d.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? std::min(2u, bg_base) : bg_base;
     for (unsigned i = 0; i < n; i++)
         m_workers.emplace_back([this, i] {
             ps3_thread_name("vk pipeline %u", i);

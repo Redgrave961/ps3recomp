@@ -739,7 +739,6 @@ static DWORD WINAPI rsx_fifo_thread(LPVOID unused)
             rsx_run_args(put);
             continue;
         }
-        // Fast batched loop over commands within the same 1MB I/O page while s.get != put.
         const u32 page_id = s.get >> 20;
         const u32 page_base = (page_id < RSX_IO_PAGES) ? s.io_ea[page_id] : 0u;
         if (!page_base) {

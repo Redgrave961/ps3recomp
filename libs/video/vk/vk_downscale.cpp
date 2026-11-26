@@ -53,7 +53,6 @@ bool downscale::create(vk_device& d)
     vkDestroyShaderModule(d.dev, mod, nullptr);
     VK_TRY(r);
 
-    // Direct hardware-bilinear graphics path for exact 2x/3x/4x box downscales (zero intermediate image / zero blit pass)
     VkSamplerCreateInfo lsi{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
     lsi.magFilter = VK_FILTER_LINEAR;
     lsi.minFilter = VK_FILTER_LINEAR;

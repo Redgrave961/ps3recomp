@@ -108,7 +108,7 @@ static void vfs_sha1_64(const uint8_t in[64], uint8_t out[20])
     uint32_t h[5];
     memcpy(h, iv, sizeof h);
     uint8_t pad[64] = { 0x80 };
-    pad[62] = 0x02; /* 512 bits = 0x200 */
+    pad[62] = 0x02;
     const uint8_t* blocks[2] = { in, pad };
     for (int blk = 0; blk < 2; blk++) {
         uint32_t w[80];

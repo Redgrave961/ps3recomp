@@ -467,7 +467,7 @@ void renderer::release_held()
     m_held_garbage.erase(keep, m_held_garbage.end());
 }
 
-bool renderer::draw_setup()
+bool renderer::draw_setup(bool sync_hint)
 {
     if (const u64 progress = rsx_core_progress(); progress != m_progress) {
         m_progress = progress;
@@ -501,12 +501,16 @@ bool renderer::draw_setup()
                     fshadow &= ~((1u << u) | (1u << (16u + u)));
                 }
             }
-            u32 fak = 0;
+            u32 fak = 0, fak_mask = 0;
             for (u32 u = 0; u < rsx::TEXTURES; u++)
-                if (m_units[u].valid && ((m_units[u].regs.control0 >> 2) & 1u)) { fak = RSX_SPV_FPOUT_ALPHAKILL; break; }
+                if (m_units[u].valid && ((m_units[u].regs.control0 >> 2) & 1u)) {
+                    fak = RSX_SPV_FPOUT_ALPHAKILL;
+                    fak_mask |= 1u << u;
+                }
             m_fp_tex_dims = fdims;
             m_fp_tex_shadow = fshadow;
             m_fp_tex_alphakill = fak;
+            m_fp_tex_alphakill_mask = fak_mask;
             m_fp_tex_valid = true;
         }
     }
@@ -553,7 +557,7 @@ bool renderer::draw_setup()
         if (vl.vp && vl.program_hash == program_hash && !std::memcmp(&vl.key, &key, sizeof key)) {
             m_vp = vl.vp;
         } else {
-            const bool sync_shader = !m_pipelines.fast_link() && !m_fb.depth && m_fb.count > 0;
+            const bool sync_shader = m_fb.count > 0 && (!m_fb.depth || sync_hint);
             m_vp = m_shaders.vertex(program, key, program_hash, !sync_shader);
             if (m_vp) {
                 vl.program_hash = program_hash;
@@ -578,10 +582,12 @@ bool renderer::draw_setup()
     seen_key.ea = m_fp_ea;
     rsx_spv_fp_key& fk = seen_key.key;
     fk.control = r(rsx::M_SHADER_CONTROL);
+    u32 alphakill_units = 0;
     if (__builtin_expect(m_fp_tex_valid, 1)) {
         fk.texture_dims = m_fp_tex_dims;
         fk.texture_shadow = m_fp_tex_shadow;
         fk.output_mask = m_fp_tex_alphakill;
+        alphakill_units = m_fp_tex_alphakill_mask;
     } else {
         for (u32 u = 0; u < rsx::TEXTURES; u++) {
             fk.texture_dims |= texture_dims(m_units[u].desc, m_units[u].valid) << (u * 2u);
@@ -591,7 +597,10 @@ bool renderer::draw_setup()
                     if (!scale_for(m_units[u].desc.width, m_units[u].desc.height, true, true).unit())
                         fk.texture_shadow |= 1u << (16u + u);
                 }
-                if ((m_units[u].regs.control0 >> 2) & 1u) fk.output_mask |= RSX_SPV_FPOUT_ALPHAKILL;
+                if ((m_units[u].regs.control0 >> 2) & 1u) {
+                    fk.output_mask |= RSX_SPV_FPOUT_ALPHAKILL;
+                    alphakill_units |= 1u << u;
+                }
             }
         }
     }
@@ -677,8 +686,8 @@ bool renderer::draw_setup()
         }
     }
     if (__builtin_expect(!m_occlusion.idle(), 0)) await_writes(m_fp_ea, RSX_SPV_FP_MAX_INSTRUCTIONS * 16u);
-    const bool sync_shader = !m_pipelines.fast_link() && !m_fb.depth && m_fb.count > 0;
-    m_fp = m_shaders.fragment(ucode, RSX_SPV_FP_MAX_INSTRUCTIONS * 4u, fk, !sync_shader);
+    const bool sync_shader = m_fb.count > 0 && (!m_fb.depth || sync_hint);
+    m_fp = m_shaders.fragment(ucode, RSX_SPV_FP_MAX_INSTRUCTIONS * 4u, fk, !sync_shader, alphakill_units);
     if (!m_fp) return false;
     const fp_template*& tmpl_ref = m_fp_tmpl_by_fp[m_fp];
     if (!tmpl_ref) {
@@ -1047,7 +1056,7 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
     key.vs = m_vp->hash;
     key.fs = m_fp->hash;
     key.depth_format = m_fb.depth_format;
-    const bool sync_pipe = !m_pipelines.fast_link() && !m_fb.depth && m_fb.count > 0;
+    const bool sync_pipe = !m_pipelines.fast_link() && m_fb.count > 0 && (!m_fb.depth || ecount <= 6u);
     const VkPipeline pipe = m_pipelines.get(key, m_vp->code, m_fp->code, sync_pipe);
     if (!pipe) {
         if (m_trace) std::fprintf(m_trace, "[trace] %u skipped: pipeline compiling or failed\n", id);
@@ -1083,7 +1092,7 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
         VkDescriptorImageInfo img;
         if ((check_tex_mask >> u) & 1u) {
             img = images[u];
-        } else if (m_bound.images[u].sampler && m_bound.images[u].imageView) {
+        } else if (!all && m_bound.images[u].sampler && m_bound.images[u].imageView) {
             img = m_bound.images[u];
         } else {
             const u32 dims = texture_dims(m_units[u].desc, m_units[u].valid);

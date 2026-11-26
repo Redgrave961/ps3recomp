@@ -205,7 +205,6 @@ static int read_rap_file(const char* path, uint8_t rap[16])
         memcpy(rap, buf, 16);
         return 1;
     }
-    /* Also accept ASCII hex-encoded 32-char .rap files (ignoring UTF-8 BOM, 0x prefix, whitespace) */
     size_t start = (n >= 3 && buf[0] == 0xEF && buf[1] == 0xBB && buf[2] == 0xBF) ? 3 : 0;
     while (start < n && isspace(buf[start])) start++;
     if (start + 2 <= n && buf[start] == '0' && (buf[start + 1] == 'x' || buf[start + 1] == 'X')) start += 2;
@@ -375,7 +374,6 @@ static int unlock_with_exdata(npdrm_file* d, const char* exdata_dir, uint8_t* ra
         }
     }
 
-    /* Pass 1: case-insensitive filename match or embedded Content ID; Pass 2: ANY .rap file in exdata */
     for (int pass = 0; pass < 2; pass++) {
         DIR* dir = opendir(exdata_dir);
         if (!dir) break;

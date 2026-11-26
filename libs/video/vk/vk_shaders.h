@@ -29,7 +29,8 @@ public:
     void init(vk_device& d, pipelines& p) { m_d = &d; m_pipes = &p; }
     void destroy();
     const vertex_program* vertex(const uint32_t* program, const rsx_spv_vp_key& key, uint64_t program_hash, bool async);
-    const fragment_program* fragment(const uint32_t* ucode, uint32_t max_words, const rsx_spv_fp_key& key, bool async);
+    const fragment_program* fragment(const uint32_t* ucode, uint32_t max_words, const rsx_spv_fp_key& key, bool async,
+                                     uint32_t alphakill_units = 0xFFFFu);
     const vertex_program* find_vertex(uint64_t hash);
     const fragment_program* find_fragment(uint64_t hash);
     static uint64_t hash(const void* data, size_t bytes, uint64_t seed);

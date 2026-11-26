@@ -16,13 +16,17 @@ bool vk_ring::create(vk_device& d, VkDeviceSize size, VkDeviceSize persistent, V
     VmaAllocationCreateInfo ai{};
     ai.usage = VMA_MEMORY_USAGE_AUTO;
     ai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
-    ai.requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+    ai.requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
     ai.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
     VmaAllocationInfo info{};
     VkResult r = vmaCreateBuffer(d.vma, &bi, &ai, &m_buffer, &m_mem, &info);
     if (r != VK_SUCCESS) {
         ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
         ai.preferredFlags = 0;
+        r = vmaCreateBuffer(d.vma, &bi, &ai, &m_buffer, &m_mem, &info);
+    }
+    if (r != VK_SUCCESS) {
+        ai.requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
         r = vmaCreateBuffer(d.vma, &bi, &ai, &m_buffer, &m_mem, &info);
     }
     if (r != VK_SUCCESS) {
@@ -98,9 +102,13 @@ vk_slice vk_ring::alloc(VkDeviceSize size, VkDeviceSize align)
     return { m_buffer, off, m_ptr + off };
 }
 
+void vk_ring::flush()
+{
+    if (!m_coherent && m_mem) vmaFlushAllocation(m_d->vma, m_mem, 0, VK_WHOLE_SIZE);
+}
+
 void vk_ring::close(uint64_t value)
 {
-    if (!m_coherent) vmaFlushAllocation(m_d->vma, m_mem, 0, VK_WHOLE_SIZE);
     if (!m_fences.empty() && m_fences.back().end == m_head) {
         m_fences.back().value = value;
         return;

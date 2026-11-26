@@ -183,8 +183,6 @@ void set_dynamic_state(VkCommandBuffer cmd, const frontend& f, const vk_device& 
     constexpr float k_shadow_slope_bias = 2.5f;
     s.bias_enable = game_bias || t.shadow_map;
     if (s.bias_enable) {
-        // UNORM depth targets (Z16/Z24S8) are backed by D32_SFLOAT, so constant polygon offset is applied
-        // directly to viewport Z offset in upload_vertices() in exact UNORM units on all GPUs.
         s.bias[0] = game_bias && t.depth_float ? f.f(rsx::M_POLY_OFFSET_BIAS) : 0.f;
         s.bias[1] = 0.f;
         s.bias[2] = (game_bias ? f.f(rsx::M_POLY_OFFSET_SCALE) * t.scale.value() : 0.f) +

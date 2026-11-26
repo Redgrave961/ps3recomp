@@ -18,15 +18,9 @@ public:
     bool has_staging() const { return m_lut_stage != VK_NULL_HANDLE; }
     void retire_staging(uint64_t completed);
 
-    // Runs SMAA 1x Ultra (Color Edge Detection + Stencil Mask + Blend Weights + Linear Neighborhood Blend)
-    // on `src_view` (already in SHADER_READ_ONLY_OPTIMAL).
-    // Transitions output to SHADER_READ_ONLY_OPTIMAL if `for_sample`, else TRANSFER_SRC_OPTIMAL.
     output record(VkCommandBuffer cmd, VkImageView src_view, VkFormat src_format, uint32_t width, uint32_t height,
                   bool for_sample, uint64_t submit_ticket);
 
-    // Present filter: ring-free linear-space SSAA downscale (2x2 area / anti-ringed Mitchell-Netravali / 4x4 area) +
-    // 2-stage adaptive debanding + triangular-PDF dithering into aspect-fitted `dst_img`/`dst_view`,
-    // transitioning `dst_img` to TRANSFER_SRC_OPTIMAL.
     bool downscale(VkCommandBuffer cmd, VkImageView src_view, uint32_t sw, uint32_t sh,
                    VkImage dst_img, VkImageView dst_view, VkFormat dst_format, VkExtent2D out);
 
@@ -83,4 +77,4 @@ private:
     tex m_out;
 };
 
-} // namespace vk
+}

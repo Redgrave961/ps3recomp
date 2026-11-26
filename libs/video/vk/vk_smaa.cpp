@@ -140,7 +140,7 @@ VkPipeline make_pipeline(VkDevice dev, VkPipelineLayout layout, VkShaderModule v
     return pipe;
 }
 
-} // namespace
+}
 
 bool smaa::create_image(tex& out, VkFormat format, uint32_t w, uint32_t h, VkImageUsageFlags usage, VkImageAspectFlags view_aspect)
 {
@@ -450,7 +450,6 @@ smaa::output smaa::record(VkCommandBuffer cmd, VkImageView src_view, VkFormat sr
     const VkViewport vp{ 0.f, 0.f, (float)width, (float)height, 0.f, 1.f };
     const VkRect2D scissor{ { 0, 0 }, { width, height } };
 
-    // Pass 1: Color Edge Detection + Stencil Write
     {
         const VkImageMemoryBarrier2 bs[2] = {
             make_barrier(m_edges.handle, VK_IMAGE_ASPECT_COLOR_BIT,
@@ -502,7 +501,6 @@ smaa::output smaa::record(VkCommandBuffer cmd, VkImageView src_view, VkFormat sr
         vkCmdEndRendering(cmd);
     }
 
-    // Pass 2: Blending Weight Calculation (Stencil-masked to edge pixels)
     {
         const VkImageMemoryBarrier2 bs[3] = {
             make_barrier(m_edges.handle, VK_IMAGE_ASPECT_COLOR_BIT,
@@ -511,8 +509,10 @@ smaa::output smaa::record(VkCommandBuffer cmd, VkImageView src_view, VkFormat sr
                          VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT),
             make_barrier(m_stencil.handle, m_stencil_aspect,
                          VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
-                         VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT, VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
-                         VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT, VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT),
+                         VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                         VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                         VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                         VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT),
             make_barrier(m_blend.handle, VK_IMAGE_ASPECT_COLOR_BIT,
                          VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                          VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, 0,
@@ -564,7 +564,6 @@ smaa::output smaa::record(VkCommandBuffer cmd, VkImageView src_view, VkFormat sr
         vkCmdEndRendering(cmd);
     }
 
-    // Pass 3: Linear-Space Neighborhood Blending
     {
         const VkImageMemoryBarrier2 bs[2] = {
             make_barrier(m_blend.handle, VK_IMAGE_ASPECT_COLOR_BIT,
@@ -684,4 +683,4 @@ bool smaa::downscale(VkCommandBuffer cmd, VkImageView src_view, uint32_t sw, uin
     return true;
 }
 
-} // namespace vk
+}

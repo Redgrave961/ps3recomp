@@ -124,7 +124,8 @@ bool renderer::open(vk_device& d, VkSemaphore timeline, uint64_t* submitted, con
     }
     m_ubo_align = std::max<VkDeviceSize>(16, d.props.limits.minUniformBufferOffsetAlignment);
     m_shaders.init(d, m_pipelines);
-    if (!m_ring.create(d, 256ull << 20, 256ull << 20, timeline) || !m_pipelines.create(d, cache_path) || !create_buffer_set() || !create_dummies() ||
+    const VkDeviceSize ring_half = d.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? (128ull << 20) : (256ull << 20);
+    if (!m_ring.create(d, ring_half, ring_half, timeline) || !m_pipelines.create(d, cache_path) || !create_buffer_set() || !create_dummies() ||
         !m_occlusion.create(d, timeline) || !m_depth_pack.create(d) || !m_downscale.create(d))
         return false;
     m_pipelines.precompile(m_shaders);
@@ -190,9 +191,9 @@ constexpr u32 k_trace_queries = 8192;
 constexpr u32 k_trace_points = 8192;
 constexpr u32 k_pass_start = ~0u;
 
-bool renderer::readable(const image& img)
+bool renderer::readable(const image& img, VkPipelineStageFlags2 stage)
 {
-    return img.layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL && !(img.access & k_writes);
+    return img.layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL && !(img.access & k_writes) && (img.stage & stage) == stage;
 }
 
 void renderer::trace_begin(VkCommandBuffer c)
@@ -279,8 +280,7 @@ void renderer::trace_report()
 void renderer::barrier(VkCommandBuffer cmd, image& img, VkImageLayout layout, VkPipelineStageFlags2 stage, VkAccessFlags2 access)
 {
     constexpr VkAccessFlags2 writes = k_writes;
-    if (img.layout == layout && !(img.access & writes) && !(access & writes)) {
-        img.stage |= stage;
+    if (img.layout == layout && !(img.access & writes) && !(access & writes) && (img.stage & stage) == stage) {
         img.access |= access;
         return;
     }
@@ -373,6 +373,7 @@ void renderer::submit(VkSemaphore wait, VkPipelineStageFlags2 wait_stage, VkSema
     si.pCommandBufferInfos = &cb;
     si.signalSemaphoreInfoCount = signal ? 2u : 1u;
     si.pSignalSemaphoreInfos = signals;
+    m_ring.flush();
     {
         std::lock_guard<std::mutex> hold(m_d->queue_lock);
         vkQueueSubmit2(m_d->queue, 1, &si, VK_NULL_HANDLE);
@@ -528,14 +529,13 @@ surface* renderer::surface_for(u32 ea, u32 pitch, u32 width, u32 height, u32 for
 {
     const ratio scale = scale_for(width, height, depth, depth_only);
     surface* grow_from = nullptr;
-    for (auto& p : m_surfaces) {
-        surface* s = p.get();
+    for (size_t si = m_surfaces.size(); si-- > 0;) {
+        surface* s = m_surfaces[si].get();
         if (s->ea != ea || s->depth != depth) continue;
         if (s->gcm_format == format && s->pitch == pitch && s->aa_u == aa_u && s->aa_v == aa_v && s->scale == scale) {
             if (s->width >= width && s->height >= height) return s;
-            grow_from = s;
+            if (!grow_from) grow_from = s;
         }
-        break;
     }
     auto made = std::make_unique<surface>();
     surface* s = made.get();
@@ -599,10 +599,11 @@ surface* renderer::surface_for(u32 ea, u32 pitch, u32 width, u32 height, u32 for
     const u32 bytes = s->bytes();
     for (size_t i = 0; i < m_surfaces.size();) {
         surface* o = m_surfaces[i].get();
-        bool bound = o == m_fb.depth;
-        for (surface* b : m_fb.color) bound |= o == b;
-        for (u32 k = 0; k < keep_count; k++) bound |= o == keep[k];
-        if (!bound && ranges_overlap(o->ea, o->bytes(), ea, bytes)) {
+        bool kept_s = false;
+        for (u32 k = 0; k < keep_count; k++) kept_s |= o == keep[k];
+        if (!kept_s && ranges_overlap(o->ea, o->bytes(), ea, bytes)) {
+            if (o == m_fb.depth || o == m_fb.color[0] || o == m_fb.color[1] || o == m_fb.color[2] || o == m_fb.color[3])
+                end_rendering();
             retire(o);
             continue;
         }
@@ -1217,7 +1218,8 @@ void renderer::on_draw(const rsx::draw_clause& clause)
                          r(rsx::M_SURFACE_TARGET), r(rsx::M_SURFACE_COLOR_A), r(rsx::M_SURFACE_ZETA));
         return;
     }
-    if (!draw_setup()) {
+    const bool sync_hint = clause.ranges.size() == 1u && clause.ranges[0].count <= 6u;
+    if (!draw_setup(sync_hint)) {
         if (m_trace) std::fprintf(m_trace, "[trace] %u skipped: %s program compiling or failed\n", id, m_vp ? "fragment" : "vertex");
         return;
     }

@@ -19,7 +19,6 @@ except ImportError:
     print("Error: ppu_disasm.py must be in the same directory.", file=sys.stderr)
     sys.exit(1)
 
-
 FENCE_PREAMBLE = """\
 /* Guest memory barriers: the lowering of sync/lwsync/eieio/isync/ptesync.
  *
@@ -602,15 +601,12 @@ static inline __attribute__((always_inline)) void ppu_st_raw(ppu_context* ctx, u
 
 """
 
-
 def _parse_operands(operands: str) -> list[str]:
     return [o.strip() for o in operands.split(",") if o.strip()]
-
 
 def _reg_idx(token: str) -> str:
     m = re.match(r"[rfv](\d+)", token)
     return m.group(1) if m else token
-
 
 _CS_ANY_DEF_RE = re.compile(r'ctx->gpr\[(\d+)\]\s*(?:[-+*/|&^%]|<<|>>)?=(?!=)')
 _CS_SAVE_RE = re.compile(
@@ -642,16 +638,13 @@ _FRAME_ALLOC = "ctx->gpr[1] += -0x"
 _CS_ADDR_OF_RE = re.compile(
     r'ctx->gpr\[\d+\] = ctx->gpr\[1\] \+ \(int64_t\)\((-?0x[0-9A-Fa-f]+|-?\d+)\);')
 
-
 _CS_CALL_RE = re.compile(r'\bfunc_[0-9A-Fa-f]+\(ctx\)|ps3_indirect_call|ps3_hle_call|ppu_call_')
-
 
 _CS_COND_RETURN_RE = re.compile(r'^if \(.*\) return;(?:\s*/\*.*\*/)?$')
 _CS_TAIL_TRAMP_RE = re.compile(r'^\{ PPU_TAIL return \w+\(ctx\); \}$')
 _JUMP_CTR = ("{ const ppu_host_fn _f = ppu_exec_fn((uint32_t)ctx->ctr); "
              "if (_f) { PPU_TAIL return _f(ctx); } ps3_indirect_call(ctx); return; }")
 _CALL_DRAIN_RE = re.compile(r"(\w*func_([0-9A-F]{8})\(ctx\);) DRAIN_TRAMPOLINE\(ctx\);")
-
 
 def _is_epilogue_restore(lines, i, reg, off=None):
     tok = f"ctx->gpr[{reg}]"
@@ -675,14 +668,11 @@ def _is_epilogue_restore(lines, i, reg, off=None):
             return False
     return False
 
-
 def _xea(ra, rb):
     return f"ctx->gpr[{rb}]" if str(ra) == "0" else f"(ctx->gpr[{ra}] + ctx->gpr[{rb}])"
 
-
 def _mem_base(base):
     return "0" if str(base) == "0" else f"ctx->gpr[{base}]"
-
 
 def _disp_base(token: str):
     m = re.match(r"(-?0x[0-9A-Fa-f]+|[0-9-]+)\(r(\d+)\)", token)
@@ -691,7 +681,6 @@ def _disp_base(token: str):
         base = m.group(2)
         return disp, base
     return None, None
-
 
 def _imm(token: str) -> str:
     token = token.strip()
@@ -704,7 +693,6 @@ def _imm(token: str) -> str:
         return f"0x{v:X}" if v > 9 else str(v)
     except ValueError:
         return token
-
 
 _XER_SO = "((ctx->xer >> 31) & 1u)"
 _CRSET_RE = re.compile(
@@ -735,7 +723,6 @@ _GOTO_RE = re.compile(r"\bgoto (loc_[0-9A-Fa-f]+);")
 _PLAIN_GOTO_RE = re.compile(r"^goto loc_[0-9A-Fa-f]+;$")
 _INSN_PATCH_RE = re.compile(r"^if \(([A-Za-z_]\w*)\) \{ .* /\* insn patch 0x[0-9A-F]{8}: ")
 
-
 def load_insn_patches(path: str) -> dict[int, tuple[int, int, str]]:
     with open(path) as f:
         spec = json.load(f)
@@ -751,20 +738,16 @@ def load_insn_patches(path: str) -> dict[int, tuple[int, int, str]]:
                      int(str(e["new"]), 0) & 0xFFFFFFFF, guard)
     return out
 
-
 _CA_WRITE_RE = re.compile(r" ?ctx->xer = \(ctx->xer & ~\(1u << 29\)\) \| [^;]*;")
-
 
 def _ca_shift(ra: str, fn: str, args: str) -> str:
     return f"{{ uint32_t _ca; ctx->gpr[{ra}] = {fn}(&_ca, {args}); ctx->xer = (ctx->xer & ~(1u << 29)) | (_ca << 29); }}"
-
 
 def _ca_line(s: str) -> tuple[int, int]:
     if "ctx->xer" not in s:
         return int("PPU_TAIL" in s), 0
     write = _CA_WRITE_RE.search(s)
     return int("PPU_TAIL" in s or "ctx->xer" in _CA_WRITE_RE.sub("", s)), int(bool(write) and not s.startswith("if "))
-
 
 _VFP_RE = re.compile(r"^vmx_(vaddfp|vsubfp|vmaddfp|vnmsubfp|vmaxfp|vminfp|vrefp|vrsqrtefp|vrfin|vrfiz|vrfip|vrfim)"
                      r"\(&ctx->vr\[(\d+)\]((?:, &ctx->vr\[\d+\])+), ctx->vscr\);$")
@@ -774,7 +757,6 @@ _VFP_BITS = {"A": 0x10000000, "B": 0x20000000, "C": 0x40000000}
 _VFP_RESET_RE = re.compile(r"^loc_\w+:|[(,] ?ctx[,)]|PPU_TAIL|g_trampoline_fn|DRAIN_TRAMPOLINE|\breturn\b|ctx->vscr|ctx->vr\[[^\d]")
 _VFP_NEG1_RE = re.compile(r"^vmx_st\(&ctx->vr\[(\d+)\], _mm_set1_epi32\(-1\)\);$")
 _VFP_VSLW_RE = re.compile(r"^vmx_vslw\(&ctx->vr\[(\d+)\], &ctx->vr\[(\d+)\], &ctx->vr\[(\d+)\]\);$")
-
 
 def _vfp_clean(body_lines: list[str]) -> list[str]:
     out, clean, neg1, neg0 = [], set(), set(), set()
@@ -831,14 +813,12 @@ def _vfp_clean(body_lines: list[str]) -> list[str]:
         out.append(ln)
     return [ln for ln in out if ln != ""]
 
-
 def _elide_ca(body_lines: list[str]) -> list[str]:
     if not any("ctx->xer = (ctx->xer & ~(1u << 29))" in ln for ln in body_lines):
         return body_lines
     live_out = _live_out(body_lines, [_ca_line(ln.strip()) for ln in body_lines], 1)
     return [_CA_WRITE_RE.sub("", ln) if not live_out[j] and "ctx->xer = (ctx->xer & ~(1u << 29))" in ln else ln
             for j, ln in enumerate(body_lines)]
-
 
 def _crval_to_c(val: str, mask: int, ta: str, a: str, tb: str, b: str) -> str | None:
     so = "0"
@@ -855,7 +835,6 @@ def _crval_to_c(val: str, mask: int, ta: str, a: str, tb: str, b: str) -> str | 
         return None
     conds = [bits[k] for k in (8, 4, 2, 1) if mask & k]
     return conds[0] if len(conds) == 1 else " || ".join(f"({c})" for c in conds)
-
 
 def _cr_text(s: str) -> tuple[int, int]:
     gen = kill = 0
@@ -884,7 +863,6 @@ def _cr_text(s: str) -> tuple[int, int]:
         return _CR_ALL, 0
     return gen, 0 if s.startswith("if ") else kill & ~gen
 
-
 def _cr_call(s: str) -> tuple[str | None, str | None]:
     m = _CR_DIRECT_RE.match(s)
     if m:
@@ -895,7 +873,6 @@ def _cr_call(s: str) -> tuple[str | None, str | None]:
         return ("cond" if "if (" in s else "indirect"), None
     return None, None
 
-
 def _cr_line(s: str, keep: int) -> tuple[int, int]:
     if "ctx->" not in s and "ctx)" not in s and "return" not in s:
         return 0, 0
@@ -903,7 +880,6 @@ def _cr_line(s: str, keep: int) -> tuple[int, int]:
         return _CR_ALL, 0
     gen, kill = _cr_text(s) if "ctx->cr" in s else (0, 0)
     return (gen | keep, kill) if re.search(r"\breturn\b", s) else (gen, kill)
-
 
 def _mfcr_use(stripped: list[str], j: int, reg: str) -> int:
     tok = f"ctx->gpr[{reg}]"
@@ -918,7 +894,6 @@ def _mfcr_use(stripped: list[str], j: int, reg: str) -> int:
             mask = ((1 << (me - mb + 1)) - 1) << (31 - me)
             return ((mask >> sh) | (mask << (32 - sh))) & _CR_ALL
     return _CR_ALL
-
 
 def _cr_effects(lines: list[str], entry: dict, keep: int) -> list[int]:
     stripped = [ln.strip() for ln in lines]
@@ -946,7 +921,6 @@ def _cr_effects(lines: list[str], entry: dict, keep: int) -> list[int]:
         if not changed:
             return live_out
 
-
 def _cfg(lines: list[str]) -> tuple[list, list[bool]]:
     n = len(lines)
     stripped = [ln.strip() for ln in lines]
@@ -961,7 +935,6 @@ def _cfg(lines: list[str]) -> tuple[list, list[bool]]:
                            or _PLAIN_GOTO_RE.match(body))
     return succ, fall
 
-
 def _reachable(lines: list[str]) -> set[int]:
     succ, fall = _cfg(lines)
     seen, work = set(), [0] if lines else []
@@ -972,7 +945,6 @@ def _reachable(lines: list[str]) -> set[int]:
         seen.add(j)
         work += list(succ[j]) + ([j + 1] if fall[j] else [])
     return seen
-
 
 def _live_out(lines: list[str], effects: list[tuple[int, int]], end_live: int) -> list[int]:
     n = len(lines)
@@ -994,7 +966,6 @@ def _live_out(lines: list[str], effects: list[tuple[int, int]], end_live: int) -
                 changed = True
     return live_out
 
-
 def _cr_write_mask(stmt: str) -> int:
     m = _CR_WRITE_RE.match(stmt)
     if m:
@@ -1007,12 +978,10 @@ def _cr_write_mask(stmt: str) -> int:
         return int(m.group(1), 16)
     return _CR_ALL if _CR_MTCR_RE.match(stmt) else 0
 
-
 _DECL_RE = re.compile(r"^(?:[A-Za-z_]\w* )+([A-Za-z_]\w*) = (.*)$")
 _LOCAL_SET_RE = re.compile(r"^([A-Za-z_]\w*) (?:[-+*/|&^]|<<|>>)?= (.*)$")
 _CALL_TOKEN_RE = re.compile(r"[A-Za-z_]\w*\(")
 _IDENT_RE = re.compile(r"[A-Za-z_]\w*")
-
 
 def _drop_cr_group(inner: str, live: int) -> str | None:
     if "for (" in inner or "while" in inner:
@@ -1043,7 +1012,6 @@ def _drop_cr_group(inner: str, live: int) -> str | None:
         return None
     return " ".join(f"{x};" for x in reversed(kept))
 
-
 def _drop_dead_cr(line: str, live: int) -> str | None:
     s = line.strip()
     if s.startswith("if ") or s.count("ctx->cr = ") != 1:
@@ -1062,7 +1030,6 @@ def _drop_dead_cr(line: str, live: int) -> str | None:
         return line
     new = (line[:m.start()] + (f"{{ {rep} }}" if rep else "") + line[m.end():]).rstrip()
     return new if new.strip() else None
-
 
 def _fuse_cr(body_lines: list[str], entry: dict | None = None, keep: int = _CR_SAVED) -> list[str]:
     if not any("ctx->cr" in ln for ln in body_lines):
@@ -1100,12 +1067,9 @@ def _fuse_cr(body_lines: list[str], entry: dict | None = None, keep: int = _CR_S
         skip = True
     return out
 
-
 _CTX_CALL_RE = re.compile(r"[A-Za-z_]\w*\((?:[^()]*, )?ctx[,)]")
 
-
 _CR_ENTRY_TAIL_RE = re.compile(r"PPU_TAIL return (\w*func_[0-9A-F]{8})\(ctx\);")
-
 
 def _mfcr_saved_for_restore(stripped: list[str], j: int, reg: str) -> bool:
     tok = f"ctx->gpr[{reg}]"
@@ -1127,7 +1091,6 @@ def _mfcr_saved_for_restore(stripped: list[str], j: int, reg: str) -> bool:
             if not re.fullmatch(rf"ctx->cr = \(ctx->cr & 0x[0-9A-F]{{8}}u\) \| \(\(uint32_t\)ctx->gpr\[{lm.group(1)}\] & 0x[0-9A-F]{{8}}u\);", nxt):
                 return False
     return True
-
 
 def _cr_entry_effects(lines: list[str], entry: dict) -> list[tuple[int, int]]:
     stripped = [ln.strip() for ln in lines]
@@ -1155,7 +1118,6 @@ def _cr_entry_effects(lines: list[str], entry: dict) -> list[tuple[int, int]]:
         else:
             out.append(_cr_text(s) if "ctx->cr" in s else (0, 0))
     return out
-
 
 def cr_call_abi(funcs: list, native: set) -> tuple[dict, int]:
     by_name = {f.name: f for f in funcs if f.start_addr not in native}
@@ -1195,7 +1157,6 @@ def cr_call_abi(funcs: list, native: set) -> tuple[dict, int]:
     entry[""] = any_entry
     return entry, _CR_SAVED | (across & _CR_VOLATILE)
 
-
 _CS_MEM_SNAP_RE = re.compile(r"^\s*uint64_t _cs_\d+ = vm_read64\(")
 _CS_FRAME_RE = re.compile(r"^vm_write64\(ctx->gpr\[1\] \+ -(0x[0-9A-Fa-f]+), ctx->gpr\[1\]\); ctx->gpr\[1\] \+= -\1;$")
 _CS_ADDI_RE = re.compile(r"^ctx->gpr\[(\d+)\] = ctx->gpr\[1\] \+ \(int64_t\)\((-?(?:0x)?[0-9A-Fa-f]+)\);$")
@@ -1207,7 +1168,6 @@ _CS_R1_VMX_RE = re.compile(
     r"(?:\s*&\s*~(0xF|3)ULL;|;\s*(?:ea &= ~([013])ULL;|(vmx_lv[lr]x)))")
 _CS_DIRECT_CALL_RE = re.compile(r"^ctx->lr = 0x[0-9A-Fa-f]+; \w*func_([0-9A-F]{8})\(ctx\);(?: DRAIN_TRAMPOLINE\(ctx\);)?$")
 _CS_CALLS_OK = {"ppu_call_ctr", "lv2_syscall", "ps3_hle_call", "ppu_stwcx32", "ppu_stdcx64", "DRAIN_TRAMPOLINE"}
-
 
 def _cs_is_post_pop_tail(stripped: list[str], j: int, frame: int | None) -> bool:
     if frame is None:
@@ -1227,7 +1187,6 @@ def _cs_is_post_pop_tail(stripped: list[str], j: int, frame: int | None) -> bool
                 return val == frame
     return False
 
-
 _CS_MFLR_RE = re.compile(r"^ctx->gpr\[(\d+)\] = ctx->lr;$")
 _CS_ST64_R1_RE = re.compile(r"^vm_write64\(ctx->gpr\[1\] \+ (-?(?:0x)?[0-9A-Fa-f]+), ctx->gpr\[(\d+)\]\);$")
 _CS_LD64_R1_RE = re.compile(r"^ctx->gpr\[(\d+)\] = vm_read64\(ctx->gpr\[1\] \+ (-?(?:0x)?[0-9A-Fa-f]+)\);$")
@@ -1235,7 +1194,6 @@ _CS_LFD_R1_RE = re.compile(r"^\{ uint64_t tmp = vm_read64\(ctx->gpr\[1\] \+ (-?(
 _CS_STFS_R1_RE = re.compile(r"^\{ float ftmp = \(float\)ctx->fpr\[(\d+)\]; uint32_t tmp; memcpy\(&tmp, &ftmp, 4\); vm_write32\(ctx->gpr\[1\] \+ (-?(?:0x)?[0-9A-Fa-f]+), tmp\); \}$")
 _CS_LVX_R1_RE = re.compile(r"^\{ uint64_t ea = \(\((?:ctx->gpr\[1\] \+ ctx->gpr\[(\d+)\]|ctx->gpr\[(\d+)\] \+ ctx->gpr\[1\])\)\) & ~0xFULL; vmx_st\(&ctx->vr\[(\d+)\], vmx_revv\(vm_raw_ld128\(ea\)\)\); \}$")
 _CS_TOC_SAVE = "vm_write64(ctx->gpr[1] + 0x28, ctx->gpr[2]);"
-
 
 def _fold_stack_roundtrips(body: list[str], frame: int, norm_escaped: list[int]) -> list[str]:
     stripped = [ln.strip() for ln in body]
@@ -1374,7 +1332,6 @@ def _fold_stack_roundtrips(body: list[str], frame: int, norm_escaped: list[int])
     if not replacements:
         return body
 
-    # Check which matched offsets have zero remaining readers in the function so their dead stack stores can be dropped.
     read_offs: set[int] = set()
     r_imm.clear()
     for j, s in enumerate(stripped):
@@ -1408,7 +1365,7 @@ def _fold_stack_roundtrips(body: list[str], frame: int, norm_escaped: list[int])
                     _vo = r_imm[_vr] & ~15
                     read_offs.update(range(_vo, _vo + 16))
                 else:
-                    read_offs.add(1 << 30)  # conservative sentinel
+                    read_offs.add(1 << 30)
         for _dm in _CS_ANY_DEF_RE.finditer(s):
             r_imm.pop(int(_dm.group(1)), None)
 
@@ -1434,7 +1391,6 @@ def _fold_stack_roundtrips(body: list[str], frame: int, norm_escaped: list[int])
         else:
             out[sj] = f"    {vname} = (float)ctx->fpr[{freg}]; {stripped[sj]}"
     return decls + out
-
 
 def drop_callee_saves(func, body: list[str], starts: list[int], by_addr: dict, snap_bodies: set, toc_base: int = 0) -> list[str]:
     if not body:
@@ -1539,9 +1495,6 @@ def drop_callee_saves(func, body: list[str], starts: list[int], by_addr: dict, s
                 pops.add(val)
                 post_pop = (frame is not None and val == frame)
             else:
-                # If this is a dead VMX callee-save base pointer (e.g. r0 = r1 + 0xA0 followed only by
-                # dropped VMX saves and self-increments before r0 is overwritten or function returns),
-                # it does not escape.
                 _dead_vmx_ptr = False
                 if am and dst == 0:
                     _k = j + 1
@@ -1615,7 +1568,6 @@ def drop_callee_saves(func, body: list[str], starts: list[int], by_addr: dict, s
     for off, reg in func.cs_paired:
         o = int(off, 0)
         save = f"vm_write64(ctx->gpr[1] + {off}, ctx->gpr[{reg}]);"
-        # Compute normalized offset for save
         save_norms = [no for _, no, _, _, _, s in norm_mem if s == save]
         if len(save_norms) != 1 or stripped.count(save) != 1:
             continue
@@ -1638,7 +1590,6 @@ def drop_callee_saves(func, body: list[str], starts: list[int], by_addr: dict, s
     replace_idx: dict[int, str] = {}
     prepend: list[str] = []
 
-    # 1. Drop LR stack save & replace LR stack loads with _cs_lr
     if frame is not None and lr_save is not None:
         lr_j, _, lr_raw_off, lr_pre = lr_save
         lr_norm = lr_raw_off + (fval if lr_pre else 0)
@@ -1663,7 +1614,6 @@ def drop_callee_saves(func, body: list[str], starts: list[int], by_addr: dict, s
                     replace_idx[lj] = f"    ctx->gpr[{lreg}] = _cs_lr;"
                 prepend.append("    uint64_t _cs_lr = ctx->lr;")
 
-    # 2. Drop dead TOC save (r1 + 0x28) when TOCFIX is active
     if toc_base and frame is not None and fval >= 0x30 and toc_saves:
         toc_set = set(toc_saves)
         if all(e >= 0x30 for e in norm_escaped):
@@ -1671,7 +1621,6 @@ def drop_callee_saves(func, body: list[str], starts: list[int], by_addr: dict, s
             if toc_hits and all(hj in toc_set for hj in toc_hits):
                 drop_idx.update(toc_set)
 
-    # 3. Drop dead back-chain store in pure leaf functions
     if frame is not None and stdu_idx is not None and not has_calls and not has_tail:
         if all(e >= 8 for e in norm_escaped) and not any(-8 < no < 8 for _, no, _, _, _, _ in norm_mem):
             replace_idx[stdu_idx] = f"    ctx->gpr[1] += -0x{fval:X};"
@@ -1684,10 +1633,8 @@ def drop_callee_saves(func, body: list[str], starts: list[int], by_addr: dict, s
             continue
         out.append(replace_idx.get(j, ln))
 
-    # 4. Fold GPR->FPR std->lfd and 4x stfs->lvx stack round-trips
     out = _fold_stack_roundtrips(out, fval, norm_escaped)
     return out
-
 
 @dataclass
 class LiftedFunction:
@@ -1700,9 +1647,7 @@ class LiftedFunction:
     cs_paired: set = field(default_factory=set)
     csf_paired: set = field(default_factory=set)
 
-
 _MAX_MID_TAIL = 0x6000
-
 
 def _last_line_is_terminator(body_lines: list[str]) -> bool:
     for line in reversed(body_lines):
@@ -1718,7 +1663,6 @@ def _last_line_is_terminator(body_lines: list[str]) -> bool:
                 t.startswith("func_") or
                 "{ func_" in t or t.startswith("{ PPU_TAIL"))
     return False
-
 
 class PPULifter:
     def __init__(self, prefix: str = "", wrap: frozenset = frozenset()):
@@ -1915,8 +1859,6 @@ class PPULifter:
                 _freg_snap.add(_freg)
                 func.csf_paired.add((_foff, _m.group(2)))
                 func.body_lines[_i] = f"    ctx->fpr[{_freg}] = _csf_{_freg};"
-        # VMX callee-saved registers (vr[20..31]): only track prologue saves in entry basic block
-        # using scratch regs (r0/r11/r12) and epilogue restores before return.
         _first_vdef = {}
         for _i, _l in enumerate(func.body_lines):
             for _vm in _CSV_ANY_DEF_RE.finditer(_l):
@@ -1925,8 +1867,8 @@ class PPULifter:
                     _first_vdef[_vr] = _i
         _vptr_r1, _vptr_imm = {}, {}
         _vptr_base_line = {}
-        _vsaved = {}  # (off_int, vreg) -> save_line_idx
-        _vrests = []  # (line_idx, off_int, vreg)
+        _vsaved = {}
+        _vrests = []
         _vslot_writes = Counter()
         _vsave_base_lines = set()
         _in_entry_bb = True
@@ -2056,7 +1998,6 @@ class PPULifter:
 
         self.functions.append(func)
         return func
-
 
     _CR0_SELF_HANDLED = ("stwcx.", "stdcx.")
 
@@ -3395,7 +3336,6 @@ class PPULifter:
 
         return cond_map.get(mn, f"/* cond: {mnemonic} */ 1")
 
-
     def generate_mid_function_entries(self, all_insns: list[Instruction]) -> int:
         defined = {f.start_addr for f in self.functions}
         all_refs = (self.call_targets | self.branch_targets) - defined
@@ -3473,7 +3413,6 @@ class PPULifter:
         if self.code_hi is not None and not (self.code_lo <= cont < self.code_hi):
             return
         self.branch_targets.add(cont)
-
 
     def emit_header(self) -> str:
         preamble = (HEADER_PREAMBLE.replace("function_table",
@@ -3744,7 +3683,6 @@ class PPULifter:
         print(f"  {changed} of {len(written)} source files changed", flush=True)
         return written
 
-
 def _const_base_targets(win, rC, read_u32, text_lo, text_hi, bctr_addr):
     const, have_add = 0, False
     for w in reversed(win):
@@ -3780,7 +3718,6 @@ def _const_base_targets(win, rC, read_u32, text_lo, text_hi, bctr_addr):
             return targets
     return None
 
-
 def xer_so_writers(insns) -> list[int]:
     out = []
     for ins in insns:
@@ -3791,7 +3728,6 @@ def xer_so_writers(insns) -> list[int]:
                 ((w >> 1) & 0x3FF == 467 and ((w >> 16) & 0x1F | ((w >> 11) & 0x1F) << 5) == 1):
             out.append(ins.addr)
     return out
-
 
 def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts=None):
     def mem_disp(op):
@@ -4023,9 +3959,7 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts
             tables[all_insns[i].addr] = sorted(set(best))
     return tables
 
-
 _WORKER_STATE: dict = {}
-
 
 def _worker_init(segs, big_endian, name_map, prefix, hle_stub_nids=None,
                  function_entries=None, code_lo=0, code_hi=None, jump_tables=None,
@@ -4042,7 +3976,6 @@ def _worker_init(segs, big_endian, name_map, prefix, hle_stub_nids=None,
     _WORKER_STATE["jump_tables"] = jump_tables or {}
     _WORKER_STATE["insn_patches"] = insn_patches or {}
     _WORKER_STATE["xer_so_free"] = xer_so_free
-
 
 def _worker_lift(task):
     idx0, bounds = task
@@ -4068,7 +4001,6 @@ def _worker_lift(task):
         results.append((f.name, f.start_addr, f.end_addr, f.body_lines, f.calls,
                         f.fallthrough_to, f.cs_paired, f.csf_paired))
     return idx0, results, lifter.call_targets, lifter.branch_targets
-
 
 def _parallel_lift(lifter, func_bounds, segs, big_endian, jobs):
     import multiprocessing as mp
@@ -4110,7 +4042,6 @@ def _parallel_lift(lifter, func_bounds, segs, big_endian, jobs):
                 name=name, start_addr=s, end_addr=e,
                 body_lines=body, calls=calls, fallthrough_to=ft,
                 cs_paired=csp, csf_paired=csfp))
-
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="PPU to C lifter for PS3 recompilation")
@@ -4575,7 +4506,6 @@ def main() -> None:
             print(f"  removed stale {os.path.basename(stale)}")
     print(f"  {len(lifter.functions)} functions lifted")
     print(f"  {len(lifter.call_targets)} unique call targets")
-
 
 if __name__ == "__main__":
     main()

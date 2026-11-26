@@ -1,9 +1,3 @@
-# Generate all discovered SPU ELF programs from explicitly supplied input files.
-# The helper runs at configure time so the source list belongs to this exact
-# generation. Input/tool changes trigger reconfiguration before compilation.
-# PS3RECOMP_SPU_MERGE_CHUNKS=ON lifts with --merge-chunks: the chunks of one SPU
-# function become one C function, and branches between them gotos rather than
-# trampoline round trips through the drain loop.
 function(ps3recomp_generate_spu output_dir)
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
     set(command "${Python3_EXECUTABLE}" "${PS3RECOMP_DIR}/tools/build_spu_workloads.py"
