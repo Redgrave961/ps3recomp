@@ -76,7 +76,9 @@ static SDL_Gamepad*        s_sdl_controllers[PAD_MAX_HOST_PORTS];
 static SDL_JoystickID      s_sdl_ids[PAD_MAX_HOST_PORTS];
 static SDL_GUID            s_sdl_last_guid[PAD_MAX_HOST_PORTS];
 static int                 s_sdl_had[PAD_MAX_HOST_PORTS];
-static unsigned long long  s_sdl_scan_ms;
+static int                 s_sdl_hotplug_dirty = 0;
+static SDL_JoystickID      s_sdl_failed_ids[16];
+static int                 s_sdl_failed_count = 0;
 static int s_sdl_inited = 0;
 #endif
 
@@ -362,7 +364,28 @@ static void pad_sdl_rumble_send(int i)
     r->sent_ms = on ? pad_now_ms() : 0;
 }
 
-#define PAD_SDL_RESCAN_MS 1000
+static bool SDLCALL pad_sdl_event_watch(void* userdata, SDL_Event* ev)
+{
+    (void)userdata;
+    if (ev && (ev->type == SDL_EVENT_JOYSTICK_ADDED || ev->type == SDL_EVENT_JOYSTICK_REMOVED ||
+               ev->type == SDL_EVENT_GAMEPAD_ADDED || ev->type == SDL_EVENT_GAMEPAD_REMOVED))
+        __atomic_store_n(&s_sdl_hotplug_dirty, 1, __ATOMIC_RELEASE);
+    return true;
+}
+
+static int pad_sdl_is_failed(SDL_JoystickID id)
+{
+    for (int i = 0; i < s_sdl_failed_count; i++)
+        if (s_sdl_failed_ids[i] == id) return 1;
+    return 0;
+}
+
+static void pad_sdl_mark_failed(SDL_JoystickID id)
+{
+    if (pad_sdl_is_failed(id)) return;
+    if (s_sdl_failed_count < (int)(sizeof(s_sdl_failed_ids) / sizeof(s_sdl_failed_ids[0])))
+        s_sdl_failed_ids[s_sdl_failed_count++] = id;
+}
 
 static int pad_sdl_port_of(SDL_JoystickID id)
 {
@@ -391,7 +414,7 @@ static void pad_sdl_scan(void)
     if (!ids) return;
     for (int k = 0; k < n; k++) {
         const SDL_JoystickID id = ids[k];
-        if (!id || pad_sdl_port_of(id) >= 0) continue;
+        if (!id || pad_sdl_port_of(id) >= 0 || pad_sdl_is_failed(id)) continue;
         const SDL_GUID guid = SDL_GetGamepadGUIDForID(id);
         int port = -1, back = 0;
         for (int p = 0; p < PAD_MAX_HOST_PORTS && port < 0; p++)
@@ -402,6 +425,7 @@ static void pad_sdl_scan(void)
         SDL_Gamepad* gp = SDL_OpenGamepad(id);
         if (!gp) {
             fprintf(stderr, "[cellPad] SDL gamepad %u: open failed: %s\n", (unsigned)id, SDL_GetError());
+            pad_sdl_mark_failed(id);
             continue;
         }
         s_sdl_controllers[port] = gp;
@@ -426,26 +450,17 @@ static void pad_sdl_scan(void)
 
 static void pad_sdl_hotplug(int force)
 {
-    int changed = force;
-    SDL_Event ev[32];
-    int got;
-    while ((got = SDL_PeepEvents(ev, 32, SDL_GETEVENT, SDL_EVENT_JOYSTICK_AXIS_MOTION,
-                                 SDL_EVENT_JOYSTICK_AXIS_MOTION + 0xFF)) > 0)
-        for (int i = 0; i < got; i++)
-            if (ev[i].type == SDL_EVENT_JOYSTICK_ADDED || ev[i].type == SDL_EVENT_JOYSTICK_REMOVED ||
-                ev[i].type == SDL_EVENT_GAMEPAD_ADDED || ev[i].type == SDL_EVENT_GAMEPAD_REMOVED)
-                changed = 1;
+    int changed = force | __atomic_exchange_n(&s_sdl_hotplug_dirty, 0, __ATOMIC_ACQ_REL);
     for (int p = 0; p < PAD_MAX_HOST_PORTS; p++)
         if (s_sdl_controllers[p] && !SDL_GamepadConnected(s_sdl_controllers[p])) {
             pad_sdl_close(p, 1);
             changed = 1;
         }
+    if (!changed) return;
+    s_sdl_failed_count = 0;
     int free_port = 0;
     for (int p = 0; p < PAD_MAX_HOST_PORTS; p++) if (!s_sdl_controllers[p]) free_port = 1;
     if (!free_port) return;
-    const unsigned long long now = pad_now_ms();
-    if (!changed && s_sdl_scan_ms && now - s_sdl_scan_ms < PAD_SDL_RESCAN_MS) return;
-    s_sdl_scan_ms = now;
     pad_sdl_scan();
 }
 
@@ -527,10 +542,12 @@ static void pad_init_backend(void)
             SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
             SDL_InitSubSystem(SDL_INIT_GAMEPAD);
         }
+        SDL_AddEventWatch(pad_sdl_event_watch, NULL);
         s_sdl_inited = 1;
     }
     memset(s_sdl_controllers, 0, sizeof(s_sdl_controllers));
     for (int p = 0; p < PAD_MAX_HOST_PORTS; p++) s_sdl_ids[p] = 0;
+    s_sdl_failed_count = 0;
 
     pad_sdl_hotplug(1);
 }
