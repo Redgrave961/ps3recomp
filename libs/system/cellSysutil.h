@@ -65,6 +65,7 @@ s32 cellSysutilCheckCallback(void);
 s32 cellSysutilQueueGuestCallbackArgs(u32 opd, const u64 args[8]);
 s32 cellSysutilQueueGuestCallback(u32 opd, u64 arg0, u64 arg1);
 s32 ps3_sysutil_language(void);
+void ps3_sysutil_set_language(s32 lang);
 
 s32 cellSysutilQueueGuestCallback(u32 opd, u64 arg0, u64 arg1);
 s32 cellSysutilQueueGuestCallbackArgs(u32 opd, const u64 args[8]);

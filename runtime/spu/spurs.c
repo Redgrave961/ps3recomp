@@ -2,7 +2,6 @@
 #include "spu_dma.h"
 
 #include <immintrin.h>
-#include <setjmp.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -100,12 +99,20 @@ static void mfc_seq(spu_context* c, uint32_t lsa, uint64_t ea, uint32_t size, ui
 static void tag_wait(spu_context* c, uint32_t mask)
 {
     c->mfc_tag_mask = mask;
+    if (__builtin_expect(!c->list_stall_mask && !c->stop_request && !(c->event_mask & 0x1u), 1)) {
+        c->mfc_tag_status = mask;
+        return;
+    }
     spu_wrch(c, MFC_WrTagUpdate, pref(2));
     spu_rdch(c, MFC_RdTagStat);
 }
 
 static void tag_drain(spu_context* c, uint32_t count_channel)
 {
+    if (__builtin_expect(!c->list_stall_mask && !c->stop_request, 1)) {
+        c->mfc_tag_status = c->mfc_tag_mask;
+        return;
+    }
     spu_wrch(c, MFC_WrTagUpdate, pref(0));
     while (spu_rchcnt(c, count_channel) != 1) {}
     spu_rdch(c, MFC_RdTagStat);
@@ -127,7 +134,8 @@ static uint8_t* ll_begin(spu_context* c, uint32_t ea, uint32_t lsa)
     ea &= ~127u;
     if (!mfc_ea_valid(ea, MFC_ATOMIC_LINE)) mfc_fault(c, "atomic address", MFC_GETLLAR_CMD, lsa, ea, MFC_ATOMIC_LINE);
     spu_lockline_lock(ea);
-    spu_coh_reserve(c, ea);
+    if (__builtin_expect(!spu_coh_is_reserved(ea) || !__atomic_load_n(&c->coh_listed, __ATOMIC_RELAXED), 0))
+        spu_coh_reserve(c, ea);
     memcpy(c->ls + lsa, vm_base + ea, MFC_ATOMIC_LINE);
     return c->ls + lsa;
 }
@@ -139,7 +147,7 @@ static void ll_commit(spu_context* c, uint32_t ea, uint32_t lsa)
     __atomic_store_n(&c->resv, 0u, __ATOMIC_RELAXED);
     c->atomic_stat = 0;
     if (__atomic_load_n(&c->idle_claim, __ATOMIC_RELAXED) == (ea | 1u)) __atomic_store_n(&c->idle_claim, 0u, __ATOMIC_RELAXED);
-    spu_coh_notify_write(ea);
+    spu_coh_notify_write_except(ea, c);
     spu_lockline_unlock(ea);
     spu_rsx_window_check(ea, MFC_ATOMIC_LINE);
 }
@@ -672,6 +680,7 @@ static void ss_idle(spu_context* c)
         if (was_idle && !exit_now && !found) {
             spu_rdch(c, SPU_RdEventStat);
             spu_wrch(c, SPU_WrEventAck, pref(SPU_EVENT_LR));
+            continue;
         }
         if (atomic_cmd(c, 0x100, spurs, MFC_PUTLLC_CMD)) continue;
         if (!exit_now && !found) continue;
@@ -686,6 +695,12 @@ static void ss_process_requests(spu_context* c)
     const uint32_t b = ss_bit(c), ea = spurs_ea(c) + 0x80;
     ll_begin(c, ea, 0x2D80);
     const uint32_t upd = ls[0x2DBD] & b, term = ls[0x2DBF] & b, trc = ls[0x2DCE] & b;
+    if (__builtin_expect(!(upd | term | trc), 1)) {
+        __atomic_store_n(&c->resv, 0u, __ATOMIC_RELAXED);
+        c->atomic_stat = 0;
+        spu_lockline_unlock(ea);
+        return;
+    }
     ls[0x2DBD] = (uint8_t)(ls[0x2DBD] & ~b);
     if (term) ls[0x2DC8] = (uint8_t)(ls[0x2DC8] & ~b);
     ll_commit(c, ea, 0x2D80);
@@ -720,19 +735,23 @@ static void ss_main(spu_context* c)
         ss_cleanup(c);
         trace_put(c, 0x2B90, g32(ls + 0x1CC), NULL);
     }
-    trace_put(c, 0x2BC0, g32(ls + 0x1CC), NULL);
+    if (__builtin_expect(ls[0x175] == 1, 0)) trace_put(c, 0x2BC0, g32(ls + 0x1CC), NULL);
     for (;;) {
         ss_process_requests(c);
         for (;;) {
             if (kernel_poll(c, NULL)) {
-                trace_put(c, 0x2BB0, g32(ls + 0x1CC), NULL);
-                p64(ls + 0x2BA8, guid7(ls + 0xA00));
-                trace_put(c, 0x2BA0, g32(ls + 0x1CC), NULL);
+                if (__builtin_expect(ls[0x175] == 1, 0)) {
+                    trace_put(c, 0x2BB0, g32(ls + 0x1CC), NULL);
+                    p64(ls + 0x2BA8, guid7(ls + 0xA00));
+                    trace_put(c, 0x2BA0, g32(ls + 0x1CC), NULL);
+                } else {
+                    c->mfc_tag = g32(ls + 0x1CC) & 31u;
+                }
                 tag_wait(c, bit32(g32(ls + 0x1CC)));
                 return;
             }
             if (!ls[0x1EB]) break;
-            trace_put(c, 0x2B80, g32(ls + 0x1CC), NULL);
+            if (__builtin_expect(ls[0x175] == 1, 0)) trace_put(c, 0x2B80, g32(ls + 0x1CC), NULL);
             ss_idle(c);
         }
     }
@@ -1222,9 +1241,9 @@ static void ts_entry(spu_context* c, uint64_t taskset, uint32_t ps)
 }
 
 typedef struct {
-    jmp_buf exit;
     ps3_lock* lock;
     int held;
+    int aborted;
     uint32_t b94, c90;
 } jc_state;
 
@@ -1291,7 +1310,7 @@ static void jc_fatal(spu_context* c, jc_state* s, uint32_t err, uint64_t cause)
     }
     jc_unhold(s);
     if (halt_on_error) pm_halt(c, 0xEE8);
-    longjmp(s->exit, 1);
+    s->aborted = 1;
 }
 
 static uint32_t heap_alloc(spu_context* c, uint32_t size)
@@ -1545,6 +1564,7 @@ static uint32_t jc_alloc(spu_context* c, jc_state* s, uint8_t sv[16], uint32_t s
                 sv[0] = 2;
             } else {
                 jc_fatal(c, s, 0x80410A17u, g64(c->ls + 0x4968));
+                return 0;
             }
         }
     }
@@ -1558,7 +1578,7 @@ static void jc_rollback(spu_context* c, jc_state* s, uint8_t w[16], uint32_t h, 
     w[2] = 0;
     const uint32_t sl = h >> 24;
     if (((sl - 1) & 0xFF) <= 0xFD) cache_release(c, sl, (h >> 16) & 0xFF, (h & 0xFF00) != 0);
-    if (!first && cache_evict_one(c) == 1) jc_fatal(c, s, 0x80410A17u, g64(c->ls + 0x4888));
+    if (!first && cache_evict_one(c) == 1) { jc_fatal(c, s, 0x80410A17u, g64(c->ls + 0x4888)); return; }
     w[0] = 0xFF;
 }
 
@@ -1581,7 +1601,7 @@ static void jc_stage1(spu_context* c, jc_state* s, uint8_t sv[16], uint32_t* wai
         for (uint32_t k = 0; k < g32(d + 0x24) >> 3; k++) p32(lsp(c, list + 8 * k), g32(lsp(c, list + 8 * k)) + 16);
     }
     const uint32_t lo = g32(d + 4), bin16 = g16(d + 8) << 4, x16 = g16(d + 2) << 4;
-    if (!(lo & ~3u) || (lo & 12) || !bin16) jc_fatal(c, s, 0x80410A1Fu, e1);
+    if (!(lo & ~3u) || (lo & 12) || !bin16) { jc_fatal(c, s, 0x80410A1Fu, e1); return; }
     uint8_t w[16];
     uint32_t h;
     for (;;) {
@@ -1606,7 +1626,7 @@ static void jc_stage1(spu_context* c, jc_state* s, uint8_t sv[16], uint32_t* wai
         }
         if (ok) {
             const uint32_t ldl = g16(d + 0xA), nc = g32(d + 0x24) >> 3, list = d1 + 0x30 + ldl;
-            if (nc > 4) jc_fatal(c, s, 0x80410A1Eu, e1);
+            if (nc > 4) { jc_fatal(c, s, 0x80410A1Eu, e1); return; }
             const uint64_t high = (uint64_t)g32(d + 0x20) << 32;
             uint32_t hs[4] = { 0 }, ins = 0, prev = 0;
             for (uint32_t k = 0; k < nc && ok; k++) {
@@ -1632,7 +1652,7 @@ static void jc_stage1(spu_context* c, jc_state* s, uint8_t sv[16], uint32_t* wai
                 for (uint32_t k = 0; k < nc; k++) {
                     if (!(hs[k] & 0xFF00)) continue;
                     const uint32_t sz = g32(lsp(c, list + 8 * k));
-                    if (sz & 7) jc_fatal(c, s, 0x80410A1Du, e1);
+                    if (sz & 7) { jc_fatal(c, s, 0x80410A1Du, e1); return; }
                     const uint64_t ea = high | g32(lsp(c, list + 8 * k + 4));
                     mfc_seq(c, (hs[k] >> 24) << 10, ea, sz - ((d[0x2C] & 2) && sz ? 16u : 0u), w[12], MFC_GETF_CMD);
                     w[0] = 1;
@@ -1647,7 +1667,7 @@ static void jc_stage1(spu_context* c, jc_state* s, uint8_t sv[16], uint32_t* wai
                 }
                 if (lo & 2) w[9] |= 0x80;
                 if (w[2]) {
-                    if ((ldl & 7) || ldl > 0x4000) jc_fatal(c, s, 0x80410A1Du, e1);
+                    if ((ldl & 7) || ldl > 0x4000) { jc_fatal(c, s, 0x80410A1Du, e1); return; }
                     mfc_seq(c, (uint32_t)w[2] << 10, (uint64_t)g32(d + 0xC) << 32 | (d1 + 0x30), ldl, w[12], MFC_GETLF_CMD);
                     w[0] = 1;
                 }
@@ -1659,12 +1679,17 @@ static void jc_stage1(spu_context* c, jc_state* s, uint8_t sv[16], uint32_t* wai
             }
         }
         jc_rollback(c, s, w, h, *first);
+        if (__builtin_expect(s->aborted, 0)) return;
         memcpy(sv, w, 16);
         if (!retry) break;
     }
     *first = 0;
-    const uint32_t dec = pm_dec(c);
-    trace_put(c, 0x4820, g32(ls + 0x4A9C), &dec);
+    if (__builtin_expect(ls[0x175] == 1, 0)) {
+        const uint32_t dec = pm_dec(c);
+        trace_put(c, 0x4820, g32(ls + 0x4A9C), &dec);
+    } else {
+        c->mfc_tag = g32(ls + 0x4A9C) & 31u;
+    }
 }
 
 static void jc_run(spu_context* c, jc_state* s, uint8_t sv[16], uint32_t inf[8], const uint32_t buf[4], uint32_t sc, uint32_t jt2, const uint8_t q10[16], uint32_t s1, uint32_t waited)
@@ -1690,16 +1715,22 @@ static void jc_run(spu_context* c, jc_state* s, uint8_t sv[16], uint32_t inf[8],
     if (ls[0x4A2D]) {
         const uint32_t m = g32(lsp(c, bin + 0x20));
         const uint32_t b2 = m == 0x42494E32u || m == 0x62696E32u;
-        if (g32(d + 0x28) || (g32(d + 0x2C) & 0xFFFFFFu) || b2 != ((uint32_t)(d[0x2C] >> 2) & 1) || (b2 && g32(d) != g16(lsp(c, bin + 0x2E))))
+        if (g32(d + 0x28) || (g32(d + 0x2C) & 0xFFFFFFu) || b2 != ((uint32_t)(d[0x2C] >> 2) & 1) || (b2 && g32(d) != g16(lsp(c, bin + 0x2E)))) {
             jc_fatal(c, s, 0x80410A0Bu, g64(ls + 0x4968));
+            return;
+        }
     }
-    uint32_t dec = pm_dec(c);
-    p64(ls + 0x4818, g64(ls + 0x4968) | (uint64_t)sv[10] << 32);
-    trace_put(c, 0x4810, tag, &dec);
+    if (__builtin_expect(ls[0x175] == 1, 0)) {
+        const uint32_t dec = pm_dec(c);
+        p64(ls + 0x4818, g64(ls + 0x4968) | (uint64_t)sv[10] << 32);
+        trace_put(c, 0x4810, tag, &dec);
+    } else {
+        c->mfc_tag = tag & 31u;
+    }
     const uint32_t dbg = sv[11] & 0x80;
     sv[11] &= 0x7F;
     const uint32_t stub = g32(lsp(c, bin + 0x10));
-    if (stub != 0x44012850u && stub != 0x4400A850u) jc_fatal(c, s, 0x80410A09u, g64(ls + 0x4968));
+    if (stub != 0x44012850u && stub != 0x4400A850u) { jc_fatal(c, s, 0x80410A09u, g64(ls + 0x4968)); return; }
     if (dbg) {
         tag_wait(c, 0xFFFFFFFFu);
         pm_stopd(c);
@@ -1740,10 +1771,14 @@ static void jc_run(spu_context* c, jc_state* s, uint8_t sv[16], uint32_t inf[8],
     }
     if (jt2 && spu_rchcnt(c, MFC_RdListStallStat) && (spu_rdch(c, MFC_RdListStallStat)._u32[0] & bit32(sv[12])))
         spu_wrch(c, MFC_WrListStallAck, pref(sv[12]));
-    dec = pm_dec(c);
     tag_wait(c, bit32(tag));
-    p64(ls + 0x4808, guid1(lsp(c, bin)));
-    trace_put(c, 0x4800, tag, &dec);
+    if (__builtin_expect(ls[0x175] == 1, 0)) {
+        const uint32_t dec = pm_dec(c);
+        p64(ls + 0x4808, guid1(lsp(c, bin)));
+        trace_put(c, 0x4800, tag, &dec);
+    } else {
+        c->mfc_tag = tag & 31u;
+    }
 }
 
 static void jc_pipe(spu_context* c, jc_state* s, jc_job* j, uint32_t r[4], uint32_t* busy, uint32_t* lp)
@@ -1751,7 +1786,7 @@ static void jc_pipe(spu_context* c, jc_state* s, jc_job* j, uint32_t r[4], uint3
     uint8_t* ls = c->ls;
     const uint32_t w1 = j->w1, size = w1 & ~8u, tag = g32(ls + 0x4A9C);
     for (int i = 0; i < 4; i++) p32(ls + 0x4990 + 4 * i, r[i]);
-    if (!(size == 64 || size == 128 || (size > 255 && size <= g32(ls + 0x4980) && !(w1 & 0x77)))) jc_fatal(c, s, 0x80410A0Cu, j->ea);
+    if (!(size == 64 || size == 128 || (size > 255 && size <= g32(ls + 0x4980) && !(w1 & 0x77)))) { jc_fatal(c, s, 0x80410A0Cu, j->ea); return; }
     const uint32_t sc = (size >> 7) & 15;
     uint32_t st[5], inf[8], buf[4];
     uint8_t sv[16];
@@ -1787,13 +1822,13 @@ static void jc_pipe(spu_context* c, jc_state* s, jc_job* j, uint32_t r[4], uint3
             for (;;) {
                 uint32_t okb = 0;
                 if (out_size)
-                    do okb = jc_alloc(c, s, sv, out_size, d2); while (!okb);
+                    do { okb = jc_alloc(c, s, sv, out_size, d2); if (__builtin_expect(s->aborted, 0)) return; } while (!okb);
                 sv[5] = (uint8_t)okb;
                 const uint32_t ss = g16(q10 + 12) << 4, stack = ss ? ss : 8192u;
                 uint32_t rk = sv[7];
                 if (!rk) {
                     const uint32_t need = (g16(q10 + 14) << 4) + stack;
-                    do rk = jc_alloc(c, s, sv, need, d2); while (!rk && !out_size);
+                    do { rk = jc_alloc(c, s, sv, need, d2); if (__builtin_expect(s->aborted, 0)) return; } while (!rk && !out_size);
                     sv[7] = (uint8_t)rk;
                     const uint32_t region = (need + 1023) & ~1023u;
                     p32(ls + 0x4890, (rk << 10) + region - 48);
@@ -1826,10 +1861,13 @@ static void jc_pipe(spu_context* c, jc_state* s, jc_job* j, uint32_t r[4], uint3
             sv[4] = 0;
         }
         uint32_t s1 = st[1];
-        if ((st[1] & ~0x80u) == 2) jc_stage1(c, s, sv, &waited, &first, &s1, inf, buf[1], e1);
+        if ((st[1] & ~0x80u) == 2) {
+            jc_stage1(c, s, sv, &waited, &first, &s1, inf, buf[1], e1);
+            if (__builtin_expect(s->aborted, 0)) return;
+        }
         uint32_t s0 = st[0];
         if ((st[0] & ~0x80u) == 1) {
-            if ((uint32_t)e0 & 15) jc_fatal(c, s, 0x80410A1Au, e0);
+            if ((uint32_t)e0 & 15) { jc_fatal(c, s, 0x80410A1Au, e0); return; }
             mfc_seq(c, buf[0], e0, size, sv[12], MFC_GET_CMD);
             s0 = st[0] + 1;
         }
@@ -1844,8 +1882,9 @@ static void jc_pipe(spu_context* c, jc_state* s, jc_job* j, uint32_t r[4], uint3
         inf[0] = 0;
         if ((s2 & ~0x80u) == 4) {
             jc_run(c, s, sv, inf, buf, sc, jt2, q10, s1, waited);
+            if (__builtin_expect(s->aborted, 0)) return;
         } else {
-            pm_dec(c);
+            if (__builtin_expect(ls[0x175] == 1, 0)) pm_dec(c);
             tag_wait(c, bit32(tag));
         }
         const int stall = !first;
@@ -1984,7 +2023,7 @@ static void jc_dispatch(spu_context* c, jc_state* s, uint32_t acc[4], uint64_t c
         break;
     case 4: {
         if (l[0x20]) pm_halt(c, 0x2F2C);
-        if ((uint32_t)g64(l + 8)) jc_fatal(c, s, 0x80410A1Bu, pc);
+        if ((uint32_t)g64(l + 8)) { jc_fatal(c, s, 0x80410A1Bu, pc); rv[0] = 1; rv[1] = 0; return; }
         const uint64_t ret = urgent ? pc : pc + 8;
         const uint64_t lr1 = g64(l + 0x10), lr2 = g64(l + 0x18);
         p64(l + 8, lr1);
@@ -2004,7 +2043,7 @@ static void jc_dispatch(spu_context* c, jc_state* s, uint32_t acc[4], uint64_t c
         break;
     case 6:
         if (!t) pm_halt(c, 0x2FF4);
-        if ((uint32_t)t & 15) jc_fatal(c, s, 0x80410A19u, t);
+        if ((uint32_t)t & 15) { jc_fatal(c, s, 0x80410A19u, t); rv[0] = 1; rv[1] = 0; return; }
         if (urgent) l[0x20] = 1;
         mfc_seq(c, 0x4A50 + 16 * l[0x20], t, 16, tag, MFC_GET_CMD);
         if (!urgent) pc += 8;
@@ -2020,6 +2059,7 @@ static void jc_dispatch(spu_context* c, jc_state* s, uint32_t acc[4], uint64_t c
             extra = 1;
         } else if (x == 0x07 && !olo) {
             jc_fatal(c, s, 0x80410A1Cu, pc);
+            rv[0] = 1; rv[1] = 0; return;
         } else if (x == 0x0F) {
             const uint32_t g = (uint32_t)(cmd & ~0x7Full);
             uint8_t* gl = ll_begin(c, g, 0x80);
@@ -2066,6 +2106,7 @@ static void jc_dispatch(spu_context* c, jc_state* s, uint32_t acc[4], uint64_t c
     if (unknown) {
         if (urgent) pm_halt(c, 0x331C);
         jc_fatal(c, s, 0x80410A18u, pc);
+        rv[0] = 1; rv[1] = 0; return;
     }
     p[13] = (uint8_t)p13;
     p64(l, pc + (stop ? 0 : 8));
@@ -2105,14 +2146,15 @@ static void jc_lock(spu_context* c, jc_state* s)
     uint8_t* ls = c->ls;
     const uint32_t ea = (uint32_t)g64(ls + 0x4A90);
     if (!s->lock) s->lock = chain_lock_of(ea & ~127u);
-    ps3_lock_acquire_spin(s->lock, 256);
+    ps3_lock_acquire_spin(s->lock, 32);
     s->held = 1;
     for (;;) {
         uint8_t* l = ll_begin(c, ea, 0x4A00);
         if (l[0x23]) {
             ll_hold(c, ea, 0x4A00);
             jc_unhold(s);
-            longjmp(s->exit, 1);
+            s->aborted = 1;
+            return;
         }
         if (!l[0x29]) {
             l[0x29] = 1;
@@ -2120,6 +2162,7 @@ static void jc_lock(spu_context* c, jc_state* s)
             break;
         }
         ll_hold(c, ea, 0x4A00);
+        ps3_pause();
     }
     ls[0x4A86] = 0;
 }
@@ -2215,6 +2258,7 @@ static void jc_fetch(spu_context* c, jc_state* s, uint32_t busy, uint32_t lp, ui
     const uint32_t m8 = bit32(g32(p)) & 0xFF, tag = g32(ls + 0x4A9C);
     int extra_jobs = -1;
     jc_lock(c, s);
+    if (__builtin_expect(s->aborted, 0)) return;
     if (l[0x22] & m8) {
         l[0x22] = (uint8_t)(l[0x22] & ~m8);
         p[11] = 0;
@@ -2239,6 +2283,7 @@ static void jc_fetch(spu_context* c, jc_state* s, uint32_t busy, uint32_t lp, ui
             if (guard) mfc_seq(c, 0x3FA80, pc & ~15ull, 16, tag, MFC_GET_CMD);
             if (g64(l + 0x30)) {
                 jc_process(c, s, 0x4A30, 1, 1, 0x3FB80, r);
+                if (__builtin_expect(s->aborted, 0)) return;
                 p[6] = 1;
             }
             if (guard) {
@@ -2270,6 +2315,7 @@ static void jc_fetch(spu_context* c, jc_state* s, uint32_t busy, uint32_t lp, ui
         const uint32_t i = ((uint32_t)pc & 0x7F) >> 3, max = g16(l + 0x72);
         const uint32_t n = (int32_t)(16 - i) > (int32_t)max ? max : 16 - i;
         jc_process(c, s, 0x3FB80 + 8 * i, n, 0, 0x3FB80, r);
+        if (__builtin_expect(s->aborted, 0)) return;
         if (!r[0] && g32(l + 0x50 + 16 * slot) && p[11]) {
             jc_grab(c, r);
             extra_jobs = (int)g32(l + 0x50 + 16 * l[0x20]);
@@ -2293,25 +2339,31 @@ static void jc_main(spu_context* c, jc_state* s)
     uint8_t* ls = c->ls;
     uint8_t* p = ls + 0x4A80;
     const uint32_t tag = g32(ls + 0x4A9C);
-    uint8_t* pk = ls + 0x3FC40;
-    memset(pk, 0, 16);
-    pk[0] = 0x2C;
-    p32(pk + 8, 0x4A6F6243u);
-    p16(pk + 12, 1);
-    p16(pk + 14, 0x280);
-    uint32_t dec = pm_dec(c);
-    trace_put(c, 0x3FC40, tag, &dec);
+    if (__builtin_expect(ls[0x175] == 1, 0)) {
+        uint8_t* pk = ls + 0x3FC40;
+        memset(pk, 0, 16);
+        pk[0] = 0x2C;
+        p32(pk + 8, 0x4A6F6243u);
+        p16(pk + 12, 1);
+        p16(pk + 14, 0x280);
+        const uint32_t dec = pm_dec(c);
+        trace_put(c, 0x3FC40, tag, &dec);
+    } else {
+        c->mfc_tag = tag & 31u;
+    }
     uint32_t busy = 0, lp = 0, did = 0, r[4], yield;
     jc_job j;
     p[11] = 0;
     for (;;) {
         p[12] = 0;
         jc_fetch(c, s, busy, lp, r);
+        if (__builtin_expect(s->aborted, 0)) return;
         for (;;) {
             jc_split(c, r, &j);
             if (j.n) did = 1;
             do {
                 jc_pipe(c, s, &j, r, &busy, &lp);
+                if (__builtin_expect(s->aborted, 0)) return;
                 jc_split(c, r, &j);
             } while (j.n || (p[12] && busy));
             uint32_t st;
@@ -2328,11 +2380,15 @@ static void jc_main(spu_context* c, jc_state* s)
         p[11] = 0;
         busy = lp = 0;
     }
-    pk = ls + 0x3FC90;
-    pk[0] = 0x2D;
-    p64(pk + 8, guid1(ls + 0xA00));
-    dec = pm_dec(c);
-    trace_put(c, 0x3FC90, tag, &dec);
+    if (__builtin_expect(ls[0x175] == 1, 0)) {
+        uint8_t* pk = ls + 0x3FC90;
+        pk[0] = 0x2D;
+        p64(pk + 8, guid1(ls + 0xA00));
+        const uint32_t dec = pm_dec(c);
+        trace_put(c, 0x3FC90, tag, &dec);
+    } else {
+        c->mfc_tag = tag & 31u;
+    }
     tag_wait(c, 0xFFFFFFFFu);
     cache_reset(c);
 }
@@ -2360,12 +2416,7 @@ static void jc_init(spu_context* c, jc_state* s, uint64_t chain)
     p[7] = (uint8_t)(base >> 10);
     memset(ls + 0x4B10, p[7], 16);
     p[9] = (uint8_t)(p[7] - p[8]);
-    memset(ls + 0x48C0, 0, 16);
-    memset(ls + 0x4890, 0, 16);
-    memset(ls + 0x48D0, 0, 16);
-    memset(ls + 0x48E0, 0, 16);
-    memset(ls + 0x4880, 0, 16);
-    memset(ls + 0x48B0, 0, 16);
+    memset(ls + 0x4880, 0, 0x70);
     ls[0x48BC] = l[0x2A];
     ls[0x48BD] = l[0x2B];
     for (uint32_t i = 0; i < 4; i++) p32(ls + 0x48A0 + 4 * i, base + i * max);
@@ -2382,7 +2433,7 @@ static void jc_entry(spu_context* c, uint64_t chain)
     jc_state s;
     memset(&s, 0, sizeof s);
     jc_init(c, &s, chain);
-    if (!setjmp(s.exit)) jc_main(c, &s);
+    jc_main(c, &s);
 }
 
 static void kernel_dispatch(spu_context* c, const uint32_t r[4])

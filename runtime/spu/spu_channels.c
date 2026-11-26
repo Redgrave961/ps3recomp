@@ -349,7 +349,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
             !spu_line_differs_128(mem, ctx->resv_line)) {
             memcpy(mem, ls, MFC_ATOMIC_LINE);
             __atomic_store_n(&ctx->resv, 0u, __ATOMIC_RELAXED);
-            spu_coh_notify_write(ea);
+            spu_coh_notify_write_except(ea, ctx);
             ctx->atomic_stat = 0;
         } else {
             ctx->atomic_stat = 1;
@@ -365,8 +365,8 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
     case MFC_PUTQLLUC_CMD:
         spu_lockline_lock(ea);
         memcpy(mem, ls, MFC_ATOMIC_LINE);
-        spu_coh_notify_write(ea);
         __atomic_store_n(&ctx->resv, 0u, __ATOMIC_RELAXED); ctx->atomic_stat = 2;
+        spu_coh_notify_write_except(ea, ctx);
         spu_lockline_unlock(ea);
         spu_rsx_window_check(ea, MFC_ATOMIC_LINE);
         return 1;
@@ -399,7 +399,7 @@ static void spu_ch_park(spu_context* ctx, int (*ready)(void*), void* arg)
         __atomic_store_n(&ctx->ch_sleeping, 0, __ATOMIC_RELAXED);
         return;
     }
-    for (int spin = 0; spin < 128; spin++) {
+    for (int spin = 0; spin < 8; spin++) {
         const uint32_t cur = __atomic_load_n(&ctx->ch_wake_seq, __ATOMIC_ACQUIRE);
         if (cur != seq) {
             seq = cur;
@@ -438,7 +438,8 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
     case MFC_TagID:     ctx->mfc_tag = v & 0x1F;  return;
     case MFC_WrTagMask: ctx->mfc_tag_mask = v;    return;
     case MFC_Cmd:
-        if (!spu_mfc_atomic(ctx, v)) mfc_submit(mfc_for(ctx), ctx, v);
+        if (__builtin_expect((v & 0xFFu) >= 0xB0u, 0) && spu_mfc_atomic(ctx, v)) return;
+        mfc_submit(mfc_for(ctx), ctx, v);
         return;
     case MFC_WrTagUpdate:
         ctx->mfc_tag_status = mfc_for(ctx)->tag_completed & ctx->mfc_tag_mask;

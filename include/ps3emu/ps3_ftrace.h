@@ -44,7 +44,11 @@ typedef struct {
     char names[PS3_FT_TIDS][28];
 } ps3_ft_state;
 
+#ifdef __cplusplus
+PS3_FT_SHARED ps3_ft_state g_ps3_ft = {};
+#else
 PS3_FT_SHARED ps3_ft_state g_ps3_ft = { 0 };
+#endif
 
 static inline uint64_t ps3_ft_now(void)
 {

@@ -326,7 +326,7 @@ static int waiter_done(void* w)
 int ps3_waiter_sleep(ps3_waiter* w, uint64_t deadline_ns)
 {
     if (waiter_done(w)) return 1;
-    for (int spin = 0; spin < 256; spin++) {
+    for (int spin = 0; spin < 32; spin++) {
         if (waiter_done(w)) return 1;
         ps3_cpu_relax();
     }

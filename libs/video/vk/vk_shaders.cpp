@@ -34,8 +34,17 @@ uint64_t shader_cache::program_hash(const uint32_t* program, uint32_t start)
     const int dynamic = rsx_spv_vertex_reach(program, start, reach);
     if (dynamic) return hash(program, RSX_SPV_VP_SLOTS * 16u, 0x5650u);
     uint64_t h = 0x5650u ^ start;
-    for (uint32_t pc = 0; pc < RSX_SPV_VP_SLOTS; pc++)
-        if (reach[pc]) h = hash(program + pc * 4u, 16u, h ^ pc);
+    for (uint32_t base = 0; base < RSX_SPV_VP_SLOTS; base += 8u) {
+        uint64_t w;
+        std::memcpy(&w, reach + base, 8u);
+        if (!w) continue;
+        for (uint32_t j = 0; j < 8u; j++) {
+            if (reach[base + j]) {
+                const uint32_t pc = base + j;
+                h = hash(program + pc * 4u, 16u, h ^ pc);
+            }
+        }
+    }
     return h;
 }
 

@@ -44,17 +44,23 @@ enum method_kind : u8 {
     K_VERTEX,
 };
 
+struct reg_meta {
+    u16 bits;
+    u8 kind;
+    u8 tex_unit;
+};
+
 struct groups {
-    u16 bits[REG_COUNT] = {};
-    u8 kind[REG_COUNT] = {};
+    reg_meta meta[REG_COUNT] = {};
 
     void mark(u32 first, u32 last, u32 bit)
     {
-        for (u32 m = first; m <= last; m += 4u) bits[m >> 2] |= (u16)bit;
+        for (u32 m = first; m <= last; m += 4u) meta[m >> 2].bits |= (u16)bit;
     }
 
     groups()
     {
+        for (u32 i = 0; i < REG_COUNT; i++) meta[i].tex_unit = 0xFFu;
         mark(M_DMA_COLOR_B, M_DMA_ZETA, D_SURFACE);
         mark(M_DMA_COLOR_C, M_DMA_COLOR_D, D_SURFACE);
         mark(M_SURFACE_CLIP_H, M_SURFACE_PITCH_Z, D_SURFACE);
@@ -119,24 +125,31 @@ struct groups {
         mark(M_TEXTURE_CONTROL3, M_TEXTURE_CONTROL3 + 0x3Cu, D_TEXTURES);
         mark(M_TEXTURE_CONTROL2, M_TEXTURE_CONTROL2 + 0x3Cu, D_TEXTURES);
         mark(M_VTEX_OFFSET, M_VTEX_OFFSET + 0x7Cu, D_VERTEX_TEXTURES);
+        for (u32 u = 0; u < TEXTURES; u++) {
+            for (u32 o = 0; o < 0x20u; o += 4u) meta[(M_TEXTURE_OFFSET + u * 0x20u + o) >> 2].tex_unit = (u8)u;
+            meta[(M_TEXTURE_CONTROL2 + u * 4u) >> 2].tex_unit = (u8)u;
+            meta[(M_TEXTURE_CONTROL3 + u * 4u) >> 2].tex_unit = (u8)u;
+        }
+        for (u32 u = 0; u < VERTEX_TEXTURES; u++)
+            for (u32 o = 0; o < 0x20u; o += 4u) meta[(M_VTEX_OFFSET + u * 0x20u + o) >> 2].tex_unit = (u8)(TEXTURES + u);
         for (u32 v = 0; v < std::size(k_vertex_methods); v++)
             for (u32 m = k_vertex_methods[v].base; m < k_vertex_methods[v].base + ATTRIBS * k_vertex_methods[v].regs_per_attribute * 4u; m += 4u)
-                kind[m >> 2] = (u8)(K_VERTEX + v);
+                meta[m >> 2].kind = (u8)(K_VERTEX + v);
         for (u32 m = 0; m < 0x80u; m += 4u) {
-            kind[(M_TRANSFORM_PROGRAM + m) >> 2] = K_PROGRAM;
-            kind[(M_TRANSFORM_CONSTANT + m) >> 2] = K_CONSTANT;
+            meta[(M_TRANSFORM_PROGRAM + m) >> 2].kind = K_PROGRAM;
+            meta[(M_TRANSFORM_CONSTANT + m) >> 2].kind = K_CONSTANT;
         }
-        kind[M_BEGIN_END >> 2] = K_BEGIN_END;
-        kind[M_DRAW_ARRAYS >> 2] = K_DRAW_ARRAYS;
-        kind[M_DRAW_INDEX_ARRAY >> 2] = K_DRAW_INDEX;
-        kind[M_INLINE_ARRAY >> 2] = K_INLINE;
-        kind[M_ARRAY_ELEMENT16 >> 2] = K_ELEMENT16;
-        kind[M_ARRAY_ELEMENT32 >> 2] = K_ELEMENT32;
-        kind[M_CLEAR_SURFACE >> 2] = K_CLEAR;
-        kind[M_CLEAR_REPORT_VALUE >> 2] = K_REPORT;
-        kind[M_ZPASS_PIXEL_COUNT_ENABLE >> 2] = K_REPORT;
-        kind[M_ZCULL_STATS_ENABLE >> 2] = K_REPORT;
-        kind[M_RENDER_ENABLE >> 2] = K_REPORT;
+        meta[M_BEGIN_END >> 2].kind = K_BEGIN_END;
+        meta[M_DRAW_ARRAYS >> 2].kind = K_DRAW_ARRAYS;
+        meta[M_DRAW_INDEX_ARRAY >> 2].kind = K_DRAW_INDEX;
+        meta[M_INLINE_ARRAY >> 2].kind = K_INLINE;
+        meta[M_ARRAY_ELEMENT16 >> 2].kind = K_ELEMENT16;
+        meta[M_ARRAY_ELEMENT32 >> 2].kind = K_ELEMENT32;
+        meta[M_CLEAR_SURFACE >> 2].kind = K_CLEAR;
+        meta[M_CLEAR_REPORT_VALUE >> 2].kind = K_REPORT;
+        meta[M_ZPASS_PIXEL_COUNT_ENABLE >> 2].kind = K_REPORT;
+        meta[M_ZCULL_STATS_ENABLE >> 2].kind = K_REPORT;
+        meta[M_RENDER_ENABLE >> 2].kind = K_REPORT;
     }
 };
 
@@ -173,6 +186,8 @@ void frontend::reset()
     flush_ranges();
     for (const reg_default& d : k_flip_defaults) reg[d.method >> 2] = d.value;
     dirty = D_ALL;
+    dirty_tex = 0xFFFFFu;
+    vp_code_dirty = true;
 }
 
 void frontend::flush_ranges()
@@ -186,10 +201,11 @@ void frontend::store(u32 method, u32 value)
 {
     const u32 i = method >> 2;
     if (reg[i] == value) return;
-    const u32 bits = k_groups.bits[i];
-    if (in_begin_end && bits) flush_ranges();
+    const reg_meta m = k_groups.meta[i];
+    if (in_begin_end && m.bits) flush_ranges();
     reg[i] = value;
-    dirty |= bits;
+    dirty |= m.bits;
+    if (m.tex_unit != 0xFFu) dirty_tex |= 1u << m.tex_unit;
 }
 
 void frontend::push_vertex(u32 index, u32 sub, u32 size, u32 type, u32 value)
@@ -215,7 +231,7 @@ void frontend::push_vertex(u32 index, u32 sub, u32 size, u32 type, u32 value)
 
 void frontend::vertex_data(u32 method, u32 be)
 {
-    const vertex_method& v = k_vertex_methods[k_groups.kind[method >> 2] - K_VERTEX];
+    const vertex_method& v = k_vertex_methods[k_groups.meta[method >> 2].kind - K_VERTEX];
     const u32 word = (method - v.base) >> 2;
     const u32 index = word / v.regs_per_attribute;
     const u32 sub = word % v.regs_per_attribute;
@@ -278,12 +294,31 @@ u32 frontend::program_methods(u32 index, const u32* be, u32 count)
     const u32 first = load < VP_SLOTS ? load * 4u + (index & 3u) : limit;
     const u32 n = std::min(count, limit - first);
     bool changed = false;
-    for (u32 i = 0; i < n; i++) {
+    u32 i = 0;
+#ifdef __AVX2__
+    if (n >= 8u) {
+        const __m256i shuf = _mm256_setr_epi8(
+            3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12,
+            3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
+        __m256i diff = _mm256_setzero_si256();
+        for (; i + 8u <= n; i += 8u) {
+            const __m256i v = _mm256_shuffle_epi8(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(be + i)), shuf);
+            const __m256i cur = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(program + first + i));
+            diff = _mm256_or_si256(diff, _mm256_xor_si256(v, cur));
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(program + first + i), v);
+        }
+        changed = !_mm256_testz_si256(diff, diff);
+    }
+#endif
+    for (; i < n; i++) {
         const u32 w = swap(be[i]);
         changed |= program[first + i] != w;
         program[first + i] = w;
     }
-    if (changed) dirty |= D_VERTEX_PROGRAM;
+    if (changed) {
+        dirty |= D_VERTEX_PROGRAM;
+        vp_code_dirty = true;
+    }
     reg[M_TRANSFORM_PROGRAM_LOAD >> 2] = load + ((n + (index & 3u)) >> 2);
     return count;
 }
@@ -335,10 +370,47 @@ void frontend::methods(u32 method, u32 inc, const u32* be, u32 count)
 {
     while (count) {
         u32 used = 1;
-        switch (k_groups.kind[method >> 2]) {
-        case K_STORE:
-            store(method, swap(*be));
+        switch (k_groups.meta[method >> 2].kind) {
+        case K_STORE: {
+            if (inc == 4u && count > 1u) {
+                u32 idx = method >> 2;
+                u32 n = 0;
+                if (__builtin_expect(!in_begin_end, 1)) {
+                    u32 local_dirty = 0;
+                    u32 local_tex = 0;
+                    do {
+                        const u32 val = swap(be[n]);
+                        if (reg[idx] != val) {
+                            const reg_meta m = k_groups.meta[idx];
+                            reg[idx] = val;
+                            local_dirty |= m.bits;
+                            if (m.tex_unit != 0xFFu) local_tex |= 1u << m.tex_unit;
+                        }
+                        n++;
+                        idx++;
+                    } while (n < count && idx < REG_COUNT && k_groups.meta[idx].kind == K_STORE);
+                    dirty |= local_dirty;
+                    dirty_tex |= local_tex;
+                } else {
+                    do {
+                        const u32 val = swap(be[n]);
+                        if (reg[idx] != val) {
+                            const reg_meta m = k_groups.meta[idx];
+                            if (m.bits) flush_ranges();
+                            reg[idx] = val;
+                            dirty |= m.bits;
+                            if (m.tex_unit != 0xFFu) dirty_tex |= 1u << m.tex_unit;
+                        }
+                        n++;
+                        idx++;
+                    } while (n < count && idx < REG_COUNT && k_groups.meta[idx].kind == K_STORE);
+                }
+                used = n;
+            } else {
+                store(method, swap(*be));
+            }
             break;
+        }
         case K_PROGRAM: {
             const u32 index = (method - M_TRANSFORM_PROGRAM) >> 2;
             used = program_methods(index, be, inc ? std::min(count, 32u - index) : count);
@@ -365,17 +437,45 @@ void frontend::methods(u32 method, u32 inc, const u32* be, u32 count)
         }
         case K_INLINE:
             draw.kind = draw_kind::inlined;
+            if (!inc) {
+                draw.inline_words.insert(draw.inline_words.end(), be, be + count);
+                return;
+            }
             draw.inline_words.push_back(*be);
             break;
         case K_ELEMENT16:
             if (in_begin_end) {
+                if (!inc) {
+                    const size_t base = draw.elements.size();
+                    draw.elements.resize(base + (size_t)count * 2u);
+                    u32* dst = draw.elements.data() + base;
+                    for (u32 i = 0; i < count; i++) {
+                        const u32 value = swap(be[i]);
+                        dst[i * 2u] = value & 0xFFFFu;
+                        dst[i * 2u + 1u] = value >> 16;
+                    }
+                    return;
+                }
                 const u32 value = swap(*be);
                 draw.elements.push_back(value & 0xFFFFu);
                 draw.elements.push_back(value >> 16);
+            } else if (!inc) {
+                return;
             }
             break;
         case K_ELEMENT32:
-            if (in_begin_end) draw.elements.push_back(swap(*be));
+            if (in_begin_end) {
+                if (!inc) {
+                    const size_t base = draw.elements.size();
+                    draw.elements.resize(base + count);
+                    u32* dst = draw.elements.data() + base;
+                    for (u32 i = 0; i < count; i++) dst[i] = swap(be[i]);
+                    return;
+                }
+                draw.elements.push_back(swap(*be));
+            } else if (!inc) {
+                return;
+            }
             break;
         case K_CLEAR:
             reg[method >> 2] = swap(*be);

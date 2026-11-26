@@ -415,7 +415,7 @@ int ps3_vfs_mount_iso(const char* host_dir, const char* iso_path)
     return PS3_VFS_OK;
 }
 
-static vfs_mount* open_pkg(const char* game_dir, const char* pkg_path, char content_id[37], int* err)
+static vfs_mount* open_pkg(const char* game_dir, const char* dir_name, const char* pkg_path, char content_id[37], int* err)
 {
     vfs_mount* m = open_image("", pkg_path);
     *err = PS3_VFS_EOPEN;
@@ -446,7 +446,8 @@ static vfs_mount* open_pkg(const char* game_dir, const char* pkg_path, char cont
     cid[36] = 0;
     if (content_id) memcpy(content_id, cid, 37);
     char prefix[1100];
-    snprintf(prefix, sizeof prefix, "%s/%.9s", game_dir, cid + 7);
+    if (dir_name && *dir_name) snprintf(prefix, sizeof prefix, "%s/%s", game_dir, dir_name);
+    else snprintf(prefix, sizeof prefix, "%s/%.9s", game_dir, cid + 7);
     free(m->prefix);
     m->prefix = normalize(prefix);
     m->prefix_len = m->prefix ? strlen(m->prefix) : 0;
@@ -482,10 +483,10 @@ static vfs_mount* open_pkg(const char* game_dir, const char* pkg_path, char cont
     return m;
 }
 
-int ps3_vfs_mount_pkg(const char* game_dir, const char* pkg_path, char content_id[37])
+int ps3_vfs_mount_pkg_as(const char* game_dir, const char* dir_name, const char* pkg_path, char content_id[37])
 {
     int err;
-    vfs_mount* m = open_pkg(game_dir, pkg_path, content_id, &err);
+    vfs_mount* m = open_pkg(game_dir, dir_name, pkg_path, content_id, &err);
     if (!m) return err;
     if (add_mount(m)) {
         close_image(m);
@@ -494,10 +495,15 @@ int ps3_vfs_mount_pkg(const char* game_dir, const char* pkg_path, char content_i
     return PS3_VFS_OK;
 }
 
+int ps3_vfs_mount_pkg(const char* game_dir, const char* pkg_path, char content_id[37])
+{
+    return ps3_vfs_mount_pkg_as(game_dir, NULL, pkg_path, content_id);
+}
+
 int ps3_vfs_pkg_info(const char* pkg_path, char content_id[37], int* has_eboot)
 {
     int err;
-    vfs_mount* m = open_pkg("", pkg_path, content_id, &err);
+    vfs_mount* m = open_pkg("", NULL, pkg_path, content_id, &err);
     if (!m) return err;
     *has_eboot = 0;
     for (size_t i = 0; i < m->count && !*has_eboot; i++) *has_eboot = !strcmp(m->entries[i].key, "usrdir/eboot.bin");

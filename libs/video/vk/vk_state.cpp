@@ -141,16 +141,22 @@ void fill_pipeline_state(const frontend& f, const vk_device& d, const draw_targe
     key.depth_clip = clip;
     key.provoking_last = d.caps.provoking_vertex ? 1u : 0u;
     const uint32_t sf = f.r(rsx::M_BLEND_SFACTOR), df = f.r(rsx::M_BLEND_DFACTOR), eq = f.r(rsx::M_BLEND_EQUATION);
+    const VkBlendFactor src_color = blend_factor(sf & 0xFFFFu);
+    const VkBlendFactor src_alpha = blend_factor(sf >> 16);
+    const VkBlendFactor dst_color = blend_factor(df & 0xFFFFu);
+    const VkBlendFactor dst_alpha = blend_factor(df >> 16);
+    const VkBlendOp color_op = blend_op(eq & 0xFFFFu);
+    const VkBlendOp alpha_op = blend_op(eq >> 16);
     for (uint32_t k = 0; k < 4; k++) {
         blend_attachment& b = key.blend[k];
         if (t.color_format[k] == VK_FORMAT_UNDEFINED) continue;
         b.enable = blend_enabled(f, k) && blendable(t.color_format[k]);
-        b.src_color = blend_factor(sf & 0xFFFFu);
-        b.src_alpha = blend_factor(sf >> 16);
-        b.dst_color = blend_factor(df & 0xFFFFu);
-        b.dst_alpha = blend_factor(df >> 16);
-        b.color_op = blend_op(eq & 0xFFFFu);
-        b.alpha_op = blend_op(eq >> 16);
+        b.src_color = src_color;
+        b.src_alpha = src_alpha;
+        b.dst_color = dst_color;
+        b.dst_alpha = dst_alpha;
+        b.color_op = color_op;
+        b.alpha_op = alpha_op;
         b.write_mask = write_mask(f, k);
     }
 }
@@ -173,13 +179,16 @@ void set_dynamic_state(VkCommandBuffer cmd, const frontend& f, const vk_device& 
 
     const uint32_t cls = topology_class(prim);
     const uint32_t bias_reg = cls == 0 ? rsx::M_POLY_OFFSET_POINT : cls == 1 ? rsx::M_POLY_OFFSET_LINE : rsx::M_POLY_OFFSET_FILL;
-    s.bias_enable = t.depth && f.r(bias_reg) != 0;
+    const bool game_bias = t.depth && f.r(bias_reg) != 0;
+    constexpr float k_shadow_slope_bias = 2.5f;
+    s.bias_enable = game_bias || t.shadow_map;
     if (s.bias_enable) {
         // UNORM depth targets (Z16/Z24S8) are backed by D32_SFLOAT, so constant polygon offset is applied
         // directly to viewport Z offset in upload_vertices() in exact UNORM units on all GPUs.
-        s.bias[0] = t.depth_float ? f.f(rsx::M_POLY_OFFSET_BIAS) : 0.f;
+        s.bias[0] = game_bias && t.depth_float ? f.f(rsx::M_POLY_OFFSET_BIAS) : 0.f;
         s.bias[1] = 0.f;
-        s.bias[2] = f.f(rsx::M_POLY_OFFSET_SCALE) * t.scale.value();
+        s.bias[2] = (game_bias ? f.f(rsx::M_POLY_OFFSET_SCALE) * t.scale.value() : 0.f) +
+                    (t.shadow_map ? k_shadow_slope_bias * t.scale.value() : 0.f);
     }
 
     const uint32_t c1 = f.r(rsx::M_BLEND_COLOR);

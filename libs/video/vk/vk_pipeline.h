@@ -60,7 +60,8 @@ public:
     void precompile(shader_cache& shaders);
     VkPipelineLayout layout() const { return m_layout; }
     VkDescriptorSetLayout buffer_set_layout() const { return m_sets[RSX_SPV_SET_BUFFERS]; }
-    VkPipeline get(const pipeline_key& key, const shader& vs, const shader& fs);
+    VkPipeline get(const pipeline_key& key, const shader& vs, const shader& fs, bool sync = false);
+    bool fast_link() const { return m_libraries; }
     bool dynamic_blend() const { return m_dynamic_blend; }
     bool dynamic_polygon_mode() const { return m_dynamic_polygon; }
     bool dynamic_depth_clamp() const { return m_dynamic_clamp; }
@@ -103,6 +104,15 @@ private:
     bool m_dynamic_clamp = false;
     bool m_dynamic_clip = false;
     bool m_dynamic_provoking = false;
+
+    struct l1_slot {
+        pipeline_key key{};
+        const entry* e = nullptr;
+    };
+    static constexpr size_t k_l1_size = 256;
+    l1_slot m_l1[k_l1_size]{};
+    pipeline_key m_last_raw_key{};
+    const entry* m_last_entry = nullptr;
 
     std::mutex m_map_lock;
     flat_map<pipeline_key, std::unique_ptr<entry>> m_map;

@@ -50,7 +50,7 @@ extern "C" void ppu_guest_caller(char* out, size_t n)
 
 extern "C" alignas(64) uint64_t g_ppu_resv[PPU_RESV_MASK + 1] = {};
 
-extern "C" void ppu_resv_break_line(uint32_t ea) { ppu_resv_break(ea); }
+extern "C" void ppu_resv_break_line(uint32_t ea) { ppu_resv_break_fenced(ea); }
 
 extern "C" int ppu_stwcx32(ppu_context* self, uint64_t ea, uint32_t expected, uint32_t val)
 {

@@ -27,6 +27,7 @@ struct vk_caps {
     bool buffer_address;
     bool fifo_latest_ready;
     bool mirror_clamp_to_edge;
+    bool rgba16_unorm;
     uint32_t max_custom_border_samplers;
 };
 

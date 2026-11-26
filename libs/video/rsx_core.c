@@ -291,7 +291,7 @@ static HANDLE rsx_timer_create(void) { return NULL; }
 
 static void rsx_sleep_until(HANDLE timer, u64 target)
 {
-    const u64 spin = rsx_tick_freq() * 3u / 5000u, now = rsx_ticks();
+    const u64 spin = rsx_tick_freq() * 3u / 25000u, now = rsx_ticks();
     if (now >= target) return;
     if (target - now > spin) rsx_sleep_os(timer, target - now - spin);
     while (rsx_ticks() < target) {
@@ -615,6 +615,11 @@ static u32 rsx_dispatch(u32 reg, u32 inc, const u32* be, u32 n)
         }
         const u32 room = (0x2000u - reg) >> 2;
         const u32 k = n < room ? n : room;
+        const u32 first = reg >> 2;
+        if (__builtin_expect(s_next_core[first] >= first + k, 1)) {
+            if (s.renderer && s.renderer->methods) s.renderer->methods(s.renderer->user, reg, 4u, be, k);
+            return k;
+        }
         rsx_3d_methods(reg, be, k);
         return k;
     }
@@ -744,40 +749,53 @@ static DWORD WINAPI rsx_fifo_thread(LPVOID unused)
         }
         const u32 page_end = (page_id + 1u) << 20;
         const u32 limit = (put > s.get && put < page_end) ? put : page_end;
+        const uint8_t* const page_ptr = vm_base + page_base;
+        const rsx_renderer* const rend = s.renderer;
+        void (*const rend_methods)(void*, u32, u32, const u32*, u32) = rend ? rend->methods : NULL;
+        void* const rend_user = rend ? rend->user : NULL;
+        u32 get = s.get;
         u32 cmds = 0;
-        while (s.get < limit) {
-            const u32 cmd = __builtin_bswap32(*(const u32*)(vm_base + page_base + (s.get & 0xFFFFFu)));
+        while (get < limit) {
+            const u32 cmd = __builtin_bswap32(*(const u32*)(page_ptr + (get & 0xFFFFFu)));
             if (__builtin_expect((cmd & 0xA0030003u) != 0u, 0)) {
+                s.get = get;
                 rsx_control(cmd, put);
+                get = s.get;
                 break;
             }
             const u32 count = (cmd >> 18) & 0x7FFu;
-            s.get += 4u;
+            get += 4u;
             if (!count) continue;
             u32 reg = cmd & 0xFFFCu;
             const u32 inc = (cmd & 0x40000000u) ? 0u : 4u;
-            const u32 avail = (limit - s.get) >> 2;
+            const u32 avail = (limit - get) >> 2;
             if (__builtin_expect(count <= avail, 1)) {
-                const u32* be = (const u32*)(vm_base + page_base + (s.get & 0xFFFFFu));
-                u32 done = 0;
-                while (done < count) {
-                    const u32 k = rsx_dispatch(reg, inc, be + done, count - done);
-                    reg += inc * k;
-                    done += k;
+                const u32* be = (const u32*)(page_ptr + (get & 0xFFFFFu));
+                get += count << 2;
+                if (__builtin_expect(reg < 0x2000u && inc == 4u && reg + (count << 2) <= 0x2000u &&
+                                     s_next_core[reg >> 2] >= (reg >> 2) + count, 1)) {
+                    if (rend_methods) rend_methods(rend_user, reg, 4u, be, count);
+                } else {
+                    s.get = get - (count << 2);
+                    u32 done = 0;
+                    while (done < count) {
+                        const u32 k = rsx_dispatch(reg, inc, be + done, count - done);
+                        reg += inc * k;
+                        done += k;
+                    }
                 }
-                s.get += count << 2;
-                if (++cmds >= 32u) {
-                    rsx_publish_get_fast();
-                    break;
-                }
+                if (++cmds >= 128u) break;
             } else {
+                s.get = get;
                 s.method_reg = reg;
                 s.method_inc = inc;
                 s.method_left = count;
                 rsx_run_args(put);
+                get = s.get;
                 break;
             }
         }
+        s.get = get;
         rsx_publish_get_fast();
     }
 }

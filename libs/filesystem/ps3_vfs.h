@@ -22,6 +22,7 @@ enum { PS3_VFS_OK = 0, PS3_VFS_EOPEN = -1, PS3_VFS_EFORMAT = -2 };
 
 int ps3_vfs_mount_iso(const char* host_dir, const char* iso_path);
 int ps3_vfs_mount_pkg(const char* game_dir, const char* pkg_path, char content_id[37]);
+int ps3_vfs_mount_pkg_as(const char* game_dir, const char* dir_name, const char* pkg_path, char content_id[37]);
 int ps3_vfs_pkg_info(const char* pkg_path, char content_id[37], int* has_eboot);
 int ps3_vfs_enum_last_mount(void (*cb)(const char* full_path, void* user), void* user);
 void ps3_vfs_unmount_all(void);

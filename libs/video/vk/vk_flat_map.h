@@ -83,6 +83,7 @@ public:
     }
 
     size_t size() const { return m_size; }
+    size_t capacity() const { return m_slots.size(); }
 
 private:
     struct slot {

@@ -476,7 +476,6 @@ static u32 ushl(spv* s, u32 ty, u32 a, u32 b) { return I(s, OpShiftLeftLogical, 
 static u32 dot4(spv* s, u32 a, u32 b) { return I(s, OpDot, tf(s), a, b); }
 static u32 bnot(spv* s, u32 a) { return I(s, OpLogicalNot, tbool(s), a); }
 static u32 band(spv* s, u32 a, u32 b) { return I(s, OpLogicalAnd, tbool(s), a, b); }
-static u32 bor(spv* s, u32 a, u32 b) { return I(s, OpLogicalOr, tbool(s), a, b); }
 static u32 bitset(spv* s, u32 v, u32 bit)
 {
     return I(s, OpINotEqual, tbool(s), uand(s, tu(s), v, cu(s, 1u << bit)), cu(s, 0));
@@ -852,30 +851,76 @@ static u32 vp_fetch_bits(vpc* c, u32 addr, u32 size, u32 esz, u32 ncomp, u32 len
     u32 t = tu(s);
     u32 data = vp_data(c);
     u32 pt = tptr(s, SC_StorageBuffer, t);
+    if (esz == 1) {
+        u32 w = ushr(s, t, addr, cu(s, 2));
+        u32 b = uand(s, t, addr, cu(s, 3));
+        u32 sh = ushl(s, t, b, cu(s, 3));
+        u32 w0 = X(s, t, GL_UMin, w, lenm1);
+        u32 lo = ushr(s, t, ld(s, t, I(s, OpAccessChain, pt, data, ci(s, 0), w0)), sh);
+        u32 pv = lvar(s, t);
+        st(s, pv, lo);
+        {
+            u32 hm, ht;
+            sel_if(s, I(s, OpINotEqual, tbool(s), b, cu(s, 0)), &hm, &ht);
+            u32 w1 = X(s, t, GL_UMin, I(s, OpIAdd, t, w, cu(s, 1)), lenm1);
+            u32 hv = ld(s, t, I(s, OpAccessChain, pt, data, ci(s, 0), w1));
+            u32 hi = ushl(s, t, ushl(s, t, hv, cu(s, 1)), I(s, OpISub, t, cu(s, 31), sh));
+            st(s, pv, uor(s, t, lo, hi));
+            sel_end(s, hm);
+        }
+        u32 packed = ld(s, t, pv);
+        u32 comp[4];
+        for (u32 n = 0; n < 4; n++) {
+            if (n >= ncomp) {
+                comp[n] = cu(s, 0);
+                continue;
+            }
+            u32 v = uand(s, t, n ? ushr(s, t, packed, cu(s, n * 8u)) : packed, cu(s, 0xFFu));
+            if (ncomp > 1 && n > 0) v = sel(s, t, I(s, OpULessThan, tbool(s), cu(s, n), size), v, cu(s, 0));
+            comp[n] = v;
+        }
+        return I(s, OpCompositeConstruct, tu4(s), comp[0], comp[1], comp[2], comp[3]);
+    }
     u32 comp[4];
     for (u32 n = 0; n < 4; n++) {
         if (n >= ncomp) {
             comp[n] = cu(s, 0);
             continue;
         }
+        u32 cv = 0, cm = 0, ct = 0;
+        if (ncomp > 1 && n > 0) {
+            cv = lvar(s, t);
+            st(s, cv, cu(s, 0));
+            sel_if(s, I(s, OpULessThan, tbool(s), cu(s, n), size), &cm, &ct);
+        }
         u32 ea = n ? I(s, OpIAdd, t, addr, cu(s, n * esz)) : addr;
         u32 w = ushr(s, t, ea, cu(s, 2));
-        u32 sh = ushl(s, t, uand(s, t, ea, cu(s, 3)), cu(s, 3));
+        u32 b = uand(s, t, ea, cu(s, 3));
+        u32 sh = ushl(s, t, b, cu(s, 3));
         u32 w0 = X(s, t, GL_UMin, w, lenm1);
         u32 lo = ushr(s, t, ld(s, t, I(s, OpAccessChain, pt, data, ci(s, 0), w0)), sh);
-        u32 le = lo;
-        if (esz > 1) {
+        u32 lev = lvar(s, t);
+        st(s, lev, lo);
+        {
+            u32 hm, ht;
+            sel_if(s, I(s, OpUGreaterThan, tbool(s), b, cu(s, 4u - esz)), &hm, &ht);
             u32 w1 = X(s, t, GL_UMin, I(s, OpIAdd, t, w, cu(s, 1)), lenm1);
             u32 hv = ld(s, t, I(s, OpAccessChain, pt, data, ci(s, 0), w1));
             u32 hi = ushl(s, t, ushl(s, t, hv, cu(s, 1)), I(s, OpISub, t, cu(s, 31), sh));
-            le = uor(s, t, lo, hi);
+            st(s, lev, uor(s, t, lo, hi));
+            sel_end(s, hm);
         }
+        u32 le = ld(s, t, lev);
         u32 v;
         if (esz == 4) v = bswap32(s, le);
-        else if (esz == 2) v = uor(s, t, ushl(s, t, uand(s, t, le, cu(s, 0xFFu)), cu(s, 8)), uand(s, t, ushr(s, t, le, cu(s, 8)), cu(s, 0xFFu)));
-        else v = uand(s, t, le, cu(s, 0xFFu));
-        if (ncomp > 1) v = sel(s, t, I(s, OpULessThan, tbool(s), cu(s, n), size), v, cu(s, 0));
-        comp[n] = v;
+        else v = uor(s, t, ushl(s, t, uand(s, t, le, cu(s, 0xFFu)), cu(s, 8)), uand(s, t, ushr(s, t, le, cu(s, 8)), cu(s, 0xFFu)));
+        if (ncomp > 1 && n > 0) {
+            st(s, cv, v);
+            sel_end(s, cm);
+            comp[n] = ld(s, t, cv);
+        } else {
+            comp[n] = v;
+        }
     }
     return I(s, OpCompositeConstruct, tu4(s), comp[0], comp[1], comp[2], comp[3]);
 }
@@ -899,7 +944,6 @@ static u32 vp_fetch_body(vpc* c, u32 k)
     u32 off = ex(s, t, attr, 0), stride = ex(s, t, attr, 1), fmt = ex(s, t, attr, 2), freq = ex(s, t, attr, 3);
     u32 typ = uand(s, t, fmt, cu(s, 15));
     u32 size = uand(s, t, ushr(s, t, fmt, cu(s, 4)), cu(s, 15));
-    u32 modu = I(s, OpLogicalAnd, tbool(s), bitset(s, fmt, 8), I(s, OpINotEqual, tbool(s), freq, cu(s, 0)));
     if (!c->vidx) {
         c->vidx = gvar(s, it, SC_Input, 0);
         deco1(s, c->vidx, DEC_BuiltIn, BI_VertexIndex);
@@ -907,11 +951,25 @@ static u32 vp_fetch_body(vpc* c, u32 k)
     u32 vid = ld(s, it, c->vidx);
     u32 vb = bc(s, it, vp_layout_u32(c, 3));
     u32 ib = vp_layout_u32(c, 4);
-    u32 f1 = X(s, t, GL_UMax, freq, cu(s, 1));
     u32 per = I(s, OpISub, it, vid, vb);
-    u32 dv = bc(s, t, I(s, OpSDiv, it, per, bc(s, it, f1)));
-    u32 md = I(s, OpUMod, t, I(s, OpIAdd, t, bc(s, t, vid), ib), f1);
-    u32 idx = sel(s, t, modu, md, dv);
+    u32 idxv = lvar(s, t);
+    st(s, idxv, bc(s, t, per));
+    {
+        u32 fm, ft;
+        sel_if(s, I(s, OpINotEqual, tbool(s), freq, cu(s, 0)), &fm, &ft);
+        u32 mm = newl(s), lm = newl(s), ld_ = newl(s);
+        V(s, OpSelectionMerge, mm, 0);
+        V(s, OpBranchConditional, bitset(s, fmt, 8), lm, ld_);
+        label(s, lm);
+        st(s, idxv, I(s, OpUMod, t, I(s, OpIAdd, t, bc(s, t, vid), ib), freq));
+        V(s, OpBranch, mm);
+        label(s, ld_);
+        st(s, idxv, bc(s, t, I(s, OpSDiv, it, per, bc(s, it, freq))));
+        V(s, OpBranch, mm);
+        label(s, mm);
+        sel_end(s, fm);
+    }
+    u32 idx = ld(s, t, idxv);
     u32 addr = I(s, OpIAdd, t, I(s, OpIMul, t, idx, stride), off);
     u32 dflt = ld(s, tv4(s), I(s, OpAccessChain, tptr(s, SC_Uniform, tv4(s)), L, ci(s, 1), k));
     u32 res = lvar(s, tv4(s));
@@ -1276,11 +1334,13 @@ static void vp_epilogue(vpc* c)
     u32 pos = (c->written & 1u) ? ld(s, T4, c->o[0]) : dflt;
     u32 L = vp_layout(c);
     u32 pt = tptr(s, SC_Uniform, T4);
+    u32 pw = exf(s, pos, 3);
     u32 d[4];
-    for (u32 r = 0; r < 4; r++) {
+    for (u32 r = 0; r < 3; r++) {
         u32 row = ld(s, T4, I(s, OpAccessChain, pt, L, ci(s, 2), ci(s, (s32)r)));
-        d[r] = dot4(s, row, pos);
+        d[r] = fadd(s, tf(s), fmul(s, tf(s), exf(s, row, r), exf(s, pos, r)), fmul(s, tf(s), exf(s, row, 3), pw));
     }
+    d[3] = pw;
     u32 posv = gvar(s, T4, SC_Output, 0);
     deco1(s, posv, DEC_BuiltIn, BI_Position);
     st(s, posv, vec4c(s, d[0], d[1], d[2], d[3]));
@@ -1614,7 +1674,6 @@ static int fp_scan(fpc* c, const u32* ucode, u32 max_words)
     u32 lstack[64];
     u32 lsp = 0;
     u32 pc = 0;
-    int ended = 0;
     while (pc < lim) {
         fpi i;
         fp_decode(c, pc, &i);
@@ -1655,12 +1714,8 @@ static int fp_scan(fpc* c, const u32* ucode, u32 max_words)
             step = 2;
         }
         pc += step;
-        if (i.d & 1u) {
-            ended = 1;
-            break;
-        }
+        if (i.d & 1u) break;
     }
-    (void)ended;
     if (pc > lim) pc = lim;
     c->nprog = pc;
     c->words = (c->start + pc) * 4u;
@@ -1677,9 +1732,9 @@ static void fp_mark(fpc* c, u32 reg, int fp16)
 
 static void fp_widths(fpc* c, const rsx_spv_fp_key* key, int depth)
 {
-    int can_fp32_half = key->texture_shadow != 0;
+    int can_fp32_half = 1;
     u8 lane[256];
-    if (can_fp32_half) memset(lane, 0, sizeof lane);
+    memset(lane, 0, sizeof lane);
     for (u32 pc = 0; pc < c->nprog;) {
         fpi i;
         fp_decode(c, pc, &i);
@@ -2032,31 +2087,53 @@ static u32 fp_fog_compute(fpc* c)
     spv* s = c->s;
     u32 TF = tf(s);
     u32 x = exf(s, fp_invar(c, RSX_SPV_VAR_FOG), 0);
-    u32 ax = X(s, TF, GL_FAbs, x);
     u32 p0 = fp_state_f(c, 4), p1 = fp_state_f(c, 5);
     u32 mode = fp_state_u(c, 3);
-    u32 lin = fadd(s, TF, fmul(s, TF, p1, x), fsub(s, TF, p0, cf(s, 1.0f)));
-    u32 lina = fadd(s, TF, fmul(s, TF, p1, ax), fsub(s, TF, p0, cf(s, 1.0f)));
-    u32 e1 = fsub(s, TF, fadd(s, TF, fmul(s, TF, p1, x), p0), cf(s, 1.5f));
-    u32 e1a = fsub(s, TF, fadd(s, TF, fmul(s, TF, p1, ax), p0), cf(s, 1.5f));
-    u32 ex1 = X(s, TF, GL_Exp, fmul(s, TF, cf(s, 11.084f), e1));
-    u32 ex1a = X(s, TF, GL_Exp, fmul(s, TF, cf(s, 11.084f), e1a));
-    u32 t2 = fmul(s, TF, cf(s, 4.709f), e1);
-    u32 t2a = fmul(s, TF, cf(s, 4.709f), e1a);
-    u32 ex2 = X(s, TF, GL_Exp, I(s, OpFNegate, TF, fmul(s, TF, t2, t2)));
-    u32 ex2a = X(s, TF, GL_Exp, I(s, OpFNegate, TF, fmul(s, TF, t2a, t2a)));
-    u32 y = cf(s, 0.0f);
-    u32 known = cb(s, 0);
-    const u32 modes[6] = { RSX_SPV_FOG_LINEAR, RSX_SPV_FOG_EXP, RSX_SPV_FOG_EXP2, RSX_SPV_FOG_EXP_ABS, RSX_SPV_FOG_EXP2_ABS, RSX_SPV_FOG_LINEAR_ABS };
-    const u32 vals[6] = { lin, ex1, ex2, ex1a, ex2a, lina };
-    for (u32 k = 0; k < 6; k++) {
-        u32 is = I(s, OpIEqual, tbool(s), mode, cu(s, modes[k]));
-        y = sel(s, TF, is, vals[k], y);
-        known = bor(s, known, is);
+    u32 yv = lvar(s, TF);
+    st(s, yv, cf(s, 0.0f));
+    u32 merge = newl(s), llin = newl(s), llina = newl(s), le1 = newl(s), le1a = newl(s), le2 = newl(s), le2a = newl(s);
+    V(s, OpSelectionMerge, merge, 0);
+    V(s, OpSwitch, mode, merge,
+      RSX_SPV_FOG_LINEAR, llin, RSX_SPV_FOG_LINEAR_ABS, llina,
+      RSX_SPV_FOG_EXP, le1, RSX_SPV_FOG_EXP_ABS, le1a,
+      RSX_SPV_FOG_EXP2, le2, RSX_SPV_FOG_EXP2_ABS, le2a);
+    label(s, llin);
+    st(s, yv, X(s, TF, GL_FClamp, fadd(s, TF, fmul(s, TF, p1, x), fsub(s, TF, p0, cf(s, 1.0f))), cf(s, 0.0f), cf(s, 1.0f)));
+    V(s, OpBranch, merge);
+    label(s, llina);
+    {
+        u32 ax = X(s, TF, GL_FAbs, x);
+        st(s, yv, X(s, TF, GL_FClamp, fadd(s, TF, fmul(s, TF, p1, ax), fsub(s, TF, p0, cf(s, 1.0f))), cf(s, 0.0f), cf(s, 1.0f)));
+        V(s, OpBranch, merge);
     }
-    u32 yc = X(s, TF, GL_FClamp, y, cf(s, 0.0f), cf(s, 1.0f));
-    y = sel(s, TF, known, yc, cf(s, 0.0f));
-    return vec4c(s, x, y, cf(s, 0.0f), cf(s, 0.0f));
+    label(s, le1);
+    {
+        u32 e1 = fsub(s, TF, fadd(s, TF, fmul(s, TF, p1, x), p0), cf(s, 1.5f));
+        st(s, yv, X(s, TF, GL_FClamp, X(s, TF, GL_Exp, fmul(s, TF, cf(s, 11.084f), e1)), cf(s, 0.0f), cf(s, 1.0f)));
+        V(s, OpBranch, merge);
+    }
+    label(s, le1a);
+    {
+        u32 e1a = fsub(s, TF, fadd(s, TF, fmul(s, TF, p1, X(s, TF, GL_FAbs, x)), p0), cf(s, 1.5f));
+        st(s, yv, X(s, TF, GL_FClamp, X(s, TF, GL_Exp, fmul(s, TF, cf(s, 11.084f), e1a)), cf(s, 0.0f), cf(s, 1.0f)));
+        V(s, OpBranch, merge);
+    }
+    label(s, le2);
+    {
+        u32 e1 = fsub(s, TF, fadd(s, TF, fmul(s, TF, p1, x), p0), cf(s, 1.5f));
+        u32 t2 = fmul(s, TF, cf(s, 4.709f), e1);
+        st(s, yv, X(s, TF, GL_FClamp, X(s, TF, GL_Exp, I(s, OpFNegate, TF, fmul(s, TF, t2, t2))), cf(s, 0.0f), cf(s, 1.0f)));
+        V(s, OpBranch, merge);
+    }
+    label(s, le2a);
+    {
+        u32 e1a = fsub(s, TF, fadd(s, TF, fmul(s, TF, p1, X(s, TF, GL_FAbs, x)), p0), cf(s, 1.5f));
+        u32 t2a = fmul(s, TF, cf(s, 4.709f), e1a);
+        st(s, yv, X(s, TF, GL_FClamp, X(s, TF, GL_Exp, I(s, OpFNegate, TF, fmul(s, TF, t2a, t2a))), cf(s, 0.0f), cf(s, 1.0f)));
+        V(s, OpBranch, merge);
+    }
+    label(s, merge);
+    return vec4c(s, x, ld(s, TF, yv), cf(s, 0.0f), cf(s, 0.0f));
 }
 
 static u32 bitrt(spv* s, u32 v, u32 bit)
@@ -2071,20 +2148,26 @@ static u32 fp_texcoord_body(fpc* c, u32 v, u32 t, u32 persp)
     u32 fc = fp_fragcoord(c);
     u32 fw = exf(s, fc, 3);
     u32 ctl = fp_state_u(c, 9);
-    u32 is2d = bitrt(s, ctl, t);
-    u32 ispc = bitrt(s, ctl, I(s, OpIAdd, tu(s), t, cu(s, 16)));
-    u32 in_w = fdiv(s, tf(s), cf(s, 1.0f), fw);
-    u32 pcd = fp_pointcoord(c);
-    u32 pcx = exf(s, pcd, 0), pcy = exf(s, pcd, 1);
-    u32 pc2 = vec4c(s, pcx, pcy, cf(s, 0.0f), in_w);
-    u32 pc1 = vec4c(s, pcx, pcy, cf(s, 1.0f), cf(s, 0.0f));
-    u32 pcv = sel(s, T4, is2d, pc2, pc1);
-    u32 m = I(s, OpVectorTimesScalar, T4, v, fw);
-    u32 pd2 = vec4c(s, exf(s, m, 0), exf(s, m, 1), cf(s, 0.0f), cf(s, 1.0f));
-    u32 np = sel(s, T4, is2d, pd2, m);
-    u32 d2 = vec4c(s, exf(s, v, 0), exf(s, v, 1), cf(s, 0.0f), in_w);
-    u32 nn = sel(s, T4, is2d, d2, v);
-    return sel(s, T4, ispc, pcv, sel(s, T4, persp, np, nn));
+    u32 m, tl;
+    sel_if(s, I(s, OpINotEqual, tbool(s), ctl, cu(s, 0)), &m, &tl);
+    {
+        u32 is2d = bitrt(s, ctl, t);
+        u32 ispc = bitrt(s, ctl, I(s, OpIAdd, tu(s), t, cu(s, 16)));
+        u32 in_w = fdiv(s, tf(s), cf(s, 1.0f), fw);
+        u32 pcd = fp_pointcoord(c);
+        u32 pcx = exf(s, pcd, 0), pcy = exf(s, pcd, 1);
+        u32 pc2 = vec4c(s, pcx, pcy, cf(s, 0.0f), in_w);
+        u32 pc1 = vec4c(s, pcx, pcy, cf(s, 1.0f), cf(s, 0.0f));
+        u32 pcv = sel(s, T4, is2d, pc2, pc1);
+        u32 mul = I(s, OpVectorTimesScalar, T4, v, fw);
+        u32 pd2 = vec4c(s, exf(s, mul, 0), exf(s, mul, 1), cf(s, 0.0f), cf(s, 1.0f));
+        u32 np = sel(s, T4, is2d, pd2, mul);
+        u32 d2 = vec4c(s, exf(s, v, 0), exf(s, v, 1), cf(s, 0.0f), in_w);
+        u32 nn = sel(s, T4, is2d, d2, v);
+        V(s, 254, sel(s, T4, ispc, pcv, sel(s, T4, persp, np, nn)));
+    }
+    label(s, m);
+    return sel(s, T4, persp, I(s, OpVectorTimesScalar, T4, v, fw), v);
 }
 
 static u32 fp_texcoord(fpc* c, u32 t, int persp)
@@ -2217,29 +2300,78 @@ static u32 fp_process_texel_body(fpc* c, u32 rgba, u32 ctl, u32 bx2)
     spv* s = c->s;
     u32 T4 = tv4(s);
     const u32 orig = rgba;
-    u32 any_op = I(s, OpINotEqual, tbool(s), uand(s, tu(s), ctl, cu(s, 0x3FFFu)), cu(s, 0));
+    u32 any_op = I(s, OpINotEqual, tbool(s), uand(s, tu(s), ctl, cu(s, 0x1FFFu)), cu(s, 0));
     u32 m, t;
     sel_if(s, any_op, &m, &t);
     if (c->key->output_mask & RSX_SPV_FPOUT_ALPHAKILL) {
         u32 ak = I(s, OpLogicalAnd, tbool(s), bitset(s, ctl, 12), I(s, OpFOrdLessThan, tbool(s), exf(s, rgba, 3), cf(s, 0.000001f)));
         demote_if(s, ak);
     }
-    u32 ren = bitset(s, ctl, 13);
-    rgba = sel(s, T4, ren, fdiv(s, T4, X(s, T4, GL_Floor, fmul(s, T4, rgba, cvs(s, 255.0f))), cvs(s, 255.0f)), rgba);
+    u32 rv = lvar(s, T4);
+    st(s, rv, rgba);
     u32 is16 = bitset(s, ctl, 17);
     u32 sx = bitmask4(s, ctl, RSX_SPV_TEXC_SEXT_SHIFT);
-    u32 conv = sel(s, T4, is16, sext_norm(s, rgba, 1), sext_norm(s, rgba, 0));
-    rgba = sel(s, T4, sx, conv, rgba);
+    {
+        u32 sm, st_l;
+        sel_if(s, I(s, OpINotEqual, tbool(s), uand(s, tu(s), ctl, cu(s, 0xF00u)), cu(s, 0)), &sm, &st_l);
+        u32 cur = ld(s, T4, rv);
+        u32 im = newl(s), i16 = newl(s), i8 = newl(s);
+        V(s, OpSelectionMerge, im, 0);
+        V(s, OpBranchConditional, is16, i16, i8);
+        label(s, i16);
+        st(s, rv, sel(s, T4, sx, sext_norm(s, cur, 1), cur));
+        V(s, OpBranch, im);
+        label(s, i8);
+        st(s, rv, sel(s, T4, sx, sext_norm(s, cur, 0), cur));
+        V(s, OpBranch, im);
+        label(s, im);
+        sel_end(s, sm);
+    }
     u32 nsx = I(s, OpLogicalNot, tb4(s), sx);
     u32 gm = I(s, OpLogicalAnd, tb4(s), bitmask4(s, ctl, RSX_SPV_TEXC_GAMMA_SHIFT), nsx);
-    rgba = sel(s, T4, gm, srgb_to_linear(s, rgba), rgba);
-    u32 ch = I(s, OpLogicalAnd, tb4(s), nsx, I(s, OpLogicalNot, tb4(s), gm));
-    u32 exm = I(s, OpLogicalAnd, tb4(s), bitmask4(s, ctl, RSX_SPV_TEXC_EXPAND_SHIFT), ch);
-    u32 e16 = fdiv(s, T4, fsub(s, T4, X(s, T4, GL_Floor, X(s, T4, GL_Fma, rgba, cvs(s, 65535.0f), cvs(s, 0.5f))), cvs(s, 32768.0f)), cvs(s, 32767.0f));
-    u32 e8 = fdiv(s, T4, fsub(s, T4, X(s, T4, GL_Floor, X(s, T4, GL_Fma, rgba, cvs(s, 255.0f), cvs(s, 0.5f))), cvs(s, 128.0f)), cvs(s, 127.0f));
-    u32 eb = fsub(s, T4, fmul(s, T4, rgba, cvs(s, 2.0f)), cvs(s, 1.0f));
-    u32 e = sel(s, T4, bx2, eb, sel(s, T4, is16, e16, e8));
-    V(s, 254, sel(s, T4, exm, e, rgba));
+    {
+        u32 gm_m, gm_t;
+        sel_if(s, I(s, OpINotEqual, tbool(s), uand(s, tu(s), ctl, cu(s, 0xFu)), cu(s, 0)), &gm_m, &gm_t);
+        u32 cur = ld(s, T4, rv);
+        st(s, rv, sel(s, T4, gm, srgb_to_linear(s, cur), cur));
+        sel_end(s, gm_m);
+    }
+    {
+        u32 em, et;
+        sel_if(s, I(s, OpINotEqual, tbool(s), uand(s, tu(s), ctl, cu(s, 0xF0u)), cu(s, 0)), &em, &et);
+        u32 ch = I(s, OpLogicalAnd, tb4(s), nsx, I(s, OpLogicalNot, tb4(s), gm));
+        u32 exm = I(s, OpLogicalAnd, tb4(s), bitmask4(s, ctl, RSX_SPV_TEXC_EXPAND_SHIFT), ch);
+        u32 cur = ld(s, T4, rv);
+        u32 bm = newl(s), lbx = newl(s), lnbx = newl(s);
+        V(s, OpSelectionMerge, bm, 0);
+        V(s, OpBranchConditional, bx2, lbx, lnbx);
+        label(s, lbx);
+        st(s, rv, sel(s, T4, exm, fsub(s, T4, fmul(s, T4, cur, cvs(s, 2.0f)), cvs(s, 1.0f)), cur));
+        V(s, OpBranch, bm);
+        label(s, lnbx);
+        {
+            u32 im = newl(s), l16 = newl(s), l8 = newl(s);
+            V(s, OpSelectionMerge, im, 0);
+            V(s, OpBranchConditional, is16, l16, l8);
+            label(s, l16);
+            {
+                u32 e16 = fdiv(s, T4, fsub(s, T4, X(s, T4, GL_Floor, X(s, T4, GL_Fma, cur, cvs(s, 65535.0f), cvs(s, 0.5f))), cvs(s, 32768.0f)), cvs(s, 32767.0f));
+                st(s, rv, sel(s, T4, exm, e16, cur));
+                V(s, OpBranch, im);
+            }
+            label(s, l8);
+            {
+                u32 e8 = fdiv(s, T4, fsub(s, T4, X(s, T4, GL_Floor, X(s, T4, GL_Fma, cur, cvs(s, 255.0f), cvs(s, 0.5f))), cvs(s, 128.0f)), cvs(s, 127.0f));
+                st(s, rv, sel(s, T4, exm, e8, cur));
+                V(s, OpBranch, im);
+            }
+            label(s, im);
+            V(s, OpBranch, bm);
+        }
+        label(s, bm);
+        sel_end(s, em);
+    }
+    V(s, 254, ld(s, T4, rv));
     label(s, m);
     return orig;
 }
@@ -2295,31 +2427,30 @@ static u32 fp_tex(fpc* c, const fpi* i, u32 op, u32 s0, u32 s1, u32 s2)
         u32 res;
         if (dim == 1) {
             u32 xy = fmul(s, tv2(s), I(s, OpVectorShuffle, tv2(s), coord, coord, 0, 1), fct);
-            u32 ref = proj ? fmul(s, TF, exf(s, s0, 2), fdiv(s, TF, cf(s, 1.0f), w)) : exf(s, coord, 2);
+            u32 ref = exf(s, coord, 2);
             u32 is_df = bitset(s, ctl, 14);
             ref = sel(s, TF, is_df, ref, X(s, TF, GL_FMin, ref, cf(s, 1.0f)));
 
-            /* Per-pixel IGN-rotated 8-tap Vogel-disk hardware PCF */
-            u32 tex_x = exf(s, sc, 0), tex_y = exf(s, sc, 1);
-            u32 pcf_rad = bc(s, TF, ex(s, tu(s), ts, 1));
-            u32 sx = fmul(s, TF, tex_x, pcf_rad), sy = fmul(s, TF, tex_y, pcf_rad);
-            u32 fc = fp_fragcoord(c);
-            u32 ign_dot = fadd(s, TF, fmul(s, TF, exf(s, fc, 0), cf(s, 0.06711056f)), fmul(s, TF, exf(s, fc, 1), cf(s, 0.00583715f)));
-            u32 ign = X(s, TF, GL_Fract, fmul(s, TF, cf(s, 52.9829189f), X(s, TF, GL_Fract, ign_dot)));
-            u32 ang = fmul(s, TF, ign, cf(s, 6.2831853f));
-            u32 ca = X(s, TF, GL_Cos, ang), sa = X(s, TF, GL_Sin, ang);
-            static const float k_vx[8] = {  0.250000f, -0.319290f,  0.048836f,  0.402406f, -0.738525f,  0.699710f, -0.236700f, -0.459819f };
-            static const float k_vy[8] = {  0.000000f,  0.292496f, -0.556862f,  0.524943f, -0.130694f, -0.444935f,  0.869766f, -0.852066f };
-            u32 acc = cf(s, 0.0f);
-            for (int k = 0; k < 8; k++) {
-                u32 vx = cf(s, k_vx[k]), vy = cf(s, k_vy[k]);
-                u32 rx = fsub(s, TF, fmul(s, TF, vx, ca), fmul(s, TF, vy, sa));
-                u32 ry = fadd(s, TF, fmul(s, TF, vx, sa), fmul(s, TF, vy, ca));
-                u32 dk = I(s, OpCompositeConstruct, tv2(s), fmul(s, TF, rx, sx), fmul(s, TF, ry, sy));
-                u32 tap = I(s, OpImageSampleDrefImplicitLod, TF, img, fadd(s, tv2(s), xy, dk), ref);
-                acc = k == 0 ? tap : fadd(s, TF, acc, tap);
+            int shadow_scaled = (int)((c->key->texture_shadow >> (16u + unit)) & 1u);
+            if (!shadow_scaled) {
+                /* Native 1:1 shadow map: UE3's rotated 4x4 PCF taps already sit 1.000 physical texel apart,
+                   so a single hardware 2x2 PCF fetch per tap gives gapless, zero-grain filtering at 4x lower GPU cost. */
+                res = I(s, OpImageSampleDrefImplicitLod, TF, img, xy, ref);
+            } else {
+                /* Fallback for upscaled shadow maps: deterministic warp-coherent 4-tap RGSS hardware PCF. */
+                u32 pcf_rad = bc(s, TF, ex(s, tu(s), ts, 1));
+                u32 sx = fmul(s, TF, exf(s, sc, 0), pcf_rad);
+                u32 sy = fmul(s, TF, exf(s, sc, 1), pcf_rad);
+                u32 ax = fmul(s, TF, sx, cf(s, 0.37f)), bx = fmul(s, TF, sx, cf(s, 0.13f));
+                u32 nay = fmul(s, TF, sy, cf(s, -0.37f)), by = fmul(s, TF, sy, cf(s, 0.13f));
+                u32 d0 = I(s, OpCompositeConstruct, tv2(s), ax, by);
+                u32 d1 = I(s, OpCompositeConstruct, tv2(s), bx, nay);
+                u32 t0 = I(s, OpImageSampleDrefImplicitLod, TF, img, fadd(s, tv2(s), xy, d0), ref);
+                u32 t1 = I(s, OpImageSampleDrefImplicitLod, TF, img, fsub(s, tv2(s), xy, d0), ref);
+                u32 t2 = I(s, OpImageSampleDrefImplicitLod, TF, img, fadd(s, tv2(s), xy, d1), ref);
+                u32 t3 = I(s, OpImageSampleDrefImplicitLod, TF, img, fsub(s, tv2(s), xy, d1), ref);
+                res = fmul(s, TF, fadd(s, TF, fadd(s, TF, t0, t1), fadd(s, TF, t2, t3)), cf(s, 0.25f));
             }
-            res = fmul(s, TF, acc, cf(s, 0.125f));
         } else {
             u32 xyz = I(s, OpVectorShuffle, tv3(s), coord, coord, 0, 1, 2);
             u32 ref = exf(s, coord, 3);
@@ -2384,9 +2515,9 @@ static void fp_setdst(fpc* c, const fpi* i, u32 v)
     case 1: v = fmul(s, T4, v, cvs(s, 2.0f)); break;
     case 2: v = fmul(s, T4, v, cvs(s, 4.0f)); break;
     case 3: v = fmul(s, T4, v, cvs(s, 8.0f)); break;
-    case 5: v = fdiv(s, T4, v, cvs(s, 2.0f)); break;
-    case 6: v = fdiv(s, T4, v, cvs(s, 4.0f)); break;
-    case 7: v = fdiv(s, T4, v, cvs(s, 8.0f)); break;
+    case 5: v = fmul(s, T4, v, cvs(s, 0.5f)); break;
+    case 6: v = fmul(s, T4, v, cvs(s, 0.25f)); break;
+    case 7: v = fmul(s, T4, v, cvs(s, 0.125f)); break;
     default: break;
     }
     u32 exec = bf(i->s0, 18, 3);
@@ -2882,7 +3013,7 @@ int rsx_spv_box_down(rsx_spv_blob* out)
     deco1(s, gvarid, DEC_BuiltIn, BI_GlobalInvocationId);
 
     fn_begin(s, mainid);
-    u32 sum = lvar(s, tv4(s)), n = lvar(s, tu(s));
+    u32 sum = lvar(s, tv4(s)), yv = lvar(s, tu(s)), xv = lvar(s, tu(s));
     u32 gid = ld(s, tu3, gvarid);
     u32 x = ex(s, tu(s), gid, 0), y = ex(s, tu(s), gid, 1);
     u32 pp = tptr(s, SC_PushConstant, tu(s));
@@ -2896,30 +3027,44 @@ int rsx_spv_box_down(rsx_spv_blob* out)
     u32 ti2 = tvec(s, ti(s), 2);
     u32 ax = I(s, OpIMul, tu(s), x, pc[2]), bx = I(s, OpIAdd, tu(s), ax, pc[2]);
     u32 ay = I(s, OpIMul, tu(s), y, pc[4]), by = I(s, OpIAdd, tu(s), ay, pc[4]);
-    u32 x0 = box_first(s, ax, pc[3]), y0 = box_first(s, ay, pc[5]);
-    u32 cols = I(s, OpISub, tu(s), box_end(s, bx, pc[3]), x0);
-    u32 taps = I(s, OpIMul, tu(s), cols, I(s, OpISub, tu(s), box_end(s, by, pc[5]), y0));
+    u32 x0 = box_first(s, ax, pc[3]), x1 = box_end(s, bx, pc[3]);
+    u32 y0 = box_first(s, ay, pc[5]), y1 = box_end(s, by, pc[5]);
     st(s, sum, cv4(s, 0.f, 0.f, 0.f, 0.f));
-    st(s, n, cu(s, 0));
-    u32 hdr = newl(s), chk = newl(s), body = newl(s), cont = newl(s), done = newl(s);
-    V(s, OpBranch, hdr);
-    label(s, hdr);
-    V(s, OpLoopMerge, done, cont, 0);
-    V(s, OpBranch, chk);
-    label(s, chk);
-    u32 i = ld(s, tu(s), n);
-    V(s, OpBranchConditional, I(s, OpULessThan, tbool(s), i, taps), body, done);
-    label(s, body);
-    u32 jx = I(s, OpIAdd, tu(s), x0, I(s, OpUMod, tu(s), i, cols)), jy = I(s, OpIAdd, tu(s), y0, I(s, OpUDiv, tu(s), i, cols));
+    st(s, yv, y0);
+    u32 yhdr = newl(s), ychk = newl(s), ybody = newl(s), ycont = newl(s), ydone = newl(s);
+    V(s, OpBranch, yhdr);
+    label(s, yhdr);
+    V(s, OpLoopMerge, ydone, ycont, 0);
+    V(s, OpBranch, ychk);
+    label(s, ychk);
+    u32 jy = ld(s, tu(s), yv);
+    V(s, OpBranchConditional, I(s, OpULessThan, tbool(s), jy, y1), ybody, ydone);
+    label(s, ybody);
+    u32 wy = box_cover(s, jy, pc[5], ay, by);
+    st(s, xv, x0);
+    u32 xhdr = newl(s), xchk = newl(s), xbody = newl(s), xcont = newl(s), xdone = newl(s);
+    V(s, OpBranch, xhdr);
+    label(s, xhdr);
+    V(s, OpLoopMerge, xdone, xcont, 0);
+    V(s, OpBranch, xchk);
+    label(s, xchk);
+    u32 jx = ld(s, tu(s), xv);
+    V(s, OpBranchConditional, I(s, OpULessThan, tbool(s), jx, x1), xbody, xdone);
+    label(s, xbody);
     u32 coord = I(s, OpCompositeConstruct, ti2, bc(s, ti(s), jx), bc(s, ti(s), jy));
-    u32 weight = I(s, OpConvertUToF, tf(s), I(s, OpIMul, tu(s), box_cover(s, jx, pc[3], ax, bx), box_cover(s, jy, pc[5], ay, by)));
+    u32 weight = I(s, OpConvertUToF, tf(s), I(s, OpIMul, tu(s), box_cover(s, jx, pc[3], ax, bx), wy));
     u32 texel = I(s, OpVectorTimesScalar, tv4(s), I(s, OpImageFetch, tv4(s), img, coord, IMG_Lod, ci(s, 0)), weight);
     st(s, sum, fadd(s, tv4(s), ld(s, tv4(s), sum), texel));
-    V(s, OpBranch, cont);
-    label(s, cont);
-    st(s, n, I(s, OpIAdd, tu(s), i, cu(s, 1)));
-    V(s, OpBranch, hdr);
-    label(s, done);
+    V(s, OpBranch, xcont);
+    label(s, xcont);
+    st(s, xv, I(s, OpIAdd, tu(s), jx, cu(s, 1)));
+    V(s, OpBranch, xhdr);
+    label(s, xdone);
+    V(s, OpBranch, ycont);
+    label(s, ycont);
+    st(s, yv, I(s, OpIAdd, tu(s), jy, cu(s, 1)));
+    V(s, OpBranch, yhdr);
+    label(s, ydone);
     u32 avg = I(s, OpVectorTimesScalar, tv4(s), ld(s, tv4(s), sum), inv);
     V(s, OpImageWrite, ld(s, oimg, dst), I(s, OpCompositeConstruct, ti2, bc(s, ti(s), x), bc(s, ti(s), y)), avg);
     sel_end(s, merge);
@@ -2927,6 +3072,92 @@ int rsx_spv_box_down(rsx_spv_blob* out)
     fn_end(s);
     const u32 caps[1] = { 1 };
     return spv_finish(s, 5, caps, 1, mainid, NULL, 0, out);
+}
+
+int rsx_spv_box_down_vs(rsx_spv_blob* out)
+{
+    spv* s = spv_begin();
+    if (!s) return -1;
+    u32 mainid = newl(s);
+    u32 vidx = gvar(s, tu(s), SC_Input, 0);
+    deco1(s, vidx, DEC_BuiltIn, BI_VertexIndex);
+    u32 posv = gvar(s, tv4(s), SC_Output, 0);
+    deco1(s, posv, DEC_BuiltIn, BI_Position);
+
+    fn_begin(s, mainid);
+    u32 vid = ld(s, tu(s), vidx);
+    u32 u = I(s, OpConvertUToF, tf(s), uand(s, tu(s), ushl(s, tu(s), vid, cu(s, 1)), cu(s, 2)));
+    u32 v = I(s, OpConvertUToF, tf(s), uand(s, tu(s), vid, cu(s, 2)));
+    u32 px = fsub(s, tf(s), fmul(s, tf(s), u, cf(s, 2.f)), cf(s, 1.f));
+    u32 py = fsub(s, tf(s), fmul(s, tf(s), v, cf(s, 2.f)), cf(s, 1.f));
+    st(s, posv, I(s, OpCompositeConstruct, tv4(s), px, py, cf(s, 0.f), cf(s, 1.f)));
+    sb_ins(s, BODY(s), OpReturn, k_none, 0);
+    fn_end(s);
+    const u32 caps[1] = { 1 };
+    return spv_finish(s, 0, caps, 1, mainid, NULL, 0, out);
+}
+
+int rsx_spv_box_down_fs(int scale, rsx_spv_blob* out)
+{
+    if (scale != 2 && scale != 3 && scale != 4) return -1;
+    spv* s = spv_begin();
+    if (!s) return -1;
+    u32 mainid = newl(s);
+    u32 pst = intern(s, OpTypeStruct, 0, (const u32[]){ tf(s), tf(s) }, 2, 1);
+    mdeco(s, pst, 0, DEC_Offset, 0);
+    mdeco(s, pst, 1, DEC_Offset, 4);
+    deco(s, pst, DEC_Block);
+    u32 push = gvar(s, pst, SC_PushConstant, 0);
+    u32 tex = sampler_var(s, 1, 0, 0, 0);
+    u32 fcv = gvar(s, tv4(s), SC_Input, 0);
+    deco1(s, fcv, DEC_BuiltIn, BI_FragCoord);
+    u32 colv = gvar(s, tv4(s), SC_Output, 0);
+    deco1(s, colv, DEC_Location, 0);
+
+    fn_begin(s, mainid);
+    u32 TF = tf(s), TV2 = tvec(s, TF, 2), T4 = tv4(s);
+    u32 pp = tptr(s, SC_PushConstant, TF);
+    u32 inv_w = ld(s, TF, I(s, OpAccessChain, pp, push, ci(s, 0)));
+    u32 inv_h = ld(s, TF, I(s, OpAccessChain, pp, push, ci(s, 1)));
+    u32 fc = ld(s, T4, fcv);
+    u32 bx = fmul(s, TF, X(s, TF, GL_Floor, ex(s, TF, fc, 0)), cf(s, (float)scale));
+    u32 by = fmul(s, TF, X(s, TF, GL_Floor, ex(s, TF, fc, 1)), cf(s, (float)scale));
+    u32 smp = ld(s, sampler_type(s, 1, 0), tex);
+    u32 z0 = cf(s, 0.f);
+    u32 res;
+    if (scale == 2) {
+        u32 uv = I(s, OpCompositeConstruct, TV2, fmul(s, TF, fadd(s, TF, bx, cf(s, 1.f)), inv_w),
+                   fmul(s, TF, fadd(s, TF, by, cf(s, 1.f)), inv_h));
+        res = I(s, OpImageSampleExplicitLod, T4, smp, uv, IMG_Lod, z0);
+    } else if (scale == 3) {
+        u32 u0 = fmul(s, TF, fadd(s, TF, bx, cf(s, 1.0f)), inv_w);
+        u32 u1 = fmul(s, TF, fadd(s, TF, bx, cf(s, 2.5f)), inv_w);
+        u32 v0 = fmul(s, TF, fadd(s, TF, by, cf(s, 1.0f)), inv_h);
+        u32 v1 = fmul(s, TF, fadd(s, TF, by, cf(s, 2.5f)), inv_h);
+        u32 t0 = I(s, OpImageSampleExplicitLod, T4, smp, I(s, OpCompositeConstruct, TV2, u0, v0), IMG_Lod, z0);
+        u32 t1 = I(s, OpImageSampleExplicitLod, T4, smp, I(s, OpCompositeConstruct, TV2, u1, v0), IMG_Lod, z0);
+        u32 t2 = I(s, OpImageSampleExplicitLod, T4, smp, I(s, OpCompositeConstruct, TV2, u0, v1), IMG_Lod, z0);
+        u32 t3 = I(s, OpImageSampleExplicitLod, T4, smp, I(s, OpCompositeConstruct, TV2, u1, v1), IMG_Lod, z0);
+        u32 sum = fadd(s, T4, I(s, OpVectorTimesScalar, T4, t0, cf(s, 4.f)),
+                       fadd(s, T4, I(s, OpVectorTimesScalar, T4, fadd(s, T4, t1, t2), cf(s, 2.f)), t3));
+        res = I(s, OpVectorTimesScalar, T4, sum, cf(s, 1.f / 9.f));
+    } else {
+        u32 u0 = fmul(s, TF, fadd(s, TF, bx, cf(s, 1.0f)), inv_w);
+        u32 u1 = fmul(s, TF, fadd(s, TF, bx, cf(s, 3.0f)), inv_w);
+        u32 v0 = fmul(s, TF, fadd(s, TF, by, cf(s, 1.0f)), inv_h);
+        u32 v1 = fmul(s, TF, fadd(s, TF, by, cf(s, 3.0f)), inv_h);
+        u32 t0 = I(s, OpImageSampleExplicitLod, T4, smp, I(s, OpCompositeConstruct, TV2, u0, v0), IMG_Lod, z0);
+        u32 t1 = I(s, OpImageSampleExplicitLod, T4, smp, I(s, OpCompositeConstruct, TV2, u1, v0), IMG_Lod, z0);
+        u32 t2 = I(s, OpImageSampleExplicitLod, T4, smp, I(s, OpCompositeConstruct, TV2, u0, v1), IMG_Lod, z0);
+        u32 t3 = I(s, OpImageSampleExplicitLod, T4, smp, I(s, OpCompositeConstruct, TV2, u1, v1), IMG_Lod, z0);
+        res = I(s, OpVectorTimesScalar, T4, fadd(s, T4, fadd(s, T4, t0, t1), fadd(s, T4, t2, t3)), cf(s, 0.25f));
+    }
+    st(s, colv, res);
+    sb_ins(s, BODY(s), OpReturn, k_none, 0);
+    fn_end(s);
+    const u32 caps[1] = { 1 };
+    const u32 modes[1] = { 7 }; /* OriginUpperLeft */
+    return spv_finish(s, 4, caps, 1, mainid, modes, 1, out);
 }
 
 int rsx_spv_overlay_vs(rsx_spv_blob* out)

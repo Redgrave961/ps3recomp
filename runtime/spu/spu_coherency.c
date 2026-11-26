@@ -20,8 +20,8 @@ extern "C" {
 
 extern uint8_t* vm_base;
 
-#define SPU_LL_STRIPES 256u
-#define SPU_LL_SPIN 256u
+#define SPU_LL_STRIPES 1024u
+#define SPU_LL_SPIN 16u
 
 typedef struct {
     ps3_lock lock;

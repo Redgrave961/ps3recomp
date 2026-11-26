@@ -157,21 +157,11 @@ bool renderer::upload_vertices(const rsx::draw_clause& clause, u32 first, u32 co
     const u32 modulo_mask = r(rsx::M_FREQUENCY_DIVIDER_OPERATION);
     const bool immediate_arrays = clause.immediate && clause.kind != rsx::draw_kind::indexed;
 
-    struct source {
-        const uint8_t* ptr;
-        u32 bytes;
-    };
-    source src[rsx::ATTRIBS + 1]{};
-    u32 dst_offset[rsx::ATTRIBS + 1]{};
+    const uint8_t* inline_ptr = nullptr;
+    u32 inline_bytes = 0;
     u32 total = 0;
     copied regions[rsx::ATTRIBS + 1];
     u32 nregions = 0;
-
-    auto place = [&](u32 slot, const uint8_t* ptr, u32 bytes) {
-        src[slot] = { ptr, bytes };
-        dst_offset[slot] = total;
-        total += (bytes + 15u) & ~15u;
-    };
 
     u32 inline_stride = 0;
     u32 inline_offset[rsx::ATTRIBS]{};
@@ -183,10 +173,12 @@ bool renderer::upload_vertices(const rsx::draw_clause& clause, u32 first, u32 co
             inline_offset[k] = inline_stride;
             inline_stride += host_size(fmt & 0xFu, size);
         }
-        place(rsx::ATTRIBS, reinterpret_cast<const uint8_t*>(clause.inline_words.data()), (u32)clause.inline_words.size() * 4u);
+        inline_ptr = reinterpret_cast<const uint8_t*>(clause.inline_words.data());
+        inline_bytes = (u32)clause.inline_words.size() * 4u;
+        total = (inline_bytes + 15u) & ~15u;
     }
 
-    u32 slot_of[rsx::ATTRIBS];
+    u32 inline_mask = 0;
     struct pending_attr {
         u32 k;
         u32 type;
@@ -202,10 +194,13 @@ bool renderer::upload_vertices(const rsx::draw_clause& clause, u32 first, u32 co
     std::vector<uint8_t>& regbytes = m_regbytes;
     regbytes.clear();
 
-    for (u32 k = 0; k < rsx::ATTRIBS; k++) {
+    const u32 vp_mask = m_vp ? m_vp->info.input_mask : 0xFFFFu;
+    for (u32 bits = vp_mask; bits; bits &= bits - 1u) {
+        const u32 k = (u32)__builtin_ctz(bits);
         layout.value[k][3] = 1.0f;
-        slot_of[k] = ~0u;
-        if (!(input_mask & (1u << k))) continue;
+    }
+    for (u32 bits = input_mask; bits; bits &= bits - 1u) {
+        const u32 k = (u32)__builtin_ctz(bits);
         const u32 fmt = r(rsx::M_VERTEX_ARRAY_FORMAT + k * 4u);
         u32 type = fmt & 0xFu, size = (fmt >> 4) & 0xFu, stride = (fmt >> 8) & 0xFFu, freq = fmt >> 16;
         rsx_spv_vertex_attrib& a = layout.attrib[k];
@@ -231,7 +226,7 @@ bool renderer::upload_vertices(const rsx::draw_clause& clause, u32 first, u32 co
             a.stride = inline_stride;
             a.format = type | (size << RSX_SPV_VFMT_SIZE_SHIFT);
             a.frequency = 0;
-            slot_of[k] = rsx::ATTRIBS;
+            inline_mask |= 1u << k;
             continue;
         }
 
@@ -281,13 +276,27 @@ bool renderer::upload_vertices(const rsx::draw_clause& clause, u32 first, u32 co
 
     for (u32 i = 0; i < nregions; i++) {
         const u32 bytes = regions[i].end - regions[i].src;
-        cached& e = m_vertex_cache[(uint64_t)regions[i].src << 32 | bytes];
+        const uint64_t vkey = (uint64_t)regions[i].src << 32 | bytes;
+        const u32 l1_i = ((((u32)(vkey >> 36) ^ (u32)vkey) * 0x9E3779B1u) >> 26) & 63u;
+        vcache_l1& slot = m_vcache_l1[l1_i];
+        cached* ep = (slot.val && slot.key == vkey) ? slot.val : nullptr;
+        if (!ep) {
+            ep = &m_vertex_cache[vkey];
+            const size_t cap = m_vertex_cache.capacity();
+            if (cap != m_vcache_cap) {
+                std::memset(m_vcache_l1, 0, sizeof m_vcache_l1);
+                m_vcache_cap = cap;
+            }
+            m_vcache_l1[l1_i] = { vkey, ep };
+        }
+        cached& e = *ep;
         u32 offset = 0, fresh = 0;
         uint8_t* out = nullptr;
         if (!cache_place(e, regions[i].src, bytes, bytes, offset, out)) return false;
         if (out) {
             fresh = refresh(regions[i].src, bytes, e.stamp, out);
             e.stamp = m_stamp;
+            e.checked_stamp = m_stamp;
         }
         stats.copy_bytes += fresh;
         stats.reuse_bytes += bytes - fresh;
@@ -301,12 +310,12 @@ bool renderer::upload_vertices(const rsx::draw_clause& clause, u32 first, u32 co
         const vk_slice slice = m_ring.alloc(total, 16);
         if (!slice.ptr) return false;
         transient = (u32)slice.offset;
-        if (src[rsx::ATTRIBS].ptr) std::memcpy(slice.ptr + dst_offset[rsx::ATTRIBS], src[rsx::ATTRIBS].ptr, src[rsx::ATTRIBS].bytes);
+        if (inline_ptr) std::memcpy(slice.ptr, inline_ptr, inline_bytes);
         if (!regbytes.empty()) std::memcpy(slice.ptr + reg_base, regbytes.data(), regbytes.size());
     }
 
-    for (u32 k = 0; k < rsx::ATTRIBS; k++)
-        if (slot_of[k] == rsx::ATTRIBS) layout.attrib[k].offset += transient + dst_offset[rsx::ATTRIBS];
+    for (u32 bits = inline_mask; bits; bits &= bits - 1u)
+        layout.attrib[(u32)__builtin_ctz(bits)].offset += transient;
     for (u32 i = 0; i < npend; i++) {
         const pending_attr& p = pend[i];
         rsx_spv_vertex_attrib& a = layout.attrib[p.k];
@@ -341,10 +350,12 @@ bool renderer::upload_vertices(const rsx::draw_clause& clause, u32 first, u32 co
     layout.instance_base = 0;
     const u32 ucp = r(rsx::M_USER_CLIP_PLANE_CONTROL);
     u32 planes = 0;
-    for (u32 i = 0; i < 6; i++) {
-        const u32 op = (ucp >> (i * 4u)) & 0xFu;
-        const u32 enc = op == 1u ? (u32)RSX_SPV_CLIP_LT : op == 2u ? (u32)RSX_SPV_CLIP_GE : (u32)RSX_SPV_CLIP_DISABLED;
-        planes |= enc << (i * 2u);
+    if (__builtin_expect(ucp != 0u, 0)) {
+        for (u32 i = 0; i < 6; i++) {
+            const u32 op = (ucp >> (i * 4u)) & 0xFu;
+            const u32 enc = op == 1u ? (u32)RSX_SPV_CLIP_LT : op == 2u ? (u32)RSX_SPV_CLIP_GE : (u32)RSX_SPV_CLIP_DISABLED;
+            planes |= enc << (i * 2u);
+        }
     }
     layout.clip_planes = planes;
     layout.transform_branch_bits = r(rsx::M_TRANSFORM_BRANCH_BITS);
@@ -354,40 +365,56 @@ bool renderer::upload_vertices(const rsx::draw_clause& clause, u32 first, u32 co
     return upload(m_layout_upload, &layout, sizeof layout, layout_info);
 }
 
-static inline bool bytes_equal(const uint8_t* a, const uint8_t* b, u32 n)
+static inline u32 bytes_diff_pos(const uint8_t* a, const uint8_t* b, u32 n)
 {
 #ifdef __AVX2__
     u32 i = 0;
     for (; i + 32u <= n; i += 32u) {
         const __m256i d = _mm256_xor_si256(_mm256_loadu_si256((const __m256i*)(a + i)),
                                            _mm256_loadu_si256((const __m256i*)(b + i)));
-        if (!_mm256_testz_si256(d, d)) return false;
+        if (!_mm256_testz_si256(d, d)) return i;
     }
-    return i == n || std::memcmp(a + i, b + i, n - i) == 0;
+    return (i == n || std::memcmp(a + i, b + i, n - i) == 0) ? n : i;
 #else
-    return std::memcmp(a, b, n) == 0;
+    return std::memcmp(a, b, n) == 0 ? n : 0u;
 #endif
 }
 
 bool renderer::upload(reused_upload& u, const void* data, u32 size, VkDescriptorBufferInfo& out)
 {
     const uint64_t submission = *m_submitted + 1u;
-    if (u.submission != submission || u.bytes.size() != size || !bytes_equal(u.bytes.data(), (const uint8_t*)data, size)) {
-        const vk_slice s = m_ring.alloc(size, m_ubo_align);
-        if (!s.ptr) return false;
-        std::memcpy(s.ptr, data, size);
+    u32 diff = 0u;
+    if (u.submission == submission && u.bytes.size() == size) {
+        diff = bytes_diff_pos(u.bytes.data(), (const uint8_t*)data, size);
+        if (diff == size) {
+            out = u.info;
+            return true;
+        }
+    } else {
         u.bytes.resize(size);
-        std::memcpy(u.bytes.data(), data, size);
-        u.submission = submission;
-        u.info = { s.buffer, s.offset, size };
     }
+    const vk_slice s = m_ring.alloc(size, m_ubo_align);
+    if (!s.ptr) return false;
+    std::memcpy(s.ptr, data, size);
+    std::memcpy(u.bytes.data() + diff, (const uint8_t*)data + diff, size - diff);
+    u.submission = submission;
+    u.info = { s.buffer, s.offset, size };
     out = u.info;
     return true;
 }
 
 bool renderer::cache_place(cached& e, u32 ea, u32 size, u32 bytes, u32& offset, uint8_t*& out)
 {
-    const bool changed = !e.seen || (size && memory_changed(ea, size, e.stamp));
+    bool changed = !e.seen;
+    if (!changed && size) {
+        if (__builtin_expect(e.watched, 1)) {
+            changed = memory_changed_watched(ea, size, e.stamp, e.checked_stamp);
+        } else {
+            changed = memory_changed(ea, size, e.stamp);
+            e.watched = true;
+            if (!changed) e.checked_stamp = m_stamp;
+        }
+    }
     e.seen = true;
     e.used = m_flips;
     if (e.alloc && !changed) {
@@ -398,6 +425,7 @@ bool renderer::cache_place(cached& e, u32 ea, u32 size, u32 bytes, u32& offset, 
     }
     if (e.alloc) m_held_garbage.emplace_back(e.submission, std::exchange(e.alloc, VK_NULL_HANDLE));
     e.stamp = 0;
+    e.checked_stamp = 0;
     VkDeviceSize at = 0;
     if (!changed && m_ring.hold(bytes, e.alloc, at)) {
         e.offset = (u32)at;
@@ -423,6 +451,8 @@ void renderer::evict(u64 age)
     };
     drop(m_vertex_cache);
     drop(m_index_cache);
+    std::memset(m_vcache_l1, 0, sizeof m_vcache_l1);
+    std::memset(m_icache_l1, 0, sizeof m_icache_l1);
     vkGetSemaphoreCounterValue(m_d->dev, m_timeline, &m_reached);
     release_held();
 }
@@ -443,42 +473,94 @@ bool renderer::draw_setup()
         m_progress = progress;
         m_epoch++;
         stats.epochs++;
+        if (!m_page_stamp.empty()) {
+            const u64 batch = rsx_core_batch();
+            if (batch != m_scan_batch) prescan(batch);
+        }
     }
     const u32 tex_dirty = dirty & (rsx::D_TEXTURES | rsx::D_VERTEX_TEXTURES);
     if (tex_dirty & rsx::D_TEXTURES) {
-        describe_units(0, rsx::TEXTURES);
-        u32 fdims = 0, fshadow = 0, fak = 0;
-        for (u32 u = 0; u < rsx::TEXTURES; u++) {
-            fdims |= texture_dims(m_units[u].desc, m_units[u].valid) << (u * 2u);
-            if (m_units[u].valid) {
-                if (m_units[u].desc.ops.depth_compare) fshadow |= 1u << u;
-                if ((m_units[u].regs.control0 >> 2) & 1u) fak = RSX_SPV_FPOUT_ALPHAKILL;
+        u32 mask = m_fp_tex_valid ? (dirty_tex & 0xFFFFu) : 0xFFFFu;
+        dirty_tex &= ~0xFFFFu;
+        if (mask) {
+            u32 fdims = m_fp_tex_valid ? m_fp_tex_dims : 0u;
+            u32 fshadow = m_fp_tex_valid ? m_fp_tex_shadow : 0u;
+            while (mask) {
+                const u32 u = (u32)__builtin_ctz(mask);
+                mask &= mask - 1u;
+                describe_units(u, u + 1u);
+                const u32 shift = u * 2u;
+                fdims = (fdims & ~(3u << shift)) | (texture_dims(m_units[u].desc, m_units[u].valid) << shift);
+                if (m_units[u].valid && m_units[u].desc.ops.depth_compare) {
+                    fshadow |= 1u << u;
+                    if (!scale_for(m_units[u].desc.width, m_units[u].desc.height, true, true).unit())
+                        fshadow |= 1u << (16u + u);
+                    else
+                        fshadow &= ~(1u << (16u + u));
+                } else {
+                    fshadow &= ~((1u << u) | (1u << (16u + u)));
+                }
             }
+            u32 fak = 0;
+            for (u32 u = 0; u < rsx::TEXTURES; u++)
+                if (m_units[u].valid && ((m_units[u].regs.control0 >> 2) & 1u)) { fak = RSX_SPV_FPOUT_ALPHAKILL; break; }
+            m_fp_tex_dims = fdims;
+            m_fp_tex_shadow = fshadow;
+            m_fp_tex_alphakill = fak;
+            m_fp_tex_valid = true;
         }
-        m_fp_tex_dims = fdims;
-        m_fp_tex_shadow = fshadow;
-        m_fp_tex_alphakill = fak;
-        m_fp_tex_valid = true;
     }
     if (tex_dirty & rsx::D_VERTEX_TEXTURES) {
-        describe_units(rsx::TEXTURES, rsx::TEXTURES + rsx::VERTEX_TEXTURES);
-        u32 vdims = 0;
-        for (u32 u = 0; u < rsx::VERTEX_TEXTURES; u++)
-            vdims |= texture_dims(m_units[rsx::TEXTURES + u].desc, m_units[rsx::TEXTURES + u].valid) << (u * 2u);
-        if (vdims != m_vertex_dims) {
-            m_vertex_dims = vdims;
-            dirty |= rsx::D_VERTEX_PROGRAM;
+        u32 mask = (dirty_tex >> rsx::TEXTURES) & 0xFu;
+        dirty_tex &= ~(0xFu << rsx::TEXTURES);
+        if (mask) {
+            u32 vdims = m_vertex_dims;
+            while (mask) {
+                const u32 u = (u32)__builtin_ctz(mask);
+                mask &= mask - 1u;
+                describe_units(rsx::TEXTURES + u, rsx::TEXTURES + u + 1u);
+                const u32 shift = u * 2u;
+                vdims = (vdims & ~(3u << shift)) | (texture_dims(m_units[rsx::TEXTURES + u].desc, m_units[rsx::TEXTURES + u].valid) << shift);
+            }
+            if (vdims != m_vertex_dims) {
+                m_vertex_dims = vdims;
+                dirty |= rsx::D_VERTEX_PROGRAM;
+            }
         }
     }
     dirty &= ~(rsx::D_TEXTURES | rsx::D_VERTEX_TEXTURES);
     if ((dirty & rsx::D_VERTEX_PROGRAM) || !m_vp) {
         rsx_spv_vp_key key{};
         key.start = r(rsx::M_TRANSFORM_PROGRAM_START);
-        const uint64_t program_hash = shader_cache::program_hash(program, key.start);
+        if (vp_code_dirty) {
+            for (vp_hash_slot& s : m_vp_hashes) s.start = ~0u;
+            vp_code_dirty = false;
+        }
+        vp_hash_slot& hs = m_vp_hashes[key.start & 63u];
+        uint64_t program_hash;
+        if (hs.start == key.start) {
+            program_hash = hs.hash;
+        } else {
+            program_hash = shader_cache::program_hash(program, key.start);
+            hs.start = key.start;
+            hs.hash = program_hash;
+        }
         key.output_mask = r(rsx::M_VERTEX_ATTRIB_OUTPUT_MASK);
         key.texture_dims = m_vertex_dims;
 
-        m_vp = m_shaders.vertex(program, key, program_hash, true);
+        const u32 vp_i = ((((u32)(program_hash ^ (program_hash >> 32)) ^ key.output_mask ^ (key.start * 31u)) * 0x9E3779B1u) >> 26) & 63u;
+        vp_l1_slot& vl = m_vp_l1[vp_i];
+        if (vl.vp && vl.program_hash == program_hash && !std::memcmp(&vl.key, &key, sizeof key)) {
+            m_vp = vl.vp;
+        } else {
+            const bool sync_shader = !m_pipelines.fast_link() && !m_fb.depth && m_fb.count > 0;
+            m_vp = m_shaders.vertex(program, key, program_hash, !sync_shader);
+            if (m_vp) {
+                vl.program_hash = program_hash;
+                vl.key = key;
+                vl.vp = m_vp;
+            }
+        }
         dirty &= ~rsx::D_VERTEX_PROGRAM;
     }
     if (!m_vp) return false;
@@ -504,7 +586,11 @@ bool renderer::draw_setup()
         for (u32 u = 0; u < rsx::TEXTURES; u++) {
             fk.texture_dims |= texture_dims(m_units[u].desc, m_units[u].valid) << (u * 2u);
             if (m_units[u].valid) {
-                if (m_units[u].desc.ops.depth_compare) fk.texture_shadow |= 1u << u;
+                if (m_units[u].desc.ops.depth_compare) {
+                    fk.texture_shadow |= 1u << u;
+                    if (!scale_for(m_units[u].desc.width, m_units[u].desc.height, true, true).unit())
+                        fk.texture_shadow |= 1u << (16u + u);
+                }
                 if ((m_units[u].regs.control0 >> 2) & 1u) fk.output_mask |= RSX_SPV_FPOUT_ALPHAKILL;
             }
         }
@@ -512,41 +598,115 @@ bool renderer::draw_setup()
     for (u32 k = 0; k < 4; k++)
         if (m_fb.color_format[k] != VK_FORMAT_UNDEFINED) fk.output_mask |= 1u << k;
     if (r(rsx::M_ALPHA_TEST_ENABLE)) fk.output_mask |= RSX_SPV_FPOUT_ALPHA_TEST;
-    if (!m_fp_last || !(seen_key == m_fp_last_key)) {
-        fp_lookup*& found = m_fp_seen[seen_key];
-        if (!found) found = &m_fp_pool.emplace_back();
-        m_fp_last = found;
+    if (m_fp_last && seen_key == m_fp_last_key) {
+        if (m_fp && m_fp_last_epoch == m_epoch) return true;
+    }
+    const u32 set_idx = ((((seen_key.ea >> 4) ^ (seen_key.key.control * 31u) ^ (seen_key.key.output_mask * 131u) ^ seen_key.key.texture_dims) * 0x9E3779B1u) >> 24) & 255u;
+    fp_l1_set& l1s = m_fp_l1[set_idx];
+    fp_l1_entry* l1e = nullptr;
+    if (l1s.ways[0].val && l1s.ways[0].key == seen_key) {
+        l1e = &l1s.ways[0];
+    } else if (l1s.ways[1].val && l1s.ways[1].key == seen_key) {
+        l1e = &l1s.ways[1];
+    }
+    if (l1e && l1e->verified_epoch == m_epoch) {
+        m_fp = l1e->fp;
+        m_fp_last = l1e->val;
         m_fp_last_key = seen_key;
+        m_fp_last_epoch = m_epoch;
+        return true;
     }
-    fp_lookup& seen = *m_fp_last;
-    const u32 count = (u32)seen.slots.size();
-    for (u32 k = 1; k <= count; k++) {
-        fp_candidate& c = seen.slots[(seen.next + count - k) % count];
-        if (!c.fp) continue;
-        await_writes(m_fp_ea, c.count * 4u);
-        if (program_matches(ucode, c.code.data(), c.count)) {
-            m_fp = c.fp;
-            return true;
+    fp_lookup* found = l1e ? l1e->val : nullptr;
+    if (!found) {
+        fp_lookup*& slot = m_fp_seen[seen_key];
+        if (!slot) slot = &m_fp_pool.emplace_back();
+        found = slot;
+        l1e = &l1s.ways[l1s.next_way];
+        l1s.next_way ^= 1u;
+        l1e->key = seen_key;
+        l1e->val = found;
+        l1e->fp = nullptr;
+        l1e->verified_epoch = 0;
+    }
+    m_fp_last = found;
+    m_fp_last_key = seen_key;
+    fp_lookup& seen = *found;
+    auto finish_fp = [&](const fragment_program* fp) {
+        m_fp = fp;
+        m_fp_last_epoch = m_epoch;
+        l1e->fp = fp;
+        l1e->verified_epoch = m_epoch;
+        return true;
+    };
+    {
+        fp_candidate& c = seen.slots[seen.last_slot];
+        if (c.tmpl) {
+            if (c.verified_epoch == m_epoch) return finish_fp(c.tmpl->fp);
+            if (__builtin_expect(!m_occlusion.idle(), 0)) await_writes(m_fp_ea, c.tmpl->count * 4u);
+            if (program_matches(ucode, c.tmpl->code.data(), c.tmpl->count)) {
+                c.verified_epoch = m_epoch;
+                return finish_fp(c.tmpl->fp);
+            }
         }
     }
-    await_writes(m_fp_ea, RSX_SPV_FP_MAX_INSTRUCTIONS * 16u);
-    m_fp = m_shaders.fragment(ucode, RSX_SPV_FP_MAX_INSTRUCTIONS * 4u, fk, true);
+    for (u32 k = 1; k <= 8u; k++) {
+        const u32 idx = (seen.next + 8u - k) & 7u;
+        if (idx == seen.last_slot) continue;
+        fp_candidate& c = seen.slots[idx];
+        if (!c.tmpl) continue;
+        if (__builtin_expect(!m_occlusion.idle(), 0)) await_writes(m_fp_ea, c.tmpl->count * 4u);
+        if (program_matches(ucode, c.tmpl->code.data(), c.tmpl->count)) {
+            c.verified_epoch = m_epoch;
+            seen.last_slot = idx;
+            return finish_fp(c.tmpl->fp);
+        }
+    }
+    if (__builtin_expect(!m_occlusion.idle(), 0)) await_writes(m_fp_ea, 16u);
+    const u32 p0 = ucode[0], p1 = ucode[1], p2 = ucode[2], p3 = ucode[3];
+    const u32 sig_idx = ((p0 ^ (p1 * 31u) ^ (p2 * 131u) ^ (p3 * 1313u) ^ fk.control ^ fk.output_mask ^ fk.texture_dims) * 0x9E3779B1u) >> 24;
+    fp_sig_slot& sig = m_fp_sig[sig_idx];
+    if (sig.tmpl && sig.prefix[0] == p0 && sig.prefix[1] == p1 && sig.prefix[2] == p2 && sig.prefix[3] == p3 &&
+        std::memcmp(&sig.key, &fk, sizeof fk) == 0) {
+        if (__builtin_expect(!m_occlusion.idle(), 0)) await_writes(m_fp_ea, sig.tmpl->count * 4u);
+        if (program_matches(ucode, sig.tmpl->code.data(), sig.tmpl->count)) {
+            const u32 slot_idx = seen.next;
+            seen.slots[slot_idx] = { sig.tmpl, m_epoch };
+            seen.next = (slot_idx + 1u) & 7u;
+            seen.last_slot = slot_idx;
+            return finish_fp(sig.tmpl->fp);
+        }
+    }
+    if (__builtin_expect(!m_occlusion.idle(), 0)) await_writes(m_fp_ea, RSX_SPV_FP_MAX_INSTRUCTIONS * 16u);
+    const bool sync_shader = !m_pipelines.fast_link() && !m_fb.depth && m_fb.count > 0;
+    m_fp = m_shaders.fragment(ucode, RSX_SPV_FP_MAX_INSTRUCTIONS * 4u, fk, !sync_shader);
     if (!m_fp) return false;
-    fp_candidate& c = seen.slots[seen.next];
-    seen.next = (seen.next + 1u) % count;
-    c.fp = m_fp;
-    c.count = m_fp->info.ucode_words;
-    c.code.assign(((c.count + 7u) & ~size_t(7)) * 2u, 0u);
-    for (u32 i = 0; i < c.count; i++) {
-        c.code[(i & ~7u) * 2u + (i & 7u)] = ucode[i];
-        c.code[(i & ~7u) * 2u + 8u + (i & 7u)] = ~0u;
-    }
-    for (u32 i = 0; i < m_fp->info.constant_count; i++)
-        for (u32 w = m_fp->info.constant_word[i]; w < m_fp->info.constant_word[i] + 4u && w < c.count; w++) {
-            c.code[(w & ~7u) * 2u + (w & 7u)] = 0u;
-            c.code[(w & ~7u) * 2u + 8u + (w & 7u)] = 0u;
+    const fp_template*& tmpl_ref = m_fp_tmpl_by_fp[m_fp];
+    if (!tmpl_ref) {
+        fp_template& t = m_fp_templates.emplace_back();
+        t.fp = m_fp;
+        t.count = m_fp->info.ucode_words;
+        t.prefix[0] = p0; t.prefix[1] = p1; t.prefix[2] = p2; t.prefix[3] = p3;
+        t.key = fk;
+        t.code.assign(((t.count + 7u) & ~size_t(7)) * 2u, 0u);
+        for (u32 i = 0; i < t.count; i++) {
+            t.code[(i & ~7u) * 2u + (i & 7u)] = ucode[i];
+            t.code[(i & ~7u) * 2u + 8u + (i & 7u)] = ~0u;
         }
-    return true;
+        for (u32 i = 0; i < m_fp->info.constant_count; i++)
+            for (u32 w = m_fp->info.constant_word[i]; w < m_fp->info.constant_word[i] + 4u && w < t.count; w++) {
+                t.code[(w & ~7u) * 2u + (w & 7u)] = 0u;
+                t.code[(w & ~7u) * 2u + 8u + (w & 7u)] = 0u;
+            }
+        tmpl_ref = &t;
+    }
+    sig.prefix[0] = p0; sig.prefix[1] = p1; sig.prefix[2] = p2; sig.prefix[3] = p3;
+    sig.key = fk;
+    sig.tmpl = tmpl_ref;
+    const u32 slot_idx = seen.next;
+    seen.slots[slot_idx] = { tmpl_ref, m_epoch };
+    seen.next = (slot_idx + 1u) & 7u;
+    seen.last_slot = slot_idx;
+    return finish_fp(m_fp);
 }
 
 void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
@@ -601,7 +761,20 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
         uint8_t* out = nullptr;
         if (source && clause.ranges.size() == 1) {
             const rsx::draw_range& rg = clause.ranges[0];
-            e = &m_index_cache[index_key{ source, rg.first, rg.count, prim, restart_index, (u32)wide | (u32)restart << 1 }];
+            const index_key ik{ source, rg.first, rg.count, prim, restart_index, (u32)wide | (u32)restart << 1 };
+            const u32 l1_i = ((((ik.source >> 4) ^ (ik.first * 31u) ^ (ik.count * 131u) ^ ik.prim ^ ik.flags) * 0x9E3779B1u) >> 27) & 31u;
+            icache_l1& slot = m_icache_l1[l1_i];
+            if (slot.val && !std::memcmp(&slot.key, &ik, sizeof ik)) {
+                e = slot.val;
+            } else {
+                e = &m_index_cache[ik];
+                const size_t cap = m_index_cache.capacity();
+                if (cap != m_icache_cap) {
+                    std::memset(m_icache_l1, 0, sizeof m_icache_l1);
+                    m_icache_cap = cap;
+                }
+                m_icache_l1[l1_i] = { ik, e };
+            }
             if (!cache_place(*e, source + rg.first * isize, rg.count * isize, total * isize, offset, out)) return;
         } else {
             const vk_slice s = m_ring.alloc((VkDeviceSize)total * isize, 16);
@@ -626,6 +799,7 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
             }
             if (e) {
                 e->stamp = m_stamp;
+                e->checked_stamp = m_stamp;
                 e->count = at;
                 e->min = lo;
                 e->max = hi;
@@ -663,7 +837,20 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
         if (emulated) {
             for (draw_sub& s : subs) {
                 const u32 n = expanded_index_count(prim, s.count);
-                cached& e = m_index_cache[index_key{ 0u, 0u, s.count, prim, 0u, 0u }];
+                const index_key ik{ 0u, 0u, s.count, prim, 0u, 0u };
+                const u32 l1_i = ((((ik.count * 131u) ^ ik.prim) * 0x9E3779B1u) >> 27) & 31u;
+                icache_l1& slot = m_icache_l1[l1_i];
+                cached* ep = (slot.val && !std::memcmp(&slot.key, &ik, sizeof ik)) ? slot.val : nullptr;
+                if (!ep) {
+                    ep = &m_index_cache[ik];
+                    const size_t cap = m_index_cache.capacity();
+                    if (cap != m_icache_cap) {
+                        std::memset(m_icache_l1, 0, sizeof m_icache_l1);
+                        m_icache_cap = cap;
+                    }
+                    m_icache_l1[l1_i] = { ik, ep };
+                }
+                cached& e = *ep;
                 u32 offset = 0;
                 uint8_t* out = nullptr;
                 if (!cache_place(e, 0, 0, (n + 1u) * 4u, offset, out)) return;
@@ -702,23 +889,33 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
 
     const rsx_spv_fp_info& fi = m_fp->info;
     VkDescriptorBufferInfo fp_consts{};
+    const uint64_t cur_sub = *m_submitted + 1u;
     if (fi.constant_count) {
-        m_fp_constants.resize((size_t)fi.constant_count * 4u);
-        const u32* ucode = reinterpret_cast<const u32*>(vm_base + m_fp_ea);
+        if (m_fp == m_fp_const_fp && m_fp_ea == m_fp_const_ea && m_fp_const_epoch == m_epoch && m_fp_const_sub == cur_sub) {
+            fp_consts = m_fp_const_info;
+        } else {
+            m_fp_constants.resize((size_t)fi.constant_count * 4u);
+            const u32* ucode = reinterpret_cast<const u32*>(vm_base + m_fp_ea);
 #ifdef __SSSE3__
-        const __m128i swap16 = _mm_setr_epi8(1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14);
-        for (u32 i = 0; i < fi.constant_count; i++) {
-            const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(ucode + fi.constant_word[i]));
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(m_fp_constants.data() + i * 4u), _mm_shuffle_epi8(v, swap16));
-        }
-#else
-        for (u32 i = 0; i < fi.constant_count; i++)
-            for (u32 w = 0; w < 4u; w++) {
-                const u32 v = ucode[fi.constant_word[i] + w];
-                m_fp_constants[i * 4u + w] = ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu);
+            const __m128i swap16 = _mm_setr_epi8(1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14);
+            for (u32 i = 0; i < fi.constant_count; i++) {
+                const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(ucode + fi.constant_word[i]));
+                _mm_storeu_si128(reinterpret_cast<__m128i*>(m_fp_constants.data() + i * 4u), _mm_shuffle_epi8(v, swap16));
             }
+#else
+            for (u32 i = 0; i < fi.constant_count; i++)
+                for (u32 w = 0; w < 4u; w++) {
+                    const u32 v = ucode[fi.constant_word[i] + w];
+                    m_fp_constants[i * 4u + w] = ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu);
+                }
 #endif
-        if (!upload(m_fp_constant_upload, m_fp_constants.data(), fi.constant_count * 16u, fp_consts)) return;
+            if (!upload(m_fp_constant_upload, m_fp_constants.data(), fi.constant_count * 16u, fp_consts)) return;
+            m_fp_const_fp = m_fp;
+            m_fp_const_ea = m_fp_ea;
+            m_fp_const_epoch = m_epoch;
+            m_fp_const_sub = cur_sub;
+            m_fp_const_info = fp_consts;
+        }
     } else {
         static constexpr u32 k_zero_const[4] = {};
         if (!upload(m_fp_constant_upload, k_zero_const, sizeof k_zero_const, fp_consts)) return;
@@ -743,18 +940,17 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
     fs.wpos_bias = bottom ? (float)(window & 0xFFFu) : 0.f;
     VkDescriptorImageInfo images[rsx::TEXTURES + rsx::VERTEX_TEXTURES];
     u8 unit0_tag = 0;
-    for (u32 u = 0; u < rsx::TEXTURES + rsx::VERTEX_TEXTURES; u++) {
+    const u32 used_tex_mask = (m_fp->info.texture_mask & 0xFFFFu) | ((m_vp->info.texture_mask & 0xFu) << rsx::TEXTURES);
+    const u32 check_tex_mask = m_bound.valid ? used_tex_mask : ((1u << (rsx::TEXTURES + rsx::VERTEX_TEXTURES)) - 1u);
+    for (u32 bits = check_tex_mask; bits; bits &= bits - 1u) {
+        const u32 u = (u32)__builtin_ctz(bits);
         const bool vertex_unit = u >= rsx::TEXTURES;
         const u32 unit = vertex_unit ? u - rsx::TEXTURES : u;
-        const u32 used = vertex_unit ? m_vp->info.texture_mask : m_fp->info.texture_mask;
         rsx_spv_texture_state scratch{};
         rsx_spv_texture_state& st = vertex_unit ? scratch : fs.texture[u];
         st.scale[0] = st.scale[1] = 1.f;
-        if ((used >> unit) & 1u) {
+        if ((used_tex_mask >> u) & 1u) {
             if (resolve_texture(unit, vertex_unit, images[u], st, u == 0 ? &unit0_tag : nullptr)) continue;
-        } else if (m_bound.valid && m_bound.images[u].sampler && m_bound.images[u].imageView) {
-            images[u] = m_bound.images[u];
-            continue;
         }
         const u32 dims = texture_dims(m_units[u].desc, m_units[u].valid);
         const image& dummy = m_dummy[dims == RSX_SPV_TEX_CUBE ? 1 : dims == RSX_SPV_TEX_3D ? 2 : 0];
@@ -841,6 +1037,7 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
         t.depth = m_fb.depth != nullptr;
         t.stencil = m_fb.depth && (m_fb.depth->img.aspect & VK_IMAGE_ASPECT_STENCIL_BIT);
         t.depth_float = m_fb.depth && m_fb.depth->depth_float;
+        t.shadow_map = m_fb.depth && m_fb.depth->depth_only && m_fb.depth->width == m_fb.depth->height && m_fb.depth->width >= 512u;
         for (u32 k = 0; k < 4; k++) t.color_format[k] = m_fb.color_format[k];
         m_last_pipe_key = {};
         fill_pipeline_state(*this, *m_d, t, prim, m_last_pipe_key);
@@ -850,7 +1047,8 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
     key.vs = m_vp->hash;
     key.fs = m_fp->hash;
     key.depth_format = m_fb.depth_format;
-    const VkPipeline pipe = m_pipelines.get(key, m_vp->code, m_fp->code);
+    const bool sync_pipe = !m_pipelines.fast_link() && !m_fb.depth && m_fb.count > 0;
+    const VkPipeline pipe = m_pipelines.get(key, m_vp->code, m_fp->code, sync_pipe);
     if (!pipe) {
         if (m_trace) std::fprintf(m_trace, "[trace] %u skipped: pipeline compiling or failed\n", id);
         return;
@@ -877,16 +1075,26 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
         std::memcpy(m_bound.offsets, offsets, sizeof offsets);
         vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelines.layout(), RSX_SPV_SET_BUFFERS, 1, &m_buffer_set, 4, offsets);
     }
-    VkWriteDescriptorSet w[rsx::TEXTURES + rsx::VERTEX_TEXTURES]{};
+    VkWriteDescriptorSet w[rsx::TEXTURES + rsx::VERTEX_TEXTURES];
     u32 nw = 0;
-    for (u32 u = 0; u < rsx::TEXTURES + rsx::VERTEX_TEXTURES; u++) {
-        if (!images[u].sampler || !images[u].imageView)
-            images[u] = { m_dummy_sampler, m_dummy[0].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+    const u32 bind_tex_mask = all ? ((1u << (rsx::TEXTURES + rsx::VERTEX_TEXTURES)) - 1u) : check_tex_mask;
+    for (u32 bits = bind_tex_mask; bits; bits &= bits - 1u) {
+        const u32 u = (u32)__builtin_ctz(bits);
+        VkDescriptorImageInfo img;
+        if ((check_tex_mask >> u) & 1u) {
+            img = images[u];
+        } else if (m_bound.images[u].sampler && m_bound.images[u].imageView) {
+            img = m_bound.images[u];
+        } else {
+            const u32 dims = texture_dims(m_units[u].desc, m_units[u].valid);
+            const image& dummy = m_dummy[dims == RSX_SPV_TEX_CUBE ? 1 : dims == RSX_SPV_TEX_3D ? 2 : 0];
+            img = { m_dummy_sampler, dummy.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        }
         VkDescriptorImageInfo& last = m_bound.images[u];
-        if (!all && last.sampler == images[u].sampler && last.imageView == images[u].imageView && last.imageLayout == images[u].imageLayout) continue;
-        last = images[u];
+        if (!all && last.sampler == img.sampler && last.imageView == img.imageView && last.imageLayout == img.imageLayout) continue;
+        last = img;
         VkWriteDescriptorSet& x = w[nw++];
-        x.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        x = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
         x.dstBinding = u >= rsx::TEXTURES ? RSX_SPV_BIND_VERTEX_TEXTURE0 + (u - rsx::TEXTURES) : RSX_SPV_BIND_TEXTURE0 + u;
         x.descriptorCount = 1;
         x.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;

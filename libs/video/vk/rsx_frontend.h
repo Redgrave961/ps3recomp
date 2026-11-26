@@ -142,7 +142,9 @@ public:
     push_attribute push[ATTRIBS];
     draw_clause draw;
     u32 dirty = D_ALL;
+    u32 dirty_tex = 0xFFFFFu;
     u32 pushed = 0;
+    bool vp_code_dirty = true;
     bool in_begin_end = false;
 
     frontend();

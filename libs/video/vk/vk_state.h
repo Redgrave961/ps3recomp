@@ -15,6 +15,7 @@ struct draw_target {
     bool depth;
     bool stencil;
     bool depth_float;
+    bool shadow_map;
     VkFormat color_format[4];
 };
 

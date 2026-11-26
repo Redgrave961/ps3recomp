@@ -303,7 +303,20 @@ void pipelines::save_cache()
 
 pipeline_key pipelines::normalize(const pipeline_key& key) const{
     pipeline_key k = key;
-    if (m_dynamic_blend) std::memset(k.blend, 0, sizeof k.blend);
+    if (m_dynamic_blend) {
+        std::memset(k.blend, 0, sizeof k.blend);
+    } else {
+        for (blend_attachment& b : k.blend) {
+            if (!b.enable) {
+                b.src_color = VK_BLEND_FACTOR_ZERO;
+                b.dst_color = VK_BLEND_FACTOR_ZERO;
+                b.color_op = VK_BLEND_OP_ADD;
+                b.src_alpha = VK_BLEND_FACTOR_ZERO;
+                b.dst_alpha = VK_BLEND_FACTOR_ZERO;
+                b.alpha_op = VK_BLEND_OP_ADD;
+            }
+        }
+    }
     if (m_dynamic_polygon) k.polygon_mode = 0;
     if (m_dynamic_clamp) k.depth_clamp = 0;
     if (m_dynamic_clip) k.depth_clip = 0;
@@ -495,8 +508,7 @@ bool pipelines::shader_library(shader& s, VkShaderStageFlagBits stage)
 {
     if (!m_libraries) return true;
     const bool vertex = stage == VK_SHADER_STAGE_VERTEX_BIT;
-    VkPipelineRenderingCreateInfo ri{ VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
-    VkGraphicsPipelineLibraryCreateInfoEXT gl{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT, &ri };
+    VkGraphicsPipelineLibraryCreateInfoEXT gl{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT };
     gl.flags = vertex ? VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT : VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT;
     const VkPipelineShaderStageCreateInfo st{ VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, stage, s.module, "main" };
     VkPipelineViewportStateCreateInfo vp{ VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
@@ -593,9 +605,21 @@ VkPipeline pipelines::link(const pipeline_key& k, const shader& vs, const shader
     return vkCreateGraphicsPipelines(m_d->dev, m_cache, 1, &pi, nullptr, &p) == VK_SUCCESS ? p : VK_NULL_HANDLE;
 }
 
-VkPipeline pipelines::get(const pipeline_key& key, const shader& vs, const shader& fs)
+VkPipeline pipelines::get(const pipeline_key& key, const shader& vs, const shader& fs, bool sync)
 {
+    if (!g_replay && m_last_entry && std::memcmp(&m_last_raw_key, &key, sizeof key) == 0 &&
+        m_last_entry->done.load(std::memory_order_acquire))
+        return m_last_entry->pipe.load(std::memory_order_acquire);
     const pipeline_key k = normalize(key);
+    const size_t l1_idx = (size_t)hash_key(k) & (k_l1_size - 1u);
+    if (!g_replay) {
+        const l1_slot& s = m_l1[l1_idx];
+        if (s.e && std::memcmp(&s.key, &k, sizeof k) == 0 && s.e->done.load(std::memory_order_acquire)) {
+            m_last_raw_key = key;
+            m_last_entry = s.e;
+            return s.e->pipe.load(std::memory_order_acquire);
+        }
+    }
     entry* e;
     bool owner;
     {
@@ -607,13 +631,19 @@ VkPipeline pipelines::get(const pipeline_key& key, const shader& vs, const shade
     }
     if (!owner) {
         if (!e->done.load(std::memory_order_acquire)) {
-            if (!g_replay) return VK_NULL_HANDLE;
+            if (!g_replay && !sync) return VK_NULL_HANDLE;
             e->done.wait(false, std::memory_order_acquire);
+        }
+        if (!g_replay) {
+            m_l1[l1_idx].key = k;
+            m_l1[l1_idx].e = e;
+            m_last_raw_key = key;
+            m_last_entry = e;
         }
         return e->pipe.load(std::memory_order_acquire);
     }
     record('P', &k, sizeof k, nullptr, 0);
-    if (!m_libraries && !g_replay) {
+    if (!m_libraries && !g_replay && !sync) {
         work([this, k, v = vs, f = fs, e] {
             const VkPipeline p = m_stopping.load(std::memory_order_relaxed) ? VK_NULL_HANDLE : monolithic(k, v, f);
             e->pipe.store(p, std::memory_order_release);
@@ -622,14 +652,13 @@ VkPipeline pipelines::get(const pipeline_key& key, const shader& vs, const shade
         }, true);
         return VK_NULL_HANDLE;
     }
-    const bool fast = m_libraries;
-    const VkPipeline p = !m_libraries ? monolithic(k, vs, fs) : link(k, vs, fs, !fast);
+    const VkPipeline p = !m_libraries ? monolithic(k, vs, fs) : link(k, vs, fs, false);
     if (!p) std::fprintf(stderr, "[vk] pipeline creation failed\n");
-    e->fast = fast ? p : VK_NULL_HANDLE;
+    e->fast = m_libraries ? p : VK_NULL_HANDLE;
     e->pipe.store(p, std::memory_order_release);
     e->done.store(true, std::memory_order_release);
     e->done.notify_all();
-    if (fast && p)
+    if (m_libraries && p)
         work([this, k, v = vs, f = fs, e] {
             if (m_stopping.load(std::memory_order_relaxed)) return;
             if (VkPipeline opt = link(k, v, f, true)) e->pipe.store(opt, std::memory_order_release);

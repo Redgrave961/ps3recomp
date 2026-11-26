@@ -270,10 +270,18 @@ static void sysutil_host_language(char* out, size_t n)
 #endif
 }
 
+static s32 s_lang_override = -1;
+static s32 s_lang_cached = -1;
+
+void ps3_sysutil_set_language(s32 lang)
+{
+    s_lang_override = (lang >= 0 && lang <= CELL_SYSUTIL_LANG_TURKISH) ? lang : -1;
+    s_lang_cached = -1;
+}
+
 static s32 sysutil_language(void)
 {
-    static s32 lang = -1;
-    if (lang >= 0) return lang;
+    if (s_lang_cached >= 0) return s_lang_cached;
     static const struct { const char* code; s32 id; } k[] = {
         {"ja", CELL_SYSUTIL_LANG_JAPANESE}, {"en", CELL_SYSUTIL_LANG_ENGLISH_US},
         {"en-us", CELL_SYSUTIL_LANG_ENGLISH_US}, {"fr", CELL_SYSUTIL_LANG_FRENCH},
@@ -287,7 +295,7 @@ static s32 sysutil_language(void)
         {"pl", CELL_SYSUTIL_LANG_POLISH}, {"pt-br", CELL_SYSUTIL_LANG_PORTUGUESE_BR},
         {"en-gb", CELL_SYSUTIL_LANG_ENGLISH_GB}, {"tr", CELL_SYSUTIL_LANG_TURKISH},
     };
-    lang = CELL_SYSUTIL_LANG_ENGLISH_US;
+    s32 lang = CELL_SYSUTIL_LANG_ENGLISH_US;
     const char* e = getenv("PS3_LANG");
     const char* from = "default";
     if (e && *e) {
@@ -301,12 +309,16 @@ static s32 sysutil_language(void)
             if (i == sizeof k / sizeof k[0])
                 printf("[cellSysutil] PS3_LANG=%s not recognised, using English\n", e);
         }
+    } else if (s_lang_override >= 0) {
+        lang = s_lang_override;
+        from = "options";
     } else {
         char host[8];
         sysutil_host_language(host, sizeof host);
         for (unsigned i = 0; host[0] && i < sizeof k / sizeof k[0]; i++)
             if (sysutil_ieq(host, k[i].code)) { lang = k[i].id; from = "host"; break; }
     }
+    s_lang_cached = lang;
     printf("[cellSysutil] system language %d (%s)\n", (int)lang, from);
     return lang;
 }

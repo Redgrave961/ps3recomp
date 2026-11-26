@@ -159,11 +159,13 @@ static inline void spu_ls_lzf_decompress(uint8_t* ls, uint32_t* p_src, uint32_t 
             uint8_t* dp = ls + d0;
             uint8_t* const send = ls + src_end;
             uint8_t* const dsafe = ls + (0x40000u - 32u);
+            const int src_safe = send <= dsafe;
+            const int dp_after_send = dp >= send;
             while (sp < send && dp < dsafe) {
                 const uint32_t ctrl = *sp++;
                 if (ctrl < 32u) {
                     const uint32_t len = ctrl + 1u;
-                    if (__builtin_expect(sp + 32 <= ls + 0x40000u && (dp >= sp + len || sp >= dp + 32), 1)) {
+                    if (__builtin_expect((src_safe || sp + 32 <= ls + 0x40000u) && (dp_after_send || dp >= sp + len || sp >= dp + 32), 1)) {
                         memcpy(dp, sp, 16);
                         if (len > 16u) memcpy(dp + 16, sp + 16, 16);
                     } else if (sp + len <= ls + 0x40000u && dp + len <= ls + 0x40000u) {
@@ -178,6 +180,16 @@ static inline void spu_ls_lzf_decompress(uint8_t* ls, uint32_t* p_src, uint32_t 
                     sp += len;
                     dp += len;
                 } else {
+                    if (__builtin_expect(ctrl < 0xE0u && sp < send, 1)) {
+                        const uint32_t len = (ctrl >> 5) + 2u;
+                        const uint32_t back = ((ctrl & 31u) << 8) + 1u + *sp++;
+                        if (__builtin_expect(back >= 16u && (uint32_t)(dp - ls) >= back, 1)) {
+                            memcpy(dp, dp - back, 16);
+                            dp += len;
+                            continue;
+                        }
+                        sp--;
+                    }
                     uint32_t len = ctrl >> 5;
                     uint32_t back = ((ctrl & 31u) << 8) + 1u;
                     if (len == 7u) {

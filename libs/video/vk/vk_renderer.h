@@ -57,6 +57,7 @@ struct surface {
     u32 gcm_format = 0;
     bool depth = false;
     bool depth_float = false;
+    bool depth_only = false;
     u32 bpp = 0;
     u32 aa_u = 1;
     u32 aa_v = 1;
@@ -115,6 +116,7 @@ public:
     bool blit(const rsx_blit& b);
     void flip_reset();
     void rescale(ratio scale);
+    void invalidate_graphics_state();
     bool report(u32 type, u32 ea);
     bool defer(const rsx_write& w);
     std::atomic<u32> trace_frames{ 0 };
@@ -138,12 +140,13 @@ private:
     VkCommandBuffer cmd();
     void end_rendering();
     bool bind_framebuffer(u32 context);
-    void begin_rendering();
+    void begin_rendering(u32 clear_color_mask = 0, const VkClearValue* clear_color = nullptr,
+                         VkImageAspectFlags clear_ds_mask = 0, const VkClearValue* clear_ds = nullptr);
     surface* surface_at(u32 ea, u32 pitch, u32 bpp, u32& x, u32& y);
     surface* scanout_surface(u32 ea, u32 pitch) const;
-    ratio scale_for(u32 width, u32 height, bool depth) const;
+    ratio scale_for(u32 width, u32 height, bool depth, bool depth_only = false) const;
     surface* surface_for(u32 ea, u32 pitch, u32 width, u32 height, u32 format, bool depth, u32 aa_u, u32 aa_v,
-                         const surface* const* keep = nullptr, u32 keep_count = 0);
+                         const surface* const* keep = nullptr, u32 keep_count = 0, bool depth_only = false);
     bool create_image(image& img, VkFormat format, u32 width, u32 height, VkImageUsageFlags usage, VkImageAspectFlags aspect);
     void destroy_image(image& img);
     void discard(image& img);
@@ -224,26 +227,69 @@ private:
     bool m_fp_tex_valid = false;
     const vertex_program* m_constants_vp = nullptr;
     VkDescriptorBufferInfo m_constants{};
+    struct vp_hash_slot {
+        u32 start = ~0u;
+        uint64_t hash = 0;
+    };
+    vp_hash_slot m_vp_hashes[64]{};
+    struct vp_l1_slot {
+        uint64_t program_hash = 0;
+        rsx_spv_vp_key key{};
+        const vertex_program* vp = nullptr;
+    };
+    vp_l1_slot m_vp_l1[64]{};
     const vertex_program* m_vp = nullptr;
     const fragment_program* m_fp = nullptr;
+    const fragment_program* m_fp_const_fp = nullptr;
+    u32 m_fp_const_ea = 0;
+    u64 m_fp_const_epoch = 0;
+    uint64_t m_fp_const_sub = 0;
+    VkDescriptorBufferInfo m_fp_const_info{};
     struct fp_seen_key {
         u32 ea;
         rsx_spv_fp_key key;
         bool operator==(const fp_seen_key& o) const { return !std::memcmp(this, &o, sizeof o); }
     };
-    struct fp_candidate {
+    struct fp_template {
         const fragment_program* fp = nullptr;
         u32 count = 0;
+        u32 prefix[4]{};
+        rsx_spv_fp_key key{};
         std::vector<u32> code;
     };
-    struct fp_lookup {
-        std::array<fp_candidate, 4> slots;
-        u32 next = 0;
+    struct fp_candidate {
+        const fp_template* tmpl = nullptr;
+        u64 verified_epoch = 0;
     };
+    struct fp_lookup {
+        std::array<fp_candidate, 8> slots;
+        u32 next = 0;
+        u32 last_slot = 0;
+    };
+    struct fp_l1_entry {
+        fp_seen_key key{};
+        const fragment_program* fp = nullptr;
+        u64 verified_epoch = 0;
+        fp_lookup* val = nullptr;
+    };
+    struct fp_l1_set {
+        fp_l1_entry ways[2]{};
+        u32 next_way = 0;
+    };
+    struct fp_sig_slot {
+        u32 prefix[4]{};
+        rsx_spv_fp_key key{};
+        const fp_template* tmpl = nullptr;
+    };
+    std::deque<fp_template> m_fp_templates;
+    flat_map<const fragment_program*, const fp_template*> m_fp_tmpl_by_fp;
+    fp_sig_slot m_fp_sig[256]{};
     std::deque<fp_lookup> m_fp_pool;
     flat_map<fp_seen_key, fp_lookup*> m_fp_seen;
+    fp_l1_set m_fp_l1[256]{};
     fp_seen_key m_fp_last_key{};
     fp_lookup* m_fp_last = nullptr;
+    u64 m_fp_last_epoch = 0;
     u32 m_fp_ea = 0;
     VkDeviceSize m_ubo_align = 256;
     std::vector<uint8_t> m_index_scratch;
@@ -262,18 +308,26 @@ private:
         VmaVirtualAllocation alloc = VK_NULL_HANDLE;
         u32 offset = 0;
         u32 stamp = 0;
+        u32 checked_stamp = 0;
         u32 count = 0;
         u32 min = 0;
         u32 max = 0;
         uint64_t submission = 0;
         u64 used = 0;
         bool seen = false;
+        bool watched = false;
     };
     bool cache_place(cached& e, u32 ea, u32 size, u32 bytes, u32& offset, uint8_t*& out);
     void evict(u64 age);
     void release_held();
     flat_map<uint64_t, cached> m_vertex_cache;
     flat_map<index_key, cached> m_index_cache;
+    struct vcache_l1 { uint64_t key = 0; cached* val = nullptr; };
+    struct icache_l1 { index_key key{}; cached* val = nullptr; };
+    vcache_l1 m_vcache_l1[64]{};
+    icache_l1 m_icache_l1[32]{};
+    size_t m_vcache_cap = 0;
+    size_t m_icache_cap = 0;
     std::vector<std::pair<uint64_t, VmaVirtualAllocation>> m_held_garbage;
     uint64_t m_reached = 0;
     u64 m_progress = 0;
@@ -305,6 +359,7 @@ private:
         uint64_t key = 0;
         image img;
         u32 stamp = 0;
+        u32 checked_stamp = 0;
         u64 checked = 0;
         u64 used = 0;
         u8 patch_tag = 0;
@@ -316,8 +371,10 @@ private:
         u32 variant = 0;
         rsx::texture_regs regs{};
         u32 ea = 0;
+        u32 stamp = 0;
         u64 epoch = 0;
         u64 generation = 0;
+        texture_entry* entry = nullptr;
         VkDescriptorImageInfo info{};
         rsx_spv_texture_state state{};
     };
@@ -329,6 +386,7 @@ private:
         bool valid = false;
         rsx::texture_regs regs{};
         rsx::texture_desc desc{};
+        VkSampler sampler = VK_NULL_HANDLE;
     };
 
     void describe_units(u32 first, u32 last);
@@ -337,6 +395,7 @@ private:
     VkImageView view_for(image& img, VkImageViewType type, VkFormat format, VkImageAspectFlags aspect, const VkComponentMapping& swizzle);
     VkSampler sampler_for(const VkSamplerCreateInfo& info, const VkSamplerCustomBorderColorCreateInfoEXT* border);
     bool memory_changed(u32 ea, u32 size, u32 stamp);
+    bool memory_changed_watched(u32 ea, u32 size, u32 stamp, u32& checked_stamp);
     u32 refresh(u32 ea, u32 size, u32 stamp, uint8_t* dst);
     void watch(u32 ea, u32 size);
     void prescan(u64 batch);

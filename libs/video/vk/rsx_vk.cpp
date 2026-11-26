@@ -212,15 +212,40 @@ void apply_display()
     SDL_SetWindowFullscreen(g.window, true);
 }
 
+bool is_present_format(VkFormat f)
+{
+    return f == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || f == VK_FORMAT_A2R10G10B10_UNORM_PACK32 ||
+           f == VK_FORMAT_B8G8R8A8_UNORM || f == VK_FORMAT_R8G8B8A8_UNORM;
+}
+
+bool is_smaa_source_format(VkFormat f)
+{
+    return f == VK_FORMAT_R16G16B16A16_UNORM || is_present_format(f);
+}
+
+bool format_supports_present(VkFormat f)
+{
+    VkFormatProperties fp{};
+    vkGetPhysicalDeviceFormatProperties(g.d.gpu, f, &fp);
+    constexpr VkFormatFeatureFlags need = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT |
+                                          VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT |
+                                          VK_FORMAT_FEATURE_BLIT_DST_BIT;
+    return (fp.optimalTilingFeatures & need) == need;
+}
+
 VkSurfaceFormatKHR pick_format()
 {
     uint32_t n = 0;
     vkGetPhysicalDeviceSurfaceFormatsKHR(g.d.gpu, g.surface, &n, nullptr);
     std::vector<VkSurfaceFormatKHR> list(n);
     vkGetPhysicalDeviceSurfaceFormatsKHR(g.d.gpu, g.surface, &n, list.data());
-    for (VkFormat want : { VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM })
+    for (VkFormat want : { VK_FORMAT_A2B10G10R10_UNORM_PACK32, VK_FORMAT_A2R10G10B10_UNORM_PACK32,
+                           VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM }) {
+        if ((want == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || want == VK_FORMAT_A2R10G10B10_UNORM_PACK32) && !format_supports_present(want))
+            continue;
         for (const VkSurfaceFormatKHR& f : list)
             if (f.format == want && f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) return f;
+    }
     if (list.empty() || list[0].format == VK_FORMAT_UNDEFINED) return { VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR };
     return list[0];
 }
@@ -267,7 +292,12 @@ bool swapchain_build()
         g.sc.extent = extent;
         return true;
     }
-    if (g.sc.format.format == VK_FORMAT_UNDEFINED) g.sc.format = pick_format();
+    if (g.sc.format.format == VK_FORMAT_UNDEFINED) {
+        g.sc.format = pick_format();
+        const bool ten_bit = g.sc.format.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ||
+                             g.sc.format.format == VK_FORMAT_A2R10G10B10_UNORM_PACK32;
+        std::fprintf(stderr, "[vk] swapchain format %d (%s sRGB)\n", (int)g.sc.format.format, ten_bit ? "10-bit" : "8-bit");
+    }
     g.sc.mode = pick_mode();
     uint32_t count = std::max(caps.minImageCount + 1u, 3u);
     if (caps.maxImageCount) count = std::min(count, caps.maxImageCount);
@@ -316,7 +346,7 @@ bool swapchain_build()
         g.sc.ready.push_back(s);
     }
     const VkFormat f = g.sc.format.format;
-    if (f == VK_FORMAT_B8G8R8A8_UNORM || f == VK_FORMAT_R8G8B8A8_UNORM)
+    if (is_present_format(f))
         g.fit.store((uint64_t)extent.width << 40 | (uint64_t)extent.height << 20 | (uint64_t)f, std::memory_order_release);
     return true;
 }
@@ -826,6 +856,7 @@ void window_main()
             break;
         case SDL_EVENT_KEY_DOWN:
             if (e.key.repeat) break;
+            if (e.key.key == SDLK_F12) g.r.trace_frames.store(1, std::memory_order_relaxed);
             if (e.key.key == SDLK_F11 || (e.key.key == SDLK_RETURN && (e.key.mod & SDL_KMOD_ALT))) {
                 const rsx_vk_display next = g.display == RSX_VK_WINDOWED ? g.last_fullscreen : RSX_VK_WINDOWED;
                 g.display = next;
@@ -983,8 +1014,7 @@ int vk_present(void*, u32, const rsx_display_buffer* db)
     else capture_path = nullptr;
     const VkExtent2D out{ (uint32_t)(fit >> 40), (uint32_t)(fit >> 20) & 0xFFFFFu };
     const VkFormat out_format = (VkFormat)(fit & 0xFFFFFu);
-    const bool fitted = fit && !capture_path && src->width == sw && src->height == sh &&
-                        (src->format == VK_FORMAT_B8G8R8A8_UNORM || src->format == VK_FORMAT_R8G8B8A8_UNORM);
+    const bool fitted = fit && !capture_path && src->width == sw && src->height == sh && is_smaa_source_format(src->format);
     if (!(fitted ? slot_reserve(s, out.width, out.height, out_format) : slot_reserve(s, sw, sh, VK_FORMAT_B8G8R8A8_UNORM))) {
         g.r.flush();
         return 0;
@@ -999,13 +1029,11 @@ int vk_present(void*, u32, const rsx_display_buffer* db)
         uint64_t done = 0;
         if (vkGetSemaphoreCounterValue(g.d.dev, g.timeline, &done) == VK_SUCCESS) g.smaa.retire_staging(done);
     }
-    const bool aa_ok = aa_mode == RSX_VK_AA_SMAA && src->width == sw && src->height == sh && src->view &&
-                       (src->format == VK_FORMAT_B8G8R8A8_UNORM || src->format == VK_FORMAT_R8G8B8A8_UNORM);
+    const bool aa_ok = aa_mode == RSX_VK_AA_SMAA && src->width == sw && src->height == sh && src->view && is_smaa_source_format(src->format);
     if (aa_mode == RSX_VK_AA_OFF) g.smaa.release_targets();
     const VkExtent2D present_out = fitted ? out : VkExtent2D{ sw, sh };
     const bool want_present_filter = s.view && src->view && src->width == sw && src->height == sh &&
-                                     (src->format == VK_FORMAT_B8G8R8A8_UNORM || src->format == VK_FORMAT_R8G8B8A8_UNORM) &&
-                                     (s.format == VK_FORMAT_B8G8R8A8_UNORM || s.format == VK_FORMAT_R8G8B8A8_UNORM);
+                                     is_smaa_source_format(src->format) && is_present_format(s.format);
 
     VkImage blit_src = src->handle;
     VkImageView sample_src = VK_NULL_HANDLE;
@@ -1013,6 +1041,7 @@ int vk_present(void*, u32, const rsx_display_buffer* db)
         vk::renderer::barrier(cmd, *src, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
                               VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
         const vk::smaa::output res = g.smaa.record(cmd, src->view, src->format, sw, sh, want_present_filter, g.submitted + 1u);
+        g.r.invalidate_graphics_state();
         if (res.image) {
             blit_src = res.image;
             sample_src = res.view;
@@ -1026,6 +1055,7 @@ int vk_present(void*, u32, const rsx_display_buffer* db)
             sample_src = src->view;
         }
         filtered = g.smaa.downscale(cmd, sample_src, sw, sh, s.image, s.view, s.format, present_out);
+        if (filtered) g.r.invalidate_graphics_state();
     }
     if (!filtered) {
         if (blit_src == src->handle)

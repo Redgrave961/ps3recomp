@@ -169,6 +169,7 @@ void renderer::close()
         if (s) vkDestroySampler(m_d->dev, s, nullptr);
         return true;
     });
+    for (unit_binding& b : m_units) b.sampler = VK_NULL_HANDLE;
     m_sampler_count = 0;
     m_custom_border_count = 0;
     if (m_dummy_sampler) vkDestroySampler(m_d->dev, m_dummy_sampler, nullptr);
@@ -181,7 +182,8 @@ void renderer::close()
     m_d = nullptr;
 }
 
-constexpr VkAccessFlags2 k_writes = VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+constexpr VkAccessFlags2 k_writes = VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
+                                    VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
                                     VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT |
                                     VK_ACCESS_2_HOST_WRITE_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
 constexpr u32 k_trace_queries = 8192;
@@ -333,11 +335,17 @@ VkCommandBuffer renderer::cmd()
     VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(s.cmd, &bi);
-    m_dynamic.valid = false;
-    m_bound.valid = false;
-    m_bound.pipeline = VK_NULL_HANDLE;
+    invalidate_graphics_state();
     m_recording = true;
     return s.cmd;
+}
+
+void renderer::invalidate_graphics_state()
+{
+    m_dynamic.valid = false;
+    m_dyn_dirty = ~0u;
+    m_bound.valid = false;
+    m_bound.pipeline = VK_NULL_HANDLE;
 }
 
 void renderer::submit(VkSemaphore wait, VkPipelineStageFlags2 wait_stage, VkSemaphore signal)
@@ -372,9 +380,7 @@ void renderer::submit(VkSemaphore wait, VkPipelineStageFlags2 wait_stage, VkSema
     m_submissions[m_submission].done = value;
     m_submission = (m_submission + 1u) % (u32)m_submissions.size();
     m_recording = false;
-    m_dynamic.valid = false;
-    m_bound.valid = false;
-    m_bound.pipeline = VK_NULL_HANDLE;
+    invalidate_graphics_state();
     m_constants_vp = nullptr;
     m_ring.close(value);
     m_occlusion.submitted(value);
@@ -406,7 +412,7 @@ bool renderer::create_image(image& img, VkFormat format, u32 width, u32 height, 
     VkFormat view_formats[2]{};
     VkImageFormatListCreateInfo fmt_list{ VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO };
     if (aspect == VK_IMAGE_ASPECT_COLOR_BIT) {
-        if (format == VK_FORMAT_R16G16B16A16_SFLOAT || format == VK_FORMAT_R32G32B32A32_SFLOAT) {
+        if (format == VK_FORMAT_R16G16B16A16_SFLOAT || format == VK_FORMAT_R16G16B16A16_UNORM || format == VK_FORMAT_R32G32B32A32_SFLOAT) {
             ii.flags = 0;
         } else if (format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_R8G8B8A8_UNORM) {
             ii.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
@@ -506,8 +512,9 @@ void renderer::retire(surface* s)
     m_binding_gen++;
 }
 
-ratio renderer::scale_for(u32 width, u32 height, bool depth) const
+ratio renderer::scale_for(u32 width, u32 height, bool depth, bool depth_only) const
 {
+    if (depth && depth_only && width == height && width >= 512u) return {};
     if (resolution_scale.unit()) return {};
     if (std::max(width, height) < 128u || std::min(width, height) < 64u) return {};
     if (!depth && width <= 640u && height <= 360u) return {};
@@ -517,9 +524,9 @@ ratio renderer::scale_for(u32 width, u32 height, bool depth) const
 }
 
 surface* renderer::surface_for(u32 ea, u32 pitch, u32 width, u32 height, u32 format, bool depth, u32 aa_u, u32 aa_v,
-                               const surface* const* keep, u32 keep_count)
+                               const surface* const* keep, u32 keep_count, bool depth_only)
 {
-    const ratio scale = scale_for(width, height, depth);
+    const ratio scale = scale_for(width, height, depth, depth_only);
     surface* grow_from = nullptr;
     for (auto& p : m_surfaces) {
         surface* s = p.get();
@@ -538,6 +545,7 @@ surface* renderer::surface_for(u32 ea, u32 pitch, u32 width, u32 height, u32 for
     s->height = std::max(height, grow_from ? grow_from->height : 0u);
     s->gcm_format = format;
     s->depth = depth;
+    s->depth_only = depth && depth_only;
     s->aa_u = aa_u;
     s->aa_v = aa_v;
     s->scale = scale;
@@ -551,6 +559,9 @@ surface* renderer::surface_for(u32 ea, u32 pitch, u32 width, u32 height, u32 for
         aspect = format == 1 ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
     } else {
         vf = color_format(format);
+        if (m_d && m_d->caps.rgba16_unorm && (vf == VK_FORMAT_B8G8R8A8_UNORM || vf == VK_FORMAT_R8G8B8A8_UNORM) &&
+            s->width >= 1280u && s->height >= 720u)
+            vf = VK_FORMAT_R16G16B16A16_UNORM;
         aspect = VK_IMAGE_ASPECT_COLOR_BIT;
     }
     if (!create_image(s->img, vf, scale.edge(s->width * aa_u), scale.edge(s->height * aa_v), surface_usage(depth), aspect)) return nullptr;
@@ -559,14 +570,26 @@ surface* renderer::surface_for(u32 ea, u32 pitch, u32 width, u32 height, u32 for
     if (grow_from) {
         end_rendering();
         const trace_span span(*this, c, "surface grow %ux%u", s->img.width, s->img.height);
-        barrier(c, grow_from->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
-        barrier(c, s->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
-        VkImageCopy region{};
-        region.srcSubresource = { aspect, 0, 0, 1 };
-        region.dstSubresource = { aspect, 0, 0, 1 };
-        region.extent = { grow_from->img.width, grow_from->img.height, 1 };
-        vkCmdCopyImage(c, grow_from->img.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s->img.handle,
-                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        if (grow_from->img.format == s->img.format) {
+            barrier(c, grow_from->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+            barrier(c, s->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+            VkImageCopy region{};
+            region.srcSubresource = { aspect, 0, 0, 1 };
+            region.dstSubresource = { aspect, 0, 0, 1 };
+            region.extent = { grow_from->img.width, grow_from->img.height, 1 };
+            vkCmdCopyImage(c, grow_from->img.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s->img.handle,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        } else {
+            barrier(c, grow_from->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+            barrier(c, s->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+            VkImageBlit region{};
+            region.srcSubresource = { aspect, 0, 0, 1 };
+            region.srcOffsets[1] = { (int32_t)grow_from->img.width, (int32_t)grow_from->img.height, 1 };
+            region.dstSubresource = { aspect, 0, 0, 1 };
+            region.dstOffsets[1] = { (int32_t)grow_from->img.width, (int32_t)grow_from->img.height, 1 };
+            vkCmdBlitImage(c, grow_from->img.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s->img.handle,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, VK_FILTER_NEAREST);
+        }
         s->state = grow_from->state;
         s->gpu_dirty = grow_from->gpu_dirty;
         retire(grow_from);
@@ -757,6 +780,15 @@ void renderer::download_surface(surface& s)
     if (!slice.ptr) return;
     image* source = s.scale.unit() ? &s.img : native_image(s, s.img);
     if (!source) return;
+    image conv{};
+    const VkFormat native_fmt = color_format(s.gcm_format);
+    if (source->format != native_fmt) {
+        if (!create_image(conv, native_fmt, w, h, VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                          VK_IMAGE_ASPECT_COLOR_BIT))
+            return;
+        scale_blit(c, *source, conv, VK_FILTER_NEAREST);
+        source = &conv;
+    }
     {
         const trace_span span(*this, c, "surface download %ux%u", w, h);
         barrier(c, *source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
@@ -767,6 +799,7 @@ void renderer::download_surface(surface& s)
         vkCmdCopyImageToBuffer(c, source->handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, slice.buffer, 1, &region);
         memory_barrier(c, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
     }
+    if (conv.handle) discard(conv);
     stats.downloads++;
     submit(VK_NULL_HANDLE, 0, VK_NULL_HANDLE);
     const uint64_t value = *m_submitted;
@@ -849,7 +882,7 @@ bool renderer::bind_framebuffer(u32 context)
     const u32 target = r(rsx::M_SURFACE_TARGET);
     const u32 n = target_indexes(target, idx);
 
-    bool zeta_write = depth_test && depth_write;
+    bool zeta_write = (context & FB_CLEAR_DEPTH) != 0 || (depth_test && depth_write);
     if (!zeta_write && stencil_test) zeta_write = stencil_writes(*this, false) || (r(rsx::M_TWO_SIDED_STENCIL) && stencil_writes(*this, true));
 
     bool color_write_any = false;
@@ -961,7 +994,7 @@ bool renderer::bind_framebuffer(u32 context)
     }
     if (zeta_ea) {
         const u32 ea = zeta_ea + zeta_pitch * woy + depth_texel * wox;
-        fb.depth = surface_for(ea, zeta_pitch, width, height, depth_fmt ? depth_fmt : 2u, true, aa_u, aa_v, kept, nkept);
+        fb.depth = surface_for(ea, zeta_pitch, width, height, depth_fmt ? depth_fmt : 2u, true, aa_u, aa_v, kept, nkept, fb.count == 0);
         if (fb.depth) {
             fb.depth_format = fb.depth->img.format;
             fb.scale = fb.depth->scale;
@@ -976,38 +1009,97 @@ bool renderer::bind_framebuffer(u32 context)
     return true;
 }
 
-void renderer::begin_rendering()
+void renderer::begin_rendering(u32 clear_color_mask, const VkClearValue* clear_color,
+                               VkImageAspectFlags clear_ds_mask, const VkClearValue* clear_ds)
 {
     if (m_rendering) return;
     VkCommandBuffer c = cmd();
     VkRenderingAttachmentInfo color[4]{};
+    VkImageMemoryBarrier2 barriers[5]{};
+    u32 nb = 0;
+    auto push_barrier = [&](image& img, VkImageLayout layout, VkPipelineStageFlags2 stage, VkAccessFlags2 access) {
+        if (img.layout == layout && !(img.access & k_writes) && !(access & k_writes)) {
+            img.stage |= stage;
+            img.access |= access;
+            return;
+        }
+        VkImageMemoryBarrier2& b = barriers[nb++];
+        b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+        b.srcStageMask = img.stage ? img.stage : VK_PIPELINE_STAGE_2_NONE;
+        b.srcAccessMask = img.access & k_writes;
+        b.dstStageMask = stage;
+        b.dstAccessMask = access;
+        b.oldLayout = img.layout;
+        b.newLayout = layout;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = img.handle;
+        b.subresourceRange = { img.aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS };
+        img.layout = layout;
+        img.stage = stage;
+        img.access = access;
+    };
     for (u32 k = 0; k < m_fb.count; k++) {
         color[k].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
         surface* s = m_fb.color[k];
         if (!s) continue;
         if (s->state == SURFACE_UNINITIALIZED) load_surface(*s);
-        barrier(c, s->img, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-                VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+        push_barrier(s->img, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                     VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
         color[k].imageView = s->img.view;
         color[k].imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        color[k].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        if (clear_color && ((clear_color_mask >> k) & 1u)) {
+            color[k].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            color[k].clearValue = *clear_color;
+        } else {
+            color[k].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        }
         color[k].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     }
     VkRenderingAttachmentInfo depth{ VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
     VkRenderingAttachmentInfo stencil{ VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
+    const u32 ra_w = m_fb.scale.edge(m_fb.width * m_fb.aa_u);
+    const u32 ra_h = m_fb.scale.edge(m_fb.height * m_fb.aa_v);
     if (surface* s = m_fb.depth) {
-        if (s->state == SURFACE_UNINITIALIZED) load_surface(*s);
-        barrier(c, s->img, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-                VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
-                VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+        const bool full_depth_init = s->state == SURFACE_UNINITIALIZED && ra_w == s->img.width && ra_h == s->img.height;
+        if (s->state == SURFACE_UNINITIALIZED && !full_depth_init) load_surface(*s);
+        if (full_depth_init) s->state = SURFACE_VALID;
+        push_barrier(s->img, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                     VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                     VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
         depth.imageView = s->img.view;
         depth.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-        depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        if (clear_ds && (clear_ds_mask & VK_IMAGE_ASPECT_DEPTH_BIT)) {
+            depth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            depth.clearValue = *clear_ds;
+        } else if (full_depth_init) {
+            depth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            depth.clearValue.depthStencil = { 1.0f, 0u };
+        } else {
+            depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        }
         depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        if (s->img.aspect & VK_IMAGE_ASPECT_STENCIL_BIT) stencil = depth;
+        if (s->img.aspect & VK_IMAGE_ASPECT_STENCIL_BIT) {
+            stencil = depth;
+            if (clear_ds && (clear_ds_mask & VK_IMAGE_ASPECT_STENCIL_BIT)) {
+                stencil.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+                stencil.clearValue = *clear_ds;
+            } else if (full_depth_init) {
+                stencil.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+                stencil.clearValue.depthStencil = { 1.0f, 0u };
+            } else {
+                stencil.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+            }
+        }
+    }
+    if (nb) {
+        VkDependencyInfo di{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+        di.imageMemoryBarrierCount = nb;
+        di.pImageMemoryBarriers = barriers;
+        vkCmdPipelineBarrier2(c, &di);
     }
     VkRenderingInfo ri{ VK_STRUCTURE_TYPE_RENDERING_INFO };
-    ri.renderArea = { { 0, 0 }, { m_fb.scale.edge(m_fb.width * m_fb.aa_u), m_fb.scale.edge(m_fb.height * m_fb.aa_v) } };
+    ri.renderArea = { { 0, 0 }, { ra_w, ra_h } };
     ri.layerCount = 1;
     ri.colorAttachmentCount = m_fb.count;
     ri.pColorAttachments = color;
@@ -1084,6 +1176,27 @@ void renderer::on_clear(u32 mask)
         if (d.aspectMask) count++;
     }
     if (!count) return;
+    if (!m_rendering && full && (!color_mask || full_color)) {
+        u32 cmask = 0;
+        VkClearValue cval{};
+        VkImageAspectFlags dmask = 0;
+        VkClearValue dval{};
+        for (u32 i = 0; i < count; i++) {
+            if (att[i].aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) {
+                cmask |= 1u << att[i].colorAttachment;
+                cval = att[i].clearValue;
+            } else {
+                dmask |= att[i].aspectMask;
+                dval = att[i].clearValue;
+            }
+        }
+        if (cmask || dmask) {
+            begin_rendering(cmask, cmask ? &cval : nullptr, dmask, dmask ? &dval : nullptr);
+            stats.clears++;
+            m_draw_counter++;
+            return;
+        }
+    }
     begin_rendering();
     const ratio& sc = m_fb.scale;
     const u32 rx = sc.edge(x0 * m_fb.aa_u), ry = sc.edge(y0 * m_fb.aa_v);
@@ -1126,6 +1239,15 @@ void renderer::trace_draw(u32 id, u32 prim, u32 count, bool indexed) const
                  r(rsx::M_STENCIL_TEST_ENABLE), r(rsx::M_COLOR_MASK), r(rsx::M_BLEND_ENABLE), r(rsx::M_ALPHA_TEST_ENABLE), r(rsx::M_ALPHA_FUNC),
                  r(rsx::M_ALPHA_REF), r(rsx::M_CULL_FACE_ENABLE), r(rsx::M_CULL_FACE), (unsigned long long)(m_vp ? m_vp->hash : 0),
                  (unsigned long long)(m_fp ? m_fp->hash : 0));
+    if (r(rsx::M_STENCIL_TEST_ENABLE)) {
+        std::fprintf(m_trace,
+                     "[trace] %u   stencil mask %02X func %X ref %02X cmp %02X ops %X/%X/%X | 2side %u back mask %02X func %X ref %02X cmp %02X ops %X/%X/%X | zsclear %08X\n",
+                     id, r(rsx::M_STENCIL_MASK) & 0xFFu, r(rsx::M_STENCIL_MASK + 4u), r(rsx::M_STENCIL_MASK + 8u) & 0xFFu,
+                     r(rsx::M_STENCIL_MASK + 12u) & 0xFFu, r(rsx::M_STENCIL_FAIL), r(rsx::M_STENCIL_FAIL + 4u), r(rsx::M_STENCIL_FAIL + 8u),
+                     r(rsx::M_TWO_SIDED_STENCIL), r(rsx::M_BACK_STENCIL_MASK) & 0xFFu, r(rsx::M_BACK_STENCIL_MASK + 4u),
+                     r(rsx::M_BACK_STENCIL_MASK + 8u) & 0xFFu, r(rsx::M_BACK_STENCIL_MASK + 12u) & 0xFFu, r(rsx::M_BACK_STENCIL_FAIL),
+                     r(rsx::M_BACK_STENCIL_FAIL + 4u), r(rsx::M_BACK_STENCIL_ZPASS), r(rsx::M_ZSTENCIL_CLEAR_VALUE));
+    }
     for (u32 k = 0; k < rsx::ATTRIBS; k++) {
         const u32 fmt = r(rsx::M_VERTEX_ARRAY_FORMAT + k * 4u), off = r(rsx::M_VERTEX_ARRAY_OFFSET + k * 4u);
         if (!((fmt >> 4) & 0xFu)) continue;
@@ -1449,11 +1571,13 @@ void renderer::rescale(ratio scale)
     m_binding_gen++;
     m_fb_dirty = true;
     m_dyn_dirty = ~0u;
+    m_fp_tex_valid = false;
+    dirty |= rsx::D_TEXTURES;
     VkCommandBuffer c = cmd();
     end_rendering();
     for (auto& p : m_surfaces) {
         surface& s = *p;
-        const ratio to = scale_for(s.width, s.height, s.depth);
+        const ratio to = scale_for(s.width, s.height, s.depth, s.depth_only);
         if (to == s.scale) continue;
         image img{};
         if (!create_image(img, s.img.format, to.edge(s.width * s.aa_u), to.edge(s.height * s.aa_v), surface_usage(s.depth), s.img.aspect)) {

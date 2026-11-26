@@ -219,6 +219,15 @@ bool vk_device_create(vk_device& d, VkSurfaceKHR surface)
     if (d.dynamic_state3 && !d.caps.dynamic_state3) d.caps.dynamic_state3 = d.dynamic_state3->extendedDynamicState3PolygonMode != VK_FALSE;
     d.caps.buffer_address = f12->bufferDeviceAddress != VK_FALSE;
     d.caps.mirror_clamp_to_edge = f12->samplerMirrorClampToEdge != VK_FALSE;
+    {
+        VkFormatProperties fp{};
+        vkGetPhysicalDeviceFormatProperties(d.gpu, VK_FORMAT_R16G16B16A16_UNORM, &fp);
+        constexpr VkFormatFeatureFlags need = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT |
+                                              VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+                                              VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT |
+                                              VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+        d.caps.rgba16_unorm = (fp.optimalTilingFeatures & need) == need;
+    }
     if (d.caps.custom_border_color) {
         VkPhysicalDeviceCustomBorderColorPropertiesEXT cb{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_PROPERTIES_EXT };
         VkPhysicalDeviceProperties2 p2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &cb };
@@ -254,9 +263,9 @@ bool vk_device_create(vk_device& d, VkSurfaceKHR surface)
     if (d.caps.maintenance5) ai.flags |= VMA_ALLOCATOR_CREATE_KHR_MAINTENANCE5_BIT;
     VK_TRY(vmaCreateAllocator(&ai, &d.vma));
 
-    std::fprintf(stderr, "[vk] %s, Vulkan %u.%u.%u: push descriptors %d, dynamic state 3 %d, pipeline library %d, custom border %d (%u), fifo latest ready %d\n",
+    std::fprintf(stderr, "[vk] %s, Vulkan %u.%u.%u: push descriptors %d, dynamic state 3 %d, pipeline library %d, custom border %d (%u), fifo latest ready %d, rgba16_unorm %d\n",
                  d.props.deviceName, VK_API_VERSION_MAJOR(d.props.apiVersion), VK_API_VERSION_MINOR(d.props.apiVersion),
                  VK_API_VERSION_PATCH(d.props.apiVersion), d.caps.push_descriptor, d.caps.dynamic_state3, d.caps.pipeline_library,
-                 d.caps.custom_border_color, d.caps.max_custom_border_samplers, d.caps.fifo_latest_ready);
+                 d.caps.custom_border_color, d.caps.max_custom_border_samplers, d.caps.fifo_latest_ready, d.caps.rgba16_unorm);
     return true;
 }
