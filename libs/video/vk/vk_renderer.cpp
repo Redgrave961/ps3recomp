@@ -735,8 +735,9 @@ void renderer::load_surface(surface& s)
             }
             image native{};
             image* target = &s.img;
-            if (!s.scale.unit()) {
-                if (!create_image(native, s.img.format, w, h, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT))
+            const VkFormat native_fmt = color_format(s.gcm_format);
+            if (!s.scale.unit() || s.img.format != native_fmt) {
+                if (!create_image(native, native_fmt, w, h, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT))
                     return;
                 target = &native;
             }
@@ -747,7 +748,7 @@ void renderer::load_surface(surface& s)
             region.imageExtent = { w, h, 1 };
             vkCmdCopyBufferToImage(c, slice.buffer, target->handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
             if (target == &native) {
-                scale_blit(c, native, s.img, VK_FILTER_LINEAR);
+                scale_blit(c, native, s.img, s.scale.unit() ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
                 discard(native);
             }
             s.state = SURFACE_VALID;

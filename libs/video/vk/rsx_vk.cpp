@@ -229,7 +229,8 @@ bool format_supports_present(VkFormat f)
     vkGetPhysicalDeviceFormatProperties(g.d.gpu, f, &fp);
     constexpr VkFormatFeatureFlags need = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT |
                                           VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT |
-                                          VK_FORMAT_FEATURE_BLIT_DST_BIT;
+                                          VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT |
+                                          VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
     return (fp.optimalTilingFeatures & need) == need;
 }
 
@@ -323,7 +324,16 @@ bool swapchain_build()
     g.sc.handle = VK_NULL_HANDLE;
     g.sc.extent = { 0, 0 };
     VkSwapchainKHR made;
-    VK_TRY(vkCreateSwapchainKHR(g.d.dev, &ci, nullptr, &made));
+    VkResult sc_res = vkCreateSwapchainKHR(g.d.dev, &ci, nullptr, &made);
+    if (sc_res != VK_SUCCESS && (g.sc.format.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ||
+                                 g.sc.format.format == VK_FORMAT_A2R10G10B10_UNORM_PACK32)) {
+        g.sc.format = { VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR };
+        ci.imageFormat = g.sc.format.format;
+        ci.imageColorSpace = g.sc.format.colorSpace;
+        std::fprintf(stderr, "[vk] 10-bit swapchain rejected (%d), falling back to 8-bit sRGB\n", (int)sc_res);
+        sc_res = vkCreateSwapchainKHR(g.d.dev, &ci, nullptr, &made);
+    }
+    VK_TRY(sc_res);
     g.sc.handle = made;
     g.sc.extent = extent;
     uint32_t n = 0;

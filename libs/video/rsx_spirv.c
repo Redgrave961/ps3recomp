@@ -958,8 +958,9 @@ static u32 vp_fetch_body(vpc* c, u32 k)
         u32 fm, ft;
         sel_if(s, I(s, OpINotEqual, tbool(s), freq, cu(s, 0)), &fm, &ft);
         u32 mm = newl(s), lm = newl(s), ld_ = newl(s);
+        u32 is_mod = bitset(s, fmt, 8);
         V(s, OpSelectionMerge, mm, 0);
-        V(s, OpBranchConditional, bitset(s, fmt, 8), lm, ld_);
+        V(s, OpBranchConditional, is_mod, lm, ld_);
         label(s, lm);
         st(s, idxv, I(s, OpUMod, t, I(s, OpIAdd, t, bc(s, t, vid), ib), freq));
         V(s, OpBranch, mm);
