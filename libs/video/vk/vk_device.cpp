@@ -47,10 +47,6 @@ const ext_entry k_extensions[] = {
       sizeof(VkPhysicalDeviceShaderFloat8FeaturesEXT), nullptr },
     { VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR,
       sizeof(VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR), nullptr },
-    { VK_NV_COOPERATIVE_MATRIX_2_EXTENSION_NAME, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_2_FEATURES_NV,
-      sizeof(VkPhysicalDeviceCooperativeMatrix2FeaturesNV), nullptr },
-    { VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT,
-      sizeof(VkPhysicalDeviceDescriptorBufferFeaturesEXT), &vk_caps::descriptor_buffer },
 };
 
 VKAPI_ATTR VkBool32 VKAPI_CALL vk_message(VkDebugUtilsMessageSeverityFlagBitsEXT, VkDebugUtilsMessageTypeFlagsEXT,
@@ -201,7 +197,7 @@ bool vk_device_create(vk_device& d, VkSurfaceKHR surface)
     const std::vector<VkExtensionProperties> available = device_extensions(d.gpu);
     std::vector<const char*> enable{ VK_KHR_SWAPCHAIN_EXTENSION_NAME };
     d.features = VkPhysicalDeviceFeatures2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
-    std::vector<std::pair<bool vk_caps::*, void*>> gated;
+    std::vector<std::pair<bool vk_caps::*, const void*>> gated;
     for (const ext_entry& e : k_extensions) {
         if (!has_extension(available, e.name)) continue;
         if (!std::strcmp(e.name, VK_EXT_PRESENT_MODE_FIFO_LATEST_READY_EXTENSION_NAME) &&
@@ -235,8 +231,6 @@ bool vk_device_create(vk_device& d, VkSurfaceKHR surface)
         if (cap == &vk_caps::custom_border_color) {
             const auto* cb = static_cast<const VkPhysicalDeviceCustomBorderColorFeaturesEXT*>(s);
             d.caps.custom_border_without_format = cb->customBorderColorWithoutFormat != VK_FALSE;
-        } else if (cap == &vk_caps::descriptor_buffer) {
-            static_cast<VkPhysicalDeviceDescriptorBufferFeaturesEXT*>(s)->descriptorBufferCaptureReplay = VK_FALSE;
         }
     }
     if (d.dynamic_state3 && !d.caps.dynamic_state3) d.caps.dynamic_state3 = d.dynamic_state3->extendedDynamicState3PolygonMode != VK_FALSE;

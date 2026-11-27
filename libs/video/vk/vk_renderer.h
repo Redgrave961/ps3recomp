@@ -211,6 +211,13 @@ private:
     bool m_upscaled_this_frame = false;
     bool m_last_frame_upscaled = false;
     bool m_upscale_resync = false;
+    enum upscale_result { UP_OK, UP_SKIPPED, UP_BACKOFF, UP_NO_SCENE, UP_VELOCITY, UP_INVALID, UP_DEPTH_SIZE, UP_DISPATCH, UP_COUNT };
+    u32 m_up_count[UP_COUNT]{};
+    u32 m_up_frames = 0;
+    u32 m_up_backoff = 0;
+    u32 m_up_in[2]{};
+    u32 m_up_out[2]{};
+    bool upscale_failed(upscale_result r);
     bool rendering_reduced() const { return m_last_frame_upscaled && !m_upscaled_this_frame; }
     surface* m_scene_color = nullptr;
     surface* m_scene_depth = nullptr;

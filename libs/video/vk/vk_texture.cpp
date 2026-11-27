@@ -181,12 +181,8 @@ VkSampler renderer::sampler_for(const VkSamplerCreateInfo& info, const VkSampler
     } else if (ci.anisotropyEnable) {
         ci.maxAnisotropy = std::clamp(ci.maxAnisotropy, 1.f, std::max(m_d->props.limits.maxSamplerAnisotropy, 1.f));
     }
-    if (allow_lod_bias && rendering_reduced() && ci.maxLod > 0.f) {
-        const float rw = (float)resolution_scale.x.edge(1280u);
-        const float dw = (float)display_scale.x.edge(1280u);
-        if (rw > 0.f && dw > rw)
-            ci.mipLodBias += std::log2(rw / dw);
-    }
+    if (allow_lod_bias && rendering_reduced() && ci.maxLod > 0.f)
+        ci.mipLodBias += std::log2((float)resolution_scale.x.edge(1280u) / (float)display_scale.x.edge(1280u)) - 1.f;
     const float max_bias = m_d->props.limits.maxSamplerLodBias;
     ci.mipLodBias = std::clamp(std::floor(ci.mipLodBias * 16.f + 0.5f) * 0.0625f, -max_bias, max_bias);
     if (ci.mipLodBias == 0.f) ci.mipLodBias = 0.f;

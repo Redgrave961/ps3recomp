@@ -1617,6 +1617,19 @@ void renderer::flip_reset()
         if (m_trace_pool) vkResetQueryPool(m_d->dev, m_trace_pool, 0, k_trace_queries + k_trace_points);
     }
     frontend::reset();
+    if (upscale_mode != RSX_VK_UPSCALE_OFF && ++m_up_frames == 300u) {
+        u32 calls = 0;
+        for (u32 n : m_up_count) calls += n;
+        std::fprintf(stderr,
+                     "[vk] upscale %u frames: upscaled %u, full-res %u, backoff %u, no request %u, failed: no scene %u, velocity %u, "
+                     "invalid %u, depth size %u, dispatch %u | last %ux%u -> %ux%u\n",
+                     m_up_frames, m_up_count[UP_OK], m_up_count[UP_SKIPPED], m_up_count[UP_BACKOFF], m_up_frames - std::min(calls, m_up_frames),
+                     m_up_count[UP_NO_SCENE], m_up_count[UP_VELOCITY], m_up_count[UP_INVALID], m_up_count[UP_DEPTH_SIZE],
+                     m_up_count[UP_DISPATCH], m_up_in[0], m_up_in[1], m_up_out[0], m_up_out[1]);
+        m_up_frames = 0;
+        std::memset(m_up_count, 0, sizeof m_up_count);
+    }
+    if (m_up_backoff) m_up_backoff--;
     m_last_frame_upscaled = m_upscaled_this_frame;
     m_upscaled_this_frame = false;
     m_scene_color = nullptr;
@@ -1636,20 +1649,32 @@ void renderer::flip_reset()
     if ((m_flips & 63u) == 0) evict(64);
 }
 
+bool renderer::upscale_failed(upscale_result r)
+{
+    m_up_count[r]++;
+    if (rendering_reduced()) m_up_backoff = 120;
+    return false;
+}
+
 bool renderer::run_upscale(const rsx_vk_upscale_frame& frame)
 {
     if (upscale_mode == RSX_VK_UPSCALE_OFF || m_upscaled_this_frame) return false;
-    if (!m_scene_color || !m_scene_depth || m_scene_color == m_scene_velocity) return false;
-    if (m_scene_color->state != SURFACE_VALID || m_scene_depth->state != SURFACE_VALID) return false;
-    if (!m_scene_color->img.handle || !m_scene_depth->img.handle) return false;
-    if (m_scene_color->img.width != m_scene_depth->img.width || m_scene_color->img.height != m_scene_depth->img.height) return false;
+    if (!m_scene_color || !m_scene_depth) return upscale_failed(UP_NO_SCENE);
+    if (m_scene_color == m_scene_velocity) return upscale_failed(UP_VELOCITY);
+    if (m_scene_color->state != SURFACE_VALID || m_scene_depth->state != SURFACE_VALID || !m_scene_color->img.handle ||
+        !m_scene_depth->img.handle)
+        return upscale_failed(UP_INVALID);
+    if (m_scene_depth->img.width < m_scene_color->img.width || m_scene_depth->img.height < m_scene_color->img.height)
+        return upscale_failed(UP_DEPTH_SIZE);
 
     const bool wide = (m_scene_color->width * m_scene_color->aa_u) * 10u >= (m_scene_color->height * m_scene_color->aa_v) * 15u;
     const scale2d dst_scale = display_scale.unit() ? scale2d{} : (wide ? display_scale : scale2d{ display_scale.y, display_scale.y });
     const u32 out_w = dst_scale.x.edge(m_scene_color->width * m_scene_color->aa_u);
     const u32 out_h = dst_scale.y.edge(m_scene_color->height * m_scene_color->aa_v);
-    if (!out_w || !out_h) return false;
+    if (!out_w || !out_h) return upscale_failed(UP_INVALID);
     if (m_scene_color->scale == dst_scale && resolution_scale != display_scale) {
+        if (m_up_backoff) return upscale_failed(UP_BACKOFF);
+        m_up_count[UP_SKIPPED]++;
         m_upscaled_this_frame = true;
         m_upscale_resync = true;
         return true;
@@ -1713,16 +1738,17 @@ bool renderer::run_upscale(const rsx_vk_upscale_frame& frame)
 
     invalidate_graphics_state();
     if (!ok) {
-        static bool logged_fail = false;
-        if (!logged_fail) {
-            logged_fail = true;
-            std::fprintf(stderr, "[vk] upscale dispatch failed: mode=%d in=%ux%u(fmt=%d) depth=%ux%u(fmt=%d) out=%ux%u(fmt=%d)\n",
-                         upscale_mode, color_in->width, color_in->height, (int)color_in->format,
-                         m_scene_depth->img.width, m_scene_depth->img.height, (int)m_scene_depth->img.format,
-                         out_w, out_h, (int)m_upscale_out.format);
-        }
-        return false;
+        std::fprintf(stderr, "[vk] upscale dispatch failed: mode=%d in=%ux%u(fmt=%d) depth=%ux%u(fmt=%d) out=%ux%u(fmt=%d)\n",
+                     upscale_mode, color_in->width, color_in->height, (int)color_in->format,
+                     m_scene_depth->img.width, m_scene_depth->img.height, (int)m_scene_depth->img.format,
+                     out_w, out_h, (int)m_upscale_out.format);
+        return upscale_failed(UP_DISPATCH);
     }
+    m_up_count[UP_OK]++;
+    m_up_in[0] = color_in->width;
+    m_up_in[1] = color_in->height;
+    m_up_out[0] = out_w;
+    m_up_out[1] = out_h;
 
     m_upscale_out.layout = VK_IMAGE_LAYOUT_GENERAL;
     m_upscale_out.stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
@@ -1737,16 +1763,6 @@ bool renderer::run_upscale(const rsx_vk_upscale_frame& frame)
         scale_blit(c, m_upscale_out, dst_img, VK_FILTER_NEAREST);
         discard(m_scene_color->img);
         m_scene_color->img = std::move(dst_img);
-    }
-
-    static int logged_mode = 0;
-    static u32 logged_rw = 0, logged_dw = 0;
-    if (logged_mode != upscale_mode || logged_rw != color_in->width || logged_dw != out_w) {
-        logged_mode = upscale_mode;
-        logged_rw = color_in->width;
-        logged_dw = out_w;
-        std::fprintf(stderr, "[vk] upscale active: mode=%d %ux%u -> %ux%u (vel=%d)\n",
-                     upscale_mode, color_in->width, color_in->height, out_w, out_h, vel_view != m_dummy[0].view ? 1 : 0);
     }
 
     discard(m_scene_color->snapshot);

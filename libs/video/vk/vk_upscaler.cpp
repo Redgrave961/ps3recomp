@@ -33,7 +33,6 @@ namespace fs = std::filesystem;
 constexpr const char* k_ffx_module = "amd_fidelityfx_loader_vk.dll";
 constexpr const char* k_dlss_module = "nvngx_dlss.dll";
 constexpr const char* k_ngx_init = "NVSDK_NGX_VULKAN_Init_with_ProjectID";
-constexpr bool k_ffx_needs_descriptor_buffer = false;
 using ngx_init_fn = decltype(&NVSDK_NGX_VULKAN_Init_with_ProjectID);
 
 void* lib_open(const fs::path& p) { return LoadLibraryExW(p.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH); }
@@ -50,7 +49,6 @@ fs::path exe_dir()
 constexpr const char* k_ffx_module = "amd_fidelityfx_upscaler_vk.so";
 constexpr const char* k_dlss_module = "libnvidia-ngx-dlss.so";
 constexpr const char* k_ngx_init = "NVSDK_NGX_VULKAN_Init_ProjectID_Ext";
-constexpr bool k_ffx_needs_descriptor_buffer = true;
 using ngx_init_fn = NVSDK_NGX_Result (*)(const char*, NVSDK_NGX_EngineType, const char*, const wchar_t*, VkInstance, VkPhysicalDevice,
                                          VkDevice, PFN_vkGetInstanceProcAddr, PFN_vkGetDeviceProcAddr, NVSDK_NGX_Version,
                                          const NVSDK_NGX_FeatureCommonInfo*);
@@ -356,32 +354,6 @@ bool upscaler::ensure_mv_image(uint32_t width, uint32_t height)
     return true;
 }
 
-bool upscaler::ensure_exposure(VkCommandBuffer cmd)
-{
-    if (m_exposure_img) return true;
-    VkImageCreateInfo ii{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
-    ii.imageType = VK_IMAGE_TYPE_2D;
-    ii.format = VK_FORMAT_R32_SFLOAT;
-    ii.extent = { 1, 1, 1 };
-    ii.mipLevels = 1;
-    ii.arrayLayers = 1;
-    ii.samples = VK_SAMPLE_COUNT_1_BIT;
-    ii.tiling = VK_IMAGE_TILING_OPTIMAL;
-    ii.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    VmaAllocationCreateInfo ai{};
-    ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
-    if (vmaCreateImage(m_d->vma, &ii, &ai, &m_exposure_img, &m_exposure_mem, nullptr) != VK_SUCCESS) return false;
-    transition_image(cmd, m_exposure_img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                     VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
-    const VkClearColorValue one{ { 1.f, 1.f, 1.f, 1.f } };
-    const VkImageSubresourceRange range{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-    vkCmdClearColorImage(cmd, m_exposure_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &one, 1, &range);
-    transition_image(cmd, m_exposure_img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
-                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
-    return true;
-}
-
 void upscaler::destroy_mv_image()
 {
     if (!m_d) return;
@@ -396,7 +368,6 @@ void upscaler::destroy_mv_image()
 
 bool upscaler::init_ffx()
 {
-    if (k_ffx_needs_descriptor_buffer && !m_d->caps.descriptor_buffer) return false;
     void* mod = open_bundled(k_ffx_module);
     if (!mod) return false;
     VkDeviceContext dev_ctx{ m_d->dev, m_d->gpu, vkGetDeviceProcAddr };
@@ -464,7 +435,11 @@ bool upscaler::ensure_ffx_context(uint32_t render_w, uint32_t render_h, uint32_t
         desc.header.pNext = &backend.header;
         rc = g_ffx.create(&ctx, &desc.header, nullptr);
     }
-    if (rc != FFX_API_RETURN_OK || !ctx) return false;
+    if (rc != FFX_API_RETURN_OK || !ctx) {
+        std::fprintf(stderr, "[vk] FSR context creation failed: code %d, render %ux%u, output %ux%u\n", (int)rc, render_w, render_h,
+                     display_w, display_h);
+        return false;
+    }
     m_ffx_ctx = ctx;
     m_ffx_rw = render_w;
     m_ffx_rh = render_h;
@@ -587,9 +562,6 @@ void upscaler::destroy()
     release_ffx();
     release_ngx();
     destroy_mv_image();
-    if (m_exposure_img) vmaDestroyImage(m_d->vma, m_exposure_img, m_exposure_mem);
-    m_exposure_img = VK_NULL_HANDLE;
-    m_exposure_mem = nullptr;
     if (m_mv_pipe) vkDestroyPipeline(m_d->dev, m_mv_pipe, nullptr);
     if (m_mv_layout) vkDestroyPipelineLayout(m_d->dev, m_mv_layout, nullptr);
     if (m_mv_set) vkDestroyDescriptorSetLayout(m_d->dev, m_mv_set, nullptr);
@@ -598,12 +570,13 @@ void upscaler::destroy()
     m_mv_layout = VK_NULL_HANDLE;
     m_mv_set = VK_NULL_HANDLE;
     m_sampler = VK_NULL_HANDLE;
+    m_dropped = 0;
     m_d = nullptr;
 }
 
 int upscaler::caps() const
 {
-    return (m_ffx_mod ? RSX_VK_UPSCALE_CAP_FSR : 0) | (m_ngx_mod ? RSX_VK_UPSCALE_CAP_DLSS : 0);
+    return ((m_ffx_mod ? RSX_VK_UPSCALE_CAP_FSR : 0) | (m_ngx_mod ? RSX_VK_UPSCALE_CAP_DLSS : 0)) & ~m_dropped;
 }
 
 void upscaler::render_size(uint32_t display_w, uint32_t display_h, int mode, uint32_t& out_w, uint32_t& out_h) const
@@ -671,10 +644,13 @@ bool upscaler::dispatch(VkCommandBuffer cmd, int mode,
                         uint32_t render_w, uint32_t render_h, uint32_t display_w, uint32_t display_h,
                         const rsx_vk_upscale_frame& frame)
 {
+    if (m_dropped & RSX_VK_UPSCALE_CAP_FSR) release_ffx();
+    if (m_dropped & RSX_VK_UPSCALE_CAP_DLSS) release_ngx();
+    m_dropped = 0;
     const bool fsr = is_fsr_mode(mode) && m_ffx_mod;
     const bool dlss = is_dlss_mode(mode) && m_ngx_mod;
     if (!m_mv_pipe || !(fsr || dlss) || !ensure_mv_image(render_w, render_h)) return false;
-    if (fsr ? !ensure_ffx_context(render_w, render_h, display_w, display_h) || !ensure_exposure(cmd)
+    if (fsr ? !ensure_ffx_context(render_w, render_h, display_w, display_h)
             : !ensure_ngx_feature(cmd, mode, render_w, render_h, display_w, display_h)) {
         std::fprintf(stderr, "[vk] %s unavailable on this device, disabling it\n", fsr ? "FSR" : "DLSS");
         if (fsr) release_ffx();
@@ -747,7 +723,6 @@ bool upscaler::dispatch(VkCommandBuffer cmd, int mode,
         dd.depth = make_res(depth_img, depth_fmt, render_w, render_h, depth_usage, FFX_API_RESOURCE_STATE_COMPUTE_READ);
         dd.motionVectors = make_res(m_mv_img, VK_FORMAT_R16G16_SFLOAT, render_w, render_h, FFX_API_RESOURCE_USAGE_READ_ONLY, FFX_API_RESOURCE_STATE_COMPUTE_READ);
         dd.output = make_res(out_img, out_fmt, display_w, display_h, FFX_API_RESOURCE_USAGE_UAV, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
-        dd.exposure = make_res(m_exposure_img, VK_FORMAT_R32_SFLOAT, 1, 1, FFX_API_RESOURCE_USAGE_READ_ONLY, FFX_API_RESOURCE_STATE_COMPUTE_READ);
         dd.jitterOffset = { frame.jitter_x, frame.jitter_y };
         dd.motionVectorScale = { 1.f, 1.f };
         dd.renderSize = { render_w, render_h };
@@ -763,7 +738,10 @@ bool upscaler::dispatch(VkCommandBuffer cmd, int mode,
         dd.viewSpaceToMetersFactor = 0.02f;
         dd.flags = FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_SRGB;
         ffxContext ctx = m_ffx_ctx;
-        return g_ffx.dispatch(&ctx, &dd.header) == FFX_API_RETURN_OK;
+        if (g_ffx.dispatch(&ctx, &dd.header) == FFX_API_RETURN_OK) return true;
+        std::fprintf(stderr, "[vk] FSR dispatch rejected, disabling it\n");
+        m_dropped |= RSX_VK_UPSCALE_CAP_FSR;
+        return false;
     }
 
     const VkImageSubresourceRange color_sr{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
@@ -786,7 +764,10 @@ bool upscaler::dispatch(VkCommandBuffer cmd, int mode,
     g_ngx.set_ui(p, NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, render_h);
     g_ngx.set_f(p, NVSDK_NGX_Parameter_DLSS_Pre_Exposure, 1.f);
     g_ngx.set_f(p, NVSDK_NGX_Parameter_FrameTimeDeltaInMsec, std::max(frame.dt_ms, 0.1f));
-    return NVSDK_NGX_SUCCEED(g_ngx.eval(cmd, static_cast<NVSDK_NGX_Handle*>(m_ngx_handle), p, nullptr));
+    if (NVSDK_NGX_SUCCEED(g_ngx.eval(cmd, static_cast<NVSDK_NGX_Handle*>(m_ngx_handle), p, nullptr))) return true;
+    std::fprintf(stderr, "[vk] DLSS evaluate rejected, disabling it\n");
+    m_dropped |= RSX_VK_UPSCALE_CAP_DLSS;
+    return false;
 }
 
 }

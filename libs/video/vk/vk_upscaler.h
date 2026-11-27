@@ -26,7 +26,6 @@ public:
 private:
     bool init_mv_pipeline(VkPipelineCache cache);
     bool ensure_mv_image(uint32_t width, uint32_t height);
-    bool ensure_exposure(VkCommandBuffer cmd);
     void destroy_mv_image();
     bool init_ffx();
     void destroy_ffx_context();
@@ -47,8 +46,6 @@ private:
     VkImageView m_mv_view = VK_NULL_HANDLE;
     uint32_t m_mv_w = 0;
     uint32_t m_mv_h = 0;
-    VkImage m_exposure_img = VK_NULL_HANDLE;
-    VmaAllocation m_exposure_mem = nullptr;
 
     void* m_ffx_mod = nullptr;
     void* m_ffx_ctx = nullptr;
@@ -60,6 +57,7 @@ private:
     void* m_ngx_handle = nullptr;
     int m_ngx_mode = 0;
     uint32_t m_ngx_rw = 0, m_ngx_rh = 0, m_ngx_dw = 0, m_ngx_dh = 0;
+    int m_dropped = 0;
 };
 
 }
