@@ -335,7 +335,7 @@ PS3_AES_TARGET static int64_t load_block(npdrm_file* d, uint32_t b)
 
 PS3_AES_TARGET static int try_rif_key(npdrm_file* d, const uint8_t key[16])
 {
-    memcpy(d->key, key, 16);
+    if (d->key != key) memcpy(d->key, key, 16);
     ps3_aes128_init(&d->ek_main, d->key);
     d->cached = -1;
     return !d->blocks || load_block(d, 0) >= 0;

@@ -31,18 +31,16 @@ static inline int spu_line_differs_128(const uint8_t* a, const uint8_t* b);
 extern "C" {
 #endif
 
-#define SPU_DECREMENTER_HZ  79800000ull
-
 static uint64_t spu_host_ns(void)
 {
 #ifdef _WIN32
     static LARGE_INTEGER s_freq;
     LARGE_INTEGER c;
-    if (!s_freq.QuadPart) QueryPerformanceFrequency(&s_freq);
+    if (__builtin_expect(!s_freq.QuadPart, 0)) QueryPerformanceFrequency(&s_freq);
     QueryPerformanceCounter(&c);
-    return (uint64_t)(c.QuadPart / s_freq.QuadPart) * 1000000000ull
-         + (uint64_t)(c.QuadPart % s_freq.QuadPart) * 1000000000ull
-           / (uint64_t)s_freq.QuadPart;
+    if (__builtin_expect(s_freq.QuadPart == 10000000LL, 1))
+        return (uint64_t)c.QuadPart * 100ull;
+    return (uint64_t)(((unsigned __int128)(uint64_t)c.QuadPart * 1000000000ull) / (uint64_t)s_freq.QuadPart);
 #elif defined(__APPLE__)
     return clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
 #else
@@ -55,8 +53,6 @@ static uint64_t spu_host_ns(void)
 static __thread jmp_buf s_spu_halt_env;
 static __thread int     s_spu_halt_armed = 0;
 
-#define SPUCHECK_ABNORMAL(ctx) ((void)0)
-
 void spu_jmp_no_unwind(void* env)
 {
 #if defined(_WIN64)
@@ -68,7 +64,6 @@ void spu_jmp_no_unwind(void* env)
 
 void spu_restart_dispatch(spu_context* ctx)
 {
-    SPUCHECK_ABNORMAL(ctx);
     g_spu_trampoline_fn = 0;
     if (s_spu_halt_armed) SPU_LONGJMP(s_spu_halt_env, 2);
     fprintf(stderr, "[spu] non-local return outside execution driver at 0x%05X\n", ctx->pc);
@@ -84,7 +79,6 @@ void (*g_rsx_window_write)(void) = 0;
 
 void spu_halt(spu_context* ctx)
 {
-    SPUCHECK_ABNORMAL(ctx);
     { static int _n = 0;
       if (_n < 6 && ctx->status == SPU_STATUS_STOPPED_BY_HALT) { _n++;
         fprintf(stderr, "[spu-halt] img=%d pc=0x%05X regs:", ctx->image_id,
@@ -109,7 +103,6 @@ void spu_stop_exit_check(spu_context* ctx)
 
 void spu_stop(spu_context* ctx)
 {
-    SPUCHECK_ABNORMAL(ctx);
     ctx->status = SPU_STATUS_STOPPED_BY_STOP;
     spu_stop_exit_check(ctx);
 }
@@ -171,7 +164,7 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
     if (outer_armed) memcpy(outer_env, s_spu_halt_env, sizeof(jmp_buf));
     s_spu_halt_armed = 1;
     g_spu_trampoline_fn = 0;
-    yz_lockstep_register(ctx);
+    if (__builtin_expect(g_yz_lockstep_on != 0, 0)) yz_lockstep_register(ctx);
     switch (SPU_SETJMP(s_spu_halt_env)) {
     case 1:
         halted = 1;
@@ -190,7 +183,7 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
         entry(ctx);
         SPU_DRAIN(ctx);
     }
-    yz_lockstep_unregister(ctx);
+    if (__builtin_expect(g_yz_lockstep_on != 0, 0)) yz_lockstep_unregister(ctx);
     s_spu_halt_armed = outer_armed;
     if (outer_armed) memcpy(s_spu_halt_env, outer_env, sizeof(jmp_buf));
     spu_float_mode_leave(fpcr_outer);
@@ -320,7 +313,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
 
     switch (cmd) {
     case MFC_GETLLAR_CMD:
-        yz_lockstep_tick(ctx);
+        if (__builtin_expect(g_yz_lockstep_on != 0, 0)) yz_lockstep_tick(ctx);
         uint32_t llar_seq;
         int llar_fast = spu_coh_reserve_fast(ctx, ea, &llar_seq);
         if (llar_fast) {
@@ -352,9 +345,9 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
             spu_coh_notify_write_except(ea, ctx);
             ctx->atomic_stat = 0;
         } else {
+            __atomic_store_n(&ctx->resv, 0u, __ATOMIC_RELAXED);
             ctx->atomic_stat = 1;
         }
-        __atomic_store_n(&ctx->resv, 0u, __ATOMIC_RELAXED);
         spu_lockline_unlock(ea);
         if (ctx->atomic_stat == 0) {
             spu_rsx_window_check(ea, MFC_ATOMIC_LINE);
@@ -567,16 +560,16 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
                 ctx->event_status, ctx->event_mask); }
 
     ctx->status = SPU_STATUS_WAITING_CHANNEL;
-    yz_lockstep_block_begin(ctx);
+    if (__builtin_expect(g_yz_lockstep_on != 0, 0)) yz_lockstep_block_begin(ctx);
     spu_ch_wait_arg a = { ctx, channel };
     while (!spu_ch_ready(ctx, channel)) {
         if (ctx->stop_request) {
-            yz_lockstep_block_end(ctx);
+            if (__builtin_expect(g_yz_lockstep_on != 0, 0)) yz_lockstep_block_end(ctx);
             spu_honour_stop_request(ctx);
         }
         spu_ch_park(ctx, spu_ch_wait_ready, &a);
     }
-    yz_lockstep_block_end(ctx);
+    if (__builtin_expect(g_yz_lockstep_on != 0, 0)) yz_lockstep_block_end(ctx);
     if (ft_t0) spu_ft_wait_span(ctx, channel, ft_t0);
     ctx->status = SPU_STATUS_RUNNING;
 }
@@ -606,12 +599,15 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
     case SPU_RdSigNotify1:  v = spu_channel_read(&ctx->ch_sig_notify[0]); break;
     case SPU_RdSigNotify2:  v = spu_channel_read(&ctx->ch_sig_notify[1]); break;
     case SPU_RdDec: {
-        if (!ctx->dec_base_ns) ctx->dec_base_ns = spu_host_ns();
-        uint64_t elapsed = spu_host_ns() - ctx->dec_base_ns;
-        const uint64_t secs = elapsed / 1000000000ull, rem = elapsed % 1000000000ull;
-        uint32_t ticks   = (uint32_t)(secs * SPU_DECREMENTER_HZ +
-                                      (rem * SPU_DECREMENTER_HZ) / 1000000000ull);
-        v = ctx->decrementer - ticks;
+        const uint64_t now = spu_host_ns();
+        if (__builtin_expect(!ctx->dec_base_ns, 0)) {
+            ctx->dec_base_ns = now;
+            v = ctx->decrementer;
+        } else {
+            const uint64_t elapsed = now - ctx->dec_base_ns;
+            const uint32_t ticks = (uint32_t)((elapsed / 5000ull) * 399ull + ((elapsed % 5000ull) * 399ull) / 5000ull);
+            v = ctx->decrementer - ticks;
+        }
         break;
     }
     case SPU_RdEventMask:   v = ctx->event_mask;                        break;
@@ -868,6 +864,7 @@ static atomic_int s_ovl_has_sig;
 #define SPU_OVL_EA_SET 512u
 static uint32_t s_ovl_ea_set[SPU_OVL_EA_SET];
 static uint8_t s_ovl_ea_used[SPU_OVL_EA_SET];
+static int s_ovl_ea_count = 0;
 static unsigned spu_ovl_ea_slot(uint32_t ea) { return (ea * 0x9E3779B1u) >> 23; }
 static void spu_ovl_ea_add(uint32_t ea)
 {
@@ -878,6 +875,7 @@ static void spu_ovl_ea_add(uint32_t ea)
         }
         s_ovl_ea_set[i] = ea;
         __atomic_store_n(&s_ovl_ea_used[i], 1, __ATOMIC_RELEASE);
+        __atomic_store_n(&s_ovl_ea_count, s_ovl_ea_count + 1, __ATOMIC_RELEASE);
         return;
     }
 }
@@ -893,6 +891,8 @@ static int spu_ovl_ea_known(uint32_t ea)
 #define SPU_OVL_SIG_SET 512u
 static uint64_t s_ovl_sig_set[SPU_OVL_SIG_SET];
 static uint8_t s_ovl_sig_used[SPU_OVL_SIG_SET];
+uint64_t g_spu_ovl_ea_64k[1024];
+uint64_t g_spu_ovl_sig_bloom[4];
 static inline unsigned spu_ovl_sig_slot(uint64_t sig0)
 {
     return (unsigned)(((uint32_t)(sig0 ^ (sig0 >> 32)) * 0x9E3779B1u) >> 23) & (SPU_OVL_SIG_SET - 1);
@@ -903,13 +903,18 @@ static void spu_ovl_sig_add(const uint8_t sig[16])
     memcpy(&sig0, sig, 8);
     for (unsigned i = spu_ovl_sig_slot(sig0), n = 0; n < SPU_OVL_SIG_SET; ++n, i = (i + 1) & (SPU_OVL_SIG_SET - 1)) {
         if (__atomic_load_n(&s_ovl_sig_used[i], __ATOMIC_ACQUIRE)) {
-            if (s_ovl_sig_set[i] == sig0) return;
+            if (s_ovl_sig_set[i] == sig0) break;
             continue;
         }
         s_ovl_sig_set[i] = sig0;
         __atomic_store_n(&s_ovl_sig_used[i], 1, __ATOMIC_RELEASE);
-        return;
+        break;
     }
+    const uint64_t h = sig0 * 0x9E3779B97F4A7C15ull;
+    const unsigned b0 = (unsigned)(h >> 56);
+    const unsigned b1 = (unsigned)((h >> 48) & 255u);
+    __atomic_fetch_or(&g_spu_ovl_sig_bloom[b0 >> 6], 1ull << (b0 & 63u), __ATOMIC_RELEASE);
+    __atomic_fetch_or(&g_spu_ovl_sig_bloom[b1 >> 6], 1ull << (b1 & 63u), __ATOMIC_RELEASE);
 }
 static inline int spu_ovl_sig_known(uint64_t sig0)
 {
@@ -926,6 +931,12 @@ int g_spu_ovl_has_sig = 0;
 
 static inline void spu_ovl_note_ea_range(uint32_t lo, uint32_t hi)
 {
+    if (lo < hi) {
+        const uint32_t c0 = lo >> 16;
+        const uint32_t c1 = (hi - 1u) >> 16;
+        for (uint32_t c = c0; c <= c1; ++c)
+            __atomic_fetch_or(&g_spu_ovl_ea_64k[c >> 6], 1ull << (c & 63u), __ATOMIC_RELEASE);
+    }
     uint32_t cur = __atomic_load_n(&g_spu_ovl_ea_lo, __ATOMIC_RELAXED);
     while (lo < cur && !__atomic_compare_exchange_n(&g_spu_ovl_ea_lo, &cur, lo, 1, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {}
     cur = __atomic_load_n(&g_spu_ovl_ea_hi, __ATOMIC_RELAXED);
@@ -1371,7 +1382,7 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
         sig_ok = spu_ovl_sig_known(a0);
         if (sig_ok) memcpy(&a1, ls + 8, 8);
     }
-    const int ea_ok = spu_ovl_ea_known(ea);
+    const int ea_ok = __atomic_load_n(&s_ovl_ea_count, __ATOMIC_ACQUIRE) ? spu_ovl_ea_known(ea) : 0;
     if (!sig_ok && !ea_ok) return;
     for (int i = 0; i < nsrc; i++) {
         const spu_ovl_src* o = &s_ovl_src[i];
@@ -1586,8 +1597,10 @@ static int spu_smc_microstep(spu_context* ctx)
 void spu_indirect_branch(spu_context* ctx)
 {
     ctx->pc &= SPU_LS_MASK;
-    { extern int spu_irq_regs_maybe_restore(spu_context*);
-      spu_irq_regs_maybe_restore(ctx); }
+    if (__builtin_expect(ctx->irq_saved, 0)) {
+        extern int spu_irq_regs_maybe_restore(spu_context*);
+        spu_irq_regs_maybe_restore(ctx);
+    }
     spu_fn fn = spu_lifted_lookup(ctx, ctx->pc);
     if (!fn && spu_overlay_resolve_reloc(ctx, ctx->pc & SPU_LS_MASK))
         fn = spu_lifted_lookup(ctx, ctx->pc);

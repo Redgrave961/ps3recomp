@@ -4,7 +4,7 @@
 
 namespace vk {
 
-bool depth_pack::create(vk_device& d)
+bool depth_pack::create(vk_device& d, VkPipelineCache cache)
 {
     m_d = &d;
     VkSamplerCreateInfo si{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
@@ -32,6 +32,7 @@ bool depth_pack::create(vk_device& d)
         rsx_spv_blob blob{};
         if (rsx_spv_depth_pack(v, &blob) != 0) {
             rsx_spv_blob_free(&blob);
+            destroy();
             return false;
         }
         VkShaderModuleCreateInfo mi{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
@@ -40,16 +41,22 @@ bool depth_pack::create(vk_device& d)
         VkShaderModule mod = VK_NULL_HANDLE;
         VkResult r = vkCreateShaderModule(d.dev, &mi, nullptr, &mod);
         rsx_spv_blob_free(&blob);
-        VK_TRY(r);
+        if (r != VK_SUCCESS) {
+            destroy();
+            return false;
+        }
         VkComputePipelineCreateInfo ci{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
         ci.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
         ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
         ci.stage.module = mod;
         ci.stage.pName = "main";
         ci.layout = m_layout;
-        r = vkCreateComputePipelines(d.dev, VK_NULL_HANDLE, 1, &ci, nullptr, &m_pipe[v]);
+        r = vkCreateComputePipelines(d.dev, cache, 1, &ci, nullptr, &m_pipe[v]);
         vkDestroyShaderModule(d.dev, mod, nullptr);
-        VK_TRY(r);
+        if (r != VK_SUCCESS) {
+            destroy();
+            return false;
+        }
     }
     return true;
 }

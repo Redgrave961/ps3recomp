@@ -1,4 +1,7 @@
 #include "ps3emu/milestone.h"
+#undef ps3_ms
+#undef ps3_msf
+#undef ps3_ms_kv
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -21,7 +24,7 @@ static int       g_lock;
 static unsigned  g_next_ord;
 static int       g_full_warned;
 
-static int       g_enabled = -1;
+int              g_ps3_ms_enabled = -1;
 static FILE*     g_out;
 static int       g_dumped;
 
@@ -49,11 +52,11 @@ static unsigned ms_hash(const char* s)
 
 static int ms_enabled(void)
 {
-    int e = __atomic_load_n(&g_enabled, __ATOMIC_RELAXED);
+    int e = __atomic_load_n(&g_ps3_ms_enabled, __ATOMIC_RELAXED);
     if (e >= 0) return e;
 
     ms_lock();
-    e = __atomic_load_n(&g_enabled, __ATOMIC_RELAXED);
+    e = __atomic_load_n(&g_ps3_ms_enabled, __ATOMIC_RELAXED);
     if (e < 0) {
         const char* path = getenv("PS3_MILESTONE_OUT");
         e = 0;
@@ -68,7 +71,7 @@ static int ms_enabled(void)
                 fprintf(stderr, "[milestone] cannot open %s -- log disabled\n", path);
             }
         }
-        __atomic_store_n(&g_enabled, e, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_ps3_ms_enabled, e, __ATOMIC_RELAXED);
     }
     ms_unlock();
     return e;

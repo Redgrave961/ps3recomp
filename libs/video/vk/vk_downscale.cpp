@@ -7,9 +7,10 @@
 
 namespace vk {
 
-bool downscale::create(vk_device& d)
+bool downscale::create(vk_device& d, VkPipelineCache cache)
 {
     m_d = &d;
+    m_cache = cache;
     VkSamplerCreateInfo si{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
     VK_TRY(vkCreateSampler(d.dev, &si, nullptr, &m_sampler));
     VkDescriptorSetLayoutBinding b[2]{};
@@ -49,7 +50,7 @@ bool downscale::create(vk_device& d)
     ci.stage.module = mod;
     ci.stage.pName = "main";
     ci.layout = m_layout;
-    r = vkCreateComputePipelines(d.dev, VK_NULL_HANDLE, 1, &ci, nullptr, &m_pipe);
+    r = vkCreateComputePipelines(d.dev, m_cache, 1, &ci, nullptr, &m_pipe);
     vkDestroyShaderModule(d.dev, mod, nullptr);
     VK_TRY(r);
 
@@ -175,7 +176,7 @@ VkPipeline downscale::pipeline_for(VkFormat format, uint32_t scale)
     gi.pDynamicState = &dy;
     gi.layout = m_gfx_layout;
     VkPipeline pipe = VK_NULL_HANDLE;
-    if (vkCreateGraphicsPipelines(m_d->dev, VK_NULL_HANDLE, 1, &gi, nullptr, &pipe) != VK_SUCCESS) return VK_NULL_HANDLE;
+    if (vkCreateGraphicsPipelines(m_d->dev, m_cache, 1, &gi, nullptr, &pipe) != VK_SUCCESS) return VK_NULL_HANDLE;
     m_gfx_pipes.push_back({ format, scale, pipe });
     return pipe;
 }

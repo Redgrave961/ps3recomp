@@ -43,7 +43,7 @@ struct pipeline_key {
     uint32_t logic_op;
     uint32_t depth_clamp;
     uint32_t depth_clip;
-    uint32_t provoking_last;
+    uint32_t pad;
     blend_attachment blend[4];
 };
 
@@ -59,6 +59,7 @@ public:
     void save_cache();
     void precompile(shader_cache& shaders);
     VkPipelineLayout layout() const { return m_layout; }
+    VkPipelineCache cache() const { return m_cache; }
     VkDescriptorSetLayout buffer_set_layout() const { return m_sets[RSX_SPV_SET_BUFFERS]; }
     VkPipeline get(const pipeline_key& key, const shader& vs, const shader& fs, bool sync = false);
     bool fast_link() const { return m_libraries; }
@@ -66,7 +67,7 @@ public:
     bool dynamic_polygon_mode() const { return m_dynamic_polygon; }
     bool dynamic_depth_clamp() const { return m_dynamic_clamp; }
     bool dynamic_depth_clip() const { return m_dynamic_clip; }
-    bool dynamic_provoking() const { return m_dynamic_provoking; }
+    bool dynamic_logic() const { return m_dynamic_logic; }
     pipeline_key normalize(const pipeline_key& key) const;
 
     bool shader_library(shader& s, VkShaderStageFlagBits stage);
@@ -103,7 +104,7 @@ private:
     bool m_dynamic_polygon = false;
     bool m_dynamic_clamp = false;
     bool m_dynamic_clip = false;
-    bool m_dynamic_provoking = false;
+    bool m_dynamic_logic = false;
 
     struct l1_slot {
         pipeline_key key{};
@@ -121,6 +122,7 @@ private:
     VkPipeline m_input[3] = {};
 
     std::mutex m_db_lock;
+    std::string m_db_path;
     FILE* m_db = nullptr;
 
     std::mutex m_work_lock;
@@ -130,6 +132,7 @@ private:
     unsigned m_background_running = 0;
     unsigned m_background_limit = 1;
     std::vector<std::thread> m_workers;
+    std::thread m_precompile_thread;
     bool m_stop = false;
     std::atomic<bool> m_stopping{ false };
     std::atomic<bool> m_cache_dirty{ false };

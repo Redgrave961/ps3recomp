@@ -224,13 +224,29 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
         mfc_copy(ls_ptr, ea_ptr, size);
         { extern uint32_t g_spu_ovl_ea_lo, g_spu_ovl_ea_hi;
           extern int g_spu_ovl_has_sig;
+          extern uint64_t g_spu_ovl_ea_64k[1024];
+          extern uint64_t g_spu_ovl_sig_bloom[4];
           extern void spu_overlay_note_get(spu_context*, uint32_t, const uint8_t*, uint32_t);
           const uint32_t ea32 = (uint32_t)ea;
-          if (__builtin_expect(
-                  (spu->resident_code_mask && lsa < spu->resident_code_hi && lsa + size > spu->resident_code_lo) ||
-                  (ea32 < __atomic_load_n(&g_spu_ovl_ea_hi, __ATOMIC_RELAXED) &&
-                   (uint64_t)ea32 + size > (uint64_t)__atomic_load_n(&g_spu_ovl_ea_lo, __ATOMIC_RELAXED)) ||
-                  (size >= 512u && __atomic_load_n(&g_spu_ovl_has_sig, __ATOMIC_RELAXED)), 0))
+          int hit = spu->resident_code_mask && lsa < spu->resident_code_hi && lsa + size > spu->resident_code_lo;
+          if (__builtin_expect(!hit && size && ea32 < __atomic_load_n(&g_spu_ovl_ea_hi, __ATOMIC_RELAXED) &&
+                  (uint64_t)ea32 + size > (uint64_t)__atomic_load_n(&g_spu_ovl_ea_lo, __ATOMIC_RELAXED), 0)) {
+              const uint32_t c0 = ea32 >> 16;
+              const uint32_t c1 = (ea32 + size - 1u) >> 16;
+              hit = (int)((__atomic_load_n(&g_spu_ovl_ea_64k[c0 >> 6], __ATOMIC_RELAXED) >> (c0 & 63u)) & 1ull);
+              if (!hit && c1 != c0)
+                  hit = (int)((__atomic_load_n(&g_spu_ovl_ea_64k[c1 >> 6], __ATOMIC_RELAXED) >> (c1 & 63u)) & 1ull);
+          }
+          if (__builtin_expect(!hit && size >= 512u && __atomic_load_n(&g_spu_ovl_has_sig, __ATOMIC_RELAXED), 0)) {
+              uint64_t sig0;
+              memcpy(&sig0, ls_ptr, 8);
+              const uint64_t h = sig0 * 0x9E3779B97F4A7C15ull;
+              const unsigned b0 = (unsigned)(h >> 56);
+              const unsigned b1 = (unsigned)((h >> 48) & 255u);
+              hit = (int)(((__atomic_load_n(&g_spu_ovl_sig_bloom[b0 >> 6], __ATOMIC_RELAXED) >> (b0 & 63u)) &
+                           (__atomic_load_n(&g_spu_ovl_sig_bloom[b1 >> 6], __ATOMIC_RELAXED) >> (b1 & 63u))) & 1ull);
+          }
+          if (__builtin_expect(hit, 0))
               spu_overlay_note_get(spu, ea32, (const uint8_t*)ls_ptr, size); }
     } else if (mfc_is_put(cmd)) {
         {
@@ -266,6 +282,11 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                     }
                     if (a == a1) break;
                 }
+            } else if (span_reserved && a0 == a1) {
+                spu_lockline_lock(a0);
+                mfc_copy(ea_ptr, ls_ptr, size);
+                spu_coh_notify_write_except(a0, spu);
+                spu_lockline_unlock(a0);
             } else if (span_reserved) {
                 spu_lockline_lock_range((uint32_t)ea, size);
                 mfc_copy(ea_ptr, ls_ptr, size);
@@ -303,6 +324,8 @@ static inline int mfc_run_list(spu_context* spu, uint32_t elem_lsa,
     const int is_get = mfc_is_get(base_cmd);
     extern uint32_t g_spu_ovl_ea_lo, g_spu_ovl_ea_hi;
     extern int g_spu_ovl_has_sig;
+    extern uint64_t g_spu_ovl_ea_64k[1024];
+    extern uint64_t g_spu_ovl_sig_bloom[4];
     extern void spu_overlay_note_get(spu_context*, uint32_t, const uint8_t*, uint32_t);
     const uint32_t ovl_hi = is_get ? __atomic_load_n(&g_spu_ovl_ea_hi, __ATOMIC_RELAXED) : 0u;
     const uint32_t ovl_lo = is_get ? __atomic_load_n(&g_spu_ovl_ea_lo, __ATOMIC_RELAXED) : 0u;
@@ -331,10 +354,24 @@ static inline int mfc_run_list(spu_context* spu, uint32_t elem_lsa,
                     mfc_fault(spu, "DMA local store range", base_cmd, lsa, ea, xfer_size);
                 uint8_t* ls_ptr = &spu->ls[lsa];
                 mfc_copy(ls_ptr, vm_base + (uint32_t)ea, xfer_size);
-                if (__builtin_expect(
-                        (spu->resident_code_mask && lsa < spu->resident_code_hi && lsa + xfer_size > spu->resident_code_lo) ||
-                        (eal < ovl_hi && (uint64_t)eal + xfer_size > (uint64_t)ovl_lo) ||
-                        (xfer_size >= 512u && ovl_sig), 0))
+                int hit = spu->resident_code_mask && lsa < spu->resident_code_hi && lsa + xfer_size > spu->resident_code_lo;
+                if (__builtin_expect(!hit && eal < ovl_hi && (uint64_t)eal + xfer_size > (uint64_t)ovl_lo, 0)) {
+                    const uint32_t c0 = eal >> 16;
+                    const uint32_t c1 = (eal + xfer_size - 1u) >> 16;
+                    hit = (int)((__atomic_load_n(&g_spu_ovl_ea_64k[c0 >> 6], __ATOMIC_RELAXED) >> (c0 & 63u)) & 1ull);
+                    if (!hit && c1 != c0)
+                        hit = (int)((__atomic_load_n(&g_spu_ovl_ea_64k[c1 >> 6], __ATOMIC_RELAXED) >> (c1 & 63u)) & 1ull);
+                }
+                if (__builtin_expect(!hit && xfer_size >= 512u && ovl_sig, 0)) {
+                    uint64_t sig0;
+                    memcpy(&sig0, ls_ptr, 8);
+                    const uint64_t h = sig0 * 0x9E3779B97F4A7C15ull;
+                    const unsigned b0 = (unsigned)(h >> 56);
+                    const unsigned b1 = (unsigned)((h >> 48) & 255u);
+                    hit = (int)(((__atomic_load_n(&g_spu_ovl_sig_bloom[b0 >> 6], __ATOMIC_RELAXED) >> (b0 & 63u)) &
+                                 (__atomic_load_n(&g_spu_ovl_sig_bloom[b1 >> 6], __ATOMIC_RELAXED) >> (b1 & 63u))) & 1ull);
+                }
+                if (__builtin_expect(hit, 0))
                     spu_overlay_note_get(spu, eal, (const uint8_t*)ls_ptr, xfer_size);
             } else {
                 int rc = mfc_do_transfer(spu, transfer_lsa, ea, xfer_size, base_cmd);
@@ -387,15 +424,8 @@ static inline int mfc_list_stall_ack(struct mfc_engine* mfc, spu_context* spu,
                 spu->image_id, t, spu->list_stall_elem_lsa[t],
                 spu->list_stall_remaining[t]); }
     {
-      static volatile LONG _n = 0;
-      LONG _seen = InterlockedCompareExchange(&_n, 0, 0);
-      int _emit = 0;
-      while (_seen < 16) {
-          LONG _previous = InterlockedCompareExchange(&_n, _seen + 1, _seen);
-          if (_previous == _seen) { _emit = 1; break; }
-          _seen = _previous;
-      }
-      if (_emit) {
+      static int _n = 0;
+      if (PS3_LOG_FIRST(_n, 16)) {
         uint32_t _e = spu->list_stall_elem_lsa[t] & SPU_LS_MASK;
         fprintf(stderr, "[mfc-list] RESUME-ELEMS dest=0x%05X elems\n0x%05X:",
                 spu->list_stall_dest_lsa[t], _e);
@@ -465,18 +495,8 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
 static inline uint32_t mfc_tag_wait(const mfc_engine* mfc, uint32_t tag_mask,
                                      uint32_t update_type)
 {
-    uint32_t completed = mfc->tag_completed & tag_mask;
-
-    switch (update_type) {
-    case MFC_TAG_UPDATE_IMMEDIATE:
-        return completed;
-    case MFC_TAG_UPDATE_ANY:
-        return completed;
-    case MFC_TAG_UPDATE_ALL:
-        return completed;
-    default:
-        return completed;
-    }
+    (void)update_type;
+    return mfc->tag_completed & tag_mask;
 }
 
 static inline void mfc_channel_write(mfc_engine* mfc, spu_context* spu,

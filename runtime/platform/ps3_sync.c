@@ -21,14 +21,6 @@
 #  include <time.h>
 #endif
 
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
-static inline void ps3_cpu_relax(void) { __asm__ __volatile__("pause" ::: "memory"); }
-#elif defined(__aarch64__)
-static inline void ps3_cpu_relax(void) { __asm__ __volatile__("yield" ::: "memory"); }
-#else
-static inline void ps3_cpu_relax(void) { __asm__ __volatile__("" ::: "memory"); }
-#endif
-
 extern int32_t ppu_thread_priority(uint64_t tid);
 
 #if defined(_WIN32)
@@ -43,6 +35,8 @@ uint64_t ps3_sync_now_ns(void)
     }
     LARGE_INTEGER c;
     QueryPerformanceCounter(&c);
+    if (__builtin_expect(s_qpc_freq == 10000000ull, 1))
+        return (uint64_t)c.QuadPart * 100ull;
     return (uint64_t)(((unsigned __int128)(uint64_t)c.QuadPart * 1000000000ull) / s_qpc_freq);
 }
 #else
@@ -328,7 +322,7 @@ int ps3_waiter_sleep(ps3_waiter* w, uint64_t deadline_ns)
     if (waiter_done(w)) return 1;
     for (int spin = 0; spin < 32; spin++) {
         if (waiter_done(w)) return 1;
-        ps3_cpu_relax();
+        ps3_pause();
     }
     uint32_t state = 0;
     __atomic_compare_exchange_n(&w->done, &state, PS3_WAITER_PARKED, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);

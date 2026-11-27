@@ -132,9 +132,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     if (!q) return (int64_t)(int32_t)CELL_ESRCH;
     if (q->type != SYS_PPU_QUEUE) return (int64_t)(int32_t)CELL_EINVAL;
 
-    ps3_waiter w;
-    ps3_waiter_init(&w, ctx->thread_id, 0);
-    int64_t rc = CELL_OK;
+    uint64_t a0, a1, a2, a3;
 
     ps3_lock_acquire(&q->lock);
     if (!q->active) {
@@ -143,35 +141,53 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     }
     if (q->count) {
         const sys_event_t* e = &q->buffer[q->head];
-        w.arg[0] = e->source; w.arg[1] = e->data1; w.arg[2] = e->data2; w.arg[3] = e->data3;
-        q->head = (q->head + 1) % q->capacity;
+        a0 = e->source; a1 = e->data1; a2 = e->data2; a3 = e->data3;
+        const int next = q->head + 1;
+        q->head = next < q->capacity ? next : 0;
         q->count--;
         ps3_lock_release(&q->lock);
     } else {
+        ps3_lock_release(&q->lock);
+        ps3_waiter w;
+        ps3_waiter_init(&w, ctx->thread_id, 0);
         ppu_thread_note_block(ctx->thread_id);
         const uint64_t deadline = ps3_sync_deadline_us(timeout_us);
-        ps3_waitq_push(&q->q, &w);
-        ps3_lock_release(&q->lock);
-        if (!ps3_waiter_sleep(&w, deadline)) {
-            ps3_lock_acquire(&q->lock);
-            const int removed = ps3_waitq_remove(&q->q, &w);
+        ps3_lock_acquire(&q->lock);
+        if (!q->active) {
             ps3_lock_release(&q->lock);
-            if (removed) return (int64_t)(int32_t)CELL_ETIMEDOUT;
-            ps3_waiter_sleep(&w, 0);
+            return (int64_t)(int32_t)CELL_ESRCH;
         }
-        rc = w.result;
-        if (rc != CELL_OK) return rc;
+        if (q->count) {
+            const sys_event_t* e = &q->buffer[q->head];
+            a0 = e->source; a1 = e->data1; a2 = e->data2; a3 = e->data3;
+            const int next = q->head + 1;
+            q->head = next < q->capacity ? next : 0;
+            q->count--;
+            ps3_lock_release(&q->lock);
+        } else {
+            ps3_waitq_push(&q->q, &w);
+            ps3_lock_release(&q->lock);
+            if (!ps3_waiter_sleep(&w, deadline)) {
+                ps3_lock_acquire(&q->lock);
+                const int removed = ps3_waitq_remove(&q->q, &w);
+                ps3_lock_release(&q->lock);
+                if (removed) return (int64_t)(int32_t)CELL_ETIMEDOUT;
+                ps3_waiter_sleep(&w, 0);
+            }
+            if (w.result != CELL_OK) return w.result;
+            a0 = w.arg[0]; a1 = w.arg[1]; a2 = w.arg[2]; a3 = w.arg[3];
+        }
     }
 
-    ctx->gpr[4] = w.arg[0];
-    ctx->gpr[5] = w.arg[1];
-    ctx->gpr[6] = w.arg[2];
-    ctx->gpr[7] = w.arg[3];
+    ctx->gpr[4] = a0;
+    ctx->gpr[5] = a1;
+    ctx->gpr[6] = a2;
+    ctx->gpr[7] = a3;
     if (event_addr != 0) {
-        write_be64(event_addr,      w.arg[0]);
-        write_be64(event_addr + 8,  w.arg[1]);
-        write_be64(event_addr + 16, w.arg[2]);
-        write_be64(event_addr + 24, w.arg[3]);
+        write_be64(event_addr,      a0);
+        write_be64(event_addr + 8,  a1);
+        write_be64(event_addr + 16, a2);
+        write_be64(event_addr + 24, a3);
     }
     return CELL_OK;
 }
@@ -196,7 +212,8 @@ int64_t sys_event_queue_tryreceive(ppu_context* ctx)
             write_be64(o + 16, e->data2);
             write_be64(o + 24, e->data3);
         }
-        q->head = (q->head + 1) % q->capacity;
+        const int next = q->head + 1;
+        q->head = next < q->capacity ? next : 0;
         q->count--;
         received++;
     }
@@ -236,7 +253,8 @@ static int event_queue_push(sys_event_queue_info* q, const sys_event_t* evt)
         return -1;
     }
     q->buffer[q->tail] = *evt;
-    q->tail = (q->tail + 1) % q->capacity;
+    const int next = q->tail + 1;
+    q->tail = next < q->capacity ? next : 0;
     q->count++;
     ps3_lock_release(&q->lock);
     return 0;
@@ -426,10 +444,6 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
     } else if (!f) {
         rc = (int64_t)(int32_t)CELL_ESRCH;
     } else {
-        ps3_waiter w;
-        ps3_waiter_init(&w, ctx->thread_id, 0);
-        w.arg[0] = bits;
-        w.arg[1] = mode;
         ps3_lock_acquire(&f->lock);
         uint64_t pat = f->pattern;
         if (flag_take(&pat, bits, mode, &result)) {
@@ -440,6 +454,10 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
             ps3_lock_release(&f->lock);
             rc = (int64_t)(int32_t)CELL_EPERM;
         } else {
+            ps3_waiter w;
+            ps3_waiter_init(&w, ctx->thread_id, 0);
+            w.arg[0] = bits;
+            w.arg[1] = mode;
             ppu_thread_note_block(ctx->thread_id);
             const uint64_t deadline = ps3_sync_deadline_us(timeout_us);
             ps3_waitq_push(&f->q, &w);

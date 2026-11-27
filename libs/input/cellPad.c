@@ -888,6 +888,7 @@ s32 cellPadSetActDirect(u32 port_no, CellPadActParam* param)
     u16 lo, hi;
     pad_rumble_levels(param->motor[CELL_PAD_ACTUATOR_PARAM_SMALL],
                       param->motor[CELL_PAD_ACTUATOR_PARAM_LARGE], &lo, &hi);
+    pad_lock();
     s_rumble[port_no].lo = lo;
     s_rumble[port_no].hi = hi;
 
@@ -901,10 +902,9 @@ s32 cellPadSetActDirect(u32 port_no, CellPadActParam* param)
 #endif
 
 #if PAD_BACKEND_SDL
-    pad_lock();
     pad_sdl_rumble_send((int)port_no);
-    pad_unlock();
 #endif
+    pad_unlock();
 
     return CELL_OK;
 }

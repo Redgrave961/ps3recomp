@@ -225,7 +225,7 @@ uint32_t expanded_index_count(uint32_t prim, uint32_t count)
 {
     switch (prim) {
     case PRIM_LINE_LOOP: return count + 1u;
-    case PRIM_QUADS: return (6u * count) / 4u;
+    case PRIM_QUADS: return (count / 4u) * 6u;
     default: return count;
     }
 }

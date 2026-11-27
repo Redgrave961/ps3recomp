@@ -22,7 +22,6 @@ extern void spu_raw_note_image(uint32_t src_ea, uint32_t entry);
 #include "../spu/spu_lifted_thread.h"
 #include "../spu/spu_context.h"
 #include "../spu/spu_workload.h"
-#include "sys_event.h"
 
 #include <stdio.h>
 #include <string.h>

@@ -64,7 +64,7 @@ struct surface {
     u32 bpp = 0;
     u32 aa_u = 1;
     u32 aa_v = 1;
-    ratio scale;
+    scale2d scale;
     surface_state state = SURFACE_UNINITIALIZED;
     bool gpu_dirty = false;
     image img;
@@ -84,7 +84,7 @@ struct framebuffer {
     u32 height = 0;
     u32 aa_u = 1;
     u32 aa_v = 1;
-    ratio scale;
+    scale2d scale;
     u32 count = 0;
     surface* color[4] = {};
     surface* depth = nullptr;
@@ -93,7 +93,7 @@ struct framebuffer {
     bool color_write[4] = {};
     VkFormat color_format[4] = {};
     VkFormat depth_format = VK_FORMAT_UNDEFINED;
-    bool operator==(const framebuffer& o) const;
+    bool same_pass(const framebuffer& o) const;
 };
 
 struct submission {
@@ -109,7 +109,8 @@ public:
 
     void flush();
     void save_caches() { m_pipelines.save_cache(); }
-    void present_source(u32 ea, u32 width, u32 height, u32 pitch, image*& out, ratio& scale, VkCommandBuffer& cmd);
+    VkPipelineCache pipeline_cache() const { return m_pipelines.cache(); }
+    void present_source(u32 ea, u32 width, u32 height, u32 pitch, image*& out, scale2d& scale, VkCommandBuffer& cmd);
     u64 content(u32 ea, u32 pitch) const;
     void submit(VkSemaphore wait, VkPipelineStageFlags2 wait_stage, VkSemaphore signal);
     void read_back(u32 ea, u32 size);
@@ -118,12 +119,12 @@ public:
     void wrote(u32 ea, u32 size);
     bool blit(const rsx_blit& b);
     void flip_reset();
-    void rescale(ratio scale);
+    void rescale(scale2d scale);
     void invalidate_graphics_state();
     bool report(u32 type, u32 ea);
     bool defer(const rsx_write& w);
     std::atomic<u32> trace_frames{ 0 };
-    ratio resolution_scale;
+    scale2d resolution_scale;
 
     bool tracing() const { return m_trace != nullptr; }
     void trace_begin(VkCommandBuffer c);
@@ -147,7 +148,7 @@ private:
                          VkImageAspectFlags clear_ds_mask = 0, const VkClearValue* clear_ds = nullptr);
     surface* surface_at(u32 ea, u32 pitch, u32 bpp, u32& x, u32& y);
     surface* scanout_surface(u32 ea, u32 pitch) const;
-    ratio scale_for(u32 width, u32 height, bool depth, bool depth_only = false) const;
+    scale2d scale_for(u32 width, u32 height, u32 aa_u, u32 aa_v, bool depth, bool depth_only = false) const;
     surface* surface_for(u32 ea, u32 pitch, u32 width, u32 height, u32 format, bool depth, u32 aa_u, u32 aa_v,
                          const surface* const* keep = nullptr, u32 keep_count = 0, bool depth_only = false);
     bool create_image(image& img, VkFormat format, u32 width, u32 height, VkImageUsageFlags usage, VkImageAspectFlags aspect);
@@ -197,7 +198,7 @@ private:
     image m_box;
     image* depth_as_color(surface& s);
 
-    bool draw_setup(bool sync_hint);
+    bool draw_setup();
     void draw_execute(const rsx::draw_clause& clause, u32 id);
     void trace_draw(u32 id, u32 prim, u32 count, bool indexed) const;
     std::FILE* m_trace = nullptr;
@@ -229,8 +230,11 @@ private:
     u32 m_fp_tex_alphakill = 0;
     u32 m_fp_tex_alphakill_mask = 0;
     bool m_fp_tex_valid = false;
-    const vertex_program* m_constants_vp = nullptr;
-    VkDescriptorBufferInfo m_constants{};
+    u32 m_tcc = 0;
+    bool m_tcc_valid = false;
+    uint64_t m_constants_sub = 0;
+    u32 m_constants_valid[(rsx::VP_CONSTANTS + 31u) / 32u]{};
+    u32 m_constants_offset = 0;
     struct vp_hash_slot {
         u32 start = ~0u;
         uint64_t hash = 0;
@@ -244,11 +248,14 @@ private:
     vp_l1_slot m_vp_l1[64]{};
     const vertex_program* m_vp = nullptr;
     const fragment_program* m_fp = nullptr;
-    const fragment_program* m_fp_const_fp = nullptr;
-    u32 m_fp_const_ea = 0;
-    u64 m_fp_const_epoch = 0;
-    uint64_t m_fp_const_sub = 0;
-    VkDescriptorBufferInfo m_fp_const_info{};
+    struct fp_const_slot {
+        const fragment_program* fp = nullptr;
+        u32 ea = 0;
+        u64 epoch = 0;
+        uint64_t sub = 0;
+        VkDescriptorBufferInfo info{};
+    };
+    fp_const_slot m_fp_const_cache[64]{};
     struct fp_seen_key {
         u32 ea;
         rsx_spv_fp_key key;
@@ -358,9 +365,6 @@ private:
     std::vector<u32> m_fp_constants;
 
     struct texture_entry {
-        u32 ea = 0;
-        u32 size = 0;
-        uint64_t key = 0;
         image img;
         u32 stamp = 0;
         u32 checked_stamp = 0;
@@ -375,10 +379,13 @@ private:
         u32 variant = 0;
         rsx::texture_regs regs{};
         u32 ea = 0;
-        u32 stamp = 0;
         u64 epoch = 0;
         u64 generation = 0;
         texture_entry* entry = nullptr;
+        surface* surf = nullptr;
+        image* surf_img = nullptr;
+        u64 surf_version = 0;
+        scale2d fb_scale{};
         VkDescriptorImageInfo info{};
         rsx_spv_texture_state state{};
     };
@@ -400,10 +407,11 @@ private:
     VkSampler sampler_for(const VkSamplerCreateInfo& info, const VkSamplerCustomBorderColorCreateInfoEXT* border);
     bool memory_changed(u32 ea, u32 size, u32 stamp);
     bool memory_changed_watched(u32 ea, u32 size, u32 stamp, u32& checked_stamp);
-    u32 refresh(u32 ea, u32 size, u32 stamp, uint8_t* dst);
     void watch(u32 ea, u32 size);
     void prescan(u64 batch);
     void mark_written(u32 ea, u32 size);
+    bool supports_linear_blit(VkFormat format);
+    flat_map<VkFormat, bool> m_linear_blit_ok;
 
     unit_binding m_units[rsx::TEXTURES + rsx::VERTEX_TEXTURES];
     unit_resolved m_resolved[rsx::TEXTURES + rsx::VERTEX_TEXTURES];
@@ -417,6 +425,11 @@ private:
     u32 m_sampler_count = 0;
     u32 m_custom_border_count = 0;
     std::vector<u32> m_page_stamp;
+    std::vector<u32> m_chunk_stamp;
+    VkBuffer m_readback = VK_NULL_HANDLE;
+    VmaAllocation m_readback_alloc = nullptr;
+    uint8_t* m_readback_map = nullptr;
+    VkDeviceSize m_readback_size = 0;
     u64 m_scan_batch = ~0ull;
     u32 m_stamp = 1;
     u64 m_epoch = 1;

@@ -45,7 +45,7 @@ typedef struct sys_mutex_info {
     int               active;
     char              name[8];
     ps3_waitq         q;
-} sys_mutex_info;
+} __attribute__((aligned(64))) sys_mutex_info;
 
 extern sys_mutex_info g_sys_mutexes[SYS_MUTEX_MAX];
 

@@ -201,6 +201,7 @@ s32 cellRtcConvertUtcToLocalTime(const CellRtcTick* pUtc, CellRtcTick* pLocalTim
     gmtime_r(&now, &utc_tm);
 #endif
 
+    utc_tm.tm_isdst = -1;
     time_t local_t = mktime(&local_tm);
     time_t utc_t   = mktime(&utc_tm);
     s64 offset_sec = (s64)(local_t - utc_t);
@@ -211,6 +212,7 @@ s32 cellRtcConvertUtcToLocalTime(const CellRtcTick* pUtc, CellRtcTick* pLocalTim
 
 s32 cellRtcGetDayOfWeek(s32 year, s32 month, s32 day)
 {
+    if (month < 1 || month > 12) return CELL_EINVAL;
     static const int t[] = { 0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4 };
     int y = year;
     if (month < 3) y -= 1;

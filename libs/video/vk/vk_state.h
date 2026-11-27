@@ -11,7 +11,7 @@ struct draw_target {
     uint32_t height;
     uint32_t aa_u;
     uint32_t aa_v;
-    ratio scale;
+    scale2d scale;
     bool depth;
     bool stencil;
     bool depth_float;
@@ -36,7 +36,7 @@ struct dynamic_state {
     uint32_t stencil_test;
     face faces[2];
     uint32_t cull, front, topology, restart;
-    uint32_t polygon_mode, depth_clamp, depth_clip, provoking;
+    uint32_t polygon_mode, depth_clamp, depth_clip, logic_enable, logic_op;
     uint32_t blend_count;
     VkBool32 blend_enable[4];
     VkColorBlendEquationEXT equation[4];
@@ -48,6 +48,7 @@ struct dynamic_cache {
     bool valid = false;
     bool bias_set = false;
     bool bounds_set = false;
+    bool stencil_set = false;
 };
 
 void fill_pipeline_state(const rsx::frontend& f, const vk_device& d, const draw_target& t, uint32_t prim, pipeline_key& key);

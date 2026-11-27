@@ -24,6 +24,7 @@ static mapper_reservation s_mapper_reservations[SYS_MEMORY_ALLOC_MAX];
 
 static uint32_t s_total_allocated = 0;
 static int s_alloc_count = 0;
+static uint32_t s_alloc_hint = SYS_MEM_ALLOC_BASE;
 
 static int alloc_after(uint64_t addr)
 {
@@ -65,7 +66,8 @@ static void write_be32(uint32_t addr, uint32_t val)
 
 static uint32_t user_address(uint32_t size, uint32_t alignment)
 {
-    uint64_t candidate = SYS_MEM_ALLOC_BASE;
+    uint64_t candidate = s_alloc_hint;
+    int idx = alloc_after(candidate);
     for (;;) {
         candidate = (candidate + alignment - 1u) & ~(uint64_t)(alignment - 1u);
         if (candidate + size > SYS_MEM_ALLOC_END) return 0;
@@ -77,7 +79,9 @@ static uint32_t user_address(uint32_t size, uint32_t alignment)
         if (candidate < (uint64_t)VM_PPU_TLS_BASE + VM_PPU_TLS_SIZE &&
             VM_PPU_TLS_BASE < candidate + size && (uint64_t)VM_PPU_TLS_BASE + VM_PPU_TLS_SIZE > next)
             next = (uint64_t)VM_PPU_TLS_BASE + VM_PPU_TLS_SIZE;
-        for (int i = alloc_after(candidate); i < s_alloc_count && g_sys_mem_allocs[i].addr < candidate + size; ++i) {
+        while (idx < s_alloc_count && (uint64_t)g_sys_mem_allocs[idx].addr + g_sys_mem_allocs[idx].size <= candidate)
+            ++idx;
+        for (int i = idx; i < s_alloc_count && g_sys_mem_allocs[i].addr < candidate + size; ++i) {
             const uint64_t end = (uint64_t)g_sys_mem_allocs[i].addr + g_sys_mem_allocs[i].size;
             if (end > next) next = end;
         }
@@ -149,6 +153,7 @@ static int64_t memory_allocate(const ppu_context* ctx, uint64_t requested, uint3
     a->container_id = (int32_t)cid; a->page_size = alignment;
     s_total_allocated += size;
     if (ct) ct->used_size += size;
+    if (addr <= s_alloc_hint && addr + size > s_alloc_hint) s_alloc_hint = addr + size;
     if (addr + size > g_sys_mem_bump_ptr) g_sys_mem_bump_ptr = addr + size;
     bump_unlock();
     if (addr_out) write_be32(addr_out, addr);
@@ -182,6 +187,7 @@ int64_t sys_memory_free(ppu_context* ctx)
             g_sys_mem_containers[cid - 1].used_size -= g_sys_mem_allocs[i].size;
         s_alloc_count--;
         memmove(&g_sys_mem_allocs[i], &g_sys_mem_allocs[i + 1], (size_t)(s_alloc_count - i) * sizeof g_sys_mem_allocs[0]);
+        if (addr < s_alloc_hint) s_alloc_hint = addr;
         bump_unlock(); return CELL_OK;
     }
     bump_unlock();
@@ -483,6 +489,7 @@ void sys_memory_init(lv2_syscall_table* tbl)
     bump_lock();
     memset(g_sys_mem_allocs,     0, sizeof(g_sys_mem_allocs));
     s_alloc_count = 0;
+    s_alloc_hint = SYS_MEM_ALLOC_BASE;
     memset(g_sys_mem_containers, 0, sizeof(g_sys_mem_containers));
     memset(g_sys_mmapper_shared, 0, sizeof(g_sys_mmapper_shared));
     g_sys_mem_bump_ptr = 0;

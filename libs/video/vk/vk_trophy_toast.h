@@ -13,7 +13,7 @@ namespace vk {
 
 class trophy_toast {
 public:
-    bool create(vk_device& d);
+    bool create(vk_device& d, VkPipelineCache cache = VK_NULL_HANDLE);
     void destroy();
 
     bool record(VkCommandBuffer cmd, VkImage target, VkImageView target_view, VkExtent2D extent, VkFormat format);
@@ -45,6 +45,7 @@ private:
     void poll_chime();
 
     vk_device* m_d = nullptr;
+    VkPipelineCache m_cache = VK_NULL_HANDLE;
     bool m_disabled = false;
 
     VkSampler m_sampler = VK_NULL_HANDLE;

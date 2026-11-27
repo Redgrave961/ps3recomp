@@ -139,7 +139,6 @@ void fill_pipeline_state(const frontend& f, const vk_device& d, const draw_targe
     const bool clip = (zmm & 0xFu) != 0, clamp = ((zmm >> 4) & 0xFu) != 0;
     key.depth_clamp = d.features.features.depthClamp && (clamp || !clip);
     key.depth_clip = clip;
-    key.provoking_last = d.caps.provoking_vertex ? 1u : 0u;
     const uint32_t sf = f.r(rsx::M_BLEND_SFACTOR), df = f.r(rsx::M_BLEND_DFACTOR), eq = f.r(rsx::M_BLEND_EQUATION);
     const VkBlendFactor src_color = blend_factor(sf & 0xFFFFu);
     const VkBlendFactor src_alpha = blend_factor(sf >> 16);
@@ -165,16 +164,16 @@ void set_dynamic_state(VkCommandBuffer cmd, const frontend& f, const vk_device& 
                        uint32_t prim, bool restart, const pipeline_key& key, dynamic_cache& cache)
 {
     dynamic_state s{};
-    s.viewport = { 0.f, 0.f, t.scale.exact(t.width * t.aa_u), t.scale.exact(t.height * t.aa_v), 0.f, 1.f };
+    s.viewport = { 0.f, 0.f, t.scale.x.exact(t.width * t.aa_u), t.scale.y.exact(t.height * t.aa_v), 0.f, 1.f };
 
     const uint32_t sh = f.r(rsx::M_SCISSOR_H), sv = f.r(rsx::M_SCISSOR_V);
     const uint32_t x0 = std::min(sh & 0xFFFFu, t.width), y0 = std::min(sv & 0xFFFFu, t.height);
     const uint32_t x1 = std::min((sh & 0xFFFFu) + (sh >> 16), t.width), y1 = std::min((sv & 0xFFFFu) + (sv >> 16), t.height);
-    const uint32_t ex = t.scale.edge(x0 * t.aa_u), ey = t.scale.edge(y0 * t.aa_v);
-    s.scissor = { { (int32_t)ex, (int32_t)ey }, { t.scale.edge(x1 * t.aa_u) - ex, t.scale.edge(y1 * t.aa_v) - ey } };
+    const uint32_t ex = t.scale.x.edge(x0 * t.aa_u), ey = t.scale.y.edge(y0 * t.aa_v);
+    s.scissor = { { (int32_t)ex, (int32_t)ey }, { t.scale.x.edge(x1 * t.aa_u) - ex, t.scale.y.edge(y1 * t.aa_v) - ey } };
 
     const uint32_t lw = f.r(rsx::M_LINE_WIDTH);
-    const float width = ((float)(lw >> 3) + (float)(lw & 7u) / 8.f) * t.scale.value();
+    const float width = ((float)(lw >> 3) + (float)(lw & 7u) / 8.f) * t.scale.y.value();
     s.line_width = d.features.features.wideLines ? std::clamp(width, d.props.limits.lineWidthRange[0], d.props.limits.lineWidthRange[1]) : 1.f;
 
     const uint32_t cls = topology_class(prim);
@@ -185,8 +184,8 @@ void set_dynamic_state(VkCommandBuffer cmd, const frontend& f, const vk_device& 
     if (s.bias_enable) {
         s.bias[0] = game_bias && t.depth_float ? f.f(rsx::M_POLY_OFFSET_BIAS) : 0.f;
         s.bias[1] = 0.f;
-        s.bias[2] = (game_bias ? f.f(rsx::M_POLY_OFFSET_SCALE) * t.scale.value() : 0.f) +
-                    (t.shadow_map ? k_shadow_slope_bias * t.scale.value() : 0.f);
+        s.bias[2] = (game_bias ? f.f(rsx::M_POLY_OFFSET_SCALE) * t.scale.y.value() : 0.f) +
+                    (t.shadow_map ? k_shadow_slope_bias * t.scale.y.value() : 0.f);
     }
 
     const uint32_t c1 = f.r(rsx::M_BLEND_COLOR);
@@ -213,11 +212,13 @@ void set_dynamic_state(VkCommandBuffer cmd, const frontend& f, const vk_device& 
     }
 
     s.stencil_test = t.stencil && f.r(rsx::M_STENCIL_TEST_ENABLE) != 0;
-    const uint32_t back_base = f.r(rsx::M_TWO_SIDED_STENCIL) != 0 ? rsx::M_BACK_STENCIL_MASK : rsx::M_STENCIL_MASK;
-    for (int side = 0; side < 2; side++) {
-        const uint32_t base = side ? back_base : rsx::M_STENCIL_MASK;
-        s.faces[side] = { f.r(base) & 0xFFu, f.r(base + 12u) & 0xFFu, f.r(base + 8u) & 0xFFu, stencil_op(f.r(base + 16u)),
-                          stencil_op(f.r(base + 24u)), stencil_op(f.r(base + 20u)), compare_op(f.r(base + 4u)) };
+    if (s.stencil_test) {
+        const uint32_t back_base = f.r(rsx::M_TWO_SIDED_STENCIL) != 0 ? rsx::M_BACK_STENCIL_MASK : rsx::M_STENCIL_MASK;
+        for (int side = 0; side < 2; side++) {
+            const uint32_t base = side ? back_base : rsx::M_STENCIL_MASK;
+            s.faces[side] = { f.r(base) & 0xFFu, f.r(base + 12u) & 0xFFu, f.r(base + 8u) & 0xFFu, stencil_op(f.r(base + 16u)),
+                              stencil_op(f.r(base + 24u)), stencil_op(f.r(base + 20u)), compare_op(f.r(base + 4u)) };
+        }
     }
 
     const uint32_t cull = f.r(rsx::M_CULL_FACE);
@@ -230,7 +231,8 @@ void set_dynamic_state(VkCommandBuffer cmd, const frontend& f, const vk_device& 
     s.polygon_mode = key.polygon_mode;
     s.depth_clamp = key.depth_clamp;
     s.depth_clip = key.depth_clip;
-    s.provoking = key.provoking_last ? VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT : VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT;
+    s.logic_enable = key.logic_enable;
+    s.logic_op = key.logic_op;
     if (p.dynamic_blend()) {
         for (uint32_t k = 0; k < 4; k++)
             if (t.color_format[k] != VK_FORMAT_UNDEFINED) s.blend_count = k + 1u;
@@ -244,10 +246,11 @@ void set_dynamic_state(VkCommandBuffer cmd, const frontend& f, const vk_device& 
     }
 
     const bool all = !cache.valid;
-    if (all) cache.bias_set = cache.bounds_set = false;
+    if (all) cache.bias_set = cache.bounds_set = cache.stencil_set = false;
     const dynamic_state& o = cache.last;
     if (!s.bias_enable && cache.bias_set) std::memcpy(s.bias, o.bias, sizeof s.bias);
     if (!s.bounds_enable && cache.bounds_set) std::memcpy(s.bounds, o.bounds, sizeof s.bounds);
+    if (!s.stencil_test && cache.stencil_set) std::memcpy(s.faces, o.faces, sizeof s.faces);
     const auto changed = [all](const auto& a, const auto& b) { return all || std::memcmp(&a, &b, sizeof a) != 0; };
     if (all) vkCmdSetRasterizerDiscardEnable(cmd, VK_FALSE);
     if (changed(s.viewport, o.viewport)) vkCmdSetViewportWithCount(cmd, 1, &s.viewport);
@@ -268,15 +271,19 @@ void set_dynamic_state(VkCommandBuffer cmd, const frontend& f, const vk_device& 
         cache.bounds_set = true;
     }
     if (changed(s.stencil_test, o.stencil_test)) vkCmdSetStencilTestEnable(cmd, s.stencil_test);
-    for (int side = 0; side < 2; side++) {
-        const dynamic_state::face& n = s.faces[side];
-        const dynamic_state::face& l = o.faces[side];
-        const VkStencilFaceFlags face = side ? VK_STENCIL_FACE_BACK_BIT : VK_STENCIL_FACE_FRONT_BIT;
-        if (changed(n.write, l.write)) vkCmdSetStencilWriteMask(cmd, face, n.write);
-        if (changed(n.compare, l.compare)) vkCmdSetStencilCompareMask(cmd, face, n.compare);
-        if (changed(n.reference, l.reference)) vkCmdSetStencilReference(cmd, face, n.reference);
-        if (all || n.fail != l.fail || n.pass != l.pass || n.depth_fail != l.depth_fail || n.op != l.op)
-            vkCmdSetStencilOp(cmd, face, n.fail, n.pass, n.depth_fail, n.op);
+    if (s.stencil_test) {
+        const bool sf = !cache.stencil_set;
+        for (int side = 0; side < 2; side++) {
+            const dynamic_state::face& n = s.faces[side];
+            const dynamic_state::face& l = o.faces[side];
+            const VkStencilFaceFlags face = side ? VK_STENCIL_FACE_BACK_BIT : VK_STENCIL_FACE_FRONT_BIT;
+            if (sf || n.write != l.write) vkCmdSetStencilWriteMask(cmd, face, n.write);
+            if (sf || n.compare != l.compare) vkCmdSetStencilCompareMask(cmd, face, n.compare);
+            if (sf || n.reference != l.reference) vkCmdSetStencilReference(cmd, face, n.reference);
+            if (sf || n.fail != l.fail || n.pass != l.pass || n.depth_fail != l.depth_fail || n.op != l.op)
+                vkCmdSetStencilOp(cmd, face, n.fail, n.pass, n.depth_fail, n.op);
+        }
+        cache.stencil_set = true;
     }
     if (changed(s.cull, o.cull)) vkCmdSetCullMode(cmd, s.cull);
     if (changed(s.front, o.front)) vkCmdSetFrontFace(cmd, (VkFrontFace)s.front);
@@ -285,7 +292,10 @@ void set_dynamic_state(VkCommandBuffer cmd, const frontend& f, const vk_device& 
     if (p.dynamic_polygon_mode() && changed(s.polygon_mode, o.polygon_mode)) vkCmdSetPolygonModeEXT(cmd, (VkPolygonMode)s.polygon_mode);
     if (p.dynamic_depth_clamp() && changed(s.depth_clamp, o.depth_clamp)) vkCmdSetDepthClampEnableEXT(cmd, s.depth_clamp);
     if (p.dynamic_depth_clip() && changed(s.depth_clip, o.depth_clip)) vkCmdSetDepthClipEnableEXT(cmd, s.depth_clip);
-    if (p.dynamic_provoking() && changed(s.provoking, o.provoking)) vkCmdSetProvokingVertexModeEXT(cmd, (VkProvokingVertexModeEXT)s.provoking);
+    if (p.dynamic_logic()) {
+        if (changed(s.logic_enable, o.logic_enable)) vkCmdSetLogicOpEnableEXT(cmd, s.logic_enable);
+        if (changed(s.logic_op, o.logic_op)) vkCmdSetLogicOpEXT(cmd, (VkLogicOp)s.logic_op);
+    }
     if (s.blend_count) {
         if (all || s.blend_count != o.blend_count || std::memcmp(s.blend_enable, o.blend_enable, s.blend_count * sizeof s.blend_enable[0]))
             vkCmdSetColorBlendEnableEXT(cmd, 0, s.blend_count, s.blend_enable);

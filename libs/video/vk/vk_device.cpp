@@ -15,6 +15,8 @@ struct ext_entry {
 
 const ext_entry k_extensions[] = {
     { VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, VkStructureType(0), 0, &vk_caps::push_descriptor },
+    { VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT,
+      sizeof(VkPhysicalDeviceExtendedDynamicState2FeaturesEXT), nullptr },
     { VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT,
       sizeof(VkPhysicalDeviceExtendedDynamicState3FeaturesEXT), &vk_caps::dynamic_state3 },
     { VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME, VkStructureType(0), 0, nullptr },
@@ -196,7 +198,9 @@ bool vk_device_create(vk_device& d, VkSurfaceKHR surface)
         enable.push_back(e.name);
         if (e.size) {
             void* s = chain_add(d, e.stype, e.size);
-            if (e.stype == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT)
+            if (e.stype == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT)
+                d.dynamic_state2 = static_cast<VkPhysicalDeviceExtendedDynamicState2FeaturesEXT*>(s);
+            else if (e.stype == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT)
                 d.dynamic_state3 = static_cast<VkPhysicalDeviceExtendedDynamicState3FeaturesEXT*>(s);
             gated.emplace_back(e.cap, s);
         } else if (e.cap) {
@@ -214,8 +218,13 @@ bool vk_device_create(vk_device& d, VkSurfaceKHR surface)
     f13->robustImageAccess = VK_FALSE;
     f12->bufferDeviceAddressCaptureReplay = VK_FALSE;
     f12->bufferDeviceAddressMultiDevice = VK_FALSE;
-    for (const auto& [cap, s] : gated)
+    for (const auto& [cap, s] : gated) {
         if (cap) d.caps.*cap = first_feature(s);
+        if (cap == &vk_caps::custom_border_color) {
+            const auto* cb = static_cast<const VkPhysicalDeviceCustomBorderColorFeaturesEXT*>(s);
+            d.caps.custom_border_without_format = cb->customBorderColorWithoutFormat != VK_FALSE;
+        }
+    }
     if (d.dynamic_state3 && !d.caps.dynamic_state3) d.caps.dynamic_state3 = d.dynamic_state3->extendedDynamicState3PolygonMode != VK_FALSE;
     d.caps.buffer_address = f12->bufferDeviceAddress != VK_FALSE;
     d.caps.mirror_clamp_to_edge = f12->samplerMirrorClampToEdge != VK_FALSE;

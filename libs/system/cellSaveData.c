@@ -705,11 +705,6 @@ s32 cellSaveDataAutoLoad2(u32 version, const char* dirName,
     if (!dirName || !setBuf || !funcStat)
         return CELL_SAVEDATA_ERROR_PARAM;
 
-    char save_path[1024];
-    build_save_path(save_path, sizeof(save_path), dirName);
-    int is_new = !dir_has_save(save_path);
-
-    (void)is_new;
     s32 r = savedata_execute(dirName, 0, setBuf, funcStat, funcFile, userdata);
     return r == CELL_SAVEDATA_ERROR_NODATA ? CELL_OK : r;
 }
@@ -735,11 +730,6 @@ s32 cellSaveDataAutoSave(u32 version, const char* dirName,
     if (!dirName || !setBuf || !funcStat)
         return CELL_SAVEDATA_ERROR_PARAM;
 
-    char save_path[1024];
-    build_save_path(save_path, sizeof(save_path), dirName);
-    int is_new = !dir_has_save(save_path);
-
-    (void)is_new;
     return savedata_execute(dirName, 1, setBuf, funcStat, funcFile, userdata);
 }
 
@@ -758,11 +748,6 @@ s32 cellSaveDataAutoLoad(u32 version, const char* dirName,
     if (!dirName || !setBuf || !funcStat)
         return CELL_SAVEDATA_ERROR_PARAM;
 
-    char save_path[1024];
-    build_save_path(save_path, sizeof(save_path), dirName);
-    int is_new = !dir_has_save(save_path);
-
-    (void)is_new;
     s32 r = savedata_execute(dirName, 0, setBuf, funcStat, funcFile, userdata);
     return r == CELL_SAVEDATA_ERROR_NODATA ? CELL_OK : r;
 }

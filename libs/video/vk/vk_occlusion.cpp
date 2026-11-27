@@ -69,7 +69,7 @@ uint32_t occlusion::allocate()
     return q;
 }
 
-void occlusion::begin(VkCommandBuffer cmd, const ratio& scale)
+void occlusion::begin(VkCommandBuffer cmd, const scale2d& scale)
 {
     const uint32_t q = allocate();
     vkCmdBeginQuery(cmd, m_pool, q, m_control);
@@ -250,7 +250,7 @@ void occlusion::worker()
             for (const segment& g : j.queries) {
                 uint64_t n = 0;
                 vkGetQueryPoolResults(m_d->dev, m_pool, g.query, 1, sizeof n, &n, sizeof n, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
-                const uint64_t area = (uint64_t)g.scale.num * g.scale.num, unit = (uint64_t)g.scale.den * g.scale.den;
+                const uint64_t area = (uint64_t)g.scale.x.num * g.scale.y.num, unit = (uint64_t)g.scale.x.den * g.scale.y.den;
                 sum += n ? std::max<uint64_t>((n * unit + area / 2u) / area, 1u) : 0u;
             }
             write_report(j.ea, sum);

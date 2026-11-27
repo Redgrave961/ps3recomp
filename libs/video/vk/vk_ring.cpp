@@ -11,8 +11,8 @@ bool vk_ring::create(vk_device& d, VkDeviceSize size, VkDeviceSize persistent, V
     VK_TRY(vmaCreateVirtualBlock(&vi, &m_heap));
     VkBufferCreateInfo bi{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
     bi.size = size + persistent;
-    bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-               VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+    bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
     VmaAllocationCreateInfo ai{};
     ai.usage = VMA_MEMORY_USAGE_AUTO;
     ai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
@@ -92,10 +92,18 @@ void vk_ring::wait_for(VkDeviceSize need)
 vk_slice vk_ring::alloc(VkDeviceSize size, VkDeviceSize align)
 {
     if (size >= m_size) return { VK_NULL_HANDLE, 0, nullptr };
+    if (m_used == 0) m_head = m_tail = 0;
     VkDeviceSize off = (m_head + align - 1) & ~(align - 1);
     VkDeviceSize consumed = off + size > m_size ? (m_size - m_head) + size : (off - m_head) + size;
     if (off + size > m_size) off = 0;
-    if (m_used + consumed >= m_size) wait_for(consumed);
+    if (m_used + consumed >= m_size) {
+        wait_for(consumed);
+        if (m_used == 0) {
+            m_head = m_tail = 0;
+            off = 0;
+            consumed = size;
+        }
+    }
     if (m_used + consumed >= m_size) return { VK_NULL_HANDLE, 0, nullptr };
     m_head = off + size == m_size ? 0 : off + size;
     m_used += consumed;
@@ -114,9 +122,4 @@ void vk_ring::close(uint64_t value)
         return;
     }
     m_fences.push_back({ m_head, value });
-}
-
-void vk_ring::invalidate(VkDeviceSize offset, VkDeviceSize size)
-{
-    if (!m_coherent && m_mem) vmaInvalidateAllocation(m_d->vma, m_mem, offset, size);
 }

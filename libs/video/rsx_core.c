@@ -740,7 +740,7 @@ static DWORD WINAPI rsx_fifo_thread(LPVOID unused)
             continue;
         }
         const u32 page_id = s.get >> 20;
-        const u32 page_base = (page_id < RSX_IO_PAGES) ? s.io_ea[page_id] : 0u;
+        const u32 page_base = (page_id < RSX_IO_PAGES) ? __atomic_load_n(&s.io_ea[page_id], __ATOMIC_ACQUIRE) : 0u;
         if (!page_base) {
             rsx_fault("get unmapped", s.get, 0);
             rsx_wait_change(put);

@@ -58,7 +58,7 @@ void img_barriers(VkCommandBuffer cmd, const VkImageMemoryBarrier2* barriers, ui
     vkCmdPipelineBarrier2(cmd, &dep);
 }
 
-VkPipeline make_pipeline(VkDevice dev, VkPipelineLayout layout, VkShaderModule vs, VkShaderModule fs,
+VkPipeline make_pipeline(VkDevice dev, VkPipelineCache cache, VkPipelineLayout layout, VkShaderModule vs, VkShaderModule fs,
                          VkFormat color_fmt, VkFormat stencil_fmt, bool stencil_write, bool stencil_test)
 {
     VkPipelineShaderStageCreateInfo stages[2]{};
@@ -136,7 +136,7 @@ VkPipeline make_pipeline(VkDevice dev, VkPipelineLayout layout, VkShaderModule v
     gi.layout = layout;
 
     VkPipeline pipe = VK_NULL_HANDLE;
-    if (vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gi, nullptr, &pipe) != VK_SUCCESS) return VK_NULL_HANDLE;
+    if (vkCreateGraphicsPipelines(dev, cache, 1, &gi, nullptr, &pipe) != VK_SUCCESS) return VK_NULL_HANDLE;
     return pipe;
 }
 
@@ -179,9 +179,10 @@ void smaa::destroy_image(tex& t)
     t = {};
 }
 
-bool smaa::create(vk_device& d)
+bool smaa::create(vk_device& d, VkPipelineCache cache)
 {
     m_d = &d;
+    m_cache = cache;
 
     const VkFormat stencil_candidates[] = {
         VK_FORMAT_S8_UINT,
@@ -247,9 +248,9 @@ bool smaa::create(vk_device& d)
         return false;
     }
 
-    m_pipe_edge = make_pipeline(d.dev, m_layout, m_edge_vs, m_edge_fs,
+    m_pipe_edge = make_pipeline(d.dev, m_cache, m_layout, m_edge_vs, m_edge_fs,
                                 VK_FORMAT_R8G8_UNORM, m_stencil_format, true, false);
-    m_pipe_weight = make_pipeline(d.dev, m_layout, m_weight_vs, m_weight_fs,
+    m_pipe_weight = make_pipeline(d.dev, m_cache, m_layout, m_weight_vs, m_weight_fs,
                                   VK_FORMAT_R8G8B8A8_UNORM, m_stencil_format, false, true);
     if (!m_pipe_edge || !m_pipe_weight) {
         destroy();
@@ -296,7 +297,7 @@ void smaa::destroy_targets()
 
 void smaa::release_targets()
 {
-    if (!m_d || !m_out.handle) return;
+    if (!m_d || (!m_out.handle && !m_edges.handle)) return;
     {
         std::lock_guard<std::mutex> hold(m_d->queue_lock);
         vkDeviceWaitIdle(m_d->dev);
@@ -351,10 +352,14 @@ bool smaa::ensure_blend_pipeline(VkFormat out_format)
 {
     if (m_pipe_blend && m_blend_format == out_format) return true;
     if (m_pipe_blend) {
+        {
+            std::lock_guard<std::mutex> hold(m_d->queue_lock);
+            vkDeviceWaitIdle(m_d->dev);
+        }
         vkDestroyPipeline(m_d->dev, m_pipe_blend, nullptr);
         m_pipe_blend = VK_NULL_HANDLE;
     }
-    m_pipe_blend = make_pipeline(m_d->dev, m_layout, m_blend_vs, m_blend_fs,
+    m_pipe_blend = make_pipeline(m_d->dev, m_cache, m_layout, m_blend_vs, m_blend_fs,
                                  out_format, VK_FORMAT_UNDEFINED, false, false);
     if (!m_pipe_blend) return false;
     m_blend_format = out_format;
@@ -365,20 +370,38 @@ bool smaa::ensure_downscale_pipeline(VkFormat dst_format)
 {
     if (m_pipe_down && m_down_format == dst_format) return true;
     if (m_pipe_down) {
+        {
+            std::lock_guard<std::mutex> hold(m_d->queue_lock);
+            vkDeviceWaitIdle(m_d->dev);
+        }
         vkDestroyPipeline(m_d->dev, m_pipe_down, nullptr);
         m_pipe_down = VK_NULL_HANDLE;
     }
-    m_pipe_down = make_pipeline(m_d->dev, m_layout, m_down_vs, m_down_fs,
+    m_pipe_down = make_pipeline(m_d->dev, m_cache, m_layout, m_down_vs, m_down_fs,
                                 dst_format, VK_FORMAT_UNDEFINED, false, false);
     if (!m_pipe_down) return false;
     m_down_format = dst_format;
     return true;
 }
 
-bool smaa::ensure_targets(uint32_t w, uint32_t h, VkFormat out_format)
+bool smaa::ensure_targets(uint32_t w, uint32_t h, VkFormat out_format, bool need_out)
 {
-    if (m_width == w && m_height == h && m_out_format == out_format && m_out.handle) return true;
-    if (m_out.handle) {
+    const bool base_ok = m_width == w && m_height == h && m_edges.handle;
+    if (base_ok && (!need_out || (m_out.handle && m_out_format == out_format))) return true;
+    if (base_ok && need_out) {
+        if (m_out.handle) {
+            std::lock_guard<std::mutex> hold(m_d->queue_lock);
+            vkDeviceWaitIdle(m_d->dev);
+            destroy_image(m_out);
+        }
+        if (!create_image(m_out, out_format, w, h,
+                          VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                          VK_IMAGE_ASPECT_COLOR_BIT))
+            return false;
+        m_out_format = out_format;
+        return true;
+    }
+    if (m_edges.handle) {
         std::lock_guard<std::mutex> hold(m_d->queue_lock);
         vkDeviceWaitIdle(m_d->dev);
     }
@@ -389,15 +412,15 @@ bool smaa::ensure_targets(uint32_t w, uint32_t h, VkFormat out_format)
                       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT) ||
         !create_image(m_stencil, m_stencil_format, w, h,
                       VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_STENCIL_BIT) ||
-        !create_image(m_out, out_format, w, h,
-                      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                      VK_IMAGE_ASPECT_COLOR_BIT)) {
+        (need_out && !create_image(m_out, out_format, w, h,
+                                   VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                                   VK_IMAGE_ASPECT_COLOR_BIT))) {
         destroy_targets();
         return false;
     }
     m_width = w;
     m_height = h;
-    m_out_format = out_format;
+    m_out_format = need_out ? out_format : VK_FORMAT_UNDEFINED;
     return true;
 }
 
@@ -440,11 +463,14 @@ bool smaa::upload_luts(VkCommandBuffer cmd, uint64_t submit_ticket)
 }
 
 smaa::output smaa::record(VkCommandBuffer cmd, VkImageView src_view, VkFormat src_format, uint32_t width, uint32_t height,
-                          bool for_sample, uint64_t submit_ticket)
+                          bool for_sample, uint64_t submit_ticket, VkImage direct_img, VkImageView direct_view)
 {
+    const bool direct = direct_img && direct_view && !for_sample;
     if (!m_d || !m_pipe_edge || !width || !height || !src_view) return {};
-    if (!ensure_blend_pipeline(src_format) || !ensure_targets(width, height, src_format)) return {};
+    if (!ensure_blend_pipeline(src_format) || !ensure_targets(width, height, src_format, !direct)) return {};
     upload_luts(cmd, submit_ticket);
+    const VkImage out_img = direct ? direct_img : m_out.handle;
+    const VkImageView out_view = direct ? direct_view : m_out.view;
 
     const float rt_metrics[4] = { 1.f / (float)width, 1.f / (float)height, (float)width, (float)height };
     const VkViewport vp{ 0.f, 0.f, (float)width, (float)height, 0.f, 1.f };
@@ -532,7 +558,7 @@ smaa::output smaa::record(VkCommandBuffer cmd, VkImageView src_view, VkFormat sr
         sa.imageView = m_stencil.view;
         sa.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
         sa.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-        sa.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        sa.storeOp = VK_ATTACHMENT_STORE_OP_NONE;
 
         VkRenderingInfo ri{ VK_STRUCTURE_TYPE_RENDERING_INFO };
         ri.renderArea = scissor;
@@ -570,7 +596,7 @@ smaa::output smaa::record(VkCommandBuffer cmd, VkImageView src_view, VkFormat sr
                          VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                          VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
                          VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT),
-            make_barrier(m_out.handle, VK_IMAGE_ASPECT_COLOR_BIT,
+            make_barrier(out_img, VK_IMAGE_ASPECT_COLOR_BIT,
                          VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                          VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_BLIT_BIT | VK_PIPELINE_STAGE_2_COPY_BIT, 0,
                          VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT),
@@ -580,7 +606,7 @@ smaa::output smaa::record(VkCommandBuffer cmd, VkImageView src_view, VkFormat sr
 
     {
         VkRenderingAttachmentInfo ca{ VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
-        ca.imageView = m_out.view;
+        ca.imageView = out_view;
         ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         ca.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
         ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -614,17 +640,17 @@ smaa::output smaa::record(VkCommandBuffer cmd, VkImageView src_view, VkFormat sr
     }
 
     if (for_sample) {
-        img_barrier(cmd, m_out.handle, VK_IMAGE_ASPECT_COLOR_BIT,
+        img_barrier(cmd, out_img, VK_IMAGE_ASPECT_COLOR_BIT,
                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                     VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
                     VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
     } else {
-        img_barrier(cmd, m_out.handle, VK_IMAGE_ASPECT_COLOR_BIT,
+        img_barrier(cmd, out_img, VK_IMAGE_ASPECT_COLOR_BIT,
                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                     VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
                     VK_PIPELINE_STAGE_2_BLIT_BIT | VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
     }
-    return { m_out.handle, m_out.view };
+    return { out_img, out_view };
 }
 
 bool smaa::downscale(VkCommandBuffer cmd, VkImageView src_view, uint32_t sw, uint32_t sh,
@@ -634,8 +660,8 @@ bool smaa::downscale(VkCommandBuffer cmd, VkImageView src_view, uint32_t sw, uin
     if (!ensure_downscale_pipeline(dst_format)) return false;
 
     const float scale = std::min((float)out.width / (float)sw, (float)out.height / (float)sh);
-    const uint32_t dw = (uint32_t)std::max(1, (int32_t)std::lround((float)sw * scale));
-    const uint32_t dh = (uint32_t)std::max(1, (int32_t)std::lround((float)sh * scale));
+    const uint32_t dw = std::min(out.width, (uint32_t)std::max(1, (int32_t)std::lround((float)sw * scale)));
+    const uint32_t dh = std::min(out.height, (uint32_t)std::max(1, (int32_t)std::lround((float)sh * scale)));
     const int32_t x0 = ((int32_t)out.width - (int32_t)dw) / 2;
     const int32_t y0 = ((int32_t)out.height - (int32_t)dh) / 2;
     const bool letterboxed = (dw != out.width || dh != out.height);

@@ -21,4 +21,11 @@ struct ratio {
     bool operator>(const ratio& o) const { return (uint64_t)num * o.den > (uint64_t)o.num * den; }
 };
 
+struct scale2d {
+    ratio x;
+    ratio y;
+    bool unit() const { return x.unit() && y.unit(); }
+    bool operator==(const scale2d&) const = default;
+};
+
 }

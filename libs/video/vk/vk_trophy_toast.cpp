@@ -272,9 +272,10 @@ void blit_icon_rounded(std::vector<uint8_t>& buf, int bw, int bh, const uint8_t*
 
 }
 
-bool trophy_toast::create(vk_device& d)
+bool trophy_toast::create(vk_device& d, VkPipelineCache cache)
 {
     m_d = &d;
+    m_cache = cache;
     const char* env = std::getenv("PS3_TROPHY_POPUP");
     if (env && env[0] == '0') {
         m_disabled = true;
@@ -363,6 +364,10 @@ bool trophy_toast::ensure_pipeline(VkFormat format)
 {
     if (m_pipe && m_pipe_format == format) return true;
     if (m_pipe) {
+        {
+            std::lock_guard<std::mutex> hold(m_d->queue_lock);
+            vkDeviceWaitIdle(m_d->dev);
+        }
         vkDestroyPipeline(m_d->dev, m_pipe, nullptr);
         m_pipe = VK_NULL_HANDLE;
     }
@@ -412,7 +417,7 @@ bool trophy_toast::ensure_pipeline(VkFormat format)
     gi.pColorBlendState = &cb;
     gi.pDynamicState = &dy;
     gi.layout = m_layout;
-    if (vkCreateGraphicsPipelines(m_d->dev, VK_NULL_HANDLE, 1, &gi, nullptr, &m_pipe) != VK_SUCCESS) {
+    if (vkCreateGraphicsPipelines(m_d->dev, m_cache, 1, &gi, nullptr, &m_pipe) != VK_SUCCESS) {
         m_pipe = VK_NULL_HANDLE;
         return false;
     }
@@ -603,7 +608,13 @@ void trophy_toast::upload_card(VkCommandBuffer cmd)
     ba.usage = VMA_MEMORY_USAGE_AUTO;
     ba.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
     VmaAllocationInfo bai{};
-    if (vmaCreateBuffer(m_d->vma, &bi, &ba, &m_stage, &m_stage_mem, &bai) != VK_SUCCESS || !bai.pMappedData) return;
+    if (vmaCreateBuffer(m_d->vma, &bi, &ba, &m_stage, &m_stage_mem, &bai) != VK_SUCCESS) return;
+    if (!bai.pMappedData) {
+        vmaDestroyBuffer(m_d->vma, m_stage, m_stage_mem);
+        m_stage = VK_NULL_HANDLE;
+        m_stage_mem = nullptr;
+        return;
+    }
     std::memcpy(bai.pMappedData, m_pixels.data(), bytes);
     vmaFlushAllocation(m_d->vma, m_stage_mem, 0, bytes);
 

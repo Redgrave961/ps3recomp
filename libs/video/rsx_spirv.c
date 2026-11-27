@@ -5,19 +5,19 @@
 #include <string.h>
 
 _Static_assert(sizeof(rsx_spv_vertex_attrib) == 16, "rsx_spv_vertex_attrib layout");
-_Static_assert(offsetof(rsx_spv_vertex_layout, value) == 256, "rsx_spv_vertex_layout.value");
-_Static_assert(offsetof(rsx_spv_vertex_layout, scale_offset) == 512, "rsx_spv_vertex_layout.scale_offset");
-_Static_assert(offsetof(rsx_spv_vertex_layout, vertex_base) == 576, "rsx_spv_vertex_layout.vertex_base");
-_Static_assert(offsetof(rsx_spv_vertex_layout, instance_base) == 580, "rsx_spv_vertex_layout.instance_base");
-_Static_assert(offsetof(rsx_spv_vertex_layout, clip_planes) == 584, "rsx_spv_vertex_layout.clip_planes");
-_Static_assert(offsetof(rsx_spv_vertex_layout, flags) == 588, "rsx_spv_vertex_layout.flags");
-_Static_assert(offsetof(rsx_spv_vertex_layout, transform_branch_bits) == 592, "rsx_spv_vertex_layout.transform_branch_bits");
+_Static_assert(offsetof(rsx_spv_vertex_layout, scale_offset) == 256, "rsx_spv_vertex_layout.scale_offset");
+_Static_assert(offsetof(rsx_spv_vertex_layout, vertex_base) == 320, "rsx_spv_vertex_layout.vertex_base");
+_Static_assert(offsetof(rsx_spv_vertex_layout, instance_base) == 324, "rsx_spv_vertex_layout.instance_base");
+_Static_assert(offsetof(rsx_spv_vertex_layout, clip_planes) == 328, "rsx_spv_vertex_layout.clip_planes");
+_Static_assert(offsetof(rsx_spv_vertex_layout, flags) == 332, "rsx_spv_vertex_layout.flags");
+_Static_assert(offsetof(rsx_spv_vertex_layout, transform_branch_bits) == 336, "rsx_spv_vertex_layout.transform_branch_bits");
 _Static_assert(sizeof(rsx_spv_texture_state) == 16, "rsx_spv_texture_state layout");
 _Static_assert(offsetof(rsx_spv_fragment_state, fog_param) == 16, "rsx_spv_fragment_state.fog_param");
 _Static_assert(offsetof(rsx_spv_fragment_state, wpos_scale) == 24, "rsx_spv_fragment_state.wpos_scale");
 _Static_assert(offsetof(rsx_spv_fragment_state, wpos_bias) == 28, "rsx_spv_fragment_state.wpos_bias");
 _Static_assert(offsetof(rsx_spv_fragment_state, texture) == 32, "rsx_spv_fragment_state.texture");
 _Static_assert(offsetof(rsx_spv_fragment_state, texcoord_control) == 288, "rsx_spv_fragment_state.texcoord_control");
+_Static_assert(offsetof(rsx_spv_fragment_state, wpos_scale_x) == 292, "rsx_spv_fragment_state.wpos_scale_x");
 
 enum {
     OpExtInstImport = 11, OpExtInst = 12, OpMemoryModel = 14, OpEntryPoint = 15, OpExecutionMode = 16,
@@ -60,8 +60,8 @@ enum {
 
 enum {
     GL_Trunc = 3, GL_FAbs = 4, GL_FSign = 6, GL_Floor = 8, GL_Fract = 10, GL_Sin = 13, GL_Cos = 14,
-    GL_Pow = 26, GL_Exp = 27, GL_Exp2 = 29, GL_Log2 = 30, GL_Sqrt = 31, GL_FMin = 37, GL_UMin = 38,
-    GL_SMin = 39, GL_FMax = 40, GL_UMax = 41, GL_SMax = 42, GL_FClamp = 43, GL_FMix = 46, GL_Fma = 50,
+    GL_Pow = 26, GL_Exp = 27, GL_Exp2 = 29, GL_Log2 = 30, GL_Sqrt = 31, GL_UMin = 38,
+    GL_SMin = 39, GL_UMax = 41, GL_SMax = 42, GL_FMix = 46, GL_Fma = 50,
     GL_PackSnorm4x8 = 54, GL_PackUnorm4x8 = 55, GL_PackUnorm2x16 = 57, GL_PackHalf2x16 = 58,
     GL_UnpackUnorm2x16 = 61, GL_UnpackHalf2x16 = 62, GL_UnpackSnorm4x8 = 63, GL_UnpackUnorm4x8 = 64,
     GL_Length = 66, GL_Normalize = 69, GL_Reflect = 71, GL_NMin = 79, GL_NMax = 80, GL_NClamp = 81
@@ -761,6 +761,19 @@ static void vp_prescan(vpc* c)
     if (c->indexed_in) c->inputs = 0xFFFFu;
 }
 
+int rsx_spv_vertex_scan(const u32* ucode, u32 start, u32* out_written, u32* out_texmask)
+{
+    if (!ucode || start >= VP_SLOTS) return -1;
+    vpc c;
+    memset(&c, 0, sizeof c);
+    c.uc = ucode;
+    vp_walk(&c, start);
+    vp_prescan(&c);
+    if (out_written) *out_written = (c.written & 1u) ? c.written : 0u;
+    if (out_texmask) *out_texmask = (c.written & 1u) ? c.texmask : 0u;
+    return 0;
+}
+
 static u32 vp_rvar(vpc* c, u32 n)
 {
     if (!c->r[n]) c->r[n] = gvar(c->s, tv4(c->s), SC_Private, cvs(c->s, 0.0f));
@@ -790,15 +803,13 @@ static u32 vp_layout(vpc* c)
     spv* s = c->s;
     if (c->ubo_l) return c->ubo_l;
     u32 au = tarr(s, tu4(s), 16, 1);
-    u32 av = tarr(s, tv4(s), 16, 1);
     u32 as = tarr(s, tv4(s), 4, 1);
     deco1(s, au, DEC_ArrayStride, 16);
-    deco1(s, av, DEC_ArrayStride, 16);
     deco1(s, as, DEC_ArrayStride, 16);
     u32 u = tu(s);
-    u32 st_ = intern(s, OpTypeStruct, 0, (const u32[]){ au, av, as, u, u, u, u, u, tf(s), tf(s) }, 10, 1);
-    static const u32 offs[10] = { 0, 256, 512, 576, 580, 584, 588, 592, 596, 600 };
-    for (u32 m = 0; m < 10; m++) mdeco(s, st_, m, DEC_Offset, offs[m]);
+    u32 st_ = intern(s, OpTypeStruct, 0, (const u32[]){ au, as, u, u, u, u, u, tf(s), tf(s) }, 9, 1);
+    static const u32 offs[9] = { 0, 256, 320, 324, 328, 332, 336, 340, 344 };
+    for (u32 m = 0; m < 9; m++) mdeco(s, st_, m, DEC_Offset, offs[m]);
     deco(s, st_, DEC_Block);
     c->ubo_l = gvar(s, st_, SC_Uniform, 0);
     deco1(s, c->ubo_l, DEC_DescriptorSet, RSX_SPV_SET_BUFFERS);
@@ -890,48 +901,122 @@ static u32 vp_fetch_bits(vpc* c, u32 addr, u32 size, u32 esz, u32 ncomp, u32 len
         }
         return I(s, OpCompositeConstruct, tu4(s), comp[0], comp[1], comp[2], comp[3]);
     }
-    u32 comp[4];
-    for (u32 n = 0; n < 4; n++) {
-        if (n >= ncomp) {
-            comp[n] = cu(s, 0);
-            continue;
+    u32 resv = lvar(s, tu4(s));
+    u32 bw = ushr(s, t, addr, cu(s, 2));
+    u32 bb = uand(s, t, addr, cu(s, 3));
+    u32 am = newl(s), la = newl(s), lu = newl(s);
+    V(s, OpSelectionMerge, am, 0);
+    V(s, OpBranchConditional, I(s, OpIEqual, tbool(s), bb, cu(s, 0)), la, lu);
+
+    label(s, la);
+    if (esz == 4) {
+        u32 comp[4];
+        for (u32 n = 0; n < 4; n++) {
+            if (n >= ncomp) {
+                comp[n] = cu(s, 0);
+                continue;
+            }
+            u32 cv = 0, cm = 0, ct = 0;
+            if (ncomp > 1 && n > 0) {
+                cv = lvar(s, t);
+                st(s, cv, cu(s, 0));
+                sel_if(s, I(s, OpULessThan, tbool(s), cu(s, n), size), &cm, &ct);
+            }
+            u32 wi = n ? I(s, OpIAdd, t, bw, cu(s, n)) : bw;
+            u32 w0 = X(s, t, GL_UMin, wi, lenm1);
+            u32 v = bswap32(s, ld(s, t, I(s, OpAccessChain, pt, data, ci(s, 0), w0)));
+            if (ncomp > 1 && n > 0) {
+                st(s, cv, v);
+                sel_end(s, cm);
+                comp[n] = ld(s, t, cv);
+            } else {
+                comp[n] = v;
+            }
         }
-        u32 cv = 0, cm = 0, ct = 0;
-        if (ncomp > 1 && n > 0) {
-            cv = lvar(s, t);
-            st(s, cv, cu(s, 0));
-            sel_if(s, I(s, OpULessThan, tbool(s), cu(s, n), size), &cm, &ct);
+        st(s, resv, I(s, OpCompositeConstruct, tu4(s), comp[0], comp[1], comp[2], comp[3]));
+    } else {
+        u32 w0 = X(s, t, GL_UMin, bw, lenm1);
+        u32 d0 = ld(s, t, I(s, OpAccessChain, pt, data, ci(s, 0), w0));
+        u32 lo0 = uand(s, t, d0, cu(s, 0xFFFFu));
+        u32 c0 = uor(s, t, ushl(s, t, uand(s, t, lo0, cu(s, 0xFFu)), cu(s, 8)), ushr(s, t, lo0, cu(s, 8)));
+        u32 c1 = cu(s, 0), c2 = cu(s, 0), c3 = cu(s, 0);
+        if (ncomp > 1) {
+            u32 hi0 = ushr(s, t, d0, cu(s, 16));
+            u32 v1 = uor(s, t, ushl(s, t, uand(s, t, hi0, cu(s, 0xFFu)), cu(s, 8)), ushr(s, t, hi0, cu(s, 8)));
+            c1 = sel(s, t, I(s, OpULessThan, tbool(s), cu(s, 1), size), v1, cu(s, 0));
         }
-        u32 ea = n ? I(s, OpIAdd, t, addr, cu(s, n * esz)) : addr;
-        u32 w = ushr(s, t, ea, cu(s, 2));
-        u32 b = uand(s, t, ea, cu(s, 3));
-        u32 sh = ushl(s, t, b, cu(s, 3));
-        u32 w0 = X(s, t, GL_UMin, w, lenm1);
-        u32 lo = ushr(s, t, ld(s, t, I(s, OpAccessChain, pt, data, ci(s, 0), w0)), sh);
-        u32 lev = lvar(s, t);
-        st(s, lev, lo);
-        {
-            u32 hm, ht;
-            sel_if(s, I(s, OpUGreaterThan, tbool(s), b, cu(s, 4u - esz)), &hm, &ht);
-            u32 w1 = X(s, t, GL_UMin, I(s, OpIAdd, t, w, cu(s, 1)), lenm1);
-            u32 hv = ld(s, t, I(s, OpAccessChain, pt, data, ci(s, 0), w1));
-            u32 hi = ushl(s, t, ushl(s, t, hv, cu(s, 1)), I(s, OpISub, t, cu(s, 31), sh));
-            st(s, lev, uor(s, t, lo, hi));
-            sel_end(s, hm);
-        }
-        u32 le = ld(s, t, lev);
-        u32 v;
-        if (esz == 4) v = bswap32(s, le);
-        else v = uor(s, t, ushl(s, t, uand(s, t, le, cu(s, 0xFFu)), cu(s, 8)), uand(s, t, ushr(s, t, le, cu(s, 8)), cu(s, 0xFFu)));
-        if (ncomp > 1 && n > 0) {
-            st(s, cv, v);
+        if (ncomp > 2) {
+            u32 cv2 = lvar(s, t), cv3 = lvar(s, t);
+            st(s, cv2, cu(s, 0));
+            st(s, cv3, cu(s, 0));
+            u32 cm, ct;
+            sel_if(s, I(s, OpULessThan, tbool(s), cu(s, 2), size), &cm, &ct);
+            u32 w1 = X(s, t, GL_UMin, I(s, OpIAdd, t, bw, cu(s, 1)), lenm1);
+            u32 d1 = ld(s, t, I(s, OpAccessChain, pt, data, ci(s, 0), w1));
+            u32 lo1 = uand(s, t, d1, cu(s, 0xFFFFu));
+            st(s, cv2, uor(s, t, ushl(s, t, uand(s, t, lo1, cu(s, 0xFFu)), cu(s, 8)), ushr(s, t, lo1, cu(s, 8))));
+            if (ncomp > 3) {
+                u32 hi1 = ushr(s, t, d1, cu(s, 16));
+                u32 v3 = uor(s, t, ushl(s, t, uand(s, t, hi1, cu(s, 0xFFu)), cu(s, 8)), ushr(s, t, hi1, cu(s, 8)));
+                st(s, cv3, sel(s, t, I(s, OpULessThan, tbool(s), cu(s, 3), size), v3, cu(s, 0)));
+            }
             sel_end(s, cm);
-            comp[n] = ld(s, t, cv);
-        } else {
-            comp[n] = v;
+            c2 = ld(s, t, cv2);
+            c3 = ld(s, t, cv3);
         }
+        st(s, resv, I(s, OpCompositeConstruct, tu4(s), c0, c1, c2, c3));
     }
-    return I(s, OpCompositeConstruct, tu4(s), comp[0], comp[1], comp[2], comp[3]);
+    V(s, OpBranch, am);
+
+    label(s, lu);
+    {
+        u32 comp[4];
+        for (u32 n = 0; n < 4; n++) {
+            if (n >= ncomp) {
+                comp[n] = cu(s, 0);
+                continue;
+            }
+            u32 cv = 0, cm = 0, ct = 0;
+            if (ncomp > 1 && n > 0) {
+                cv = lvar(s, t);
+                st(s, cv, cu(s, 0));
+                sel_if(s, I(s, OpULessThan, tbool(s), cu(s, n), size), &cm, &ct);
+            }
+            u32 ea = n ? I(s, OpIAdd, t, addr, cu(s, n * esz)) : addr;
+            u32 w = ushr(s, t, ea, cu(s, 2));
+            u32 b = uand(s, t, ea, cu(s, 3));
+            u32 sh = ushl(s, t, b, cu(s, 3));
+            u32 w0 = X(s, t, GL_UMin, w, lenm1);
+            u32 lo = ushr(s, t, ld(s, t, I(s, OpAccessChain, pt, data, ci(s, 0), w0)), sh);
+            u32 lev = lvar(s, t);
+            st(s, lev, lo);
+            {
+                u32 hm, ht;
+                sel_if(s, I(s, OpUGreaterThan, tbool(s), b, cu(s, 4u - esz)), &hm, &ht);
+                u32 w1 = X(s, t, GL_UMin, I(s, OpIAdd, t, w, cu(s, 1)), lenm1);
+                u32 hv = ld(s, t, I(s, OpAccessChain, pt, data, ci(s, 0), w1));
+                u32 hi = ushl(s, t, ushl(s, t, hv, cu(s, 1)), I(s, OpISub, t, cu(s, 31), sh));
+                st(s, lev, uor(s, t, lo, hi));
+                sel_end(s, hm);
+            }
+            u32 le = ld(s, t, lev);
+            u32 v;
+            if (esz == 4) v = bswap32(s, le);
+            else v = uor(s, t, ushl(s, t, uand(s, t, le, cu(s, 0xFFu)), cu(s, 8)), uand(s, t, ushr(s, t, le, cu(s, 8)), cu(s, 0xFFu)));
+            if (ncomp > 1 && n > 0) {
+                st(s, cv, v);
+                sel_end(s, cm);
+                comp[n] = ld(s, t, cv);
+            } else {
+                comp[n] = v;
+            }
+        }
+        st(s, resv, I(s, OpCompositeConstruct, tu4(s), comp[0], comp[1], comp[2], comp[3]));
+    }
+    V(s, OpBranch, am);
+
+    label(s, am);
+    return ld(s, tu4(s), resv);
 }
 
 static u32 vp_finalize(vpc* c, u32 v, u32 size)
@@ -958,8 +1043,8 @@ static u32 vp_fetch_body(vpc* c, u32 k)
         deco1(s, c->vidx, DEC_BuiltIn, BI_VertexIndex);
     }
     u32 vid = ld(s, it, c->vidx);
-    u32 vb = bc(s, it, vp_layout_u32(c, 3));
-    u32 ib = vp_layout_u32(c, 4);
+    u32 vb = bc(s, it, vp_layout_u32(c, 2));
+    u32 ib = vp_layout_u32(c, 3);
     u32 per = I(s, OpISub, it, vid, vb);
     u32 idxv = lvar(s, t);
     st(s, idxv, bc(s, t, per));
@@ -981,9 +1066,8 @@ static u32 vp_fetch_body(vpc* c, u32 k)
     }
     u32 idx = ld(s, t, idxv);
     u32 addr = I(s, OpIAdd, t, I(s, OpIMul, t, idx, stride), off);
-    u32 dflt = ld(s, tv4(s), I(s, OpAccessChain, tptr(s, SC_Uniform, tv4(s)), L, ci(s, 1), k));
     u32 res = lvar(s, tv4(s));
-    st(s, res, dflt);
+    st(s, res, cv4(s, 0.0f, 0.0f, 0.0f, 1.0f));
     u32 eff = sel(s, t, I(s, OpIEqual, tbool(s), size, cu(s, 0)), cu(s, 0), typ);
     u32 len = I(s, OpArrayLength, t, vp_data(c), 0);
     u32 lenm1 = I(s, OpISub, t, len, cu(s, 1));
@@ -1301,7 +1385,7 @@ static u32 vp_ins(vpc* c, u32 pc)
     case SCA_BRB: case SCA_CLB: case SCA_CAL: case SCA_CLI: {
         u32 taken;
         if (sca == SCA_BRB || sca == SCA_CLB) {
-            u32 bits = vp_layout_u32(c, 7);
+            u32 bits = vp_layout_u32(c, 6);
             u32 b = bitset(s, ushr(s, tu(s), bits, cu(s, bf(i.d3, 23, 5))), 0);
             taken = bf(i.d3, 28, 1) ? b : bnot(s, b);
         } else {
@@ -1347,7 +1431,7 @@ static void vp_epilogue(vpc* c)
     u32 pw = exf(s, pos, 3);
     u32 d[4];
     for (u32 r = 0; r < 3; r++) {
-        u32 row = ld(s, T4, I(s, OpAccessChain, pt, L, ci(s, 2), ci(s, (s32)r)));
+        u32 row = ld(s, T4, I(s, OpAccessChain, pt, L, ci(s, 1), ci(s, (s32)r)));
         d[r] = fadd(s, tf(s), fmul(s, tf(s), exf(s, row, r), exf(s, pos, r)), fmul(s, tf(s), exf(s, row, 3), pw));
     }
     d[3] = pw;
@@ -1379,8 +1463,8 @@ static void vp_epilogue(vpc* c)
         deco1(s, ps, DEC_BuiltIn, BI_PointSize);
         u32 pf = tptr(s, SC_Uniform, tf(s));
         u32 size = ((mask & RSX_SPV_VPOUT_POINTSIZE) && (c->written & (1u << 6))) ? exf(s, ld(s, T4, c->o[6]), 0)
-                                                                                    : ld(s, tf(s), I(s, OpAccessChain, pf, vp_layout(c), ci(s, 8)));
-        st(s, ps, fmul(s, tf(s), size, ld(s, tf(s), I(s, OpAccessChain, pf, vp_layout(c), ci(s, 9)))));
+                                                                                    : ld(s, tf(s), I(s, OpAccessChain, pf, vp_layout(c), ci(s, 7)));
+        st(s, ps, fmul(s, tf(s), size, ld(s, tf(s), I(s, OpAccessChain, pf, vp_layout(c), ci(s, 8)))));
     }
     u32 qual = 0;
     for (u32 p = 0; p < 6; p++) {
@@ -1391,7 +1475,7 @@ static void vp_epilogue(vpc* c)
         u32 arr = tarr(s, tf(s), 6, 0);
         u32 cd = gvar(s, arr, SC_Output, 0);
         deco1(s, cd, DEC_BuiltIn, BI_ClipDistance);
-        u32 cfg = vp_layout_u32(c, 5);
+        u32 cfg = vp_layout_u32(c, 4);
         u32 r5 = (qual & 7u) ? ld(s, T4, c->o[5]) : 0;
         u32 r6 = (qual & 0x38u) ? ld(s, T4, c->o[6]) : 0;
         u32 pf = tptr(s, SC_Output, tf(s));
@@ -1544,6 +1628,17 @@ int rsx_spv_vertex(const u32* ucode, const rsx_spv_vp_key* key, rsx_spv_blob* ou
         info->texture_mask = c->texmask;
         memcpy(info->constants_used, c->cused, sizeof info->constants_used);
         info->constants_relative = c->crel;
+        u32 mc = 0;
+        if (c->crel) {
+            mc = RSX_SPV_VP_CONSTANTS - 1u;
+        } else {
+            for (u32 w = (RSX_SPV_VP_CONSTANTS + 31u) / 32u; w-- > 0;)
+                if (c->cused[w]) {
+                    mc = w * 32u + (31u - (u32)__builtin_clz(c->cused[w]));
+                    break;
+                }
+        }
+        info->max_const = mc;
     }
     free(c);
     return rc;
@@ -1847,9 +1942,9 @@ static u32 fp_state(fpc* c)
     u32 at = tarr(s, tu4(s), RSX_SPV_TEXTURE_UNITS, 1);
     deco1(s, at, DEC_ArrayStride, 16);
     u32 u = tu(s), f = tf(s);
-    u32 st_ = intern(s, OpTypeStruct, 0, (const u32[]){ u, u, f, u, f, f, f, f, at, u }, 10, 1);
-    static const u32 offs[10] = { 0, 4, 8, 12, 16, 20, 24, 28, 32, 288 };
-    for (u32 m = 0; m < 10; m++) mdeco(s, st_, m, DEC_Offset, offs[m]);
+    u32 st_ = intern(s, OpTypeStruct, 0, (const u32[]){ u, u, f, u, f, f, f, f, at, u, f }, 11, 1);
+    static const u32 offs[11] = { 0, 4, 8, 12, 16, 20, 24, 28, 32, 288, 292 };
+    for (u32 m = 0; m < 11; m++) mdeco(s, st_, m, DEC_Offset, offs[m]);
     deco(s, st_, DEC_Block);
     c->ubo_s = gvar(s, st_, SC_Uniform, 0);
     deco1(s, c->ubo_s, DEC_DescriptorSet, RSX_SPV_SET_BUFFERS);
@@ -1963,8 +2058,8 @@ static void fp_writeR(fpc* c, u32 n, u32 v, u32 mask, u32 condv)
 static void fp_writeH(fpc* c, u32 m, u32 v, u32 mask, u32 condv)
 {
     spv* s = c->s;
-    u32 q = (c->fp32_half || (!c->has_pack && c->width[m >> 1] == FP_WIDTH_H)) ? v : f16_quantize(s, v);
     if (fp_split(c, m)) {
+        u32 q = (c->fp32_half || (!c->has_pack && c->width[m >> 1] == FP_WIDTH_H)) ? v : f16_quantize(s, v);
         u32 var = fp_hvar(c, m);
         if (mask == 0xFu && !condv) {
             st(s, var, q);
@@ -1975,9 +2070,7 @@ static void fp_writeH(fpc* c, u32 m, u32 v, u32 mask, u32 condv)
         st(s, var, mask4(s, old, q, tv4(s), mask));
         return;
     }
-    u32 w[2];
-    w[0] = X(s, tu(s), GL_PackHalf2x16, I(s, OpVectorShuffle, tv2(s), q, q, 0, 1));
-    w[1] = X(s, tu(s), GL_PackHalf2x16, I(s, OpVectorShuffle, tv2(s), q, q, 2, 3));
+    u32 q = (c->fp32_half || (!c->has_pack && c->width[m >> 1] == FP_WIDTH_H)) ? v : f16_32_clamp(s, v);
     u32 var = fp_rvar(c, m >> 1);
     u32 old = ld(s, tu4(s), var);
     u32 base = (m & 1u) * 2u;
@@ -1985,6 +2078,7 @@ static void fp_writeH(fpc* c, u32 m, u32 v, u32 mask, u32 condv)
     for (u32 k = 0; k < 2; k++) {
         u32 lm = (mask >> (k * 2u)) & 3u;
         if (!lm) continue;
+        u32 wk = X(s, tu(s), GL_PackHalf2x16, I(s, OpVectorShuffle, tv2(s), q, q, k * 2u, k * 2u + 1u));
         u32 o = ex(s, tu(s), old, base + k);
         u32 msk;
         if (condv) {
@@ -1994,13 +2088,13 @@ static void fp_writeH(fpc* c, u32 m, u32 v, u32 mask, u32 condv)
         } else {
             u32 cm = ((lm & 1u) ? 0x0000FFFFu : 0u) | ((lm & 2u) ? 0xFFFF0000u : 0u);
             if (cm == 0xFFFFFFFFu) {
-                nv = I(s, OpCompositeInsert, tu4(s), w[k], nv, base + k);
+                nv = I(s, OpCompositeInsert, tu4(s), wk, nv, base + k);
                 continue;
             }
             msk = cu(s, cm);
         }
         u32 keep = uand(s, tu(s), o, I(s, OpNot, tu(s), msk));
-        u32 put = uand(s, tu(s), w[k], msk);
+        u32 put = uand(s, tu(s), wk, msk);
         nv = I(s, OpCompositeInsert, tu4(s), uor(s, tu(s), keep, put), nv, base + k);
     }
     st(s, var, nv);
@@ -2087,11 +2181,12 @@ static u32 fp_wpos(fpc* c)
 {
     spv* s = c->s;
     u32 fc = fp_fragcoord(c);
-    u32 sc = fp_state_f(c, 6);
+    u32 scx = fp_state_f(c, 10);
+    u32 scy = fp_state_f(c, 6);
     u32 bias = fp_state_f(c, 7);
     u32 pci = bitset(s, fp_state_u(c, 0), 2);
     u32 bx = sel(s, tf(s), pci, cf(s, -0.5f), cf(s, 0.0f));
-    u32 mul = vec4c(s, X(s, tf(s), GL_FAbs, sc), sc, cf(s, 1.0f), cf(s, 1.0f));
+    u32 mul = vec4c(s, scx, scy, cf(s, 1.0f), cf(s, 1.0f));
     u32 add = vec4c(s, bx, bias, cf(s, 0.0f), cf(s, 0.0f));
     return fadd(s, tv4(s), fmul(s, tv4(s), fc, mul), add);
 }
@@ -2187,6 +2282,7 @@ static u32 fp_texcoord_body(fpc* c, u32 v, u32 t, u32 persp)
 static u32 fp_texcoord(fpc* c, u32 t, int persp)
 {
     spv* s = c->s;
+    u32 iv = fp_invar(c, RSX_SPV_VAR_TEX0 + t);
     if (!c->tcfn) {
         c->tcfn = s->id++;
         const u32 pt[3] = { tv4(s), tu(s), tbool(s) };
@@ -2196,7 +2292,7 @@ static u32 fp_texcoord(fpc* c, u32 t, int persp)
         V(s, 254, r);
         fn_end(s);
     }
-    return I(s, OpFunctionCall, tv4(s), c->tcfn, fp_invar(c, RSX_SPV_VAR_TEX0 + t), cu(s, t), cb(s, persp));
+    return I(s, OpFunctionCall, tv4(s), c->tcfn, iv, cu(s, t), cb(s, persp));
 }
 
 static u32 fp_input(fpc* c, const fpi* i, u32* prec)
@@ -2446,11 +2542,13 @@ static u32 fp_tex(fpc* c, const fpi* i, u32 op, u32 s0, u32 s1, u32 s2)
             u32 is_df = bitset(s, ctl, 14);
             ref = sel(s, TF, is_df, ref, X(s, TF, GL_NMin, ref, cf(s, 1.0f)));
 
-            int shadow_scaled = (int)((c->key->texture_shadow >> (16u + unit)) & 1u);
-            if (!shadow_scaled) {
-                res = I(s, OpImageSampleDrefImplicitLod, TF, img, xy, ref);
-            } else {
-                u32 pcf_rad = bc(s, TF, ex(s, tu(s), ts, 1));
+            u32 pcf_rad = bc(s, TF, ex(s, tu(s), ts, 1));
+            u32 rv = lvar(s, TF);
+            u32 m = newl(s), tl = newl(s), fl = newl(s);
+            V(s, OpSelectionMerge, m, 0);
+            V(s, OpBranchConditional, I(s, OpFOrdGreaterThan, tbool(s), pcf_rad, cf(s, 0.0f)), tl, fl);
+            label(s, tl);
+            {
                 u32 sx = fmul(s, TF, exf(s, sc, 0), pcf_rad);
                 u32 sy = fmul(s, TF, exf(s, sc, 1), pcf_rad);
                 u32 ax = fmul(s, TF, sx, cf(s, 0.37f)), bx = fmul(s, TF, sx, cf(s, 0.13f));
@@ -2461,8 +2559,14 @@ static u32 fp_tex(fpc* c, const fpi* i, u32 op, u32 s0, u32 s1, u32 s2)
                 u32 t1 = I(s, OpImageSampleDrefImplicitLod, TF, img, fsub(s, tv2(s), xy, d0), ref);
                 u32 t2 = I(s, OpImageSampleDrefImplicitLod, TF, img, fadd(s, tv2(s), xy, d1), ref);
                 u32 t3 = I(s, OpImageSampleDrefImplicitLod, TF, img, fsub(s, tv2(s), xy, d1), ref);
-                res = fmul(s, TF, fadd(s, TF, fadd(s, TF, t0, t1), fadd(s, TF, t2, t3)), cf(s, 0.25f));
+                st(s, rv, fmul(s, TF, fadd(s, TF, fadd(s, TF, t0, t1), fadd(s, TF, t2, t3)), cf(s, 0.25f)));
+                V(s, OpBranch, m);
             }
+            label(s, fl);
+            st(s, rv, I(s, OpImageSampleDrefImplicitLod, TF, img, xy, ref));
+            V(s, OpBranch, m);
+            label(s, m);
+            res = ld(s, TF, rv);
         } else {
             u32 xyz = I(s, OpVectorShuffle, tv3(s), coord, coord, 0, 1, 2);
             u32 ref = exf(s, coord, 3);
@@ -2648,8 +2752,10 @@ static void fp_alu(fpc* c, const fpi* i, u32 pc)
     case FP_COS: v = splat(s, X(s, TF, GL_Cos, exf(s, a, 0))); break;
     case FP_SIN: v = splat(s, X(s, TF, GL_Sin, exf(s, a, 0))); break;
     case FP_PK2: {
-        u32 src = ((i->s0 & 3u) == 0u && bf(i->s0, 8, 1)) ? a : f16_quantize(s, a);
-        v = splat(s, bc(s, TF, X(s, tu(s), GL_PackHalf2x16, I(s, OpVectorShuffle, tv2(s), src, src, 0, 1))));
+        u32 p2 = I(s, OpVectorShuffle, tv2(s), a, a, 0, 1);
+        if (!((i->s0 & 3u) == 0u && bf(i->s0, 8, 1)))
+            p2 = X(s, tv2(s), GL_NClamp, p2, cv2(s, -65504.0f, -65504.0f), cv2(s, 65504.0f, 65504.0f));
+        v = splat(s, bc(s, TF, X(s, tu(s), GL_PackHalf2x16, p2)));
         break;
     }
     case FP_UP2: {
@@ -2782,7 +2888,8 @@ static void fp_range(fpc* c, u32 pc, u32 end, int* ended)
             c->loopk[c->ldepth] = k;
             c->lmerge[c->ldepth] = lm;
             c->ldepth++;
-            fp_range(c, pc + 1u, e, ended);
+            int l_ended = 0;
+            fp_range(c, pc + 1u, e, &l_ended);
             c->ldepth--;
             V(s, OpBranch, lc);
             label(s, lc);

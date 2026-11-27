@@ -37,7 +37,15 @@ static inline void vm_track_dirty(uint32_t page)
 
 static inline void vm_track_write(uint32_t ea, uint64_t len)
 {
-    for (uint64_t p = ea >> VM_SLOW_PAGE_SHIFT; len && p <= ((uint64_t)ea + len - 1) >> VM_SLOW_PAGE_SHIFT; p++)
+    if (!len) return;
+    const uint64_t p0 = ea >> VM_SLOW_PAGE_SHIFT;
+    const uint64_t p1 = ((uint64_t)ea + len - 1) >> VM_SLOW_PAGE_SHIFT;
+    if (__builtin_expect(p0 == p1, 1)) {
+        if (__atomic_load_n(&ppu_slow_page[p0], __ATOMIC_RELAXED) & VM_PAGE_TRACKED)
+            vm_track_dirty((uint32_t)p0);
+        return;
+    }
+    for (uint64_t p = p0; p <= p1; p++)
         if (__atomic_load_n(&ppu_slow_page[p], __ATOMIC_RELAXED) & VM_PAGE_TRACKED) vm_track_dirty((uint32_t)p);
 }
 

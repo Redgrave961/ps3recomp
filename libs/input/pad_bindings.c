@@ -339,7 +339,12 @@ void pad_kbm_poll(int focused, pad_kbm_state* out)
     const uint32_t mouse = rsx_vk_mouse_input(&notches, &travel);
     out->buttons = 0;
     out->lx = out->ly = out->rx = out->ry = 128;
+    static float vx, vy;
+    static uint64_t last, moved;
     if (!focused) {
+        float dx, dy;
+        rsx_vk_mouse_motion(&dx, &dy);
+        vx = vy = 0.f;
         s_wheel[0].pending = s_wheel[1].pending = 0;
         return;
     }
@@ -383,8 +388,6 @@ void pad_kbm_poll(int focused, pad_kbm_state* out)
     int (*route_probe)(void) = __atomic_load_n(&s_route_probe, __ATOMIC_ACQUIRE);
     const int route = route_probe ? route_probe() : PAD_MOUSE_RIGHT_STICK;
     if (!menu && route != PAD_MOUSE_CAMERA) {
-        static float vx, vy;
-        static uint64_t last, moved;
         float dx, dy;
         rsx_vk_mouse_motion(&dx, &dy);
         if (dx != 0.f || dy != 0.f) moved = now;
@@ -404,6 +407,13 @@ void pad_kbm_poll(int focused, pad_kbm_state* out)
             *x = (uint8_t)lrintf(128.f + vx * 127.f);
             *y = (uint8_t)lrintf(128.f + vy * 127.f);
         }
+    } else {
+        if (menu) {
+            float dx, dy;
+            rsx_vk_mouse_motion(&dx, &dy);
+        }
+        vx = vy = 0.f;
+        last = now;
     }
     static pad_kbm_state prev = { 0, 128, 128, 128, 128 };
     if ((out->buttons & ~prev.buttons) || (out->lx != prev.lx && out->lx != 128) || (out->ly != prev.ly && out->ly != 128)

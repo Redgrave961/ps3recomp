@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <unordered_set>
 #include <utility>
 #ifdef _WIN32
 #include <windows.h>
@@ -140,9 +141,11 @@ bool pipelines::create(vk_device& d, const std::string& cache_path)
             m_dynamic_clip = true;
             m_dynamic.push_back(VK_DYNAMIC_STATE_DEPTH_CLIP_ENABLE_EXT);
         }
-        if (e->extendedDynamicState3ProvokingVertexMode && d.caps.provoking_vertex) {
-            m_dynamic_provoking = true;
-            m_dynamic.push_back(VK_DYNAMIC_STATE_PROVOKING_VERTEX_MODE_EXT);
+        if (e->extendedDynamicState3LogicOpEnable && d.dynamic_state2 && d.dynamic_state2->extendedDynamicState2LogicOp &&
+            d.features.features.logicOp) {
+            m_dynamic_logic = true;
+            m_dynamic.push_back(VK_DYNAMIC_STATE_LOGIC_OP_ENABLE_EXT);
+            m_dynamic.push_back(VK_DYNAMIC_STATE_LOGIC_OP_EXT);
         }
     }
 
@@ -151,14 +154,57 @@ bool pipelines::create(vk_device& d, const std::string& cache_path)
         VkPhysicalDeviceProperties2 p2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &gp };
         vkGetPhysicalDeviceProperties2(d.gpu, &p2);
         m_libraries = gp.graphicsPipelineLibraryFastLinking && m_dynamic_blend && m_dynamic_polygon && m_dynamic_clamp &&
-                      (m_dynamic_clip || !d.caps.depth_clip_enable) && (m_dynamic_provoking || !d.caps.provoking_vertex);
+                      (m_dynamic_clip || !d.caps.depth_clip_enable);
     }
-    if (m_libraries)
+    if (m_libraries) {
         for (uint32_t c = 0; c < 3; c++)
             if (!(m_input[c] = input_library(c))) m_libraries = false;
+    }
+    if (m_libraries) {
+        auto fmt_ok = [&](VkFormat f, VkFormatFeatureFlags need) {
+            if (f == VK_FORMAT_UNDEFINED) return true;
+            VkFormatProperties fp{};
+            vkGetPhysicalDeviceFormatProperties(d.gpu, f, &fp);
+            return (fp.optimalTilingFeatures & need) == need;
+        };
+        const VkFormat colors[] = { VK_FORMAT_UNDEFINED, VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM,
+                                    VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R16G16B16A16_UNORM, VK_FORMAT_R32_SFLOAT,
+                                    VK_FORMAT_R32G32B32A32_SFLOAT, VK_FORMAT_R8_UNORM, VK_FORMAT_R8G8_UNORM };
+        const VkFormat depths[] = { VK_FORMAT_UNDEFINED, VK_FORMAT_D32_SFLOAT, VK_FORMAT_D32_SFLOAT_S8_UINT };
+        for (VkFormat cf : colors) {
+            if (!fmt_ok(cf, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)) continue;
+            for (VkFormat df : depths) {
+                if (cf == VK_FORMAT_UNDEFINED && df == VK_FORMAT_UNDEFINED) continue;
+                if (!fmt_ok(df, VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)) continue;
+                pipeline_key ok{};
+                ok.color_format[0] = cf;
+                ok.depth_format = df;
+                output_library(ok);
+            }
+        }
+        const VkFormat mrts[][4] = {
+            { VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_UNDEFINED, VK_FORMAT_UNDEFINED },
+            { VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_UNDEFINED, VK_FORMAT_UNDEFINED },
+            { VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_UNDEFINED },
+            { VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_UNDEFINED },
+        };
+        for (const auto& m : mrts) {
+            bool all_ok = true;
+            for (VkFormat cf : m) all_ok = all_ok && fmt_ok(cf, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT);
+            if (!all_ok) continue;
+            for (VkFormat df : depths) {
+                if (!fmt_ok(df, VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)) continue;
+                pipeline_key ok{};
+                for (uint32_t i = 0; i < 4; i++) ok.color_format[i] = m[i];
+                ok.depth_format = df;
+                output_library(ok);
+            }
+        }
+    }
 
     const size_t slash = m_cache_path.find_last_of("/\\");
-    m_db = open_utf8(m_cache_path.substr(0, slash == std::string::npos ? 0 : slash + 1) + "vk_shaders.db", "ab+");
+    m_db_path = m_cache_path.substr(0, slash == std::string::npos ? 0 : slash + 1) + "vk_shaders.db";
+    m_db = open_utf8(m_db_path, "ab+");
     const unsigned n = std::max(3u, std::thread::hardware_concurrency());
     const unsigned bg_base = std::max(2u, n > 2u ? n - 2u : 2u);
     m_background_limit = d.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? std::min(2u, bg_base) : bg_base;
@@ -227,6 +273,7 @@ void pipelines::destroy()
 {
     if (!m_d) return;
     m_stopping.store(true, std::memory_order_relaxed);
+    if (m_precompile_thread.joinable()) m_precompile_thread.join();
     {
         std::lock_guard<std::mutex> hold(m_work_lock);
         m_stop = true;
@@ -321,7 +368,11 @@ pipeline_key pipelines::normalize(const pipeline_key& key) const{
     if (m_dynamic_polygon) k.polygon_mode = 0;
     if (m_dynamic_clamp) k.depth_clamp = 0;
     if (m_dynamic_clip) k.depth_clip = 0;
-    if (m_dynamic_provoking) k.provoking_last = 0;
+    if (m_dynamic_logic) {
+        k.logic_enable = 0;
+        k.logic_op = 0;
+    }
+    k.pad = 0;
     return k;
 }
 
@@ -349,16 +400,20 @@ void pipelines::record_fragment(const uint32_t* ucode, uint32_t words, const rsx
 void pipelines::precompile(shader_cache& shaders)
 {
     if (!m_db) return;
-    std::fflush(m_db);
-    std::fseek(m_db, 0, SEEK_END);
-    const long size = std::ftell(m_db);
-    std::fseek(m_db, 0, SEEK_SET);
-    auto data = std::make_shared<std::vector<uint8_t>>(size > 0 ? (size_t)size : 0u);
-    if (!data->empty() && std::fread(data->data(), 1, data->size(), m_db) != data->size()) data->clear();
-    std::fseek(m_db, 0, SEEK_END);
-    work([this, &shaders, data] {
-        struct rec { char type; const uint8_t* a; uint32_t an; const uint8_t* b; uint32_t bn; };
-        std::vector<rec> recs;
+    struct rec { char type; const uint8_t* a; uint32_t an; const uint8_t* b; uint32_t bn; };
+    auto data = std::make_shared<std::vector<uint8_t>>();
+    auto recs = std::make_shared<std::vector<rec>>();
+    {
+        std::lock_guard<std::mutex> db_hold(m_db_lock);
+        std::fflush(m_db);
+        std::fseek(m_db, 0, SEEK_END);
+        const long size = std::ftell(m_db);
+        std::fseek(m_db, 0, SEEK_SET);
+        data->resize(size > 0 ? (size_t)size : 0u);
+        if (!data->empty() && std::fread(data->data(), 1, data->size(), m_db) != data->size()) data->clear();
+        std::fseek(m_db, 0, SEEK_END);
+        std::unordered_set<uint64_t> seen;
+        size_t total_raw = 0;
         for (size_t at = 0; at + 9 <= data->size();) {
             rec r{ (char)(*data)[at] };
             std::memcpy(&r.an, data->data() + at + 1, 4);
@@ -366,13 +421,48 @@ void pipelines::precompile(shader_cache& shaders)
             if (at + 9 + (size_t)r.an + r.bn > data->size()) break;
             r.a = data->data() + at + 9;
             r.b = r.a + r.an;
-            recs.push_back(r);
             at += 9 + (size_t)r.an + r.bn;
+            total_raw++;
+            const bool valid =
+                (r.type == 'V' && r.an == sizeof(rsx_spv_vp_key) && r.bn == RSX_SPV_VP_SLOTS * 16u) ||
+                (r.type == 'F' && r.an == sizeof(rsx_spv_fp_key) && r.bn % 4u == 0) ||
+                (r.type == 'P' && r.an == sizeof(pipeline_key) && r.bn == 0);
+            if (!valid) continue;
+            uint64_t h = shader_cache::hash(r.a, r.an, (uint64_t)(unsigned char)r.type * 0x9E3779B97F4A7C15ull);
+            if (r.bn) h = shader_cache::hash(r.b, r.bn, h);
+            if (seen.insert(h).second) recs->push_back(r);
         }
+        if (recs->size() < total_raw) {
+            const std::string tmp = m_db_path + ".tmp";
+            if (FILE* f = open_utf8(tmp, "wb")) {
+                bool ok = true;
+                for (const rec& r : *recs) {
+                    const uint32_t sizes[2] = { r.an, r.bn };
+                    ok = ok && std::fputc(r.type, f) != EOF &&
+                         std::fwrite(sizes, sizeof sizes, 1, f) == 1 &&
+                         std::fwrite(r.a, 1, r.an, f) == r.an &&
+                         (!r.bn || std::fwrite(r.b, 1, r.bn, f) == r.bn);
+                }
+                std::fclose(f);
+                if (ok) {
+                    std::fclose(std::exchange(m_db, nullptr));
+                    replace_file_utf8(tmp, m_db_path);
+                    m_db = open_utf8(m_db_path, "ab+");
+                }
+            }
+        }
+    }
+    if (recs->empty()) return;
+    m_precompile_thread = std::thread([this, &shaders, data, recs] {
+        ps3_thread_name("vk precompile");
+#ifdef _WIN32
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
         auto pending = std::make_shared<std::atomic<size_t>>(0);
         auto done = std::make_shared<std::pair<std::mutex, std::condition_variable>>();
         auto run_matching = [&](auto&& pred, auto&& body) {
-            for (const rec& r : recs) {
+            for (const rec& r : *recs) {
+                if (m_stopping.load(std::memory_order_relaxed)) break;
                 if (!pred(r.type)) continue;
                 pending->fetch_add(1);
                 work([this, r, body, pending, done] {
@@ -389,13 +479,13 @@ void pipelines::precompile(shader_cache& shaders)
             done->second.wait(hold, [&] { return pending->load() == 0; });
         };
         auto shader_body = [&shaders](const rec& r) {
-            if (r.type == 'V' && r.an == sizeof(rsx_spv_vp_key) && r.bn == RSX_SPV_VP_SLOTS * 16u) {
+            if (r.type == 'V') {
                 rsx_spv_vp_key key;
                 std::memcpy(&key, r.a, sizeof key);
                 std::vector<uint32_t> program(RSX_SPV_VP_SLOTS * 4u);
                 std::memcpy(program.data(), r.b, r.bn);
                 shaders.vertex(program.data(), key, shader_cache::program_hash(program.data(), key.start), false);
-            } else if (r.type == 'F' && r.an == sizeof(rsx_spv_fp_key) && r.bn % 4u == 0) {
+            } else if (r.type == 'F') {
                 rsx_spv_fp_key key;
                 std::memcpy(&key, r.a, sizeof key);
                 std::vector<uint32_t> ucode(r.bn / 4u);
@@ -405,15 +495,14 @@ void pipelines::precompile(shader_cache& shaders)
         };
         run_matching([](char t) { return t == 'V' || t == 'F'; }, shader_body);
         run_matching([](char t) { return t == 'P'; }, [this, &shaders](const rec& r) {
-            if (r.an != sizeof(pipeline_key)) return;
             pipeline_key k;
             std::memcpy(&k, r.a, sizeof k);
             const vertex_program* vs = shaders.find_vertex(k.vs);
             const fragment_program* fs = shaders.find_fragment(k.fs);
             if (vs && fs) get(k, vs->code, fs->code);
         });
-        std::fprintf(stderr, "[vk] precompiled %zu shaders and pipelines\n", recs.size());
-    }, false);
+        std::fprintf(stderr, "[vk] precompiled %zu shaders and pipelines\n", recs->size());
+    });
 }
 
 void pipelines::fill_raster(const pipeline_key& k, VkPipelineRasterizationStateCreateInfo& rs, VkPipelineRasterizationDepthClipStateCreateInfoEXT& clip,
@@ -428,8 +517,8 @@ void pipelines::fill_raster(const pipeline_key& k, VkPipelineRasterizationStateC
         *tail = &clip;
         tail = const_cast<const void**>(&clip.pNext);
     }
-    if (m_d->caps.provoking_vertex && !m_dynamic_provoking) {
-        prov.provokingVertexMode = k.provoking_last ? VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT : VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT;
+    if (m_d->caps.provoking_vertex) {
+        prov.provokingVertexMode = VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT;
         *tail = &prov;
     }
 }
@@ -516,6 +605,11 @@ bool pipelines::shader_library(shader& s, VkShaderStageFlagBits stage)
     VkPipelineViewportStateCreateInfo vp{ VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
     VkPipelineRasterizationStateCreateInfo rs{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
     rs.lineWidth = 1.0f;
+    VkPipelineRasterizationProvokingVertexStateCreateInfoEXT prov{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_PROVOKING_VERTEX_STATE_CREATE_INFO_EXT };
+    if (vertex && m_d->caps.provoking_vertex) {
+        prov.provokingVertexMode = VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT;
+        rs.pNext = &prov;
+    }
     VkPipelineMultisampleStateCreateInfo ms{ VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
     VkPipelineDepthStencilStateCreateInfo ds{ VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
@@ -656,6 +750,7 @@ VkPipeline pipelines::get(const pipeline_key& key, const shader& vs, const shade
     }
     const VkPipeline p = !m_libraries ? monolithic(k, vs, fs) : link(k, vs, fs, false);
     if (!p) std::fprintf(stderr, "[vk] pipeline creation failed\n");
+    else m_cache_dirty.store(true, std::memory_order_relaxed);
     e->fast = m_libraries ? p : VK_NULL_HANDLE;
     e->pipe.store(p, std::memory_order_release);
     e->done.store(true, std::memory_order_release);

@@ -33,24 +33,6 @@ typedef struct {
     uint32_t param;
 } SysutilEvent;
 
-#define SYSUTIL_EVENT_QUEUE_SIZE 32
-static SysutilEvent s_event_queue[SYSUTIL_EVENT_QUEUE_SIZE];
-static int          s_event_head = 0;
-static int          s_event_tail = 0;
-
-void cellSysutilQueueEvent(int slot, uint32_t status, uint32_t param)
-{
-    int next = (s_event_tail + 1) % SYSUTIL_EVENT_QUEUE_SIZE;
-    if (next == s_event_head) {
-        printf("[cellSysutil] event queue full — dropping status=0x%X\n", status);
-        return;
-    }
-    s_event_queue[s_event_tail].slot   = slot;
-    s_event_queue[s_event_tail].status = status;
-    s_event_queue[s_event_tail].param  = param;
-    s_event_tail = next;
-}
-
 #ifdef _WIN32
 #include <windows.h>
 static SRWLOCK s_completion_lock = SRWLOCK_INIT;
@@ -62,6 +44,27 @@ static pthread_mutex_t s_completion_lock = PTHREAD_MUTEX_INITIALIZER;
 #define COMPLETION_LOCK() pthread_mutex_lock(&s_completion_lock)
 #define COMPLETION_UNLOCK() pthread_mutex_unlock(&s_completion_lock)
 #endif
+
+#define SYSUTIL_EVENT_QUEUE_SIZE 32
+static SysutilEvent s_event_queue[SYSUTIL_EVENT_QUEUE_SIZE];
+static int          s_event_head = 0;
+static int          s_event_tail = 0;
+
+void cellSysutilQueueEvent(int slot, uint32_t status, uint32_t param)
+{
+    COMPLETION_LOCK();
+    int next = (s_event_tail + 1) % SYSUTIL_EVENT_QUEUE_SIZE;
+    if (next == s_event_head) {
+        COMPLETION_UNLOCK();
+        printf("[cellSysutil] event queue full — dropping status=0x%X\n", status);
+        return;
+    }
+    s_event_queue[s_event_tail].slot   = slot;
+    s_event_queue[s_event_tail].status = status;
+    s_event_queue[s_event_tail].param  = param;
+    s_event_tail = next;
+    COMPLETION_UNLOCK();
+}
 
 typedef struct GuestCompletion {
     struct GuestCompletion* next;
@@ -163,9 +166,15 @@ s32 cellSysutilCheckCallback(void)
           printf("[cellSysutil] CheckCallback: the title pumps sysutil%c", 10);
       }
     }
-    while (s_event_head != s_event_tail) {
+    for (;;) {
+        COMPLETION_LOCK();
+        if (s_event_head == s_event_tail) {
+            COMPLETION_UNLOCK();
+            break;
+        }
         SysutilEvent e = s_event_queue[s_event_head];
         s_event_head = (s_event_head + 1) % SYSUTIL_EVENT_QUEUE_SIZE;
+        COMPLETION_UNLOCK();
 
         if (e.slot < 0 || e.slot >= CELL_SYSUTIL_MAX_CALLBACKS) continue;
         if (!s_callbacks[e.slot].registered) continue;

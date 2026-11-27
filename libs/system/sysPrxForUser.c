@@ -12,6 +12,7 @@
 #include <windows.h>
 #else
 #include <pthread.h>
+#include <sched.h>
 #endif
 
 #ifdef _WIN32
@@ -56,7 +57,8 @@ static int yz_format(char* out, size_t cap, const char* fmt, va_list ap)
 {
     extern u8* vm_base;
     size_t p = 0;
-    if (!fmt) { if (cap) out[0] = 0; return 0; }
+    if (!out || !cap) return 0;
+    if (!fmt) { out[0] = 0; return 0; }
     while (*fmt && p + 1 < cap) {
         if (*fmt != '%') { out[p++] = *fmt++; continue; }
         char spec[40]; int si = 0; spec[si++] = *fmt++;
@@ -105,8 +107,9 @@ s32 _sys_trap_process(const char* msg)
 
 s32 _sys_snprintf(char* buf, u32 size, const char* fmt, ...)
 {
+    if (!size) return 0;
     va_list ap; va_start(ap, fmt);
-    int ret = yz_format((char*)yz_g2h(buf), size ? size : 1, (const char*)yz_g2h(fmt), ap);
+    int ret = yz_format((char*)yz_g2h(buf), size, (const char*)yz_g2h(fmt), ap);
     va_end(ap);
     return ret;
 }
@@ -181,19 +184,36 @@ s32 sys_ppu_thread_once(u32 once_ctrl_ea, u32 init_opd)
     if (!once_ctrl_ea)
         return (s32)CELL_EINVAL;
 
-    slot_lock();
-    const int first = (vm_read32(once_ctrl_ea) == 0);
-    if (first)
-        vm_write32(once_ctrl_ea, 1);
-    slot_unlock();
+    for (;;) {
+        slot_lock();
+        const u32 st = vm_read32(once_ctrl_ea);
+        if (st == 1u) {
+            slot_unlock();
+            return CELL_OK;
+        }
+        if (st == 0u) {
+            vm_write32(once_ctrl_ea, 2u);
+            slot_unlock();
+            break;
+        }
+        slot_unlock();
+#ifdef _WIN32
+        SwitchToThread();
+#else
+        sched_yield();
+#endif
+    }
 
-    if (first && init_opd && g_ps3_guest_caller) {
+    if (init_opd && g_ps3_guest_caller) {
         static int n = 0;
         if (PS3_LOG_FIRST(n, 8))
             printf("[sysPrxForUser] sys_ppu_thread_once: running init 0x%08X"
                    " (ctrl 0x%08X)\n", init_opd, once_ctrl_ea);
         g_ps3_guest_caller(init_opd, 0, 0, 0, 0, 0, 0, 0, 0);
     }
+    slot_lock();
+    vm_write32(once_ctrl_ea, 1u);
+    slot_unlock();
     return CELL_OK;
 }
 

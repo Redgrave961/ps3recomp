@@ -77,8 +77,8 @@ enum rsx_spv_fp_control_bit {
 };
 
 enum rsx_spv_fp_output_bit {
-    RSX_SPV_FPOUT_ALPHA_TEST = 1u << 4,
-    RSX_SPV_FPOUT_ALPHAKILL  = 1u << 5
+    RSX_SPV_FPOUT_ALPHA_TEST   = 1u << 4,
+    RSX_SPV_FPOUT_ALPHAKILL    = 1u << 5
 };
 
 enum rsx_spv_fp_state_flag {
@@ -116,7 +116,6 @@ typedef struct rsx_spv_vertex_attrib {
 
 typedef struct rsx_spv_vertex_layout {
     rsx_spv_vertex_attrib attrib[RSX_SPV_VERTEX_INPUTS];
-    float value[RSX_SPV_VERTEX_INPUTS][4];
     float scale_offset[4][4];
     u32 vertex_base;
     u32 instance_base;
@@ -144,7 +143,8 @@ typedef struct rsx_spv_fragment_state {
     float wpos_bias;
     rsx_spv_texture_state texture[RSX_SPV_TEXTURE_UNITS];
     u32 texcoord_control;
-    u32 reserved[3];
+    float wpos_scale_x;
+    u32 reserved[2];
 } rsx_spv_fragment_state;
 
 typedef struct rsx_spv_vp_key {
@@ -182,12 +182,14 @@ typedef struct rsx_spv_vp_info {
     u32 texture_mask;
     u32 constants_used[(RSX_SPV_VP_CONSTANTS + 31u) / 32u];
     int constants_relative;
+    u32 max_const;
 } rsx_spv_vp_info;
 
 int  rsx_spv_vertex(const u32* ucode, const rsx_spv_vp_key* key, rsx_spv_blob* out, rsx_spv_vp_info* info);
 int  rsx_spv_fragment(const u32* ucode, u32 max_words, const rsx_spv_fp_key* key, rsx_spv_blob* out, rsx_spv_fp_info* info);
 int  rsx_spv_fragment_scan(const u32* ucode, u32 max_words, rsx_spv_fp_info* info);
 int  rsx_spv_vertex_reach(const u32* ucode, u32 start, u8* reach);
+int  rsx_spv_vertex_scan(const u32* ucode, u32 start, u32* out_written, u32* out_texmask);
 int  rsx_spv_depth_pack(int d16, rsx_spv_blob* out);
 int  rsx_spv_box_down(rsx_spv_blob* out);
 int  rsx_spv_box_down_vs(rsx_spv_blob* out);

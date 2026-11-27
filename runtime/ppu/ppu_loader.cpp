@@ -18,7 +18,6 @@
 #include "ps3emu/ps3_ftrace.h"
 #include "ps3emu/milestone.h"
 #include "../memory/vm.h"
-#include "../platform/win32_compat.h"
 #include "../platform/win32_backtrace.h"
 #include "../platform/ps3_stdio.h"
 #include "../platform/ps3_utf8_fs.h"
@@ -97,7 +96,6 @@ static int vm_oob_report(uint32_t a, uint32_t n)
         }
         return 1;
     }
-    return 0;
 }
 
 static inline int vm_oob(uint32_t a, uint32_t n)
@@ -502,6 +500,37 @@ extern "C" void ppu_recomp_register(void)
     if (ppu_vm_size) ppu_special_pages(ppu_vm_size, (1ull << 32) - ppu_vm_size);
 }
 
+extern "C" void ppu_exec_enable_wrapped(void)
+{
+    if (function_table_count <= function_table_lifted) return;
+    uint32_t lo = ppu_exec_n ? ppu_exec_lo : UINT32_MAX;
+    uint32_t hi = ppu_exec_n ? ppu_exec_lo + ((ppu_exec_n - 1u) << 2) : 0u;
+    for (uint64_t i = function_table_lifted; i < function_table_count; i++) {
+        const uint32_t a = (uint32_t)function_table[i].addr;
+        if (a < lo) lo = a;
+        if (a > hi) hi = a;
+    }
+    if (lo > hi) return;
+    const uint32_t n = ((hi - lo) >> 2) + 1u;
+    int32_t* tab = const_cast<int32_t*>(ppu_exec_tab);
+    if (!tab || lo != ppu_exec_lo || n > ppu_exec_n) {
+        int32_t* grown = (int32_t*)calloc(n, sizeof *grown);
+        if (!grown) return;
+        if (tab && ppu_exec_n)
+            memcpy(grown + ((ppu_exec_lo - lo) >> 2), tab, ppu_exec_n * sizeof *tab);
+        free(tab);
+        tab = grown;
+    }
+    for (uint64_t i = function_table_lifted; i < function_table_count; i++) {
+        const int64_t off = (const char*)function_table[i].func - (const char*)ps3_indirect_call;
+        if (!(function_table[i].addr & 3) && off == (int32_t)off)
+            tab[((uint32_t)function_table[i].addr - lo) >> 2] = (int32_t)off;
+    }
+    ppu_exec_tab = tab;
+    ppu_exec_lo = lo;
+    __atomic_store_n(&ppu_exec_n, n, __ATOMIC_RELEASE);
+}
+
 static uint32_t ppu_code_hi(void)
 {
     static uint32_t hi = 0;
@@ -618,14 +647,14 @@ static PPU_THREAD_LOCAL int      g_icall_target_set;
 extern "C" void ps3_indirect_call(ppu_context* ctx)
 {
     uint32_t addr = (uint32_t)ctx->ctr;
-    if (g_icall_target_set) {
+    if (__builtin_expect(g_icall_target_set, 0)) {
         addr = g_icall_target;
         g_icall_target_set = 0;
     }
     const ppu_fn fn = ppu_lookup_icall(addr);
-    if (!fn) ppu_bad_call(ctx, addr, "indirect call to");
+    if (__builtin_expect(!fn, 0)) ppu_bad_call(ctx, addr, "indirect call to");
     fn(ctx);
-    while (g_trampoline_fn) {
+    while (__builtin_expect(g_trampoline_fn != 0, 0)) {
         void (*tf)(void*) = g_trampoline_fn;
         g_trampoline_fn = 0;
         tf(ctx);
@@ -651,8 +680,8 @@ extern "C" void lv2_syscall(ppu_context* ctx)
 
     struct _ScGuard {
         ppu_context* c; uint64_t num, t0; uint32_t lr;
-        ~_ScGuard() { unsigned t = (unsigned)c->thread_id;
-                      if (PS3_FT_ON() && t0) {
+        ~_ScGuard() { if (__builtin_expect(t0 != 0, 0)) {
+                          const unsigned t = (unsigned)c->thread_id;
                           const uint64_t t1 = ps3_ft_now();
                           if (num == 141) ps3_ft_usleep(t, lr, t0, t1);
                           else if (t1 - t0 >= ps3_ft_min_ns())

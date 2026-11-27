@@ -627,6 +627,7 @@ static u32 wasapi_query_host_channels(void)
         }
         en->lpVtbl->Release(en);
     }
+    if (SUCCEEDED(hr)) CoUninitialize();
     return ch;
 }
 
@@ -817,9 +818,10 @@ static int wasapi_open_stream(void)
 #define AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY 0x08000000
 #endif
         const DWORD convert = AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+        const DWORD ev_flag = s_wasapi_event ? AUDCLNT_STREAMFLAGS_EVENTCALLBACK : 0;
         hr = s_wasapi_client->lpVtbl->Initialize(
             s_wasapi_client, AUDCLNT_SHAREMODE_SHARED,
-            AUDCLNT_STREAMFLAGS_EVENTCALLBACK | convert,
+            ev_flag | convert,
             buf_duration, 0, &wfxe.Format, NULL);
 
         if (FAILED(hr) && s_out_channels > 2) {
@@ -831,7 +833,7 @@ static int wasapi_open_stream(void)
                 fill_wasapi_format(&wfxe, 2);
                 hr = s_wasapi_client->lpVtbl->Initialize(
                     s_wasapi_client, AUDCLNT_SHAREMODE_SHARED,
-                    AUDCLNT_STREAMFLAGS_EVENTCALLBACK | convert,
+                    ev_flag | convert,
                     buf_duration, 0, &wfxe.Format, NULL);
             }
         }
@@ -1013,7 +1015,7 @@ static void audio_mix_loop(void)
         }
 
         UINT32 need = (padding < s_wasapi_target_frames) ? (s_wasapi_target_frames - padding) : 0;
-        const UINT32 avail = s_wasapi_buf_frames - padding;
+        const UINT32 avail = (padding < s_wasapi_buf_frames) ? (s_wasapi_buf_frames - padding) : 0;
         if (need > avail) need = avail;
 
         if (need == 0) {
@@ -1304,12 +1306,18 @@ s32 cellAudioPortStart(u32 portNum)
 
     if (!s_audio_initialized)
         return CELL_AUDIO_ERROR_NOT_INIT;
-    if (portNum >= CELL_AUDIO_PORT_MAX || !s_ports[portNum].in_use)
+    if (portNum >= CELL_AUDIO_PORT_MAX)
         return CELL_AUDIO_ERROR_PORT_NOT_OPEN;
-    if (s_ports[portNum].running)
-        return CELL_AUDIO_ERROR_PORT_ALREADY_RUN;
 
     mutex_lock(&s_audio_mutex);
+    if (!s_ports[portNum].in_use) {
+        mutex_unlock(&s_audio_mutex);
+        return CELL_AUDIO_ERROR_PORT_NOT_OPEN;
+    }
+    if (s_ports[portNum].running) {
+        mutex_unlock(&s_audio_mutex);
+        return CELL_AUDIO_ERROR_PORT_ALREADY_RUN;
+    }
     s_ports[portNum].running = 1;
     mutex_unlock(&s_audio_mutex);
     return CELL_OK;
@@ -1321,12 +1329,18 @@ s32 cellAudioPortStop(u32 portNum)
 
     if (!s_audio_initialized)
         return CELL_AUDIO_ERROR_NOT_INIT;
-    if (portNum >= CELL_AUDIO_PORT_MAX || !s_ports[portNum].in_use)
+    if (portNum >= CELL_AUDIO_PORT_MAX)
         return CELL_AUDIO_ERROR_PORT_NOT_OPEN;
-    if (!s_ports[portNum].running)
-        return CELL_AUDIO_ERROR_PORT_NOT_RUN;
 
     mutex_lock(&s_audio_mutex);
+    if (!s_ports[portNum].in_use) {
+        mutex_unlock(&s_audio_mutex);
+        return CELL_AUDIO_ERROR_PORT_NOT_OPEN;
+    }
+    if (!s_ports[portNum].running) {
+        mutex_unlock(&s_audio_mutex);
+        return CELL_AUDIO_ERROR_PORT_NOT_RUN;
+    }
     s_ports[portNum].running = 0;
     mutex_unlock(&s_audio_mutex);
     return CELL_OK;
@@ -1336,7 +1350,7 @@ s32 cellAudioGetPortConfig(u32 portNum, CellAudioPortConfig* config)
 {
     if (!s_audio_initialized)
         return CELL_AUDIO_ERROR_NOT_INIT;
-    if (portNum >= CELL_AUDIO_PORT_MAX || !s_ports[portNum].in_use)
+    if (portNum >= CELL_AUDIO_PORT_MAX)
         return CELL_AUDIO_ERROR_PORT_NOT_OPEN;
 
     const uint32_t cfg = (uint32_t)(uintptr_t)config;
@@ -1345,6 +1359,10 @@ s32 cellAudioGetPortConfig(u32 portNum, CellAudioPortConfig* config)
 
     mutex_lock(&s_audio_mutex);
     AudioPortSlot* port = &s_ports[portNum];
+    if (!port->in_use) {
+        mutex_unlock(&s_audio_mutex);
+        return CELL_AUDIO_ERROR_PORT_NOT_OPEN;
+    }
 
     vm_write32(cfg +  0, (u32)port->read_idx_addr);
     vm_write32(cfg +  4, port->running ? CELL_AUDIO_STATUS_RUN

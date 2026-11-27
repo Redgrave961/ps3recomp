@@ -96,7 +96,8 @@ enum dirty : u32 {
     D_TEXTURES = 1u << 10,
     D_VERTEX_TEXTURES = 1u << 11,
     D_VERTEX_CONSTANTS = 1u << 12,
-    D_ALL = (1u << 13) - 1u,
+    D_FB_STATE = 1u << 13,
+    D_ALL = (1u << 14) - 1u,
 };
 
 enum class draw_kind : u8 { none, array, indexed, inlined };
@@ -138,6 +139,7 @@ public:
     u32 reg[REG_COUNT] = {};
     u32 program[VP_SLOTS * 4] = {};
     u32 constants[VP_CONSTANTS * 4] = {};
+    u32 const_dirty[(VP_CONSTANTS + 31u) / 32u] = {};
     register_attribute attribute[ATTRIBS];
     push_attribute push[ATTRIBS];
     draw_clause draw;

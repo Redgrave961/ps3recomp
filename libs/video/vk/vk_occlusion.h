@@ -28,7 +28,7 @@ public:
     bool enabled() const { return m_enabled; }
     bool active() const { return m_active; }
     void enable(bool on) { m_enabled = on; }
-    void begin(VkCommandBuffer cmd, const ratio& scale);
+    void begin(VkCommandBuffer cmd, const scale2d& scale);
     void end(VkCommandBuffer cmd);
     void clear();
     bool report(uint32_t ea, bool counted);
@@ -44,7 +44,7 @@ public:
 private:
     struct segment {
         uint32_t query;
-        ratio scale;
+        scale2d scale;
     };
     struct job {
         uint64_t value = 0;

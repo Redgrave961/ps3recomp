@@ -57,6 +57,7 @@ struct ps3_vfile {
     const vfs_mount* m;
     const vfs_entry* e;
     uint64_t pos;
+    uint8_t dirty;
 };
 
 typedef struct {
@@ -609,7 +610,9 @@ size_t ps3_vfile_write(const void* src, size_t n, ps3_vfile* f)
 {
     if (!f->host) return 0;
     vm_commit_host(src, n);
-    return fwrite(src, 1, n, f->host);
+    const size_t wrote = fwrite(src, 1, n, f->host);
+    if (wrote) f->dirty = 1;
+    return wrote;
 }
 
 int ps3_vfile_seek(ps3_vfile* f, int64_t offset, int whence)
@@ -633,19 +636,25 @@ int ps3_vfile_fstat(ps3_vfile* f, ps3_vstat* st)
         st->size = f->e->size;
         return 0;
     }
-    const int64_t cur = VFS_TELL(f->host);
-    VFS_SEEK(f->host, 0, SEEK_END);
-    st->size = (uint64_t)VFS_TELL(f->host);
-    VFS_SEEK(f->host, cur, SEEK_SET);
+    if (f->dirty) {
+        fflush(f->host);
+        f->dirty = 0;
+    }
     host_stat_t hs;
 #ifdef _WIN32
     if (_fstat64(_fileno(f->host), &hs) == 0) {
 #else
     if (fstat(fileno(f->host), &hs) == 0) {
 #endif
+        st->size  = (uint64_t)hs.st_size;
         st->atime = (int64_t)hs.st_atime;
         st->mtime = (int64_t)hs.st_mtime;
         st->ctime = (int64_t)hs.st_ctime;
+    } else {
+        const int64_t cur = VFS_TELL(f->host);
+        VFS_SEEK(f->host, 0, SEEK_END);
+        st->size = (uint64_t)VFS_TELL(f->host);
+        VFS_SEEK(f->host, cur, SEEK_SET);
     }
     return 0;
 }

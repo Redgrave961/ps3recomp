@@ -9,7 +9,6 @@
 #include "../platform/ps3_sync.h"
 #include "../memory/vm.h"
 extern "C" uint64_t ppu_timebase_now(void);
-#define PS3_TIMEBASE_FREQ 79800000ULL
 #include "ps3emu/log_first.h"
 
 extern "C" uint8_t* vm_base;
@@ -53,7 +52,13 @@ static void sys_initialize_tls(ppu_context* ctx)
 static void sys_time_get_system_time(ppu_context* ctx)
 {
     const uint64_t tb = ppu_timebase_now();
-    ctx->gpr[3] = tb / PS3_TIMEBASE_FREQ * 1000000ull + tb % PS3_TIMEBASE_FREQ * 1000000ull / PS3_TIMEBASE_FREQ;
+    ctx->gpr[3] = (tb / 399ull) * 5ull + ((tb % 399ull) * 5ull) / 399ull;
+}
+
+static int sys_time_get_system_time_fast(ppu_context* ctx)
+{
+    sys_time_get_system_time(ctx);
+    return 1;
 }
 
 static void sys_process_is_stack(ppu_context* ctx)
@@ -249,6 +254,12 @@ static void sys_lwmutex_trylock(ppu_context* ctx)
     else ctx->gpr[3] = err(CELL_EBUSY_V);
 }
 
+static int sys_lwmutex_trylock_fast(ppu_context* ctx)
+{
+    sys_lwmutex_trylock(ctx);
+    return 1;
+}
+
 static void sys_lwmutex_unlock(ppu_context* ctx)
 {
     const uint32_t lwm = (uint32_t)ctx->gpr[3];
@@ -360,6 +371,12 @@ static void sys_ppu_thread_get_id(ppu_context* ctx)
     uint32_t p = (uint32_t)ctx->gpr[3];
     if (p) vm_write64(p, ctx->thread_id ? (uint64_t)ctx->thread_id : 0x7FFFFFFEull);
     ctx->gpr[3] = 0;
+}
+
+static int sys_ppu_thread_get_id_fast(ppu_context* ctx)
+{
+    sys_ppu_thread_get_id(ctx);
+    return 1;
 }
 
 static uint32_t s_mm_sizes[256];
@@ -520,6 +537,7 @@ extern "C" void ppu_sysprx_register(void)
     ps3_hle_register_ctx(0xB68D5625u, "netFinalizeNetwork",     hle_net_zero);
     ps3_hle_register_ctx(ps3_compute_nid("sys_initialize_tls"),       "sys_initialize_tls",       sys_initialize_tls);
     ps3_hle_register_ctx(ps3_compute_nid("sys_time_get_system_time"), "sys_time_get_system_time", sys_time_get_system_time);
+    ps3_hle_register_fast(ps3_compute_nid("sys_time_get_system_time"), sys_time_get_system_time_fast);
     ps3_hle_register_ctx(ps3_compute_nid("sys_process_is_stack"),     "sys_process_is_stack",     sys_process_is_stack);
     ps3_hle_register_ctx(ps3_compute_nid("_sys_process_atexitspawn"), "_sys_process_atexitspawn", crt_ok);
     ps3_hle_register_ctx(ps3_compute_nid("_sys_process_at_Exitspawn"),"_sys_process_at_Exitspawn",crt_ok);
@@ -529,8 +547,9 @@ extern "C" void ppu_sysprx_register(void)
     ps3_hle_register_ctx(ps3_compute_nid("sys_lwmutex_lock"),    "sys_lwmutex_lock",    sys_lwmutex_lock);
     ps3_hle_register_ctx(ps3_compute_nid("sys_lwmutex_unlock"),  "sys_lwmutex_unlock",  sys_lwmutex_unlock);
     ps3_hle_register_ctx(ps3_compute_nid("sys_lwmutex_trylock"), "sys_lwmutex_trylock", sys_lwmutex_trylock);
-    ps3_hle_register_fast(ps3_compute_nid("sys_lwmutex_lock"),   sys_lwmutex_lock_fast);
-    ps3_hle_register_fast(ps3_compute_nid("sys_lwmutex_unlock"), sys_lwmutex_unlock_fast);
+    ps3_hle_register_fast(ps3_compute_nid("sys_lwmutex_lock"),    sys_lwmutex_lock_fast);
+    ps3_hle_register_fast(ps3_compute_nid("sys_lwmutex_unlock"),  sys_lwmutex_unlock_fast);
+    ps3_hle_register_fast(ps3_compute_nid("sys_lwmutex_trylock"), sys_lwmutex_trylock_fast);
 
     ps3_hle_register_ctx(ps3_compute_nid("sys_lwcond_create"),     "sys_lwcond_create",     sys_lwcond_create);
     ps3_hle_register_ctx(ps3_compute_nid("sys_lwcond_destroy"),    "sys_lwcond_destroy",    sys_lwcond_destroy);
@@ -540,6 +559,7 @@ extern "C" void ppu_sysprx_register(void)
     ps3_hle_register_ctx(ps3_compute_nid("sys_lwcond_signal_to"),  "sys_lwcond_signal_to",  sys_lwcond_signal_to);
 
     ps3_hle_register_ctx(ps3_compute_nid("sys_ppu_thread_get_id"),      "sys_ppu_thread_get_id",      sys_ppu_thread_get_id);
+    ps3_hle_register_fast(ps3_compute_nid("sys_ppu_thread_get_id"),     sys_ppu_thread_get_id_fast);
     ps3_hle_register_ctx(ps3_compute_nid("sys_ppu_thread_create"),      "sys_ppu_thread_create",      hle_ppu_thread_create);
     ps3_hle_register_ctx(ps3_compute_nid("sys_ppu_thread_exit"),        "sys_ppu_thread_exit",        hle_ppu_thread_exit);
     ps3_hle_register_ctx(ps3_compute_nid("sys_mmapper_allocate_memory"), "sys_mmapper_allocate_memory", sys_mmapper_allocate_memory);

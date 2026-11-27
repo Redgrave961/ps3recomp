@@ -6,7 +6,7 @@ namespace vk {
 
 class depth_pack {
 public:
-    bool create(vk_device& d);
+    bool create(vk_device& d, VkPipelineCache cache = VK_NULL_HANDLE);
     void destroy();
     void record(VkCommandBuffer cmd, VkImageView depth, VkImageView stencil, VkImageView out, uint32_t width, uint32_t height,
                 bool d16, bool is_float) const;

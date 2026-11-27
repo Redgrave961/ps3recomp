@@ -26,14 +26,16 @@ static inline void p32(uint8_t* p, uint32_t v) { const uint32_t b = __builtin_bs
 static inline void p64(uint8_t* p, uint64_t v) { const uint64_t b = __builtin_bswap64(v); memcpy(p, &b, 8); }
 static inline void psplat(uint8_t* p, uint32_t v) { _mm_storeu_si128((__m128i*)p, _mm_set1_epi32((int)__builtin_bswap32(v))); }
 static inline uint32_t bit32(uint32_t n) { return n < 32 ? 1u << n : 0u; }
-#ifdef __SSE2__
 static inline uint32_t rev16_bits(uint32_t v)
 {
+#if defined(__clang__)
+    return (uint32_t)__builtin_bitreverse16((uint16_t)v);
+#else
     static const uint8_t rev4[16] = {0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15};
     return ((uint32_t)rev4[v & 15u] << 12) | ((uint32_t)rev4[(v >> 4) & 15u] << 8) |
            ((uint32_t)rev4[(v >> 8) & 15u] << 4) | (uint32_t)rev4[(v >> 12) & 15u];
-}
 #endif
+}
 static inline u128 pref(uint32_t v) { return spu_make_preferred_u32(v); }
 static inline u128 qsplat(uint32_t v) { u128 r; r._u32[0] = r._u32[1] = r._u32[2] = r._u32[3] = v; return r; }
 static inline u128 qwords(uint32_t a, uint32_t b, uint32_t c, uint32_t d) { u128 r; r._u32[0] = a; r._u32[1] = b; r._u32[2] = c; r._u32[3] = d; return r; }
@@ -579,9 +581,15 @@ static void ss_exit_if_no_work(spu_context* c)
 
 static uint32_t ss_prio_mask(const uint8_t* ls)
 {
+#ifdef __SSE2__
+    const __m128i p = _mm_loadu_si128((const __m128i*)(ls + 0x1A0));
+    const uint32_t nz = (uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(p, _mm_setzero_si128())) ^ 0xFFFFu;
+    return rev16_bits(nz);
+#else
     uint32_t m = 0;
     for (uint32_t i = 0; i < 16; i++) m |= (ls[0x1A0 + i] ? 0x8000u : 0u) >> i;
     return m;
+#endif
 }
 
 static int ss_idle_found_in(const uint8_t* l, uint32_t run, uint32_t prio)

@@ -8,7 +8,6 @@
 #include "../memory/vm.h"
 #include <stdlib.h>
 #include <string.h>
-#include <stdlib.h>
 #include "ps3emu/log_first.h"
 #include <errno.h>
 #ifdef __APPLE__
@@ -38,24 +37,25 @@ uint64_t ppu_timebase_now(void)
     ensure_qpc_init();
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
-    if (!t0) t0 = now.QuadPart;
-    uint64_t d = (uint64_t)(now.QuadPart - t0);
-    uint64_t q = (uint64_t)s_qpc_freq.QuadPart;
-    return (d / q) * PS3_TIMEBASE_FREQ + (d % q) * PS3_TIMEBASE_FREQ / q;
+    if (__builtin_expect(!t0, 0)) t0 = now.QuadPart;
+    const uint64_t d = (uint64_t)(now.QuadPart - t0);
+    const uint64_t q = (uint64_t)s_qpc_freq.QuadPart;
+    if (__builtin_expect(q == 10000000ull, 1))
+        return (d / 50ull) * 399ull + ((d % 50ull) * 399ull) / 50ull;
+    return (uint64_t)(((unsigned __int128)d * PS3_TIMEBASE_FREQ) / q);
 #else
     static uint64_t t0 = 0;
     const uint64_t now = host_monotonic_ns();
-    if (!t0) t0 = now;
+    if (__builtin_expect(!t0, 0)) t0 = now;
     const uint64_t ns = now - t0;
-    return (ns / 1000000000ull) * PS3_TIMEBASE_FREQ +
-           (ns % 1000000000ull) * PS3_TIMEBASE_FREQ / 1000000000ull;
+    return (ns / 5000ull) * 399ull + ((ns % 5000ull) * 399ull) / 5000ull;
 #endif
 }
 
 unsigned long long ps3_qpc_us(void)
 {
     const uint64_t tb = ppu_timebase_now();
-    return tb / PS3_TIMEBASE_FREQ * 1000000ull + tb % PS3_TIMEBASE_FREQ * 1000000ull / PS3_TIMEBASE_FREQ;
+    return (unsigned long long)((tb / 399ull) * 5ull + ((tb % 399ull) * 5ull) / 399ull);
 }
 
 unsigned long long ps3_ms_now(void)

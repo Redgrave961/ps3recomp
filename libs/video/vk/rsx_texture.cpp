@@ -863,6 +863,7 @@ bool texture_describe(const texture_regs& regs, bool vertex_unit, texture_desc& 
                 depth = 1;
                 pitch = packed;
             }
+            if (cube && width != height) return false;
         }
     } else {
         pitch = (border ? next_pow2(wb0 + 8) : wb0) * fi.block_bytes;

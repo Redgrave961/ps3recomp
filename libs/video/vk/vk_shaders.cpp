@@ -78,6 +78,7 @@ const T* shader_cache::resolve(std::unordered_map<uint64_t, std::unique_ptr<T>>&
         if (auto it = map.find(h); it != map.end()) return it->second.get();
         if (async) {
             if (!m_building.insert(h).second) return nullptr;
+            hold.unlock();
             m_pipes->work([finish, build = job()]() mutable { finish(build()); }, true);
             return nullptr;
         }
@@ -90,19 +91,40 @@ const T* shader_cache::resolve(std::unordered_map<uint64_t, std::unique_ptr<T>>&
 
 const vertex_program* shader_cache::vertex(const uint32_t* program_in, const rsx_spv_vp_key& key, uint64_t program_hash, bool async)
 {
-    const uint64_t h = hash(&key, sizeof key, program_hash);
-    return resolve(m_vertex, h, async, [&] { return [this, h, key, words = std::vector<uint32_t>(program_in, program_in + RSX_SPV_VP_SLOTS * 4u)]() -> std::unique_ptr<vertex_program> {
+    rsx_spv_vp_key mk = key;
+    uint32_t written = 0, texmask = 0;
+    if (rsx_spv_vertex_scan(program_in, mk.start, &written, &texmask) == 0) {
+        uint32_t used_out = 0;
+        if (written & ((1u << 1) | (1u << 3))) used_out |= RSX_SPV_VPOUT_FRONTDIFFUSE | RSX_SPV_VPOUT_BACKDIFFUSE;
+        if (written & ((1u << 2) | (1u << 4))) used_out |= RSX_SPV_VPOUT_FRONTSPECULAR | RSX_SPV_VPOUT_BACKSPECULAR;
+        if (written & (1u << 5)) used_out |= RSX_SPV_VPOUT_FOG | (7u * RSX_SPV_VPOUT_UC0);
+        if (written & (1u << 6)) used_out |= RSX_SPV_VPOUT_TEX9 | RSX_SPV_VPOUT_POINTSIZE | (0x38u * RSX_SPV_VPOUT_UC0);
+        for (uint32_t t = 0; t < 8u; t++)
+            if (written & (1u << (7u + t))) used_out |= RSX_SPV_VPOUT_TEX0 << t;
+        if (written & (1u << 15)) used_out |= RSX_SPV_VPOUT_TEX8;
+        mk.output_mask &= used_out;
+        if (mk.output_mask & (RSX_SPV_VPOUT_FRONTDIFFUSE | RSX_SPV_VPOUT_BACKDIFFUSE))
+            mk.output_mask = (mk.output_mask & ~RSX_SPV_VPOUT_BACKDIFFUSE) | RSX_SPV_VPOUT_FRONTDIFFUSE;
+        if (mk.output_mask & (RSX_SPV_VPOUT_FRONTSPECULAR | RSX_SPV_VPOUT_BACKSPECULAR))
+            mk.output_mask = (mk.output_mask & ~RSX_SPV_VPOUT_BACKSPECULAR) | RSX_SPV_VPOUT_FRONTSPECULAR;
+        uint32_t vdim_mask = 0;
+        for (uint32_t u = 0; u < 4u; u++)
+            if (texmask & (1u << u)) vdim_mask |= 3u << (u * 2u);
+        mk.texture_dims &= vdim_mask;
+    }
+    const uint64_t h = hash(&mk, sizeof mk, program_hash);
+    return resolve(m_vertex, h, async, [&] { return [this, h, mk, words = std::vector<uint32_t>(program_in, program_in + RSX_SPV_VP_SLOTS * 4u)]() -> std::unique_ptr<vertex_program> {
         const uint32_t* program = words.data();
         auto vp = std::make_unique<vertex_program>();
         vp->hash = h;
         rsx_spv_blob blob{};
-        const bool ok = rsx_spv_vertex(program, &key, &blob, &vp->info) == 0 && make_module(vp->code, blob, VK_SHADER_STAGE_VERTEX_BIT);
+        const bool ok = rsx_spv_vertex(program, &mk, &blob, &vp->info) == 0 && make_module(vp->code, blob, VK_SHADER_STAGE_VERTEX_BIT);
         rsx_spv_blob_free(&blob);
         if (!ok) {
-            std::fprintf(stderr, "[vk] vertex program at slot %u failed to translate\n", key.start);
+            std::fprintf(stderr, "[vk] vertex program at slot %u failed to translate\n", mk.start);
             return nullptr;
         }
-        m_pipes->record_vertex(program, key);
+        m_pipes->record_vertex(program, mk);
         return vp;
     }; });
 }
@@ -119,11 +141,15 @@ const fragment_program* shader_cache::fragment(const uint32_t* ucode, uint32_t m
         return nullptr;
     }
     rsx_spv_fp_key mk = key;
+    const u32 ctl = mk.control;
+    mk.control = ((ctl & RSX_SPV_FPCTL_DEPTH_EXPORT) ? RSX_SPV_FPCTL_DEPTH_EXPORT : 0u) |
+                 (ctl & RSX_SPV_FPCTL_32BIT_EXPORTS) |
+                 ((scan.input_mask & 6u) ? (ctl & RSX_SPV_FPCTL_FLAT_SHADING) : 0u);
     uint32_t dim_mask = 0u;
     for (uint32_t u = 0; u < 16u; u++)
         if (scan.texture_mask & (1u << u)) dim_mask |= 3u << (u * 2u);
     mk.texture_dims &= dim_mask;
-    mk.texture_shadow &= scan.texture_mask | (scan.texture_mask << 16u);
+    mk.texture_shadow &= scan.texture_mask;
     if ((mk.output_mask & RSX_SPV_FPOUT_ALPHAKILL) && !(alphakill_units & scan.texture_mask))
         mk.output_mask &= ~RSX_SPV_FPOUT_ALPHAKILL;
 

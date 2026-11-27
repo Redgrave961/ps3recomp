@@ -105,19 +105,40 @@ static void spu_ll_range_set(uint32_t ea, uint32_t size, uint64_t set[SPU_LL_STR
 
 void spu_lockline_lock_range(uint32_t ea, uint32_t size)
 {
+    const uint32_t first = ea >> SPU_COH_LINE_SHIFT;
+    const uint32_t last = size ? ((uint32_t)(ea + (size - 1u)) >> SPU_COH_LINE_SHIFT) : first;
+    if (__builtin_expect(first == last, 1)) {
+        spu_ll_acquire(&g_stripes[first & (SPU_LL_STRIPES - 1u)]);
+        return;
+    }
     uint64_t set[SPU_LL_STRIPES / 64u];
     spu_ll_range_set(ea, size, set);
-    for (unsigned s = 0; s < SPU_LL_STRIPES; s++)
-        if ((set[s >> 6] >> (s & 63u)) & 1u) spu_ll_acquire(&g_stripes[s]);
+    for (unsigned w = 0; w < SPU_LL_STRIPES / 64u; w++) {
+        for (uint64_t bits = set[w]; bits; bits &= bits - 1u)
+            spu_ll_acquire(&g_stripes[w * 64u + (unsigned)__builtin_ctzll(bits)]);
+    }
 }
 
 void spu_lockline_unlock_range(uint32_t ea, uint32_t size)
 {
+    const uint32_t first = ea >> SPU_COH_LINE_SHIFT;
+    const uint32_t last = size ? ((uint32_t)(ea + (size - 1u)) >> SPU_COH_LINE_SHIFT) : first;
+    if (__builtin_expect(first == last, 1)) {
+        const int pending = spu_ll_wake_begin();
+        spu_ll_release(&g_stripes[first & (SPU_LL_STRIPES - 1u)]);
+        spu_ll_wake_end(pending);
+        return;
+    }
     uint64_t set[SPU_LL_STRIPES / 64u];
     spu_ll_range_set(ea, size, set);
     const int pending = spu_ll_wake_begin();
-    for (unsigned s = SPU_LL_STRIPES; s-- > 0;)
-        if ((set[s >> 6] >> (s & 63u)) & 1u) spu_ll_release(&g_stripes[s]);
+    for (unsigned w = SPU_LL_STRIPES / 64u; w-- > 0;) {
+        for (uint64_t bits = set[w]; bits;) {
+            const unsigned b = 63u - (unsigned)__builtin_clzll(bits);
+            bits ^= 1ull << b;
+            spu_ll_release(&g_stripes[w * 64u + b]);
+        }
+    }
     spu_ll_wake_end(pending);
 }
 
@@ -266,9 +287,10 @@ uint32_t (*g_spu_idle_slots)(const uint8_t* line);
 static uint32_t spu_coh_free_slots(uint32_t line, unsigned n)
 {
     const uint32_t s = g_spu_idle_slots(vm_base + line);
+    const int fast = __builtin_expect(n <= SPU_COH_BLOCK, 1);
     uint32_t k = 0;
     for (unsigned i = 0; i < n; i++) {
-        const spu_context* c = spu_coh_holder(i);
+        const spu_context* c = fast ? __atomic_load_n(&s_coh_fast[i], __ATOMIC_ACQUIRE) : spu_coh_holder(i);
         k += c && __atomic_load_n(&c->idle_claim, __ATOMIC_RELAXED) == (line | 1u);
     }
     return s > k ? s - k : 0u;

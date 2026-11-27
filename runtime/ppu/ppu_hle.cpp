@@ -90,27 +90,43 @@ extern "C" uint32_t    g_last_hle_nid  = 0;
 extern "C" const char* g_last_hle_name = "";
 
 #define PS3_HLE_INFLIGHT_MAX 64
-extern "C" const char* g_hle_inflight[PS3_HLE_INFLIGHT_MAX] = { nullptr };
+struct alignas(64) HleInflightSlot { const char* name; };
+static HleInflightSlot g_hle_inflight[PS3_HLE_INFLIGHT_MAX]{};
+extern "C" const char* ppu_hle_inflight_name(unsigned tid)
+{
+    return tid < PS3_HLE_INFLIGHT_MAX ? g_hle_inflight[tid].name : nullptr;
+}
 
 extern "C" void     ps3_indirect_call(ppu_context* ctx);
 extern "C" uint32_t vm_read32(uint64_t a);
 #include "../platform/win32_backtrace.h"
+
+static inline bool hle_toc_matches(uint64_t sp, uint64_t toc)
+{
+    const uint32_t ea = (uint32_t)sp + 0x28u;
+    return ea >= 0x10000u && (ea & 4095u) <= 4088u &&
+           (!ppu_vm_size || ea + 8u <= ppu_vm_size) &&
+           !ppu_slow_page[ea >> 12] && vm_ld64(vm_base + ea) == toc;
+}
 
 extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 {
     if (const hle_fast_fn f = hle_fast(nid))
         if (f(ctx)) return;
 
-    struct _TocGuard { ppu_context* c; uint64_t toc, sp, ft0; uint32_t nid, lr;
-        ~_TocGuard(){ c->gpr[2] = toc; vm_write64(sp + 0x28, toc);
+    struct _TocGuard { ppu_context* c; uint64_t toc, sp, ft0; uint32_t nid, lr; bool check_toc;
+        ~_TocGuard(){ c->gpr[2] = toc;
+                      if (check_toc && !hle_toc_matches(sp, toc)) vm_write64(sp + 0x28, toc);
                       unsigned t = (unsigned)c->thread_id;
-                      if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = nullptr;
+                      if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t].name = nullptr;
                       if (ft0) { const uint64_t t1 = ps3_ft_now();
                                  if (t1 - ft0 >= ps3_ft_min_ns())
                                      ps3_ft_span(PS3_FT_HLE, t, nid, lr, ft0, t1); } }
-    } _tg{ ctx, ctx->gpr[2], ctx->gpr[1], PS3_FT_ON() ? ps3_ft_now() : 0, nid, (uint32_t)ctx->lr };
-    g_last_hle_nid = nid;
-    g_last_hle_name = "(unimplemented)";
+    } _tg{ ctx, ctx->gpr[2], ctx->gpr[1], PS3_FT_ON() ? ps3_ft_now() : 0, nid, (uint32_t)ctx->lr, true };
+    if (g_last_hle_nid != nid) {
+        g_last_hle_nid = nid;
+        g_last_hle_name = "(unimplemented)";
+    }
 
     if (nid == 0xE6F2C1E7u && (uint32_t)ctx->gpr[3] != 0) {
         uint32_t sp = (uint32_t)ctx->gpr[1];
@@ -125,7 +141,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
           for(int i=0;i<fr;i++) p+=snprintf(line+p,sizeof(line)-p," %llX",(unsigned long long)((char*)bt[i]-mb));
           fprintf(stderr,"%s\n",line); }
     }
-    vm_write64(ctx->gpr[1] + 0x28, ctx->gpr[2]);
+    if (!hle_toc_matches(ctx->gpr[1], ctx->gpr[2])) vm_write64(ctx->gpr[1] + 0x28, ctx->gpr[2]);
 
     const HleSlot* hs = hle_slot(nid);
     if (const uint32_t opd = hs->prx_opd) {
@@ -138,12 +154,10 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
     if (hs->ctx_i >= 0) {
             const uint32_t i = (uint32_t)hs->ctx_i;
             ps3_msf("hle:%s", g_ctx[i].name);
-            g_last_hle_name = g_ctx[i].name;
+            if (g_last_hle_name != g_ctx[i].name) g_last_hle_name = g_ctx[i].name;
             { unsigned t = (unsigned)ctx->thread_id;
-              if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = g_ctx[i].name; }
+              if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t].name = g_ctx[i].name; }
             g_ctx[i].fn(ctx);
-            { unsigned t = (unsigned)ctx->thread_id;
-              if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = nullptr; }
             return;
         }
 
@@ -153,12 +167,14 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
         static int logged = 0;
         if (logged < 40) { fprintf(stderr, "[hle] unresolved NID 0x%08X\n", nid); logged++; }
         ctx->gpr[3] = 0;
+        _tg.check_toc = false;
         return;
     }
-    g_last_hle_name = e->name;
+    if (g_last_hle_name != e->name) g_last_hle_name = e->name;
     ps3_msf("hle:%s", e->name);
     { unsigned t = (unsigned)ctx->thread_id;
-      if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = e->name; }
+      if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t].name = e->name; }
+    _tg.check_toc = false;
     hle_generic fn = (hle_generic)e->handler;
     uint64_t r = fn(ctx->gpr[3], ctx->gpr[4], ctx->gpr[5], ctx->gpr[6],
                     ctx->gpr[7], ctx->gpr[8], ctx->gpr[9], ctx->gpr[10]);

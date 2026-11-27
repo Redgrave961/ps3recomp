@@ -23,7 +23,7 @@ typedef struct sys_semaphore_info {
     volatile int32_t value;
     int32_t          max_value;
     ps3_waitq        q;
-} sys_semaphore_info;
+} __attribute__((aligned(64))) sys_semaphore_info;
 
 extern sys_semaphore_info g_sys_semaphores[SYS_SEMAPHORE_MAX];
 

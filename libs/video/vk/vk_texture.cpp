@@ -33,6 +33,7 @@ u32 texel_bytes(VkFormat f)
 
 struct page_stamper {
     std::vector<u32>& stamps;
+    std::vector<u32>& chunks;
     u32& clock;
     u32 stamp;
 };
@@ -42,6 +43,7 @@ void stamp_page(void* user, uint32_t page)
     page_stamper& s = *static_cast<page_stamper*>(user);
     if (!s.stamp) s.stamp = ++s.clock;
     s.stamps[page] = s.stamp;
+    s.chunks[page >> 6] = s.stamp;
 }
 
 uint64_t mix(uint64_t h, uint64_t v)
@@ -72,11 +74,12 @@ void renderer::mark_written(u32 ea, u32 size)
 {
     if (!size) return;
     m_epoch++;
-    m_binding_gen++;
     if (m_page_stamp.empty()) return;
     const u32 stamp = ++m_stamp;
-    for (uint64_t p = ea >> k_page_shift; p <= ((uint64_t)ea + size - 1u) >> k_page_shift && p < m_page_stamp.size(); p++)
+    for (uint64_t p = ea >> k_page_shift; p <= ((uint64_t)ea + size - 1u) >> k_page_shift && p < m_page_stamp.size(); p++) {
         m_page_stamp[p] = stamp;
+        m_chunk_stamp[p >> 6] = stamp;
+    }
 }
 
 void renderer::watch(u32 ea, u32 size)
@@ -84,10 +87,13 @@ void renderer::watch(u32 ea, u32 size)
     if (__builtin_expect(!m_occlusion.idle(), 0)) await_writes(ea, size);
     stats.watch_calls++;
     stats.watch_bytes += size;
-    if (m_page_stamp.empty()) m_page_stamp.assign(1u << (32 - k_page_shift), 0u);
+    if (m_page_stamp.empty()) {
+        m_page_stamp.assign(1u << (32 - k_page_shift), 0u);
+        m_chunk_stamp.assign(1u << (32 - k_page_shift - 6), 0u);
+    }
     const u64 batch = rsx_core_batch();
     if (batch != m_scan_batch) prescan(batch);
-    page_stamper s{ m_page_stamp, m_stamp, 0 };
+    page_stamper s{ m_page_stamp, m_chunk_stamp, m_stamp, 0 };
     vm_track(ea, size, stamp_page, &s);
 }
 
@@ -96,7 +102,7 @@ void renderer::prescan(u64 batch)
     m_scan_batch = batch;
     const bool timed = tracing();
     const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    page_stamper s{ m_page_stamp, m_stamp, 0 };
+    page_stamper s{ m_page_stamp, m_chunk_stamp, m_stamp, 0 };
     stats.changed_pages += vm_track_drain(stamp_page, &s);
     stats.scans++;
     if (timed)
@@ -107,9 +113,15 @@ bool renderer::memory_changed(u32 ea, u32 size, u32 stamp)
 {
     if (!size) return false;
     watch(ea, size);
+    const uint64_t first = ea >> k_page_shift;
     const uint64_t last = std::min<uint64_t>(((uint64_t)ea + size - 1u) >> k_page_shift, m_page_stamp.size() - 1u);
-    for (uint64_t p = ea >> k_page_shift; p <= last; p++)
-        if (m_page_stamp[p] > stamp) return true;
+    for (uint64_t c = first >> 6, c_end = last >> 6; c <= c_end; c++) {
+        if (m_chunk_stamp[c] <= stamp) continue;
+        const uint64_t p0 = std::max(first, c << 6);
+        const uint64_t p1 = std::min(last, (c << 6) + 63u);
+        for (uint64_t p = p0; p <= p1; p++)
+            if (m_page_stamp[p] > stamp) return true;
+    }
     return false;
 }
 
@@ -117,37 +129,23 @@ bool renderer::memory_changed_watched(u32 ea, u32 size, u32 stamp, u32& checked_
 {
     if (!size) return false;
     if (__builtin_expect(!m_occlusion.idle(), 0)) await_writes(ea, size);
+    if (m_page_stamp.empty()) return false;
     const u64 batch = rsx_core_batch();
     if (batch != m_scan_batch) prescan(batch);
     if (__builtin_expect(checked_stamp == m_stamp, 1)) return false;
+    const uint64_t first = ea >> k_page_shift;
     const uint64_t last = std::min<uint64_t>(((uint64_t)ea + size - 1u) >> k_page_shift, m_page_stamp.size() - 1u);
-    for (uint64_t p = ea >> k_page_shift; p <= last; p++)
-        if (m_page_stamp[p] > stamp) return true;
+    for (uint64_t c = first >> 6, c_end = last >> 6; c <= c_end; c++) {
+        if (m_chunk_stamp[c] <= stamp) continue;
+        const uint64_t p0 = std::max(first, c << 6);
+        const uint64_t p1 = std::min(last, (c << 6) + 63u);
+        for (uint64_t p = p0; p <= p1; p++)
+            if (m_page_stamp[p] > stamp) return true;
+    }
     checked_stamp = m_stamp;
     return false;
 }
 
-u32 renderer::refresh(u32 ea, u32 size, u32 stamp, uint8_t* dst)
-{
-    if (!size) return 0;
-    if (!stamp) {
-        std::memcpy(dst, vm_base + ea, size);
-        return size;
-    }
-    u32 copied = 0;
-    const u32 last = (u32)std::min<uint64_t>(((uint64_t)ea + size - 1u) >> k_page_shift, m_page_stamp.size() - 1u);
-    for (u32 p = ea >> k_page_shift; p <= last; p++) {
-        if (m_page_stamp[p] <= stamp) continue;
-        u32 q = p;
-        while (q < last && m_page_stamp[q + 1u] > stamp) q++;
-        const uint64_t lo = std::max<uint64_t>(ea, (uint64_t)p << k_page_shift);
-        const uint64_t hi = std::min<uint64_t>((uint64_t)ea + size, (uint64_t)(q + 1u) << k_page_shift);
-        std::memcpy(dst + (lo - ea), vm_base + lo, hi - lo);
-        copied += (u32)(hi - lo);
-        p = q;
-    }
-    return copied;
-}
 VkImageView renderer::view_for(image& img, VkImageViewType type, VkFormat format, VkImageAspectFlags aspect, const VkComponentMapping& swizzle)
 {
     const uint64_t key = swizzle_key(type, format, aspect, swizzle);
@@ -159,8 +157,10 @@ VkImageView renderer::view_for(image& img, VkImageViewType type, VkFormat format
     vi.format = format;
     vi.components = swizzle;
     vi.subresourceRange = { aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS };
-    const VkImageViewUsageCreateInfo usage{ VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, nullptr, img.usage & ~VK_IMAGE_USAGE_STORAGE_BIT };
-    if (img.usage & VK_IMAGE_USAGE_STORAGE_BIT) vi.pNext = &usage;
+    constexpr VkImageUsageFlags k_strip = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                                          VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    const VkImageViewUsageCreateInfo usage{ VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, nullptr, VK_IMAGE_USAGE_SAMPLED_BIT };
+    if (img.usage & k_strip) vi.pNext = &usage;
     VkImageView view = VK_NULL_HANDLE;
     if (vkCreateImageView(m_d->dev, &vi, nullptr, &view) != VK_SUCCESS) return VK_NULL_HANDLE;
     img.views.emplace_back(key, view);
@@ -320,12 +320,23 @@ image* renderer::depth_as_color(surface& s)
     VkCommandBuffer c = cmd();
     end_rendering();
     const trace_span span(*this, c, "depth pack %ux%u", w, h);
-    barrier(c, s.img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, k_shader_read_stages, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    barrier(c, s.img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
     barrier(c, dst, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
     m_depth_pack.record(c, dv, sv, dst.view, w, h, d16, s.depth_float);
-    invalidate_graphics_state();
     s.as_color_version = s.depth_version;
     return &dst;
+}
+
+bool renderer::supports_linear_blit(VkFormat format)
+{
+    if (const bool* cached = m_linear_blit_ok.find(format)) return *cached;
+    VkFormatProperties fp{};
+    vkGetPhysicalDeviceFormatProperties(m_d->gpu, format, &fp);
+    constexpr VkFormatFeatureFlags need = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT |
+                                          VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+    const bool ok = (fp.optimalTilingFeatures & need) == need;
+    m_linear_blit_ok[format] = ok;
+    return ok;
 }
 
 image* renderer::native_image(surface& s, image& source)
@@ -348,7 +359,7 @@ image* renderer::native_image(surface& s, image& source)
     end_rendering();
     if (direct_ok) {
         const trace_span span(*this, c, "box downscale %ux%u to %ux%u", source.width, source.height, w, h);
-        barrier(c, source, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, k_shader_read_stages,
+        barrier(c, source, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
                 VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
         barrier(c, low, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
                 VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
@@ -358,17 +369,11 @@ image* renderer::native_image(surface& s, image& source)
             return &low;
         }
     }
-    if (!direct_ok && source.width <= w * 2u && source.height <= h * 2u) {
-        VkFormatProperties fp{};
-        vkGetPhysicalDeviceFormatProperties(m_d->gpu, source.format, &fp);
-        constexpr VkFormatFeatureFlags need = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT |
-                                              VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
-        if ((fp.optimalTilingFeatures & need) == need) {
-            const trace_span span(*this, c, "linear downscale %ux%u to %ux%u", source.width, source.height, w, h);
-            scale_blit(c, source, low, VK_FILTER_LINEAR);
-            s.native_version = s.version;
-            return &low;
-        }
+    if (!direct_ok && source.width <= w * 2u && source.height <= h * 2u && supports_linear_blit(source.format)) {
+        const trace_span span(*this, c, "linear downscale %ux%u to %ux%u", source.width, source.height, w, h);
+        scale_blit(c, source, low, VK_FILTER_LINEAR);
+        s.native_version = s.version;
+        return &low;
     }
     if (m_box.width < w || m_box.height < h) {
         const u32 bw = std::max(m_box.width, w), bh = std::max(m_box.height, h);
@@ -378,10 +383,9 @@ image* renderer::native_image(surface& s, image& source)
             return nullptr;
     }
     const trace_span span(*this, c, "box downscale %ux%u to %ux%u", source.width, source.height, w, h);
-    barrier(c, source, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, k_shader_read_stages, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    barrier(c, source, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
     barrier(c, m_box, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
     m_downscale.record(c, source.view, m_box.view, w, h, source.width, source.height);
-    invalidate_graphics_state();
     barrier(c, m_box, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
     barrier(c, low, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
     VkImageBlit region{};
@@ -407,27 +411,53 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
     path = "dummy: address out of range";
     if (!ea) return false;
 
+    const VkPipelineStageFlags2 read_stage = vertex ? VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT : VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
     const rsx_vk_texture_patch* const patch = g_patch.load(std::memory_order_acquire);
-    const u32 cur_variant = patch ? patch->variant() : 0u;
+    u32 cur_variant = 0u;
+    bool variant_ready = false;
+    auto get_variant = [&]() -> u32 {
+        if (!variant_ready) {
+            cur_variant = patch ? patch->variant() : 0u;
+            variant_ready = true;
+        }
+        return cur_variant;
+    };
     unit_resolved& cached = m_resolved[slot];
     if (!m_trace && cached.valid && cached.ea == ea && cached.generation == m_binding_gen &&
-        (cached.patch_tag == 0 || cached.variant == cur_variant) && !std::memcmp(&cached.regs, &b.regs, sizeof b.regs)) {
-        bool fresh = cached.epoch == m_epoch;
-        if (!fresh && m_occlusion.idle()) {
-            const u64 batch = rsx_core_batch();
-            if (batch != m_scan_batch) prescan(batch);
-            if (cached.stamp == m_stamp) {
-                cached.epoch = m_epoch;
-                fresh = true;
+        !std::memcmp(&cached.regs, &b.regs, sizeof b.regs)) {
+        if (cached.surf) {
+            surface* cs = cached.surf;
+            bool bound = cs == m_fb.depth;
+            for (u32 k = 0; k < m_fb.count && !bound; k++)
+                if (m_fb.color[k] == cs) bound = true;
+            const u64 ver = cs->depth ? cs->depth_version : cs->version;
+            if (!bound && cs->state == SURFACE_VALID && cached.surf_version == ver && cached.fb_scale == m_fb.scale && readable(*cached.surf_img, read_stage)) {
+                path = "surface";
+                out = cached.info;
+                state = cached.state;
+                return true;
             }
-        }
-        if (fresh) {
-            if (cached.entry) cached.entry->used = m_flips;
-            path = "memory";
-            out = cached.info;
-            state = cached.state;
-            if (patch_tag) *patch_tag = cached.patch_tag;
-            return true;
+        } else if (cached.patch_tag == 0 || cached.variant == get_variant()) {
+            texture_entry* ce = cached.entry;
+            bool fresh = cached.epoch == m_epoch;
+            if (!fresh && ce->img.layout != VK_IMAGE_LAYOUT_UNDEFINED) {
+                if (ce->checked == m_epoch) {
+                    cached.epoch = m_epoch;
+                    fresh = true;
+                } else if (!memory_changed_watched(ea, d.guest_size, ce->stamp, ce->checked_stamp)) {
+                    ce->checked = m_epoch;
+                    cached.epoch = m_epoch;
+                    fresh = true;
+                }
+            }
+            if (fresh && readable(ce->img, read_stage)) {
+                ce->used = m_flips;
+                path = "memory";
+                out = cached.info;
+                state = cached.state;
+                if (patch_tag) *patch_tag = cached.patch_tag;
+                return true;
+            }
         }
     }
     cached.valid = false;
@@ -439,6 +469,7 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
         rsx::texture_sampler(b.regs, vertex, d, m_d->props.limits.maxSamplerAnisotropy, si, border);
         const bool custom = si.borderColor == VK_BORDER_COLOR_FLOAT_CUSTOM_EXT || si.borderColor == VK_BORDER_COLOR_INT_CUSTOM_EXT;
         if (custom && !m_d->caps.custom_border_color) si.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+        if (custom && m_d->caps.custom_border_without_format) border.format = VK_FORMAT_UNDEFINED;
         sampler = sampler_for(si, custom && m_d->caps.custom_border_color ? &border : nullptr);
         if (!sampler) return false;
         b.sampler = sampler;
@@ -473,12 +504,14 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
             image* packed = depth_as_color(*s);
             path = "dummy: depth pack failed";
             if (!packed) return false;
+            if (!readable(*packed, read_stage)) end_rendering();
             barrier(c, *packed, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                    k_shader_read_stages, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+                    read_stage, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
             const VkImageView view = view_for(*packed, VK_IMAGE_VIEW_TYPE_2D, d.format, VK_IMAGE_ASPECT_COLOR_BIT, d.swizzle);
             if (!view) return false;
             path = "depth packed as color";
             out = { sampler, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+            cached = { true, 0, 0, b.regs, ea, 0, m_binding_gen, nullptr, s, packed, s->depth_version, m_fb.scale, out, state };
             return true;
         }
         if (s->depth != d.depth) { skipped = "memory: color surface sampled as depth"; continue; }
@@ -486,7 +519,12 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
         const bool rgba8_tex = d.format == VK_FORMAT_B8G8R8A8_UNORM || d.format == VK_FORMAT_B8G8R8A8_SRGB ||
                                d.format == VK_FORMAT_B8G8R8A8_SNORM || d.format == VK_FORMAT_R8G8B8A8_UNORM ||
                                d.format == VK_FORMAT_R8G8B8A8_SRGB || d.format == VK_FORMAT_R8G8B8A8_SNORM;
-        if (!s->depth && (d.compressed || (promoted ? !rgba8_tex : (texel_bytes(s->img.format) == 0 || texel_bytes(s->img.format) != texel_bytes(d.format))))) {
+        const bool listed_8 = !s->depth && (s->img.format == VK_FORMAT_B8G8R8A8_UNORM || s->img.format == VK_FORMAT_R8G8B8A8_UNORM);
+        const VkFormat srgb_pair = s->img.format == VK_FORMAT_B8G8R8A8_UNORM ? VK_FORMAT_B8G8R8A8_SRGB : VK_FORMAT_R8G8B8A8_SRGB;
+        const VkFormat snorm_pair = s->img.format == VK_FORMAT_B8G8R8A8_UNORM ? VK_FORMAT_B8G8R8A8_SNORM : VK_FORMAT_R8G8B8A8_SNORM;
+        const bool listed_snorm = listed_8 && d.format == snorm_pair;
+        const bool listed_ok = !listed_8 || d.format == s->img.format || d.format == srgb_pair || listed_snorm;
+        if (!s->depth && (d.compressed || (promoted ? !rgba8_tex : (!listed_ok || texel_bytes(s->img.format) == 0 || texel_bytes(s->img.format) != texel_bytes(d.format))))) {
             skipped = "memory: surface texel size differs";
             continue;
         }
@@ -519,15 +557,15 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
             }
             source = &snap;
         }
-        if (!s->depth && s->scale > m_fb.scale) {
+        if (!s->depth && (s->scale.x > m_fb.scale.x || s->scale.y > m_fb.scale.y)) {
             path = "dummy: rescale creation failed";
             source = native_image(*s, *source);
             if (!source) return false;
         }
-        if (!readable(*source, k_shader_read_stages)) end_rendering();
+        if (!readable(*source, read_stage)) end_rendering();
         barrier(c, *source, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                k_shader_read_stages, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
-        const VkImageView view = view_for(*source, VK_IMAGE_VIEW_TYPE_2D, (s->depth || promoted) ? s->img.format : d.format, aspect, d.swizzle);
+                read_stage, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+        const VkImageView view = view_for(*source, VK_IMAGE_VIEW_TYPE_2D, (s->depth || promoted || listed_snorm) ? s->img.format : d.format, aspect, d.swizzle);
         path = "dummy: surface view failed";
         if (!view) return false;
         if (promoted) {
@@ -535,14 +573,18 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
                 state.control |= 0x7u << RSX_SPV_TEXC_GAMMA_SHIFT;
             else if (d.format == VK_FORMAT_B8G8R8A8_SNORM || d.format == VK_FORMAT_R8G8B8A8_SNORM)
                 state.control |= 0xFu << RSX_SPV_TEXC_SEXT_SHIFT;
+        } else if (listed_snorm) {
+            state.control |= 0xFu << RSX_SPV_TEXC_SEXT_SHIFT;
         }
         if (s->depth && d.ops.depth_compare) {
-            const float sc = std::max(s->scale.value(), 1.0f);
+            const float sc = std::max(s->scale.y.value(), 1.0f);
             const float pcf_rad = sc > 1.0f ? std::min(1.0f, (sc - 1.0f) * 0.5f) : 0.0f;
             std::memcpy(&state.remap, &pcf_rad, sizeof pcf_rad);
         }
         path = source == &s->native ? "surface rescaled" : bound ? "surface snapshot" : "surface";
         out = { sampler, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        if (!bound)
+            cached = { true, 0, 0, b.regs, ea, 0, m_binding_gen, nullptr, s, source, s->depth ? s->depth_version : s->version, m_fb.scale, out, state };
         return true;
     }
     path = "dummy: texture creation failed";
@@ -555,10 +597,7 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
     if (!e) {
         auto made = std::make_unique<texture_entry>();
         e = made.get();
-        e->ea = ea;
         e->used = m_flips;
-        e->size = d.guest_size;
-        e->key = key;
         VkImageCreateInfo ii{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
         ii.imageType = d.dimension == 3 ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
         ii.flags = d.cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0;
@@ -580,9 +619,11 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
         upload = true;
     } else if (e->img.layout == VK_IMAGE_LAYOUT_UNDEFINED) {
         upload = true;
+    } else if (e->patch_tag != 0 && patch && e->variant != get_variant()) {
+        upload = true;
     } else if (e->checked != m_epoch) {
         e->checked = m_epoch;
-        upload = memory_changed_watched(ea, d.guest_size, e->stamp, e->checked_stamp) || (e->patch_tag != 0 && patch && e->variant != cur_variant);
+        upload = memory_changed_watched(ea, d.guest_size, e->stamp, e->checked_stamp);
     }
 
     if (upload) {
@@ -597,7 +638,7 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
         rsx::texture_convert(d, vm_base + ea, slice.ptr, m_copies);
         e->patch_tag = 0;
         if (patch) {
-            e->variant = cur_variant;
+            e->variant = get_variant();
             e->patch_tag = (u8)patch->apply(e->variant, d.gcm_format, d.width, d.height, vm_base + ea, d.guest_size, slice.ptr);
         }
         end_rendering();
@@ -619,17 +660,17 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
             vkCmdCopyBufferToImage(c, slice.buffer, e->img.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, (u32)m_copy_regions.size(),
                                    m_copy_regions.data());
     }
-    if (!readable(e->img, k_shader_read_stages)) {
+    if (!readable(e->img, read_stage)) {
         end_rendering();
         barrier(c, e->img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                k_shader_read_stages, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+                read_stage, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
     }
     const VkImageView view = view_for(e->img, type, d.format, d.aspect & VK_IMAGE_ASPECT_DEPTH_BIT ? VK_IMAGE_ASPECT_DEPTH_BIT : d.aspect, d.swizzle);
     if (!view) return false;
     path = skipped ? skipped : "memory";
     out = { sampler, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
     if (patch_tag) *patch_tag = e->patch_tag;
-    if (!skipped) cached = { true, e->patch_tag, e->variant, b.regs, ea, m_stamp, m_epoch, m_binding_gen, e, out, state };
+    if (!skipped) cached = { true, e->patch_tag, e->variant, b.regs, ea, m_epoch, m_binding_gen, e, nullptr, nullptr, 0, {}, out, state };
     return true;
 }
 

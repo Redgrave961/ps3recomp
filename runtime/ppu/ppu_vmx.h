@@ -119,8 +119,9 @@ VMX_INL void vmx_vmaxsw(VMX_D, VMX_A, VMX_B) { vmx_st(d_, _mm_max_epi32(vmx_ld(a
 VMX_INL void vmx_vminsw(VMX_D, VMX_A, VMX_B) { vmx_st(d_, _mm_min_epi32(vmx_ld(a_), vmx_ld(b_))); }
 
 VMX_INL void vmx_vperm(VMX_D, VMX_A, VMX_B, VMX_C) {
-    const __m128i c = vmx_ld(c_), i = _mm_xor_si128(_mm_and_si128(c, _mm_set1_epi8(0x0F)), _mm_set1_epi8(0x0F));
-    vmx_st(d_, _mm_blendv_epi8(_mm_shuffle_epi8(vmx_ld(a_), i), _mm_shuffle_epi8(vmx_ld(b_), i), _mm_slli_epi16(c, 3)));
+    const __m128i ia = _mm_sub_epi8(_mm_set1_epi8(15), _mm_and_si128(vmx_ld(c_), _mm_set1_epi8(0x1F)));
+    const __m128i ib = _mm_xor_si128(ia, _mm_set1_epi8((char)0x80));
+    vmx_st(d_, _mm_or_si128(_mm_shuffle_epi8(vmx_ld(a_), ia), _mm_shuffle_epi8(vmx_ld(b_), ib)));
 }
 VMX_INL __m128i vmx_iota(void) { return _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15); }
 VMX_INL void vmx_lvlx(VMX_D, uint64_t lo, uint64_t hi, uint32_t sh) {

@@ -20,6 +20,7 @@ struct vk_caps {
     bool dynamic_state3;
     bool pipeline_library;
     bool custom_border_color;
+    bool custom_border_without_format;
     bool depth_clip_enable;
     bool provoking_vertex;
     bool maintenance5;
@@ -42,6 +43,7 @@ struct vk_device {
     VmaAllocator vma = nullptr;
     VkPhysicalDeviceProperties props{};
     VkPhysicalDeviceFeatures2 features{};
+    VkPhysicalDeviceExtendedDynamicState2FeaturesEXT* dynamic_state2 = nullptr;
     VkPhysicalDeviceExtendedDynamicState3FeaturesEXT* dynamic_state3 = nullptr;
     vk_caps caps{};
     std::vector<std::unique_ptr<uint8_t[]>> chain;

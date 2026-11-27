@@ -38,7 +38,7 @@ typedef struct sys_event_queue_info {
     int          tail;
     int          count;
     ps3_waitq    q;
-} sys_event_queue_info;
+} __attribute__((aligned(64))) sys_event_queue_info;
 
 #define SYS_EVENT_QUEUE_DESTROY_FORCE  1
 
@@ -75,7 +75,7 @@ typedef struct sys_event_flag_info {
     char              name[8];
     volatile uint64_t pattern;
     ps3_waitq         q;
-} sys_event_flag_info;
+} __attribute__((aligned(64))) sys_event_flag_info;
 
 extern sys_event_flag_info g_sys_event_flags[SYS_EVENT_FLAG_MAX];
 

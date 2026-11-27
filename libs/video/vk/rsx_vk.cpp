@@ -115,10 +115,15 @@ struct state {
     rsx_vk_display last_fullscreen = RSX_VK_BORDERLESS;
     std::atomic<void (*)(rsx_vk_display)> display_listener{ nullptr };
     std::atomic<uint32_t> display_event{ 0 };
-    std::atomic<uint64_t> scale{ (3ull << 32) | 1u };
+    std::atomic<uint32_t> resize_event{ 0 };
+    std::atomic<u32> want_win_w{ 0 };
+    std::atomic<u32> want_win_h{ 0 };
+    std::atomic<void (*)(u32, u32)> resize_listener{ nullptr };
+    std::atomic<uint64_t> scale{ (3ull << 48) | (1ull << 32) | (3ull << 16) | 1u };
     std::atomic<rsx_vk_aa> aa{ RSX_VK_AA_SMAA };
     std::mutex modes_lock;
     std::vector<rsx_vk_mode> modes;
+    rsx_vk_mode desktop_mode{};
     std::atomic<void (*)()> modes_listener{ nullptr };
     std::mutex mouse_lock;
     float mouse_dx = 0.f, mouse_dy = 0.f, mouse_travel = 0.f;
@@ -151,17 +156,27 @@ void read_refresh()
     g.refresh = mode ? mode->refresh_rate : 0.f;
 }
 
-vk::ratio resolution_scale()
+vk::ratio clamp_scale(uint32_t num, uint32_t den)
+{
+    const vk::ratio r = vk::ratio::of(num, den), top{ 12, 1 };
+    return r > top ? top : vk::ratio{} > r ? vk::ratio{} : r;
+}
+
+vk::scale2d resolution_scale()
 {
     const uint64_t v = g.scale.load(std::memory_order_relaxed);
-    const vk::ratio r = vk::ratio::of((uint32_t)(v >> 32), (uint32_t)v), top{ 8, 1 };
-    return r > top ? top : vk::ratio{} > r ? vk::ratio{} : r;
+    return { clamp_scale((uint32_t)(v >> 48), (uint32_t)(v >> 32) & 0xFFFFu),
+             clamp_scale((uint32_t)(v >> 16) & 0xFFFFu, (uint32_t)v & 0xFFFFu) };
 }
 
 void read_modes()
 {
+    const SDL_DisplayID display = SDL_GetDisplayForWindow(g.window);
+    rsx_vk_mode desk{};
+    if (const SDL_DisplayMode* dm = SDL_GetDesktopDisplayMode(display))
+        desk = { (u32)std::lround(dm->w * dm->pixel_density), (u32)std::lround(dm->h * dm->pixel_density), dm->refresh_rate };
     int n = 0;
-    SDL_DisplayMode** list = SDL_GetFullscreenDisplayModes(SDL_GetDisplayForWindow(g.window), &n);
+    SDL_DisplayMode** list = SDL_GetFullscreenDisplayModes(display, &n);
     std::vector<rsx_vk_mode> modes;
     modes.reserve((size_t)n);
     for (int i = 0; i < n; i++)
@@ -169,10 +184,12 @@ void read_modes()
     SDL_free(list);
     {
         std::lock_guard<std::mutex> hold(g.modes_lock);
-        if (modes.size() == g.modes.size() && std::equal(modes.begin(), modes.end(), g.modes.begin(), [](const rsx_vk_mode& a, const rsx_vk_mode& b) {
+        const bool same_desk = desk.width == g.desktop_mode.width && desk.height == g.desktop_mode.height && desk.refresh == g.desktop_mode.refresh;
+        if (same_desk && modes.size() == g.modes.size() && std::equal(modes.begin(), modes.end(), g.modes.begin(), [](const rsx_vk_mode& a, const rsx_vk_mode& b) {
                 return a.width == b.width && a.height == b.height && a.refresh == b.refresh;
             }))
             return;
+        g.desktop_mode = desk;
         g.modes = std::move(modes);
     }
     if (const auto listener = g.modes_listener.load()) listener();
@@ -180,8 +197,9 @@ void read_modes()
 
 void report_scale()
 {
-    const vk::ratio& s = g.r.resolution_scale;
-    std::fprintf(stderr, "[vk] resolution %ux%u for a 1280x720 frame (scale %u/%u)\n", s.edge(1280), s.edge(720), s.num, s.den);
+    const vk::scale2d& s = g.r.resolution_scale;
+    std::fprintf(stderr, "[vk] resolution %ux%u for a 1280x720 frame (scale %u/%u x %u/%u)\n",
+                 s.x.edge(1280), s.y.edge(720), s.x.num, s.x.den, s.y.num, s.y.den);
 }
 
 bool exclusive_mode(SDL_DisplayMode& out)
@@ -399,8 +417,8 @@ bool presenter_build()
     g.r.resolution_scale = resolution_scale();
     report_scale();
     if (!g.r.open(g.d, g.timeline, &g.submitted, g.cache_path.c_str())) return false;
-    g.smaa.create(g.d);
-    g.toast.create(g.d);
+    g.smaa.create(g.d, g.r.pipeline_cache());
+    g.toast.create(g.d, g.r.pipeline_cache());
     return true;
 }
 
@@ -759,6 +777,7 @@ void window_main()
     if (SDL_InitSubSystem(SDL_INIT_VIDEO)) {
         mark("sdl video");
         g.display_event = SDL_RegisterEvents(1);
+        g.resize_event = SDL_RegisterEvents(1);
         g.window = SDL_CreateWindow(g.title.c_str(), 1280, 720, SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_HIDDEN);
         if (g.window) {
             if (SDL_Surface* icon = g.icon_path.empty() ? nullptr : SDL_LoadPNG(g.icon_path.c_str())) {
@@ -775,6 +794,7 @@ void window_main()
             SDL_GetWindowSizeInPixels(g.window, &w, &h);
             g.pixel_w = (uint32_t)w;
             g.pixel_h = (uint32_t)h;
+            if (const auto fn = g.resize_listener.load()) fn((u32)w, (u32)h);
             if (vulkan_open()) ok = 1;
         }
     }
@@ -822,6 +842,28 @@ void window_main()
             apply_display();
             continue;
         }
+        if (e.type == g.resize_event) {
+            if (g.display == RSX_VK_WINDOWED) {
+                const u32 rw = g.want_win_w.load(std::memory_order_relaxed);
+                const u32 rh = g.want_win_h.load(std::memory_order_relaxed);
+                if (rw && rh) {
+                    const SDL_DisplayID disp = SDL_GetDisplayForWindow(g.window);
+                    SDL_Rect usable{};
+                    int tw = (int)rw, th = (int)rh;
+                    if (SDL_GetDisplayUsableBounds(disp, &usable) && usable.w > 0 && usable.h > 0) {
+                        const int max_w = std::max(320, usable.w - 32), max_h = std::max(180, usable.h - 48);
+                        if (tw > max_w || th > max_h) {
+                            const double s = std::min((double)max_w / tw, (double)max_h / th);
+                            tw = std::max(320, (int)std::lround(tw * s));
+                            th = std::max(180, (int)std::lround(th * s));
+                        }
+                    }
+                    SDL_SetWindowSize(g.window, tw, th);
+                    SDL_SetWindowPosition(g.window, SDL_WINDOWPOS_CENTERED_DISPLAY(disp), SDL_WINDOWPOS_CENTERED_DISPLAY(disp));
+                }
+            }
+            continue;
+        }
         switch (e.type) {
         case SDL_EVENT_QUIT:
             g.r.save_caches();
@@ -833,8 +875,12 @@ void window_main()
         case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
             g.pixel_w = (uint32_t)e.window.data1;
             g.pixel_h = (uint32_t)e.window.data2;
-            g.resized = true;
+            {
+                std::lock_guard<std::mutex> hold(g.queue_lock);
+                g.resized = true;
+            }
             g.queue_cv.notify_one();
+            if (const auto fn = g.resize_listener.load()) fn((u32)e.window.data1, (u32)e.window.data2);
             break;
         case SDL_EVENT_DISPLAY_ADDED:
         case SDL_EVENT_DISPLAY_REMOVED:
@@ -844,8 +890,11 @@ void window_main()
         case SDL_EVENT_WINDOW_DISPLAY_CHANGED:
         case SDL_EVENT_DISPLAY_CURRENT_MODE_CHANGED:
             read_modes();
-            g.display_changed = true;
-            g.resized = true;
+            {
+                std::lock_guard<std::mutex> hold(g.queue_lock);
+                g.display_changed = true;
+                g.resized = true;
+            }
             g.queue_cv.notify_one();
             break;
         case SDL_EVENT_WINDOW_SHOWN:
@@ -854,14 +903,25 @@ void window_main()
         case SDL_EVENT_WINDOW_EXPOSED:
             update_hidden();
             break;
+        case SDL_EVENT_WINDOW_FOCUS_GAINED:
+            update_hidden();
+            if (g.display == RSX_VK_FULLSCREEN) {
+                std::lock_guard<std::mutex> hold(g.queue_lock);
+                g.display_changed = true;
+                g.resized = true;
+                g.queue_cv.notify_one();
+            }
+            break;
         case SDL_EVENT_WINDOW_MINIMIZED:
         case SDL_EVENT_WINDOW_RESTORED:
-        case SDL_EVENT_WINDOW_FOCUS_GAINED:
         case SDL_EVENT_WINDOW_ENTER_FULLSCREEN:
         case SDL_EVENT_WINDOW_LEAVE_FULLSCREEN:
             update_hidden();
-            g.display_changed = true;
-            g.resized = true;
+            {
+                std::lock_guard<std::mutex> hold(g.queue_lock);
+                g.display_changed = true;
+                g.resized = true;
+            }
             g.queue_cv.notify_one();
             break;
         case SDL_EVENT_KEY_DOWN:
@@ -916,7 +976,7 @@ void vk_reset(void*)
 {
     if (stats_on()) g_rsx_cpu_ns.store(thread_cpu_ns(), std::memory_order_relaxed);
     g.r.flip_reset();
-    if (const vk::ratio scale = resolution_scale(); scale != g.r.resolution_scale) {
+    if (const vk::scale2d scale = resolution_scale(); scale != g.r.resolution_scale) {
         g.r.rescale(scale);
         report_scale();
     }
@@ -989,10 +1049,12 @@ int vk_present(void*, u32, const rsx_display_buffer* db)
     const u32 ea = (w && h && pitch >= w * 4u) ? rsx_address(RSX_DMA_LOCAL, db->offset, pitch * h) : 0u;
     static u64 shown, shown_fit;
     static rsx_vk_aa shown_aa = RSX_VK_AA_OFF;
+    static vk::scale2d shown_scale;
     const u64 content = ea ? g.r.content(ea, pitch) : 0;
     const uint64_t fit = g.fit.load(std::memory_order_acquire);
     const rsx_vk_aa aa_mode = g.aa.load(std::memory_order_relaxed);
-    if (!ea || (content && content == shown && fit == shown_fit && aa_mode == shown_aa)) {
+    const vk::scale2d cur_scale = g.r.resolution_scale;
+    if (!ea || (content && content == shown && fit == shown_fit && aa_mode == shown_aa && cur_scale == shown_scale)) {
         g.r.flush();
         return 0;
     }
@@ -1005,13 +1067,14 @@ int vk_present(void*, u32, const rsx_display_buffer* db)
     slot& s = g.slots[i];
     timeline_wait(g.present_timeline, s.released);
     vk::image* src = nullptr;
-    vk::ratio scale;
+    vk::scale2d scale;
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     g.r.present_source(ea, w, h, pitch, src, scale, cmd);
     shown = content;
     shown_fit = fit;
     shown_aa = aa_mode;
-    const uint32_t sw = std::min(scale.edge(w), src ? src->width : 0u), sh = std::min(scale.edge(h), src ? src->height : 0u);
+    shown_scale = cur_scale;
+    const uint32_t sw = std::min(scale.x.edge(w), src ? src->width : 0u), sh = std::min(scale.y.edge(h), src ? src->height : 0u);
     if (!src) {
         g.r.flush();
         return 0;
@@ -1048,20 +1111,23 @@ int vk_present(void*, u32, const rsx_display_buffer* db)
 
     VkImage blit_src = src->handle;
     VkImageView sample_src = VK_NULL_HANDLE;
+    bool filtered = false;
     if (aa_ok) {
-        vk::renderer::barrier(cmd, *src, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, vk::k_shader_read_stages,
+        vk::renderer::barrier(cmd, *src, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
                               VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
-        const vk::smaa::output res = g.smaa.record(cmd, src->view, src->format, sw, sh, want_present_filter, g.submitted + 1u);
+        const bool direct_smaa = same_size_fmt && !want_present_filter && s.view;
+        const vk::smaa::output res = g.smaa.record(cmd, src->view, src->format, sw, sh, want_present_filter, g.submitted + 1u,
+                                                   direct_smaa ? s.image : VK_NULL_HANDLE, direct_smaa ? s.view : VK_NULL_HANDLE);
         g.r.invalidate_graphics_state();
         if (res.image) {
             blit_src = res.image;
             sample_src = res.view;
+            if (direct_smaa && res.image == s.image) filtered = true;
         }
     }
-    bool filtered = false;
     if (want_present_filter) {
         if (!sample_src) {
-            vk::renderer::barrier(cmd, *src, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, vk::k_shader_read_stages,
+            vk::renderer::barrier(cmd, *src, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
                                   VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
             sample_src = src->view;
         }
@@ -1198,6 +1264,7 @@ void vk_close(void*)
         std::lock_guard<std::mutex> hold(g.d.queue_lock);
         vkDeviceWaitIdle(g.d.dev);
     }
+    g.toast.destroy();
     g.smaa.destroy();
     g.r.close();
 }
@@ -1219,9 +1286,13 @@ extern "C" const rsx_renderer* rsx_vk_renderer(const char* title, const char* ca
     return &renderer;
 }
 
-extern "C" void rsx_vk_set_resolution_scale(u32 num, u32 den)
+extern "C" void rsx_vk_set_resolution_scale(u32 num_x, u32 den_x, u32 num_y, u32 den_y)
 {
-    if (num && den) g.scale.store(((uint64_t)num << 32) | den, std::memory_order_relaxed);
+    if (!num_x || !den_x || !num_y || !den_y) return;
+    const vk::ratio rx = clamp_scale(num_x, den_x), ry = clamp_scale(num_y, den_y);
+    if (rx.num > 0xFFFFu || rx.den > 0xFFFFu || ry.num > 0xFFFFu || ry.den > 0xFFFFu) return;
+    g.scale.store(((uint64_t)rx.num << 48) | ((uint64_t)rx.den << 32) | ((uint64_t)ry.num << 16) | ry.den,
+                  std::memory_order_relaxed);
 }
 
 extern "C" void rsx_vk_set_aa(enum rsx_vk_aa aa)
@@ -1249,9 +1320,37 @@ extern "C" u32 rsx_vk_display_modes(rsx_vk_mode* out, u32 capacity)
     return (u32)g.modes.size();
 }
 
+extern "C" int rsx_vk_desktop_mode(rsx_vk_mode* out)
+{
+    std::lock_guard<std::mutex> hold(g.modes_lock);
+    if (!g.desktop_mode.width || !g.desktop_mode.height) return 0;
+    if (out) *out = g.desktop_mode;
+    return 1;
+}
+
 extern "C" void rsx_vk_on_display_modes(void (*listener)(void))
 {
     g.modes_listener = listener;
+}
+
+extern "C" void rsx_vk_window_size(u32* w, u32* h)
+{
+    if (w) *w = g.pixel_w.load(std::memory_order_relaxed);
+    if (h) *h = g.pixel_h.load(std::memory_order_relaxed);
+}
+
+extern "C" void rsx_vk_on_window_resize(void (*listener)(u32 w, u32 h))
+{
+    g.resize_listener = listener;
+}
+
+extern "C" void rsx_vk_resize_window(u32 w, u32 h)
+{
+    g.want_win_w.store(w, std::memory_order_relaxed);
+    g.want_win_h.store(h, std::memory_order_relaxed);
+    SDL_Event e{};
+    e.type = g.resize_event;
+    if (e.type) SDL_PushEvent(&e);
 }
 
 extern "C" void rsx_vk_mouse_motion(float* dx, float* dy)

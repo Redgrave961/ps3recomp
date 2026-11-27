@@ -8,7 +8,7 @@ namespace vk {
 
 class downscale {
 public:
-    bool create(vk_device& d);
+    bool create(vk_device& d, VkPipelineCache cache = VK_NULL_HANDLE);
     void destroy();
     void record(VkCommandBuffer cmd, VkImageView src, VkImageView dst, uint32_t width, uint32_t height, uint32_t src_width,
                 uint32_t src_height) const;
@@ -24,6 +24,7 @@ private:
     VkPipeline pipeline_for(VkFormat format, uint32_t scale);
 
     vk_device* m_d = nullptr;
+    VkPipelineCache m_cache = VK_NULL_HANDLE;
     VkSampler m_sampler = VK_NULL_HANDLE;
     VkDescriptorSetLayout m_set = VK_NULL_HANDLE;
     VkPipelineLayout m_layout = VK_NULL_HANDLE;

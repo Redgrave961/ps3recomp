@@ -43,7 +43,7 @@ static struct {
     u32 command_words;
     u32 segment_words;
     volatile u32 handler[RSX_EVENT_COUNT];
-    u8 map_pages[4096];
+    u16 map_pages[4096];
     gcm_tile tile[CELL_GCM_MAX_TILE_COUNT];
     SRWLOCK io_lock;
 } g = { .command_words = 0x400u, .segment_words = 0x100u, .io_lock = SRWLOCK_INIT };
@@ -205,7 +205,7 @@ static s32 gcm_prepare_flip(u32 ctx, u32 id, int reserve)
         if (r) return r;
     }
     gcm_emit(ctx, GCM_METHOD_FLIP, &id, 1);
-    if (reserve && ctx == GCM_CONTEXT_EA) gcm_put(vm_read32(RSX_PUT_EA) + 8u);
+    if (reserve && ctx == GCM_CONTEXT_EA) gcm_put(gcm_io(vm_read32(ctx + 8u)));
     return (s32)id;
 }
 
@@ -266,7 +266,7 @@ static s32 gcm_map(u32 ea, u32 io, u32 size)
     if (!size || (ea & 0xFFFFFu) || (io & 0xFFFFFu) || (size & 0xFFFFFu)) return (s32)CELL_GCM_ERROR_FAILURE;
     if (!g.initialized || io + size > g.main_size) return (s32)CELL_GCM_ERROR_FAILURE;
     if (rsx_io_map(ea, io, size) != 0) return (s32)CELL_GCM_ERROR_FAILURE;
-    g.map_pages[ea >> 20] = (u8)(size >> 20);
+    g.map_pages[ea >> 20] = (u16)(size >> 20);
     return CELL_OK;
 }
 

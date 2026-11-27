@@ -11,7 +11,7 @@ public:
         VkImageView view = VK_NULL_HANDLE;
     };
 
-    bool create(vk_device& d);
+    bool create(vk_device& d, VkPipelineCache cache = VK_NULL_HANDLE);
     void destroy();
     void release_targets();
 
@@ -19,7 +19,8 @@ public:
     void retire_staging(uint64_t completed);
 
     output record(VkCommandBuffer cmd, VkImageView src_view, VkFormat src_format, uint32_t width, uint32_t height,
-                  bool for_sample, uint64_t submit_ticket);
+                  bool for_sample, uint64_t submit_ticket,
+                  VkImage direct_img = VK_NULL_HANDLE, VkImageView direct_view = VK_NULL_HANDLE);
 
     bool downscale(VkCommandBuffer cmd, VkImageView src_view, uint32_t sw, uint32_t sh,
                    VkImage dst_img, VkImageView dst_view, VkFormat dst_format, VkExtent2D out);
@@ -33,13 +34,14 @@ private:
 
     bool create_image(tex& out, VkFormat format, uint32_t w, uint32_t h, VkImageUsageFlags usage, VkImageAspectFlags view_aspect);
     void destroy_image(tex& t);
-    bool ensure_targets(uint32_t w, uint32_t h, VkFormat out_format);
+    bool ensure_targets(uint32_t w, uint32_t h, VkFormat out_format, bool need_out);
     void destroy_targets();
     bool ensure_blend_pipeline(VkFormat out_format);
     bool ensure_downscale_pipeline(VkFormat dst_format);
     bool upload_luts(VkCommandBuffer cmd, uint64_t submit_ticket);
 
     vk_device* m_d = nullptr;
+    VkPipelineCache m_cache = VK_NULL_HANDLE;
     VkSampler m_sampler = VK_NULL_HANDLE;
     VkDescriptorSetLayout m_set = VK_NULL_HANDLE;
     VkPipelineLayout m_layout = VK_NULL_HANDLE;

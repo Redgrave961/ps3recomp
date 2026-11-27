@@ -23,7 +23,7 @@ typedef struct sys_cond_info {
     sys_mutex_info* mutex;
     char            name[8];
     ps3_waitq       q;
-} sys_cond_info;
+} __attribute__((aligned(64))) sys_cond_info;
 
 extern sys_cond_info g_sys_conds[SYS_COND_MAX];
 

@@ -23,7 +23,7 @@ typedef struct sys_rwlock_info {
     volatile int64_t owner;
     ps3_waitq        rq;
     ps3_waitq        wq;
-} sys_rwlock_info;
+} __attribute__((aligned(64))) sys_rwlock_info;
 
 extern sys_rwlock_info g_sys_rwlocks[SYS_RWLOCK_MAX];
 
