@@ -39,10 +39,12 @@ const ext_entry k_extensions[] = {
     { VK_EXT_PRESENT_MODE_FIFO_LATEST_READY_EXTENSION_NAME, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_MODE_FIFO_LATEST_READY_FEATURES_KHR,
       sizeof(VkPhysicalDevicePresentModeFifoLatestReadyFeaturesKHR), &vk_caps::fifo_latest_ready },
     { VK_EXT_MEMORY_BUDGET_EXTENSION_NAME, VkStructureType(0), 0, &vk_caps::memory_budget },
+#ifdef _WIN32
     { VK_NVX_BINARY_IMPORT_EXTENSION_NAME, VkStructureType(0), 0, nullptr },
     { VK_NVX_IMAGE_VIEW_HANDLE_EXTENSION_NAME, VkStructureType(0), 0, nullptr },
     { VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR,
       sizeof(VkPhysicalDeviceCooperativeMatrixFeaturesKHR), nullptr },
+#endif
 };
 
 VKAPI_ATTR VkBool32 VKAPI_CALL vk_message(VkDebugUtilsMessageSeverityFlagBitsEXT, VkDebugUtilsMessageTypeFlagsEXT,
@@ -237,7 +239,6 @@ bool vk_device_create(vk_device& d, VkSurfaceKHR surface)
         vkGetPhysicalDeviceFormatProperties(d.gpu, VK_FORMAT_R16G16B16A16_UNORM, &fp);
         constexpr VkFormatFeatureFlags need = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT |
                                               VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
-                                              VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT |
                                               VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT |
                                               VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
         d.caps.rgba16_unorm = (fp.optimalTilingFeatures & need) == need;

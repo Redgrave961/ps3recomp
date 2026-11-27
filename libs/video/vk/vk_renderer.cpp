@@ -129,7 +129,9 @@ bool renderer::open(vk_device& d, VkSemaphore timeline, uint64_t* submitted, con
         !m_occlusion.create(d, timeline) || !m_depth_pack.create(d, m_pipelines.cache()) || !m_downscale.create(d, m_pipelines.cache()))
         return false;
     m_pipelines.precompile(m_shaders);
+#ifdef _WIN32
     m_upscaler.create(d, m_pipelines.cache());
+#endif
     return true;
 }
 
