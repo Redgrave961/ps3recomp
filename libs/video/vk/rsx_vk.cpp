@@ -11,6 +11,7 @@
 #include "vk_smaa.h"
 #include "vk_trophy_toast.h"
 #include "../../input/pad_bindings.h"
+#include "../../system/cellSaveData.h"
 #include "ps3emu/thread_name.h"
 
 #include <SDL3/SDL.h>
@@ -866,6 +867,7 @@ void window_main()
         }
         switch (e.type) {
         case SDL_EVENT_QUIT:
+            ps3_savedata_shutdown();
             g.r.save_caches();
 #if defined(ASURA_PGO_GEN)
             __llvm_profile_write_file();

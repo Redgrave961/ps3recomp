@@ -86,6 +86,24 @@ static inline int ps3_utf8_rename(const char* old_path, const char* new_path)
     return rc;
 }
 
+static inline int ps3_utf8_replace_file(const char* src_path, const char* dst_path)
+{
+    wchar_t sbuf[512], dbuf[512];
+    wchar_t* ws = ps3_utf8_to_wide(src_path, sbuf, 512);
+    wchar_t* wd = ps3_utf8_to_wide(dst_path, dbuf, 512);
+    int rc = (ws && wd && MoveFileExW(ws, wd, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) ? 0 : -1;
+    ps3_utf8_wide_free(ws, sbuf);
+    ps3_utf8_wide_free(wd, dbuf);
+    return rc;
+}
+
+static inline int ps3_file_sync(FILE* fp)
+{
+    if (!fp) return -1;
+    if (fflush(fp) != 0) return -1;
+    return _commit(_fileno(fp));
+}
+
 static inline int ps3_utf8_remove(const char* path)
 {
     wchar_t sbuf[512];
@@ -162,6 +180,18 @@ static inline int ps3_utf8_stat64(const char* path, ps3_host_stat_t* st)
 static inline int ps3_utf8_rename(const char* old_path, const char* new_path)
 {
     return rename(old_path, new_path);
+}
+
+static inline int ps3_utf8_replace_file(const char* src_path, const char* dst_path)
+{
+    return rename(src_path, dst_path);
+}
+
+static inline int ps3_file_sync(FILE* fp)
+{
+    if (!fp) return -1;
+    if (fflush(fp) != 0) return -1;
+    return fsync(fileno(fp));
 }
 
 static inline int ps3_utf8_remove(const char* path)

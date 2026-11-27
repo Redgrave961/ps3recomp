@@ -160,6 +160,7 @@ s32 cellSaveDataUserAutoLoad(u32 version, u32 userId, const char* dirName,
 
 typedef void (*ps3_savedata_load_cb)(void);
 void cellSaveData_set_load_callback(ps3_savedata_load_cb cb);
+void ps3_savedata_shutdown(void);
 
 #ifdef __cplusplus
 }

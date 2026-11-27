@@ -23,18 +23,128 @@
 #include "../../runtime/platform/ps3_utf8_fs.h"
 #ifndef _WIN32
 #  include <dirent.h>
+#  include <pthread.h>
 #  include <sys/types.h>
 #endif
 #define HOST_MKDIR(p) ps3_utf8_mkdir(p)
 #define HOST_STAT     ps3_utf8_stat64
 #define HOST_STAT_T   ps3_host_stat_t
 
+#ifdef _WIN32
+static SRWLOCK s_save_lock = SRWLOCK_INIT;
+static void save_lock(void)   { AcquireSRWLockExclusive(&s_save_lock); }
+static void save_unlock(void) { ReleaseSRWLockExclusive(&s_save_lock); }
+static s64 filetime_to_unix(FILETIME ft)
+{
+    ULARGE_INTEGER u;
+    u.LowPart = ft.dwLowDateTime;
+    u.HighPart = ft.dwHighDateTime;
+    if (u.QuadPart < 116444736000000000ull) return 0;
+    return (s64)((u.QuadPart - 116444736000000000ull) / 10000000ull);
+}
+#else
+static pthread_mutex_t s_save_lock = PTHREAD_MUTEX_INITIALIZER;
+static void save_lock(void)   { pthread_mutex_lock(&s_save_lock); }
+static void save_unlock(void) { pthread_mutex_unlock(&s_save_lock); }
+#endif
+
+static volatile int s_shutting_down = 0;
 static char s_save_root[1024] = "./gamedata/dev_hdd0/home/00000001/savedata";
 static ps3_savedata_load_cb s_on_save_load = NULL;
 
 void cellSaveData_set_load_callback(ps3_savedata_load_cb cb)
 {
     s_on_save_load = cb;
+}
+
+void ps3_savedata_shutdown(void)
+{
+    __atomic_store_n(&s_shutting_down, 1, __ATOMIC_RELEASE);
+    save_lock();
+    save_unlock();
+}
+
+static int atomic_write_file(const char* path, const void* data, size_t size)
+{
+    char tmp_path[1040];
+    int n = snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+    if (n <= 0 || (size_t)n >= sizeof(tmp_path)) return -1;
+    FILE* fp = ps3_utf8_fopen(tmp_path, "wb");
+    if (!fp) return -1;
+    int failed = (size > 0 && fwrite(data, 1, size, fp) != size);
+    if (!failed && ps3_file_sync(fp) != 0) failed = 1;
+    if (fclose(fp) != 0) failed = 1;
+    if (!failed && ps3_utf8_replace_file(tmp_path, path) != 0) failed = 1;
+    if (failed) ps3_utf8_remove(tmp_path);
+    return failed ? -1 : 0;
+}
+
+static void pfd_add(const char* save_path, const char* name);
+
+typedef struct {
+    char name[CELL_SAVEDATA_FILENAME_SIZE];
+    char final_path[1024];
+    char tmp_path[1040];
+    u32  file_type;
+    int  is_delete;
+} staged_file;
+
+typedef struct {
+    staged_file items[32];
+    u32 count;
+} save_tx;
+
+static staged_file* tx_find(save_tx* tx, const char* name)
+{
+    for (u32 i = 0; i < tx->count; i++)
+        if (!strcmp(tx->items[i].name, name)) return &tx->items[i];
+    return NULL;
+}
+
+static int copy_existing_to_tmp(const char* src_path, const char* tmp_path)
+{
+    FILE* in = ps3_utf8_fopen(src_path, "rb");
+    if (!in) return 0;
+    FILE* out = ps3_utf8_fopen(tmp_path, "wb");
+    if (!out) { fclose(in); return -1; }
+    uint8_t buf[16384];
+    size_t got;
+    int failed = 0;
+    while ((got = fread(buf, 1, sizeof(buf), in)) > 0) {
+        if (fwrite(buf, 1, got, out) != got) { failed = 1; break; }
+    }
+    if (ferror(in)) failed = 1;
+    fclose(in);
+    if (fclose(out) != 0) failed = 1;
+    if (failed) ps3_utf8_remove(tmp_path);
+    return failed ? -1 : 0;
+}
+
+static void tx_abort(save_tx* tx)
+{
+    for (u32 i = 0; i < tx->count; i++) {
+        if (!tx->items[i].is_delete && tx->items[i].tmp_path[0])
+            ps3_utf8_remove(tx->items[i].tmp_path);
+    }
+    tx->count = 0;
+}
+
+static int tx_commit(save_tx* tx, const char* save_path)
+{
+    for (u32 i = 0; i < tx->count; i++) {
+        staged_file* sf = &tx->items[i];
+        if (sf->is_delete) {
+            ps3_utf8_remove(sf->final_path);
+            continue;
+        }
+        if (ps3_utf8_replace_file(sf->tmp_path, sf->final_path) != 0)
+            return -1;
+        sf->tmp_path[0] = '\0';
+        if (sf->file_type == CELL_SAVEDATA_FILETYPE_SECUREFILE)
+            pfd_add(save_path, sf->name);
+    }
+    tx->count = 0;
+    return 0;
 }
 
 static void adopt_gamedata_root(void)
@@ -254,7 +364,9 @@ static s32 dispatch_func_stat_full(uint32_t func_opd, int is_new, const char* di
 
 static int savedata_system_file(const char* name)
 {
-    return !strcmp(name, "PARAM.SFO") || !strcmp(name, "PARAM.PFD");
+    if (!strcmp(name, "PARAM.SFO") || !strcmp(name, "PARAM.PFD")) return 1;
+    size_t len = strlen(name);
+    return len >= 4 && !strcmp(name + len - 4, ".tmp");
 }
 
 static u32 savedata_content_type(const char* name)
@@ -294,8 +406,22 @@ static void pfd_add(const char* save_path, const char* name)
     if (pfd_has(save_path, name)) return;
     char path[1024];
     pfd_path(save_path, path, sizeof(path));
-    FILE* fp = ps3_utf8_fopen(path, "ab");
-    if (fp) { fprintf(fp, "%s\n", name); fclose(fp); }
+    char buf[4096];
+    size_t used = 0;
+    FILE* fp = ps3_utf8_fopen(path, "rb");
+    if (fp) {
+        used = fread(buf, 1, sizeof(buf) - 1, fp);
+        fclose(fp);
+    }
+    if (used > 0 && buf[used - 1] != '\n' && used + 1 < sizeof(buf))
+        buf[used++] = '\n';
+    size_t nlen = strlen(name);
+    if (used + nlen + 1 < sizeof(buf)) {
+        memcpy(buf + used, name, nlen);
+        used += nlen;
+        buf[used++] = '\n';
+        atomic_write_file(path, buf, used);
+    }
 }
 
 static u32 savedata_file_type(const char* save_path, const char* name)
@@ -340,7 +466,10 @@ static u32 enumerate_save_files(const char* save_path,
                 ULARGE_INTEGER sz;
                 sz.HighPart = fd.nFileSizeHigh;
                 sz.LowPart  = fd.nFileSizeLow;
-                fileList[count].st_size = (u64)sz.QuadPart;
+                fileList[count].st_size  = (u64)sz.QuadPart;
+                fileList[count].st_atime = filetime_to_unix(fd.ftLastAccessTime);
+                fileList[count].st_mtime = filetime_to_unix(fd.ftLastWriteTime);
+                fileList[count].st_ctime = filetime_to_unix(fd.ftCreationTime);
             }
             count++;
         } while (FindNextFileW(hFind, &fd));
@@ -393,7 +522,7 @@ static u32 enumerate_save_files(const char* save_path,
     return count;
 }
 
-static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
+static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set, save_tx* tx)
 {
     if (!set) return CELL_SAVEDATA_ERROR_PARAM;
     const char* name = set->fileName;
@@ -420,9 +549,11 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
 
     switch (set->fileOperation) {
     case CELL_SAVEDATA_FILEOP_READ: {
-        FILE* fp = ps3_utf8_fopen(file_path, "rb");
+        staged_file* sf = tx ? tx_find(tx, name) : NULL;
+        const char* read_path = (sf && !sf->is_delete && sf->tmp_path[0]) ? sf->tmp_path : file_path;
+        FILE* fp = ps3_utf8_fopen(read_path, "rb");
         if (!fp) {
-            printf("[cellSaveData] file read: cannot open '%s'\n", file_path);
+            printf("[cellSaveData] file read: cannot open '%s'\n", read_path);
             return CELL_SAVEDATA_ERROR_ACCESS_ERROR;
         }
         if (set->fileOffset > 0) {
@@ -446,18 +577,36 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
     case CELL_SAVEDATA_FILEOP_WRITE:
     case CELL_SAVEDATA_FILEOP_WRITE_NOTRUNC: {
         ensure_dirs(save_path);
-        const char* mode;
-        if (set->fileOperation == CELL_SAVEDATA_FILEOP_WRITE && set->fileOffset == 0) {
-            mode = "wb";
-        } else {
-            mode = "r+b";
+        size_t write_size = (size_t)set->fileSize;
+        if (write_size > set->fileBufSize) write_size = set->fileBufSize;
+        staged_file* sf = tx ? tx_find(tx, name) : NULL;
+        int first_touch = 0;
+        if (!sf) {
+            if (!tx || tx->count >= 32u) return CELL_SAVEDATA_ERROR_INTERNAL;
+            sf = &tx->items[tx->count++];
+            memset(sf, 0, sizeof(*sf));
+            strncpy(sf->name, name, sizeof(sf->name) - 1);
+            strncpy(sf->final_path, file_path, sizeof(sf->final_path) - 1);
+            int n = snprintf(sf->tmp_path, sizeof(sf->tmp_path), "%s.tmp", file_path);
+            if (n <= 0 || (size_t)n >= sizeof(sf->tmp_path)) return CELL_SAVEDATA_ERROR_INTERNAL;
+            sf->file_type = set->fileType;
+            first_touch = 1;
+        } else if (sf->is_delete) {
+            sf->is_delete = 0;
+            sf->file_type = set->fileType;
+            int n = snprintf(sf->tmp_path, sizeof(sf->tmp_path), "%s.tmp", file_path);
+            if (n <= 0 || (size_t)n >= sizeof(sf->tmp_path)) return CELL_SAVEDATA_ERROR_INTERNAL;
+            first_touch = 1;
         }
-        FILE* fp = ps3_utf8_fopen(file_path, mode);
-        if (!fp) {
-            fp = ps3_utf8_fopen(file_path, "wb");
+        const int truncate = (set->fileOperation == CELL_SAVEDATA_FILEOP_WRITE && set->fileOffset == 0);
+        if (first_touch && !truncate) {
+            if (copy_existing_to_tmp(file_path, sf->tmp_path) != 0)
+                return CELL_SAVEDATA_ERROR_ACCESS_ERROR;
         }
+        FILE* fp = ps3_utf8_fopen(sf->tmp_path, truncate ? "wb" : "r+b");
+        if (!fp && !truncate) fp = ps3_utf8_fopen(sf->tmp_path, "wb");
         if (!fp) {
-            printf("[cellSaveData] file write: cannot open '%s'\n", file_path);
+            printf("[cellSaveData] file write: cannot open '%s'\n", sf->tmp_path);
             return CELL_SAVEDATA_ERROR_ACCESS_ERROR;
         }
         if (set->fileOffset > 0) {
@@ -467,19 +616,30 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
             fseeko(fp, (off_t)set->fileOffset, SEEK_SET);
 #endif
         }
-        size_t write_size = (size_t)set->fileSize;
-        if (write_size > set->fileBufSize) write_size = set->fileBufSize;
-        size_t wrote = fwrite(set->fileBuf, 1, write_size, fp);
+        size_t wrote = write_size ? fwrite(set->fileBuf, 1, write_size, fp) : 0;
         int failed = wrote != write_size;
+        if (!failed && ps3_file_sync(fp) != 0) failed = 1;
         if (fclose(fp) != 0) failed = 1;
-        if (!failed && set->fileType == CELL_SAVEDATA_FILETYPE_SECUREFILE)
-            pfd_add(save_path, name);
         return failed ? CELL_SAVEDATA_ERROR_ACCESS_ERROR : (s32)wrote;
     }
 
-    case CELL_SAVEDATA_FILEOP_DELETE:
-        ps3_utf8_remove(file_path);
+    case CELL_SAVEDATA_FILEOP_DELETE: {
+        staged_file* sf = tx ? tx_find(tx, name) : NULL;
+        if (sf) {
+            if (!sf->is_delete && sf->tmp_path[0]) ps3_utf8_remove(sf->tmp_path);
+            sf->tmp_path[0] = '\0';
+            sf->is_delete = 1;
+        } else if (tx && tx->count < 32u) {
+            sf = &tx->items[tx->count++];
+            memset(sf, 0, sizeof(*sf));
+            strncpy(sf->name, name, sizeof(sf->name) - 1);
+            strncpy(sf->final_path, file_path, sizeof(sf->final_path) - 1);
+            sf->is_delete = 1;
+        } else {
+            ps3_utf8_remove(file_path);
+        }
         return 0;
+    }
 
     default:
         return 0;
@@ -512,11 +672,7 @@ static void write_param_sfo(const char* save_path, const CellSaveDataSystemFileP
     uint8_t buf[4096];
     size_t n = ps3_psf_build(buf, sizeof buf, dir, title, sub, detail, param->attribute, lp);
     if (!n) return;
-
-    FILE* fp = ps3_utf8_fopen(sfo_path, "wb");
-    if (!fp) return;
-    fwrite(buf, 1, n, fp);
-    fclose(fp);
+    atomic_write_file(sfo_path, buf, n);
 }
 
 static void read_param_sfo(const char* save_path, CellSaveDataSystemFileParam* param)
@@ -569,11 +725,11 @@ static void read_param_sfo(const char* save_path, CellSaveDataSystemFileParam* p
     }
 }
 
-static s32 savedata_execute(const char* dirName, int is_save,
-                            CellSaveDataSetBuf* setBuf,
-                            CellSaveDataStatCallback funcStat,
-                            CellSaveDataFileCallback funcFile,
-                            void* userdata)
+static s32 savedata_execute_locked(const char* dirName, int is_save,
+                                   CellSaveDataSetBuf* setBuf,
+                                   CellSaveDataStatCallback funcStat,
+                                   CellSaveDataFileCallback funcFile,
+                                   void* userdata)
 {
     if (!dirName || !funcStat)
         return CELL_SAVEDATA_ERROR_PARAM;
@@ -651,13 +807,16 @@ static s32 savedata_execute(const char* dirName, int is_save,
         return CELL_SAVEDATA_ERROR_CBRESULT;
     }
 
+    int has_param = 0;
+    CellSaveDataSystemFileParam saved_params;
     if (is_save && statSet.setParam) {
-        ensure_dirs(save_path);
-        CellSaveDataSystemFileParam params;
-        memcpy(&params, statSet.setParam, sizeof(params));
-        params.attribute = ps3_bswap32(params.attribute);
-        write_param_sfo(save_path, &params);
+        memcpy(&saved_params, statSet.setParam, sizeof(saved_params));
+        saved_params.attribute = ps3_bswap32(saved_params.attribute);
+        has_param = 1;
     }
+
+    save_tx tx;
+    tx.count = 0;
 
     if (funcFile && cbResult.result == CELL_SAVEDATA_CBRESULT_OK_NEXT) {
         u32 exc_size = 0;
@@ -666,12 +825,12 @@ static s32 savedata_execute(const char* dirName, int is_save,
             cbResult.result = dispatch_func_file((u32)(uintptr_t)funcFile,
                                                  &callback_userdata, exc_size, &fileSet);
             if (cbResult.result != CELL_SAVEDATA_CBRESULT_OK_NEXT) break;
-            s32 exc = process_file_op(save_path, &fileSet);
+            s32 exc = process_file_op(save_path, &fileSet, &tx);
             printf("[cellSaveData] file op=%u type=%u name='%s' off=%u size=%u buf=%u -> %d\n",
                    fileSet.fileOperation, fileSet.fileType,
                    fileSet.fileName ? fileSet.fileName : "", fileSet.fileOffset,
                    fileSet.fileSize, fileSet.fileBufSize, exc);
-            if (exc < 0) { free(fileList); return exc; }
+            if (exc < 0) { tx_abort(&tx); free(fileList); return exc; }
             exc_size = (u32)exc;
         }
     }
@@ -679,14 +838,41 @@ static s32 savedata_execute(const char* dirName, int is_save,
     free(fileList);
 
     if (cbResult.result < 0) {
+        tx_abort(&tx);
         if (cbResult.result == CELL_SAVEDATA_CBRESULT_ERR_NODATA)
             return CELL_SAVEDATA_ERROR_NODATA;
         return CELL_SAVEDATA_ERROR_CBRESULT;
     }
 
+    if (tx_commit(&tx, save_path) != 0) {
+        tx_abort(&tx);
+        return CELL_SAVEDATA_ERROR_ACCESS_ERROR;
+    }
+
+    if (has_param) {
+        ensure_dirs(save_path);
+        write_param_sfo(save_path, &saved_params);
+    }
+
     printf("[cellSaveData] %s complete for '%s'\n",
            is_save ? "SAVE" : "LOAD", dirName);
     return CELL_OK;
+}
+
+static s32 savedata_execute(const char* dirName, int is_save,
+                            CellSaveDataSetBuf* setBuf,
+                            CellSaveDataStatCallback funcStat,
+                            CellSaveDataFileCallback funcFile,
+                            void* userdata)
+{
+    if (__atomic_load_n(&s_shutting_down, __ATOMIC_ACQUIRE))
+        return CELL_SAVEDATA_ERROR_ACCESS_ERROR;
+    save_lock();
+    s32 r = __atomic_load_n(&s_shutting_down, __ATOMIC_ACQUIRE)
+          ? CELL_SAVEDATA_ERROR_ACCESS_ERROR
+          : savedata_execute_locked(dirName, is_save, setBuf, funcStat, funcFile, userdata);
+    save_unlock();
+    return r;
 }
 
 s32 cellSaveDataAutoLoad2(u32 version, const char* dirName,
