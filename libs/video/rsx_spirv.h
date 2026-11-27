@@ -196,6 +196,7 @@ int  rsx_spv_box_down_vs(rsx_spv_blob* out);
 int  rsx_spv_box_down_fs(int scale, rsx_spv_blob* out);
 int  rsx_spv_overlay_vs(rsx_spv_blob* out);
 int  rsx_spv_overlay_fs(rsx_spv_blob* out);
+int  rsx_spv_motion_vectors(rsx_spv_blob* out);
 void rsx_spv_blob_free(rsx_spv_blob* blob);
 
 #ifdef __cplusplus

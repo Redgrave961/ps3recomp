@@ -52,7 +52,7 @@ struct slot {
     uint32_t height = 0;
     bool fitted = false;
     uint64_t rendered = 0;
-    uint64_t released = 0;
+    std::atomic<uint64_t> released{ 0 };
 };
 
 struct present_frame {
@@ -122,6 +122,7 @@ struct state {
     std::atomic<void (*)(u32, u32)> resize_listener{ nullptr };
     std::atomic<uint64_t> scale{ (3ull << 48) | (1ull << 32) | (3ull << 16) | 1u };
     std::atomic<rsx_vk_aa> aa{ RSX_VK_AA_SMAA };
+    std::atomic<int> upscale{ RSX_VK_UPSCALE_OFF };
     std::mutex modes_lock;
     std::vector<rsx_vk_mode> modes;
     rsx_vk_mode desktop_mode{};
@@ -168,6 +169,25 @@ vk::scale2d resolution_scale()
     const uint64_t v = g.scale.load(std::memory_order_relaxed);
     return { clamp_scale((uint32_t)(v >> 48), (uint32_t)(v >> 32) & 0xFFFFu),
              clamp_scale((uint32_t)(v >> 16) & 0xFFFFu, (uint32_t)v & 0xFFFFu) };
+}
+
+vk::ratio clamp_render_scale(uint32_t num, uint32_t den)
+{
+    const vk::ratio r = vk::ratio::of(num, den), top{ 12, 1 }, bot{ 1, 4 };
+    return r > top ? top : bot > r ? bot : r;
+}
+
+void compute_scales(vk::scale2d& disp, vk::scale2d& rend, int mode)
+{
+    disp = resolution_scale();
+    if (mode == RSX_VK_UPSCALE_OFF) {
+        rend = disp;
+        return;
+    }
+    const u32 dw = disp.x.edge(1280u), dh = disp.y.edge(720u);
+    u32 rw = dw, rh = dh;
+    g.r.upscale_render_size(dw, dh, mode, rw, rh);
+    rend = { clamp_render_scale(rw, 1280u), clamp_render_scale(rh, 720u) };
 }
 
 void read_modes()
@@ -239,7 +259,7 @@ bool is_present_format(VkFormat f)
 
 bool is_smaa_source_format(VkFormat f)
 {
-    return f == VK_FORMAT_R16G16B16A16_UNORM || is_present_format(f);
+    return f == VK_FORMAT_R16G16B16A16_UNORM || f == VK_FORMAT_R16G16B16A16_SFLOAT || is_present_format(f);
 }
 
 bool format_supports_present(VkFormat f)
@@ -415,9 +435,18 @@ bool presenter_build()
         VkSemaphoreCreateInfo si{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
         VK_TRY(vkCreateSemaphore(g.d.dev, &si, nullptr, &f.acquired));
     }
-    g.r.resolution_scale = resolution_scale();
-    report_scale();
+    g.r.display_scale = resolution_scale();
+    g.r.resolution_scale = g.r.display_scale;
     if (!g.r.open(g.d, g.timeline, &g.submitted, g.cache_path.c_str())) return false;
+    {
+        const int mode = g.upscale.load(std::memory_order_relaxed);
+        vk::scale2d disp, rend;
+        compute_scales(disp, rend, mode);
+        g.r.display_scale = disp;
+        g.r.resolution_scale = rend;
+        g.r.upscale_mode = mode;
+    }
+    report_scale();
     g.smaa.create(g.d, g.r.pipeline_cache());
     g.toast.create(g.d, g.r.pipeline_cache());
     return true;
@@ -637,7 +666,7 @@ bool present_image(slot& s)
     }
     g.presented = value;
     f.done = value;
-    s.released = value;
+    s.released.store(value, std::memory_order_release);
     g.frame_index = (g.frame_index + 1u) % k_present_frames;
     if (r == VK_ERROR_OUT_OF_DATE_KHR || (r == VK_SUBOPTIMAL_KHR && swapchain_extent_changed())) g.resized = true;
     else if (r != VK_SUCCESS) std::fprintf(stderr, "[vk] present failed: %d\n", (int)r);
@@ -978,8 +1007,14 @@ void vk_reset(void*)
 {
     if (stats_on()) g_rsx_cpu_ns.store(thread_cpu_ns(), std::memory_order_relaxed);
     g.r.flip_reset();
-    if (const vk::scale2d scale = resolution_scale(); scale != g.r.resolution_scale) {
-        g.r.rescale(scale);
+    const int prev_mode = g.r.upscale_mode;
+    const int mode = g.upscale.load(std::memory_order_relaxed);
+    vk::scale2d disp, rend;
+    compute_scales(disp, rend, mode);
+    g.r.display_scale = disp;
+    g.r.upscale_mode = mode;
+    if (rend != g.r.resolution_scale || (prev_mode == RSX_VK_UPSCALE_OFF) != (mode == RSX_VK_UPSCALE_OFF)) {
+        g.r.rescale(rend);
         report_scale();
     }
 }
@@ -1051,12 +1086,14 @@ int vk_present(void*, u32, const rsx_display_buffer* db)
     const u32 ea = (w && h && pitch >= w * 4u) ? rsx_address(RSX_DMA_LOCAL, db->offset, pitch * h) : 0u;
     static u64 shown, shown_fit;
     static rsx_vk_aa shown_aa = RSX_VK_AA_OFF;
+    static int shown_upscale = RSX_VK_UPSCALE_OFF;
     static vk::scale2d shown_scale;
     const u64 content = ea ? g.r.content(ea, pitch) : 0;
     const uint64_t fit = g.fit.load(std::memory_order_acquire);
     const rsx_vk_aa aa_mode = g.aa.load(std::memory_order_relaxed);
+    const int up_mode = g.r.upscale_mode;
     const vk::scale2d cur_scale = g.r.resolution_scale;
-    if (!ea || (content && content == shown && fit == shown_fit && aa_mode == shown_aa && cur_scale == shown_scale)) {
+    if (!ea || (content && content == shown && fit == shown_fit && aa_mode == shown_aa && up_mode == shown_upscale && cur_scale == shown_scale)) {
         g.r.flush();
         return 0;
     }
@@ -1067,7 +1104,7 @@ int vk_present(void*, u32, const rsx_display_buffer* db)
         while ((int)i == g.shown || (int)i == g.latest || (int)i == g.queued) i++;
     }
     slot& s = g.slots[i];
-    timeline_wait(g.present_timeline, s.released);
+    timeline_wait(g.present_timeline, s.released.load(std::memory_order_acquire));
     vk::image* src = nullptr;
     vk::scale2d scale;
     VkCommandBuffer cmd = VK_NULL_HANDLE;
@@ -1075,6 +1112,7 @@ int vk_present(void*, u32, const rsx_display_buffer* db)
     shown = content;
     shown_fit = fit;
     shown_aa = aa_mode;
+    shown_upscale = up_mode;
     shown_scale = cur_scale;
     const uint32_t sw = std::min(scale.x.edge(w), src ? src->width : 0u), sh = std::min(scale.y.edge(h), src ? src->height : 0u);
     if (!src) {
@@ -1104,8 +1142,8 @@ int vk_present(void*, u32, const rsx_display_buffer* db)
         uint64_t done = 0;
         if (vkGetSemaphoreCounterValue(g.d.dev, g.timeline, &done) == VK_SUCCESS) g.smaa.retire_staging(done);
     }
-    const bool aa_ok = aa_mode == RSX_VK_AA_SMAA && src->width == sw && src->height == sh && src->view && is_smaa_source_format(src->format);
-    if (aa_mode == RSX_VK_AA_OFF) g.smaa.release_targets();
+    const bool aa_ok = !g.r.last_frame_upscaled() && aa_mode == RSX_VK_AA_SMAA && src->width == sw && src->height == sh && src->view && is_smaa_source_format(src->format);
+    if (aa_mode == RSX_VK_AA_OFF || g.r.last_frame_upscaled()) g.smaa.release_targets();
     const VkExtent2D present_out = fitted ? out : VkExtent2D{ sw, sh };
     const bool same_size_fmt = sw == present_out.width && sh == present_out.height && src->format == s.format;
     const bool want_present_filter = !same_size_fmt && s.view && src->view && src->width == sw && src->height == sh &&
@@ -1300,6 +1338,51 @@ extern "C" void rsx_vk_set_resolution_scale(u32 num_x, u32 den_x, u32 num_y, u32
 extern "C" void rsx_vk_set_aa(enum rsx_vk_aa aa)
 {
     g.aa.store(aa, std::memory_order_relaxed);
+}
+
+extern "C" void rsx_vk_set_upscaler(int mode)
+{
+    g.upscale.store(mode, std::memory_order_relaxed);
+}
+
+extern "C" int rsx_vk_upscaler_caps(void)
+{
+    return g.r.upscaler_caps();
+}
+
+extern "C" const char* rsx_vk_upscaler_fsr_version(void)
+{
+    return g.r.upscaler_fsr_version();
+}
+
+extern "C" void rsx_vk_upscale_render_size(u32 display_w, u32 display_h, int mode, u32* out_w, u32* out_h)
+{
+    u32 rw = display_w, rh = display_h;
+    g.r.upscale_render_size(display_w, display_h, mode, rw, rh);
+    if (out_w) *out_w = rw;
+    if (out_h) *out_h = rh;
+}
+
+extern "C" void rsx_vk_upscale_jitter(int mode, u32 render_w, u32 display_w, u32 frame_index, float* out_jx, float* out_jy)
+{
+    float jx = 0.f, jy = 0.f;
+    g.r.upscale_jitter(mode, render_w, display_w, frame_index, jx, jy);
+    if (out_jx) *out_jx = jx;
+    if (out_jy) *out_jy = jy;
+}
+
+extern "C" void rsx_vk_upscale_capture_velocity(void)
+{
+    if (g.upscale.load(std::memory_order_relaxed) == RSX_VK_UPSCALE_OFF) return;
+    rsx_core_run_on_thread([](void*) { g.r.capture_velocity(); }, nullptr);
+}
+
+extern "C" void rsx_vk_upscale_trigger(const rsx_vk_upscale_frame* frame)
+{
+    if (!frame || g.upscale.load(std::memory_order_relaxed) == RSX_VK_UPSCALE_OFF) return;
+    rsx_core_run_on_thread([](void* p) {
+        g.r.run_upscale(*static_cast<const rsx_vk_upscale_frame*>(p));
+    }, const_cast<rsx_vk_upscale_frame*>(frame));
 }
 
 extern "C" void rsx_vk_set_display(rsx_vk_display display)

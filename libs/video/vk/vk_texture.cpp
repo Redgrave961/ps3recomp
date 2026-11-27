@@ -167,7 +167,7 @@ VkImageView renderer::view_for(image& img, VkImageViewType type, VkFormat format
     return view;
 }
 
-VkSampler renderer::sampler_for(const VkSamplerCreateInfo& info, const VkSamplerCustomBorderColorCreateInfoEXT* border)
+VkSampler renderer::sampler_for(const VkSamplerCreateInfo& info, const VkSamplerCustomBorderColorCreateInfoEXT* border, bool allow_lod_bias)
 {
     VkSamplerCreateInfo ci = info;
     if (!m_d->caps.mirror_clamp_to_edge) {
@@ -180,6 +180,12 @@ VkSampler renderer::sampler_for(const VkSamplerCreateInfo& info, const VkSampler
         ci.maxAnisotropy = 1.f;
     } else if (ci.anisotropyEnable) {
         ci.maxAnisotropy = std::clamp(ci.maxAnisotropy, 1.f, std::max(m_d->props.limits.maxSamplerAnisotropy, 1.f));
+    }
+    if (allow_lod_bias && upscale_mode != RSX_VK_UPSCALE_OFF && !m_upscaled_this_frame && ci.maxLod > 0.f) {
+        const float rw = (float)resolution_scale.x.edge(1280u);
+        const float dw = (float)display_scale.x.edge(1280u);
+        if (rw > 0.f && dw > rw)
+            ci.mipLodBias += std::log2(rw / dw);
     }
     const float max_bias = m_d->props.limits.maxSamplerLodBias;
     ci.mipLodBias = std::clamp(std::floor(ci.mipLodBias * 16.f + 0.5f) * 0.0625f, -max_bias, max_bias);
@@ -470,7 +476,7 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
         const bool custom = si.borderColor == VK_BORDER_COLOR_FLOAT_CUSTOM_EXT || si.borderColor == VK_BORDER_COLOR_INT_CUSTOM_EXT;
         if (custom && !m_d->caps.custom_border_color) si.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
         if (custom && m_d->caps.custom_border_without_format) border.format = VK_FORMAT_UNDEFINED;
-        sampler = sampler_for(si, custom && m_d->caps.custom_border_color ? &border : nullptr);
+        sampler = sampler_for(si, custom && m_d->caps.custom_border_color ? &border : nullptr, !vertex);
         if (!sampler) return false;
         b.sampler = sampler;
     }
@@ -630,7 +636,12 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
         stats.uploads++;
         const uint64_t bytes = rsx::texture_staging_size(d);
         vk_slice slice = m_ring.alloc(bytes, 16);
-        if (!slice.ptr) return false;
+        if (!slice.ptr) {
+            flush();
+            c = cmd();
+            slice = m_ring.alloc(bytes, 16);
+            if (!slice.ptr) return false;
+        }
         m_copies.clear();
         e->stamp = m_stamp;
         e->checked_stamp = m_stamp;

@@ -9,6 +9,7 @@
 #include "vk_occlusion.h"
 #include "vk_depth_pack.h"
 #include "vk_downscale.h"
+#include "vk_upscaler.h"
 #include "vk_flat_map.h"
 #include "vk_scale.h"
 #include "rsx_texture.h"
@@ -125,6 +126,16 @@ public:
     bool defer(const rsx_write& w);
     std::atomic<u32> trace_frames{ 0 };
     scale2d resolution_scale;
+    scale2d display_scale;
+    int upscale_mode = RSX_VK_UPSCALE_OFF;
+
+    int upscaler_caps() const { return m_upscaler.caps(); }
+    const char* upscaler_fsr_version() const { return m_upscaler.fsr_version(); }
+    void upscale_render_size(u32 dw, u32 dh, int mode, u32& rw, u32& rh) const { m_upscaler.render_size(dw, dh, mode, rw, rh); }
+    void upscale_jitter(int mode, u32 rw, u32 dw, u32 frame_index, float& jx, float& jy) const { m_upscaler.jitter(mode, rw, dw, frame_index, jx, jy); }
+    void capture_velocity() { if (!m_upscaled_this_frame && m_fb.color[0]) m_scene_velocity = m_fb.color[0]; }
+    bool run_upscale(const rsx_vk_upscale_frame& frame);
+    bool last_frame_upscaled() const { return m_last_frame_upscaled; }
 
     bool tracing() const { return m_trace != nullptr; }
     void trace_begin(VkCommandBuffer c);
@@ -195,6 +206,14 @@ private:
     occlusion m_occlusion;
     depth_pack m_depth_pack;
     downscale m_downscale;
+    upscaler m_upscaler;
+    bool m_upscaled_this_frame = false;
+    bool m_last_frame_upscaled = false;
+    surface* m_scene_color = nullptr;
+    surface* m_scene_depth = nullptr;
+    surface* m_scene_velocity = nullptr;
+    image m_upscale_src;
+    image m_upscale_out;
     image m_box;
     image* depth_as_color(surface& s);
 
@@ -404,7 +423,7 @@ private:
     rsx::texture_regs unit_regs(u32 u) const;
     bool resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out, rsx_spv_texture_state& state, u8* patch_tag = nullptr);
     VkImageView view_for(image& img, VkImageViewType type, VkFormat format, VkImageAspectFlags aspect, const VkComponentMapping& swizzle);
-    VkSampler sampler_for(const VkSamplerCreateInfo& info, const VkSamplerCustomBorderColorCreateInfoEXT* border);
+    VkSampler sampler_for(const VkSamplerCreateInfo& info, const VkSamplerCustomBorderColorCreateInfoEXT* border, bool allow_lod_bias = true);
     bool memory_changed(u32 ea, u32 size, u32 stamp);
     bool memory_changed_watched(u32 ea, u32 size, u32 stamp, u32& checked_stamp);
     void watch(u32 ea, u32 size);

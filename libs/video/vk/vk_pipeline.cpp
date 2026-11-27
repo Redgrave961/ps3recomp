@@ -149,6 +149,8 @@ bool pipelines::create(vk_device& d, const std::string& cache_path)
         }
     }
 
+    m_saved = std::chrono::steady_clock::now();
+
     if (d.caps.pipeline_library) {
         VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT gp{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_PROPERTIES_EXT };
         VkPhysicalDeviceProperties2 p2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &gp };
@@ -305,8 +307,8 @@ void pipelines::save_cache_periodic()
 {
     if (!m_cache_dirty.load(std::memory_order_relaxed)) return;
     {
-        std::lock_guard<std::mutex> hold(m_save_lock);
-        if (std::chrono::steady_clock::now() - m_saved < std::chrono::seconds(30)) return;
+        std::unique_lock<std::mutex> hold(m_save_lock, std::try_to_lock);
+        if (!hold.owns_lock() || std::chrono::steady_clock::now() - m_saved < std::chrono::seconds(30)) return;
     }
     save_cache();
 }
@@ -748,14 +750,15 @@ VkPipeline pipelines::get(const pipeline_key& key, const shader& vs, const shade
         }, true);
         return VK_NULL_HANDLE;
     }
-    const VkPipeline p = !m_libraries ? monolithic(k, vs, fs) : link(k, vs, fs, false);
+    const bool direct_lto = m_libraries && g_replay;
+    const VkPipeline p = !m_libraries ? monolithic(k, vs, fs) : link(k, vs, fs, direct_lto);
     if (!p) std::fprintf(stderr, "[vk] pipeline creation failed\n");
     else m_cache_dirty.store(true, std::memory_order_relaxed);
-    e->fast = m_libraries ? p : VK_NULL_HANDLE;
+    e->fast = (m_libraries && !direct_lto) ? p : VK_NULL_HANDLE;
     e->pipe.store(p, std::memory_order_release);
     e->done.store(true, std::memory_order_release);
     e->done.notify_all();
-    if (m_libraries && p)
+    if (m_libraries && !direct_lto && p)
         work([this, k, v = vs, f = fs, e] {
             if (m_stopping.load(std::memory_order_relaxed)) return;
             if (VkPipeline opt = link(k, v, f, true)) e->pipe.store(opt, std::memory_order_release);

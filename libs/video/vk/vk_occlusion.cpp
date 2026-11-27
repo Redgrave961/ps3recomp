@@ -85,6 +85,7 @@ void occlusion::end(VkCommandBuffer cmd)
 
 void occlusion::clear()
 {
+    m_dropped = false;
     if (m_segments.empty()) return;
     job j;
     j.release = true;
@@ -94,13 +95,15 @@ void occlusion::clear()
 
 bool occlusion::report(uint32_t ea, bool counted)
 {
+    const bool dropped = counted && m_dropped;
     if ((!counted || m_segments.empty()) && idle()) {
-        write_report(ea, 0);
+        write_report(ea, dropped ? 1u : 0u);
         return false;
     }
     job j;
     j.ea = ea;
     j.size = 16u;
+    j.dropped = dropped;
     if (counted) j.queries = m_segments;
     enqueue(std::move(j));
     return true;
@@ -253,6 +256,7 @@ void occlusion::worker()
                 const uint64_t area = (uint64_t)g.scale.x.num * g.scale.y.num, unit = (uint64_t)g.scale.x.den * g.scale.y.den;
                 sum += n ? std::max<uint64_t>((n * unit + area / 2u) / area, 1u) : 0u;
             }
+            if (j.dropped && sum == 0u) sum = 1u;
             write_report(j.ea, sum);
         }
         count(j, ~0u);

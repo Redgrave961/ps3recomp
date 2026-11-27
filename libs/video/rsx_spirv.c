@@ -1924,14 +1924,15 @@ static void fp_fill_info(const fpc* c, rsx_spv_fp_info* info, int depth_export)
     info->ucode_words = c->words;
 }
 
+static _Thread_local fpc tls_fpc;
+
 int rsx_spv_fragment_scan(const u32* ucode, u32 max_words, rsx_spv_fp_info* info)
 {
     if (!ucode) return -1;
-    fpc* c = (fpc*)calloc(1, sizeof(fpc));
-    if (!c) return -1;
+    fpc* c = &tls_fpc;
+    memset(c, 0, sizeof *c);
     int rc = fp_scan(c, ucode, max_words);
     if (!rc) fp_fill_info(c, info, c->depth_write);
-    free(c);
     return rc;
 }
 
@@ -2949,17 +2950,11 @@ static void fp_range(fpc* c, u32 pc, u32 end, int* ended)
 int rsx_spv_fragment(const u32* ucode, u32 max_words, const rsx_spv_fp_key* key, rsx_spv_blob* out, rsx_spv_fp_info* info)
 {
     if (!ucode || !key) return -1;
-    fpc* c = (fpc*)calloc(1, sizeof(fpc));
-    if (!c) return -1;
-    if (fp_scan(c, ucode, max_words)) {
-        free(c);
-        return -1;
-    }
+    fpc* c = &tls_fpc;
+    memset(c, 0, sizeof *c);
+    if (fp_scan(c, ucode, max_words)) return -1;
     spv* s = spv_begin();
-    if (!s) {
-        free(c);
-        return -1;
-    }
+    if (!s) return -1;
     c->s = s;
     c->key = key;
     u32 mainid = s->id++;
@@ -3031,7 +3026,6 @@ int rsx_spv_fragment(const u32* ucode, u32 max_words, const rsx_spv_fp_key* key,
         }
     int rc = spv_finish(s, 4, caps, ncaps, mainid, modes, nmodes, out);
     fp_fill_info(c, info, depth);
-    free(c);
     return rc;
 }
 
@@ -3353,6 +3347,97 @@ int rsx_spv_overlay_fs(rsx_spv_blob* out)
     const u32 caps[1] = { 1 };
     const u32 modes[1] = { 7 };
     return spv_finish(s, 4, caps, 1, mainid, modes, 1, out);
+}
+
+int rsx_spv_motion_vectors(rsx_spv_blob* out)
+{
+    spv* s = spv_begin();
+    if (!s) return -1;
+    u32 mainid = newl(s);
+    u32 src = sampler_var(s, 1, 0, 0, 0);
+    u32 vel = sampler_var(s, 1, 0, 0, 2);
+    const u32 fimg = intern(s, OpTypeImage, 0, (const u32[]){ tf(s), 1, 0, 0, 0, 1, 0 }, 7, 0);
+    const u32 oimg = intern(s, OpTypeImage, 0, (const u32[]){ tf(s), 1, 0, 0, 0, 2, 12 }, 7, 0);
+    u32 dst = gvar(s, oimg, SC_UniformConstant, 0);
+    deco1(s, dst, DEC_DescriptorSet, 0);
+    deco1(s, dst, DEC_Binding, 1);
+    u32 pst = intern(s, OpTypeStruct, 0, (const u32[]){ tv4(s), tv4(s), tv4(s), tv4(s), tu(s), tu(s), tf(s), tf(s), tf(s), tf(s), tf(s), tf(s) }, 12, 1);
+    mdeco(s, pst, 0, DEC_Offset, 0);
+    mdeco(s, pst, 1, DEC_Offset, 16);
+    mdeco(s, pst, 2, DEC_Offset, 32);
+    mdeco(s, pst, 3, DEC_Offset, 48);
+    mdeco(s, pst, 4, DEC_Offset, 64);
+    mdeco(s, pst, 5, DEC_Offset, 68);
+    mdeco(s, pst, 6, DEC_Offset, 72);
+    mdeco(s, pst, 7, DEC_Offset, 76);
+    mdeco(s, pst, 8, DEC_Offset, 80);
+    mdeco(s, pst, 9, DEC_Offset, 84);
+    mdeco(s, pst, 10, DEC_Offset, 88);
+    mdeco(s, pst, 11, DEC_Offset, 92);
+    deco(s, pst, DEC_Block);
+    u32 push = gvar(s, pst, SC_PushConstant, 0);
+    u32 tu3 = tvec(s, tu(s), 3);
+    u32 gvarid = gvar(s, tu3, SC_Input, 0);
+    deco1(s, gvarid, DEC_BuiltIn, BI_GlobalInvocationId);
+
+    fn_begin(s, mainid);
+    u32 gid = ld(s, tu3, gvarid);
+    u32 x = ex(s, tu(s), gid, 0), y = ex(s, tu(s), gid, 1);
+    u32 pu = tptr(s, SC_PushConstant, tu(s));
+    u32 pf = tptr(s, SC_PushConstant, tf(s));
+    u32 pv4 = tptr(s, SC_PushConstant, tv4(s));
+    u32 w = ld(s, tu(s), I(s, OpAccessChain, pu, push, ci(s, 4)));
+    u32 h = ld(s, tu(s), I(s, OpAccessChain, pu, push, ci(s, 5)));
+    u32 inside = band(s, I(s, OpULessThan, tbool(s), x, w), I(s, OpULessThan, tbool(s), y, h));
+    u32 merge, then_l;
+    sel_if(s, inside, &merge, &then_l);
+    u32 inv_w = ld(s, tf(s), I(s, OpAccessChain, pf, push, ci(s, 6)));
+    u32 inv_h = ld(s, tf(s), I(s, OpAccessChain, pf, push, ci(s, 7)));
+    u32 vel_sx = ld(s, tf(s), I(s, OpAccessChain, pf, push, ci(s, 8)));
+    u32 vel_sy = ld(s, tf(s), I(s, OpAccessChain, pf, push, ci(s, 9)));
+    u32 djx = ld(s, tf(s), I(s, OpAccessChain, pf, push, ci(s, 10)));
+    u32 djy = ld(s, tf(s), I(s, OpAccessChain, pf, push, ci(s, 11)));
+    u32 r0 = ld(s, tv4(s), I(s, OpAccessChain, pv4, push, ci(s, 0)));
+    u32 r1 = ld(s, tv4(s), I(s, OpAccessChain, pv4, push, ci(s, 1)));
+    u32 r3 = ld(s, tv4(s), I(s, OpAccessChain, pv4, push, ci(s, 3)));
+    u32 ti2 = tvec(s, ti(s), 2);
+    u32 coord = I(s, OpCompositeConstruct, ti2, bc(s, ti(s), x), bc(s, ti(s), y));
+    u32 img = I(s, OpImage, fimg, ld(s, sampler_type(s, 1, 0), src));
+    u32 d = ex(s, tf(s), I(s, OpImageFetch, tv4(s), img, coord, IMG_Lod, ci(s, 0)), 0);
+    u32 fx = I(s, OpConvertUToF, tf(s), x), fy = I(s, OpConvertUToF, tf(s), y);
+    u32 fw = I(s, OpConvertUToF, tf(s), w), fh = I(s, OpConvertUToF, tf(s), h);
+    u32 u = fmul(s, tf(s), fadd(s, tf(s), fx, cf(s, 0.5f)), inv_w);
+    u32 v = fmul(s, tf(s), fadd(s, tf(s), fy, cf(s, 0.5f)), inv_h);
+    u32 ndc_x = fsub(s, tf(s), fmul(s, tf(s), u, cf(s, 2.f)), cf(s, 1.f));
+    u32 ndc_y = fsub(s, tf(s), cf(s, 1.f), fmul(s, tf(s), v, cf(s, 2.f)));
+    u32 ndc = I(s, OpCompositeConstruct, tv4(s), ndc_x, ndc_y, d, cf(s, 1.f));
+    u32 px = I(s, OpDot, tf(s), r0, ndc);
+    u32 py = I(s, OpDot, tf(s), r1, ndc);
+    u32 pw = I(s, OpDot, tf(s), r3, ndc);
+    u32 abs_w = X(s, tf(s), GL_FAbs, pw);
+    u32 valid_w = I(s, OpFOrdGreaterThan, tbool(s), abs_w, cf(s, 1e-6f));
+    u32 safe_w = I(s, OpSelect, tf(s), valid_w, pw, cf(s, 1.f));
+    u32 inv_pw = I(s, OpFDiv, tf(s), cf(s, 1.f), safe_w);
+    u32 pu_c = fadd(s, tf(s), fmul(s, tf(s), fmul(s, tf(s), px, inv_pw), cf(s, 0.5f)), cf(s, 0.5f));
+    u32 pv_c = fsub(s, tf(s), cf(s, 0.5f), fmul(s, tf(s), fmul(s, tf(s), py, inv_pw), cf(s, 0.5f)));
+    u32 cam_x = I(s, OpSelect, tf(s), valid_w, fmul(s, tf(s), fsub(s, tf(s), pu_c, u), fw), cf(s, 0.f));
+    u32 cam_y = I(s, OpSelect, tf(s), valid_w, fmul(s, tf(s), fsub(s, tf(s), pv_c, v), fh), cf(s, 0.f));
+    u32 uv = I(s, OpCompositeConstruct, tvec(s, tf(s), 2), u, v);
+    u32 vtex = I(s, OpImageSampleExplicitLod, tv4(s), ld(s, sampler_type(s, 1, 0), vel), uv, IMG_Lod, cf(s, 0.f));
+    u32 vr = ex(s, tf(s), vtex, 0), vg = ex(s, tf(s), vtex, 1);
+    u32 has_vel = band(s, I(s, OpFOrdGreaterThan, tbool(s), fadd(s, tf(s), vr, vg), cf(s, 0.0001f)),
+                       I(s, OpFOrdGreaterThan, tbool(s), X(s, tf(s), GL_FAbs, vel_sx), cf(s, 0.f)));
+    u32 dyn_x = fsub(s, tf(s), fmul(s, tf(s), fsub(s, tf(s), vr, cf(s, 0.5f)), vel_sx), djx);
+    u32 dyn_y = fsub(s, tf(s), fmul(s, tf(s), fsub(s, tf(s), vg, cf(s, 0.5f)), vel_sy), djy);
+    u32 mv_x = I(s, OpSelect, tf(s), has_vel, dyn_x, cam_x);
+    u32 mv_y = I(s, OpSelect, tf(s), has_vel, dyn_y, cam_y);
+    u32 mv = I(s, OpCompositeConstruct, tv4(s), mv_x, mv_y, cf(s, 0.f), cf(s, 0.f));
+    V(s, OpImageWrite, ld(s, oimg, dst), coord, mv);
+    sel_end(s, merge);
+    sb_ins(s, BODY(s), OpReturn, k_none, 0);
+    fn_end(s);
+    const u32 caps[2] = { 1, 44 };
+    return spv_finish(s, 5, caps, 2, mainid, NULL, 0, out);
 }
 
 void rsx_spv_blob_free(rsx_spv_blob* blob)

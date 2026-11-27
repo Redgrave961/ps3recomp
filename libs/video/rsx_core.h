@@ -101,6 +101,7 @@ void rsx_core_fifo_reset(u32 put, u32 get);
 void rsx_core_doorbell(void);
 void rsx_core_wait_get_outside(u32 lo, u32 hi);
 void rsx_core_wait_label(u32 ea, u32 value);
+void rsx_core_run_on_thread(void (*fn)(void*), void* arg);
 
 int  rsx_io_map(u32 ea, u32 io, u32 size);
 void rsx_io_unmap(u32 io, u32 size);

@@ -59,6 +59,8 @@ target_include_directories(ps3recomp_runtime PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/libs/misc"
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime/spu"
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ffx/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ngx/include"
 )
 
 find_package(SDL3 CONFIG REQUIRED)

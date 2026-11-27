@@ -566,7 +566,6 @@ bool renderer::draw_setup()
         }
         dirty &= ~rsx::D_VERTEX_PROGRAM;
     }
-    if (!m_vp) return false;
 
     const u32 sp = r(rsx::M_SHADER_PROGRAM);
     const u32 location = (sp & 3u) - 1u;
@@ -591,7 +590,7 @@ bool renderer::draw_setup()
         if (m_fb.color_format[k] != VK_FORMAT_UNDEFINED) fk.output_mask |= 1u << k;
     if (r(rsx::M_ALPHA_TEST_ENABLE)) fk.output_mask |= RSX_SPV_FPOUT_ALPHA_TEST;
     if (m_fp_last && seen_key == m_fp_last_key) {
-        if (m_fp && m_fp_last_epoch == m_epoch) return true;
+        if (m_fp && m_fp_last_epoch == m_epoch) return m_vp != nullptr;
     }
     const u32 set_idx = ((((seen_key.ea >> 4) ^ (seen_key.key.control * 31u) ^ (seen_key.key.output_mask * 131u) ^ seen_key.key.texture_dims) * 0x9E3779B1u) >> 24) & 255u;
     fp_l1_set& l1s = m_fp_l1[set_idx];
@@ -606,7 +605,7 @@ bool renderer::draw_setup()
         m_fp_last = l1e->val;
         m_fp_last_key = seen_key;
         m_fp_last_epoch = m_epoch;
-        return true;
+        return m_vp != nullptr;
     }
     fp_lookup* found = l1e ? l1e->val : nullptr;
     if (!found) {
@@ -628,7 +627,7 @@ bool renderer::draw_setup()
         m_fp_last_epoch = m_epoch;
         l1e->fp = fp;
         l1e->verified_epoch = m_epoch;
-        return true;
+        return m_vp != nullptr;
     };
     {
         fp_candidate& c = seen.slots[seen.last_slot];
@@ -1080,6 +1079,7 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
     const bool sync_pipe = !m_pipelines.fast_link() && m_fb.count > 0 && !m_fb.depth;
     const VkPipeline pipe = m_pipelines.get(key, m_vp->code, m_fp->code, sync_pipe);
     if (!pipe) {
+        m_occlusion.note_dropped();
         if (m_trace) std::fprintf(m_trace, "[trace] %u skipped: pipeline compiling or failed\n", id);
         return;
     }

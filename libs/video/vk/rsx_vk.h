@@ -38,6 +38,48 @@ void rsx_vk_window_size(u32* w, u32* h);
 void rsx_vk_on_window_resize(void (*listener)(u32 w, u32 h));
 void rsx_vk_resize_window(u32 w, u32 h);
 
+enum rsx_vk_upscale {
+    RSX_VK_UPSCALE_OFF = 0,
+    RSX_VK_UPSCALE_FSR_NATIVE = 1,
+    RSX_VK_UPSCALE_FSR_QUALITY = 2,
+    RSX_VK_UPSCALE_FSR_BALANCED = 3,
+    RSX_VK_UPSCALE_FSR_PERFORMANCE = 4,
+    RSX_VK_UPSCALE_DLAA = 5,
+    RSX_VK_UPSCALE_DLSS_QUALITY = 6,
+    RSX_VK_UPSCALE_DLSS_BALANCED = 7,
+    RSX_VK_UPSCALE_DLSS_PERFORMANCE = 8,
+};
+
+enum rsx_vk_upscale_cap {
+    RSX_VK_UPSCALE_CAP_FSR = 1,
+    RSX_VK_UPSCALE_CAP_DLSS = 2,
+};
+
+typedef struct rsx_vk_upscale_frame {
+    float inv_curr_vp[16];
+    float prev_vp[16];
+    float jitter_x;
+    float jitter_y;
+    float near_clip;
+    float far_clip;
+    float fov_y;
+    float dt_ms;
+    float sharpness;
+    float vel_scale_x;
+    float vel_scale_y;
+    float prev_jitter_x;
+    float prev_jitter_y;
+    int   reset;
+} rsx_vk_upscale_frame;
+
+void rsx_vk_set_upscaler(int mode);
+int  rsx_vk_upscaler_caps(void);
+const char* rsx_vk_upscaler_fsr_version(void);
+void rsx_vk_upscale_render_size(u32 display_w, u32 display_h, int mode, u32* out_w, u32* out_h);
+void rsx_vk_upscale_jitter(int mode, u32 render_w, u32 display_w, u32 frame_index, float* out_jx, float* out_jy);
+void rsx_vk_upscale_capture_velocity(void);
+void rsx_vk_upscale_trigger(const rsx_vk_upscale_frame* frame);
+
 #ifdef __cplusplus
 }
 #endif

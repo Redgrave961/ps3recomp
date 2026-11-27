@@ -88,6 +88,12 @@ static struct {
     u32 irq_head;
     u32 irq_tail;
     u32 irq_vblank_queued;
+
+    _Alignas(64) SRWLOCK sync_lock;
+    CONDITION_VARIABLE sync_cv;
+    void (*sync_fn)(void*);
+    void* sync_arg;
+    volatile u32 sync_pending;
 } s;
 
 #define RSX_3D_REGS (0x2000u >> 2)
@@ -308,7 +314,7 @@ typedef struct rsx_hold {
 
 static int rsx_idle_over(const rsx_hold* w)
 {
-    if (__atomic_load_n(&s.immediate_flip, __ATOMIC_RELAXED) || (rsx_load(RSX_PUT_EA) & ~3u) != w->put || s.get != w->get) return 1;
+    if (__atomic_load_n(&s.immediate_flip, __ATOMIC_RELAXED) || __atomic_load_n(&s.sync_pending, __ATOMIC_ACQUIRE) || (rsx_load(RSX_PUT_EA) & ~3u) != w->put || s.get != w->get) return 1;
     return w->ea && rsx_load(w->ea) != w->word;
 }
 
@@ -423,6 +429,38 @@ static void rsx_flip(u32 buffer)
     if (s.vsync) rsx_wait_vblank();
     rsx_flip_done(buffer);
     for (u32 i = 0; i < 16u; i += 4u) rsx_store_label(RSX_SEMAPHORE_EA + 0x10u + i, 0);
+}
+
+static void rsx_service_sync(void)
+{
+    AcquireSRWLockExclusive(&s.sync_lock);
+    void (*fn)(void*) = s.sync_fn;
+    void* arg = s.sync_arg;
+    ReleaseSRWLockExclusive(&s.sync_lock);
+    if (fn) fn(arg);
+    AcquireSRWLockExclusive(&s.sync_lock);
+    s.sync_fn = NULL;
+    s.sync_arg = NULL;
+    __atomic_store_n(&s.sync_pending, 0u, __ATOMIC_RELEASE);
+    WakeAllConditionVariable(&s.sync_cv);
+    ReleaseSRWLockExclusive(&s.sync_lock);
+}
+
+void rsx_core_run_on_thread(void (*fn)(void*), void* arg)
+{
+    if (!fn || !__atomic_load_n(&s.started, __ATOMIC_ACQUIRE)) return;
+    AcquireSRWLockExclusive(&s.sync_lock);
+    while (__atomic_load_n(&s.sync_pending, __ATOMIC_ACQUIRE))
+        SleepConditionVariableSRW(&s.sync_cv, &s.sync_lock, INFINITE, 0);
+    s.sync_fn = fn;
+    s.sync_arg = arg;
+    __atomic_store_n(&s.sync_pending, 1u, __ATOMIC_RELEASE);
+    ReleaseSRWLockExclusive(&s.sync_lock);
+    rsx_core_doorbell();
+    AcquireSRWLockExclusive(&s.sync_lock);
+    while (__atomic_load_n(&s.sync_pending, __ATOMIC_ACQUIRE))
+        SleepConditionVariableSRW(&s.sync_cv, &s.sync_lock, INFINITE, 0);
+    ReleaseSRWLockExclusive(&s.sync_lock);
 }
 
 static void rsx_service_immediate(void)
@@ -665,6 +703,7 @@ static void rsx_park(u32 jump, u32 put)
     const rsx_hold w = { put, s.get, ea, jump };
     for (;;) {
         rsx_service_immediate();
+        if (__atomic_load_n(&s.sync_pending, __ATOMIC_ACQUIRE)) rsx_service_sync();
         if (rsx_idle_over(&w)) break;
         rsx_await(rsx_idle_over, &w, 1);
     }
@@ -731,6 +770,10 @@ static DWORD WINAPI rsx_fifo_thread(LPVOID unused)
         }
         if (s.get == put) {
             rsx_publish_get();
+            if (__atomic_load_n(&s.sync_pending, __ATOMIC_ACQUIRE)) {
+                rsx_service_sync();
+                continue;
+            }
             rsx_flush();
             rsx_wait_change(put);
             continue;
@@ -831,6 +874,8 @@ void rsx_core_init(u32 local_size, u32 main_size)
     InitializeConditionVariable(&s.vblank_cv);
     InitializeSRWLock(&s.irq_lock);
     InitializeConditionVariable(&s.irq_cv);
+    InitializeSRWLock(&s.sync_lock);
+    InitializeConditionVariable(&s.sync_cv);
     static const u16 core_regs[] = { 0x0050, 0x0060, 0x0064, 0x0068, 0x006C, 0x0104, 0x0110,
                                      0x0180, 0x01A4, 0x01A8, 0x1D6C, 0x1D70, 0x1D74, 0x1800 };
     for (u32 i = 0; i <= RSX_3D_REGS; i++) s_next_core[i] = RSX_3D_REGS;

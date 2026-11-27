@@ -46,6 +46,8 @@ struct vk_device {
     VkPhysicalDeviceExtendedDynamicState2FeaturesEXT* dynamic_state2 = nullptr;
     VkPhysicalDeviceExtendedDynamicState3FeaturesEXT* dynamic_state3 = nullptr;
     vk_caps caps{};
+    uint8_t luid[8]{};
+    bool luid_valid = false;
     std::vector<std::unique_ptr<uint8_t[]>> chain;
 };
 

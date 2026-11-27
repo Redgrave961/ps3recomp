@@ -30,6 +30,7 @@ public:
     void enable(bool on) { m_enabled = on; }
     void begin(VkCommandBuffer cmd, const scale2d& scale);
     void end(VkCommandBuffer cmd);
+    void note_dropped() { if (m_enabled) m_dropped = true; }
     void clear();
     bool report(uint32_t ea, bool counted);
     bool ordered(const rsx_write& w) const;
@@ -54,6 +55,7 @@ private:
         uint32_t src = 0;
         uint32_t src_size = 0;
         bool exposed = false;
+        bool dropped = false;
         std::vector<segment> queries;
         rsx_deferred run = nullptr;
         std::vector<uint8_t> arg;
@@ -71,6 +73,7 @@ private:
     VkQueryControlFlags m_control = 0;
     bool m_enabled = false;
     bool m_active = false;
+    bool m_dropped = false;
     bool m_pending_reports = false;
     std::vector<segment> m_segments;
     std::vector<job> m_pending;
