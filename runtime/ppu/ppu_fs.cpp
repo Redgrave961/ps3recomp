@@ -2,6 +2,7 @@
 #include "ppu_recomp.h"
 #include "../../libs/filesystem/npdrm.h"
 #include "../../libs/filesystem/ps3_vfs.h"
+#include "../platform/ps3_utf8_fs.h"
 #include "ps3emu/nid.h"
 #include <stdint.h>
 #include <stdio.h>
@@ -395,12 +396,7 @@ static void cellFsClosedir(ppu_context* ctx)
     ctx->gpr[3] = CELL_OK;
 }
 
-#ifdef _WIN32
-#include <direct.h>
-#define HOST_MKDIR(p) _mkdir(p)
-#else
-#define HOST_MKDIR(p) mkdir((p), 0777)
-#endif
+#define HOST_MKDIR(p) ps3_utf8_mkdir(p)
 
 static int host_mkdir_p(const char* path)
 {
@@ -412,7 +408,7 @@ static int host_mkdir_p(const char* path)
         if (*p == '/' || *p == '\\') { char c = *p; *p = 0; HOST_MKDIR(tmp); *p = c; }
     }
     int r = HOST_MKDIR(tmp);
-    if (r != 0) { struct stat st; if (stat(tmp, &st) == 0 && (st.st_mode & S_IFDIR)) r = 0; }
+    if (r != 0) { ps3_host_stat_t st; if (ps3_utf8_stat64(tmp, &st) == 0 && (st.st_mode & S_IFDIR)) r = 0; }
     return r;
 }
 
@@ -449,7 +445,7 @@ static void cellFsRename(ppu_context* ctx)
     ps3_vstat st;
     if (ps3_vfs_stat(hfrom, &st) != 0) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return; }
     if (ps3_vfs_stat(hto, &st) == 0) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EEXIST; return; }
-    if (rename(hfrom, hto) != 0) {
+    if (ps3_utf8_rename(hfrom, hto) != 0) {
         ctx->gpr[3] = (uint64_t)(int64_t)(errno == ENOTDIR ? CELL_FS_ENOTDIR : CELL_FS_ENOENT);
         return;
     }

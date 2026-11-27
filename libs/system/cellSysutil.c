@@ -10,13 +10,8 @@
 #include <errno.h>
 #include <sys/stat.h>
 
+#include "../../runtime/platform/ps3_utf8_fs.h"
 void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size);
-#ifdef _WIN32
-#  include <direct.h>
-#  ifndef mkdir
-#    define mkdir(p, m) _mkdir(p)
-#  endif
-#endif
 
 extern void vm_write8(uint64_t addr, uint8_t v);
 extern void vm_write32(uint64_t addr, uint32_t v);
@@ -414,10 +409,10 @@ s32 cellSysCacheMount(char* param)
       if (root && *root) {
           char gpath[512], hpath[1024];
           sys_fs_translate_path("/dev_hdd1/cache", hpath, (int)sizeof hpath);
-          mkdir(hpath, 0777);
+          ps3_utf8_mkdir(hpath);
           snprintf(gpath, sizeof gpath, "/dev_hdd1/cache/%s", cache_id);
           sys_fs_translate_path(gpath, hpath, (int)sizeof hpath);
-          if (mkdir(hpath, 0777) == 0 || errno == EEXIST)
+          if (ps3_utf8_mkdir(hpath) == 0 || errno == EEXIST)
               printf("[cellSysutil] SysCacheMount: host cache dir %s ready\n", hpath);
           else
               printf("[cellSysutil] SysCacheMount: host cache dir %s NOT created (errno=%d)\n",

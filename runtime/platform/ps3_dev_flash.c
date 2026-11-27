@@ -1,8 +1,8 @@
 #include "ps3_dev_flash.h"
+#include "ps3_utf8_fs.h"
 
 #include <stdio.h>
 #include <string.h>
-#include <sys/stat.h>
 
 void ps3_dev_flash_path(char* out, size_t cap, const char* roots, const char* rel)
 {
@@ -21,8 +21,8 @@ void ps3_dev_flash_path(char* out, size_t cap, const char* roots, const char* re
         if (!n) continue;
         if (!first_n) { first = entry; first_n = n; }
         snprintf(out, cap, "%.*s/%s", (int)n, entry, rel);
-        struct stat st;
-        if (stat(out, &st) == 0) return;
+        ps3_host_stat_t st;
+        if (ps3_utf8_stat64(out, &st) == 0) return;
     }
     snprintf(out, cap, "%.*s/%s", (int)first_n, first, rel);
 }

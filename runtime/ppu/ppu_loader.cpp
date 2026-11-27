@@ -21,6 +21,7 @@
 #include "../platform/win32_compat.h"
 #include "../platform/win32_backtrace.h"
 #include "../platform/ps3_stdio.h"
+#include "../platform/ps3_utf8_fs.h"
 #ifndef _WIN32
 #include <unistd.h>
 #endif
@@ -254,7 +255,11 @@ static __attribute__((noinline)) void barrier_watch_hit_slow(uint32_t a, uint32_
       static const char* s_wvg = (const char*)-1;
       if (s_wvg == (const char*)-1) s_wvg = getenv("PPU_WVAL_GATE");
       if (s_wv && v == s_wv && a >= s_wvlo && a < s_wvhi &&
+#ifdef _WIN32
+          (!s_wvg || ps3_utf8_file_attributes(s_wvg) != INVALID_FILE_ATTRIBUTES)) {
+#else
           (!s_wvg || GetFileAttributesA(s_wvg) != INVALID_FILE_ATTRIBUTES)) {
+#endif
           static int _n = 0;
           if (PS3_LOG_FIRST(_n, 24)) {
               fprintf(stderr, "[wv] 0x%08X <- 0x%X (w%d) guest-fn=0x%08X\n",
@@ -828,7 +833,7 @@ extern "C" uint32_t ppu_load_elf_image(const uint8_t* file, uint64_t fsz)
 
 extern "C" uint32_t ppu_load_elf(const char* path)
 {
-    FILE* f = fopen(path, "rb");
+    FILE* f = ps3_utf8_fopen(path, "rb");
     if (!f) { fprintf(stderr, "[ppu] cannot open %s\n", path); return 0; }
     fseek(f, 0, SEEK_END);
     const long sz = ftell(f);

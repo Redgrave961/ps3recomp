@@ -10,20 +10,14 @@
 #include <errno.h>
 #include <sys/stat.h>
 
-#ifdef _WIN32
-#  include <windows.h>
-#  include <direct.h>
-#  define HOST_MKDIR(p) _mkdir(p)
-#  define HOST_STAT     _stat64
-#  define HOST_STAT_T   struct __stat64
-#else
-#  include <unistd.h>
+#include "../../runtime/platform/ps3_utf8_fs.h"
+#ifndef _WIN32
 #  include <sys/types.h>
 #  include <sys/statvfs.h>
-#  define HOST_MKDIR(p) mkdir(p, 0755)
-#  define HOST_STAT     stat
-#  define HOST_STAT_T   struct stat
 #endif
+#define HOST_MKDIR(p) ps3_utf8_mkdir(p)
+#define HOST_STAT     ps3_utf8_stat64
+#define HOST_STAT_T   ps3_host_stat_t
 
 static char s_title_id[64]  = "BLES00000";
 static char s_title[256]    = "Unknown Title";
@@ -89,9 +83,9 @@ static s32 content_free_kb(void)
     snprintf(path, sizeof(path), "%s", s_content_path[0] ? s_content_path : ".");
     for (;;) {
 #ifdef _WIN32
-        ULARGE_INTEGER available;
-        if (GetDiskFreeSpaceExA(path, &available, NULL, NULL)) {
-            u64 kb = available.QuadPart / 1024;
+        uint64_t avail = 0;
+        if (ps3_utf8_disk_free_bytes(path, &avail)) {
+            u64 kb = avail / 1024;
             return kb > INT32_MAX ? INT32_MAX : (s32)kb;
         }
         DWORD error = GetLastError();

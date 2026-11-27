@@ -20,21 +20,14 @@
 #  undef st_ctime
 #endif
 
-#ifdef _WIN32
-#  include <windows.h>
-#  include <io.h>
-#  include <direct.h>
-#  define HOST_MKDIR(p) _mkdir(p)
-#  define HOST_STAT     _stat64
-#  define HOST_STAT_T   struct __stat64
-#else
-#  include <unistd.h>
+#include "../../runtime/platform/ps3_utf8_fs.h"
+#ifndef _WIN32
 #  include <dirent.h>
 #  include <sys/types.h>
-#  define HOST_MKDIR(p) mkdir(p, 0755)
-#  define HOST_STAT     stat
-#  define HOST_STAT_T   struct stat
 #endif
+#define HOST_MKDIR(p) ps3_utf8_mkdir(p)
+#define HOST_STAT     ps3_utf8_stat64
+#define HOST_STAT_T   ps3_host_stat_t
 
 static char s_save_root[1024] = "./gamedata/dev_hdd0/home/00000001/savedata";
 static ps3_savedata_load_cb s_on_save_load = NULL;
@@ -285,7 +278,7 @@ static int pfd_has(const char* save_path, const char* name)
 {
     char path[1024], line[64];
     pfd_path(save_path, path, sizeof(path));
-    FILE* fp = fopen(path, "rb");
+    FILE* fp = ps3_utf8_fopen(path, "rb");
     if (!fp) return 0;
     int found = 0;
     while (!found && fgets(line, sizeof(line), fp)) {
@@ -301,7 +294,7 @@ static void pfd_add(const char* save_path, const char* name)
     if (pfd_has(save_path, name)) return;
     char path[1024];
     pfd_path(save_path, path, sizeof(path));
-    FILE* fp = fopen(path, "ab");
+    FILE* fp = ps3_utf8_fopen(path, "ab");
     if (fp) { fprintf(fp, "%s\n", name); fclose(fp); }
 }
 
@@ -321,18 +314,28 @@ static u32 enumerate_save_files(const char* save_path,
     {
         char search[1024];
         snprintf(search, sizeof(search), "%s\\*", save_path);
-        WIN32_FIND_DATAA fd;
-        HANDLE hFind = FindFirstFileA(search, &fd);
+        wchar_t sbuf[512];
+        wchar_t* wsearch = ps3_utf8_to_wide(search, sbuf, 512);
+        if (!wsearch)
+            return 0;
+        WIN32_FIND_DATAW fd;
+        HANDLE hFind = FindFirstFileW(wsearch, &fd);
+        ps3_utf8_wide_free(wsearch, sbuf);
         if (hFind == INVALID_HANDLE_VALUE)
             return 0;
 
         do {
-            if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || savedata_system_file(fd.cFileName))
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                continue;
+            char fname[CELL_SAVEDATA_FILENAME_SIZE * 4];
+            if (!WideCharToMultiByte(CP_UTF8, 0, fd.cFileName, -1, fname, (int)sizeof(fname), NULL, NULL))
+                continue;
+            if (savedata_system_file(fname))
                 continue;
             if (count < max && fileList) {
                 memset(&fileList[count], 0, sizeof(CellSaveDataFileStat));
-                fileList[count].fileType = savedata_file_type(save_path, fd.cFileName);
-                strncpy(fileList[count].fileName, fd.cFileName,
+                fileList[count].fileType = savedata_file_type(save_path, fname);
+                strncpy(fileList[count].fileName, fname,
                         CELL_SAVEDATA_FILENAME_SIZE - 1);
                 ULARGE_INTEGER sz;
                 sz.HighPart = fd.nFileSizeHigh;
@@ -340,7 +343,7 @@ static u32 enumerate_save_files(const char* save_path,
                 fileList[count].st_size = (u64)sz.QuadPart;
             }
             count++;
-        } while (FindNextFileA(hFind, &fd));
+        } while (FindNextFileW(hFind, &fd));
 
         FindClose(hFind);
     }
@@ -417,7 +420,7 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
 
     switch (set->fileOperation) {
     case CELL_SAVEDATA_FILEOP_READ: {
-        FILE* fp = fopen(file_path, "rb");
+        FILE* fp = ps3_utf8_fopen(file_path, "rb");
         if (!fp) {
             printf("[cellSaveData] file read: cannot open '%s'\n", file_path);
             return CELL_SAVEDATA_ERROR_ACCESS_ERROR;
@@ -449,9 +452,9 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
         } else {
             mode = "r+b";
         }
-        FILE* fp = fopen(file_path, mode);
+        FILE* fp = ps3_utf8_fopen(file_path, mode);
         if (!fp) {
-            fp = fopen(file_path, "wb");
+            fp = ps3_utf8_fopen(file_path, "wb");
         }
         if (!fp) {
             printf("[cellSaveData] file write: cannot open '%s'\n", file_path);
@@ -475,7 +478,7 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
     }
 
     case CELL_SAVEDATA_FILEOP_DELETE:
-        remove(file_path);
+        ps3_utf8_remove(file_path);
         return 0;
 
     default:
@@ -510,7 +513,7 @@ static void write_param_sfo(const char* save_path, const CellSaveDataSystemFileP
     size_t n = ps3_psf_build(buf, sizeof buf, dir, title, sub, detail, param->attribute, lp);
     if (!n) return;
 
-    FILE* fp = fopen(sfo_path, "wb");
+    FILE* fp = ps3_utf8_fopen(sfo_path, "wb");
     if (!fp) return;
     fwrite(buf, 1, n, fp);
     fclose(fp);
@@ -529,7 +532,7 @@ static void read_param_sfo(const char* save_path, CellSaveDataSystemFileParam* p
     }
 #endif
 
-    FILE* fp = fopen(sfo_path, "rb");
+    FILE* fp = ps3_utf8_fopen(sfo_path, "rb");
     if (!fp) return;
 
     uint8_t buf[8192];

@@ -1,19 +1,13 @@
 #include "sys_fs.h"
 #include "../memory/vm.h"
 #include "../platform/ps3_dev_flash.h"
+#include "../platform/ps3_utf8_fs.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
 #include <sys/types.h>
-#include <sys/stat.h>
-
-#ifdef _WIN32
-  #include <direct.h>
-  #include <io.h>
-  #define stat _stat64
-#else
-  #include <unistd.h>
+#ifndef _WIN32
   #include <time.h>
 #endif
 
@@ -571,12 +565,7 @@ int64_t sys_fs_mkdir(ppu_context* ctx)
     char host_path[1024];
     sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
 
-#ifdef _WIN32
-    wchar_t whost[1100];
-    int rc = MultiByteToWideChar(CP_UTF8, 0, host_path, -1, whost, 1100) ? _wmkdir(whost) : -1;
-#else
-    int rc = mkdir(host_path, 0755);
-#endif
+    int rc = ps3_utf8_mkdir(host_path);
 
     if (rc != 0) {
         ps3_vstat st;
@@ -603,16 +592,8 @@ int64_t sys_fs_rename(ppu_context* ctx)
     sys_fs_translate_path(old_ps3, old_host, sizeof(old_host));
     sys_fs_translate_path(new_ps3, new_host, sizeof(new_host));
 
-#ifdef _WIN32
-    wchar_t wold[1100], wnew[1100];
-    if (!MultiByteToWideChar(CP_UTF8, 0, old_host, -1, wold, 1100) ||
-        !MultiByteToWideChar(CP_UTF8, 0, new_host, -1, wnew, 1100) ||
-        _wrename(wold, wnew) != 0)
+    if (ps3_utf8_rename(old_host, new_host) != 0)
         return (int64_t)(int32_t)CELL_ENOENT;
-#else
-    if (rename(old_host, new_host) != 0)
-        return (int64_t)(int32_t)CELL_ENOENT;
-#endif
 
     return CELL_OK;
 }
@@ -628,12 +609,7 @@ int64_t sys_fs_unlink(ppu_context* ctx)
     char host_path[1024];
     sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
 
-#ifdef _WIN32
-    wchar_t whost[1100];
-    if (!MultiByteToWideChar(CP_UTF8, 0, host_path, -1, whost, 1100) || _wunlink(whost) != 0)
-#else
-    if (unlink(host_path) != 0)
-#endif
+    if (ps3_utf8_unlink(host_path) != 0)
     {
         const int e = errno;
         ps3_vstat st;
@@ -659,12 +635,7 @@ int64_t sys_fs_rmdir(ppu_context* ctx)
     char host_path[1024];
     sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
 
-#ifdef _WIN32
-    wchar_t whost[1100];
-    if (!MultiByteToWideChar(CP_UTF8, 0, host_path, -1, whost, 1100) || _wrmdir(whost) != 0)
-#else
-    if (rmdir(host_path) != 0)
-#endif
+    if (ps3_utf8_rmdir(host_path) != 0)
     {
         const int e = errno;
         ps3_vstat st;

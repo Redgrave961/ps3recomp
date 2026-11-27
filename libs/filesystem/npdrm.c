@@ -6,9 +6,7 @@
 #include <string.h>
 #include "ps3_aes.h"
 #include "../../runtime/platform/win32_dirent.h"
-#ifdef _WIN32
-#include <windows.h>
-#endif
+#include "../../runtime/platform/ps3_utf8_fs.h"
 
 #define FLAG_COMPRESSED    0x00000001u
 #define FLAG_PLAIN         0x00000002u
@@ -175,17 +173,6 @@ static void rap_to_rif(const uint8_t rap[16], uint8_t key[16])
 
 void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size);
 
-static FILE* npdrm_fopen_utf8(const char* path)
-{
-#ifdef _WIN32
-    wchar_t wp[1100];
-    if (!MultiByteToWideChar(CP_UTF8, 0, path, -1, wp, 1100)) return NULL;
-    return _wfopen(wp, L"rb");
-#else
-    return fopen(path, "rb");
-#endif
-}
-
 static int hex_val(int c)
 {
     if (c >= '0' && c <= '9') return c - '0';
@@ -196,7 +183,7 @@ static int hex_val(int c)
 
 static int read_rap_file(const char* path, uint8_t rap[16])
 {
-    FILE* f = npdrm_fopen_utf8(path);
+    FILE* f = ps3_utf8_fopen(path, "rb");
     if (!f) return 0;
     uint8_t buf[96];
     const size_t n = fread(buf, 1, sizeof buf, f);

@@ -12,15 +12,13 @@
 #include "../../runtime/ppu/ppu_memory.h"
 #include "../guest_struct.h"
 
+#include "../../runtime/platform/ps3_utf8_fs.h"
 #ifdef _WIN32
-#include <direct.h>
-#define mkdir_p(path) _mkdir(path)
 #define PATH_SEP '\\'
 #else
-#include <sys/stat.h>
-#define mkdir_p(path) mkdir(path, 0755)
 #define PATH_SEP '/'
 #endif
+#define mkdir_p(path) ps3_utf8_mkdir(path)
 
 #define NP_TROPHY_COMM_SIGN_MAGIC 0xB9DDE13Bu
 #define TRP_HEADER_SIZE 0x40u
@@ -187,7 +185,7 @@ static int trophy_installed(const TrophyContext* ctx)
 {
     char path[1024];
     trophy_get_filepath(ctx, path, sizeof(path));
-    FILE* fp = fopen(path, "r");
+    FILE* fp = ps3_utf8_fopen(path, "r");
     if (!fp) return 0;
     fclose(fp);
     return 1;
@@ -198,7 +196,7 @@ static int trophy_save(const TrophyContext* ctx)
     char filepath[1024];
     trophy_ensure_dir();
     trophy_get_filepath(ctx, filepath, sizeof(filepath));
-    FILE* fp = fopen(filepath, "w");
+    FILE* fp = ps3_utf8_fopen(filepath, "w");
     if (!fp) {
         printf("[sceNpTrophy] could not save trophies to %s\n", filepath);
         return 0;
@@ -222,7 +220,7 @@ static void trophy_load(TrophyContext* ctx)
     char filepath[1024];
     char line[256];
     trophy_get_filepath(ctx, filepath, sizeof(filepath));
-    FILE* fp = fopen(filepath, "r");
+    FILE* fp = ps3_utf8_fopen(filepath, "r");
     if (!fp) return;
     while (fgets(line, sizeof(line), fp)) {
         const char* id_pos = strstr(line, "\"id\":");

@@ -8,19 +8,17 @@
 #include <sys/stat.h>
 
 #include "../../runtime/platform/win32_dirent.h"
+#include "../../runtime/platform/ps3_utf8_fs.h"
 
 #ifdef _WIN32
-#include <windows.h>
 #define VFS_SEEK _fseeki64
 #define VFS_TELL _ftelli64
-typedef struct _stat64 host_stat_t;
 #else
 #include <fcntl.h>
-#include <unistd.h>
 #define VFS_SEEK fseeko
 #define VFS_TELL ftello
-typedef struct stat host_stat_t;
 #endif
+typedef ps3_host_stat_t host_stat_t;
 
 static const uint8_t PKG_KEY[16] = { 0x2E,0x7B,0x71,0xD7,0xC9,0xC9,0xA1,0x4E,0xA3,0x22,0x1F,0x18,0x88,0x28,0xB8,0xF8 };
 
@@ -547,36 +545,10 @@ static const vfs_entry* lookup(const char* path, const vfs_mount** owner)
     return found;
 }
 
-#ifdef _WIN32
-static FILE* host_fopen(const char* path, const char* mode)
-{
-    wchar_t wp[1100], wm[16];
-    if (!MultiByteToWideChar(CP_UTF8, 0, path, -1, wp, 1100)) return NULL;
-    size_t i = 0;
-    for (; mode[i] && i < 15; i++) wm[i] = (wchar_t)(unsigned char)mode[i];
-    wm[i] = 0;
-    return _wfopen(wp, wm);
-}
-#endif
-
-static int host_stat(const char* path, host_stat_t* st)
-{
-#ifdef _WIN32
-    wchar_t t[1100];
-    int wn = MultiByteToWideChar(CP_UTF8, 0, path, -1, t, 1100);
-    if (wn <= 1) return -1;
-    size_t n = (size_t)(wn - 1);
-    while (n > 1 && (t[n - 1] == L'/' || t[n - 1] == L'\\') && t[n - 2] != L':') t[--n] = 0;
-    return _wstat64(t, st);
-#else
-    return stat(path, st);
-#endif
-}
-
 int ps3_vfs_stat(const char* path, ps3_vstat* st)
 {
     host_stat_t hs;
-    if (host_stat(path, &hs) == 0) {
+    if (ps3_utf8_stat64(path, &hs) == 0) {
         st->size = (uint64_t)hs.st_size;
         st->is_dir = (hs.st_mode & S_IFMT) == S_IFDIR;
         st->atime = (int64_t)hs.st_atime;
@@ -607,11 +579,7 @@ ps3_vfile* ps3_vfile_adopt(FILE* f)
 
 ps3_vfile* ps3_vfile_open(const char* path, const char* mode)
 {
-#ifdef _WIN32
-    FILE* f = host_fopen(path, mode);
-#else
-    FILE* f = fopen(path, mode);
-#endif
+    FILE* f = ps3_utf8_fopen(path, mode);
     if (f) return ps3_vfile_adopt(f);
     if (strpbrk(mode, "wa+")) return NULL;
     const vfs_mount* m = NULL;
@@ -732,7 +700,7 @@ ps3_vdir* ps3_vdir_open(const char* path)
             snprintf(full, sizeof full, "%s/%s", path, e->d_name);
             const int dot = e->d_name[0] == '.' && (!e->d_name[1] || (e->d_name[1] == '.' && !e->d_name[2]));
             host_stat_t st;
-            vdir_add(d, e->d_name, dot || (host_stat(full, &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR), &cap);
+            vdir_add(d, e->d_name, dot || (ps3_utf8_stat64(full, &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR), &cap);
         }
         closedir(h);
     }

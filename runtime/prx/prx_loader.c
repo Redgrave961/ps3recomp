@@ -1,4 +1,5 @@
 #include "prx_loader.h"
+#include "../platform/ps3_utf8_fs.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -101,7 +102,7 @@ prx_load_result prx_load_module(const prx_module* m, prx_register_fn reg)
 
 uint8_t* prx_image_load_file(const char* path, uint32_t* out_size)
 {
-    FILE* f = fopen(path, "rb");
+    FILE* f = ps3_utf8_fopen(path, "rb");
     if (!f) {
         fprintf(stderr, "[prx] cannot open image '%s'\n", path);
         return NULL;
