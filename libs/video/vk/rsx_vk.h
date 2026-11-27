@@ -73,6 +73,7 @@ typedef struct rsx_vk_upscale_frame {
 } rsx_vk_upscale_frame;
 
 void rsx_vk_set_upscaler(int mode);
+int  rsx_vk_upscaler_active(void);
 int  rsx_vk_upscaler_caps(void);
 const char* rsx_vk_upscaler_fsr_version(void);
 void rsx_vk_upscale_render_size(u32 display_w, u32 display_h, int mode, u32* out_w, u32* out_h);

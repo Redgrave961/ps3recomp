@@ -123,6 +123,7 @@ struct state {
     std::atomic<uint64_t> scale{ (3ull << 48) | (1ull << 32) | (3ull << 16) | 1u };
     std::atomic<rsx_vk_aa> aa{ RSX_VK_AA_SMAA };
     std::atomic<int> upscale{ RSX_VK_UPSCALE_OFF };
+    std::atomic<int> upscale_active{ RSX_VK_UPSCALE_OFF };
     std::mutex modes_lock;
     std::vector<rsx_vk_mode> modes;
     rsx_vk_mode desktop_mode{};
@@ -175,6 +176,13 @@ vk::ratio clamp_render_scale(uint32_t num, uint32_t den)
 {
     const vk::ratio r = vk::ratio::of(num, den), top{ 12, 1 }, bot{ 1, 4 };
     return r > top ? top : bot > r ? bot : r;
+}
+
+int supported_upscale(int mode)
+{
+    if (mode == RSX_VK_UPSCALE_OFF) return RSX_VK_UPSCALE_OFF;
+    const int need = mode >= RSX_VK_UPSCALE_DLAA ? RSX_VK_UPSCALE_CAP_DLSS : RSX_VK_UPSCALE_CAP_FSR;
+    return (g.r.upscaler_caps() & need) ? mode : RSX_VK_UPSCALE_OFF;
 }
 
 void compute_scales(vk::scale2d& disp, vk::scale2d& rend, int mode)
@@ -439,12 +447,13 @@ bool presenter_build()
     g.r.resolution_scale = g.r.display_scale;
     if (!g.r.open(g.d, g.timeline, &g.submitted, g.cache_path.c_str())) return false;
     {
-        const int mode = g.upscale.load(std::memory_order_relaxed);
+        const int mode = supported_upscale(g.upscale.load(std::memory_order_relaxed));
         vk::scale2d disp, rend;
         compute_scales(disp, rend, mode);
         g.r.display_scale = disp;
         g.r.resolution_scale = rend;
         g.r.upscale_mode = mode;
+        g.upscale_active.store(mode, std::memory_order_relaxed);
     }
     report_scale();
     g.smaa.create(g.d, g.r.pipeline_cache());
@@ -1008,11 +1017,12 @@ void vk_reset(void*)
     if (stats_on()) g_rsx_cpu_ns.store(thread_cpu_ns(), std::memory_order_relaxed);
     g.r.flip_reset();
     const int prev_mode = g.r.upscale_mode;
-    const int mode = g.upscale.load(std::memory_order_relaxed);
+    const int mode = supported_upscale(g.upscale.load(std::memory_order_relaxed));
     vk::scale2d disp, rend;
     compute_scales(disp, rend, mode);
     g.r.display_scale = disp;
     g.r.upscale_mode = mode;
+    g.upscale_active.store(mode, std::memory_order_relaxed);
     if (rend != g.r.resolution_scale || (prev_mode == RSX_VK_UPSCALE_OFF) != (mode == RSX_VK_UPSCALE_OFF)) {
         g.r.rescale(rend);
         report_scale();
@@ -1090,7 +1100,9 @@ int vk_present(void*, u32, const rsx_display_buffer* db)
     static vk::scale2d shown_scale;
     const u64 content = ea ? g.r.content(ea, pitch) : 0;
     const uint64_t fit = g.fit.load(std::memory_order_acquire);
-    const rsx_vk_aa aa_mode = g.aa.load(std::memory_order_relaxed);
+    rsx_vk_aa aa_mode = g.aa.load(std::memory_order_relaxed);
+    if (aa_mode == RSX_VK_AA_OFF && g.upscale.load(std::memory_order_relaxed) != RSX_VK_UPSCALE_OFF && g.r.upscale_mode == RSX_VK_UPSCALE_OFF)
+        aa_mode = RSX_VK_AA_SMAA;
     const int up_mode = g.r.upscale_mode;
     const vk::scale2d cur_scale = g.r.resolution_scale;
     if (!ea || (content && content == shown && fit == shown_fit && aa_mode == shown_aa && up_mode == shown_upscale && cur_scale == shown_scale)) {
@@ -1345,6 +1357,11 @@ extern "C" void rsx_vk_set_upscaler(int mode)
     g.upscale.store(mode, std::memory_order_relaxed);
 }
 
+extern "C" int rsx_vk_upscaler_active(void)
+{
+    return g.upscale_active.load(std::memory_order_relaxed);
+}
+
 extern "C" int rsx_vk_upscaler_caps(void)
 {
     return g.r.upscaler_caps();
@@ -1373,16 +1390,15 @@ extern "C" void rsx_vk_upscale_jitter(int mode, u32 render_w, u32 display_w, u32
 
 extern "C" void rsx_vk_upscale_capture_velocity(void)
 {
-    if (g.upscale.load(std::memory_order_relaxed) == RSX_VK_UPSCALE_OFF) return;
-    rsx_core_run_on_thread([](void*) { g.r.capture_velocity(); }, nullptr);
+    if (g.upscale_active.load(std::memory_order_relaxed) == RSX_VK_UPSCALE_OFF) return;
+    rsx_core_call_ordered([](const void*) { g.r.capture_velocity(); }, nullptr, 0);
 }
 
 extern "C" void rsx_vk_upscale_trigger(const rsx_vk_upscale_frame* frame)
 {
-    if (!frame || g.upscale.load(std::memory_order_relaxed) == RSX_VK_UPSCALE_OFF) return;
-    rsx_core_run_on_thread([](void* p) {
-        g.r.run_upscale(*static_cast<const rsx_vk_upscale_frame*>(p));
-    }, const_cast<rsx_vk_upscale_frame*>(frame));
+    static_assert(sizeof *frame <= RSX_CORE_CALL_ARG);
+    if (!frame || g.upscale_active.load(std::memory_order_relaxed) == RSX_VK_UPSCALE_OFF) return;
+    rsx_core_call_ordered([](const void* p) { g.r.run_upscale(*static_cast<const rsx_vk_upscale_frame*>(p)); }, frame, sizeof *frame);
 }
 
 extern "C" void rsx_vk_set_display(rsx_vk_display display)

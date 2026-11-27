@@ -21,6 +21,7 @@ struct vk_caps {
     bool pipeline_library;
     bool custom_border_color;
     bool custom_border_without_format;
+    bool descriptor_buffer;
     bool depth_clip_enable;
     bool provoking_vertex;
     bool maintenance5;

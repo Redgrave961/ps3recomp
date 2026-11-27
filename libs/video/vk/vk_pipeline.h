@@ -82,8 +82,9 @@ private:
         VkPipeline fast = VK_NULL_HANDLE;
     };
 
-    void worker();
+    void worker(bool urgent_only);
     void record(char type, const void* a, size_t an, const void* b, size_t bn);
+    VkPipeline create_pipeline(VkGraphicsPipelineCreateInfo pi) const;
     VkPipeline monolithic(const pipeline_key& k, const shader& vs, const shader& fs) const;
     VkPipeline link(const pipeline_key& k, const shader& vs, const shader& fs, bool optimized);
     VkPipeline output_library(const pipeline_key& k);
@@ -127,15 +128,17 @@ private:
 
     std::mutex m_work_lock;
     std::condition_variable m_work_cv;
+    std::condition_variable m_urgent_cv;
     std::deque<std::function<void()>> m_urgent;
     std::deque<std::function<void()>> m_background;
     unsigned m_background_running = 0;
     unsigned m_background_limit = 1;
+    unsigned m_urgent_busy = 0;
     std::vector<std::thread> m_workers;
     std::thread m_precompile_thread;
     bool m_stop = false;
     std::atomic<bool> m_stopping{ false };
-    std::atomic<bool> m_cache_dirty{ false };
+    mutable std::atomic<bool> m_cache_dirty{ false };
     std::mutex m_save_lock;
     std::chrono::steady_clock::time_point m_saved{};
     void save_cache_periodic();

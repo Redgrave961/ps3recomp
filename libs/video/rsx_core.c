@@ -89,12 +89,18 @@ static struct {
     u32 irq_tail;
     u32 irq_vblank_queued;
 
-    _Alignas(64) SRWLOCK sync_lock;
-    CONDITION_VARIABLE sync_cv;
-    void (*sync_fn)(void*);
-    void* sync_arg;
-    volatile u32 sync_pending;
+    _Alignas(64) SRWLOCK call_lock;
+    struct rsx_call {
+        u32 pos;
+        void (*fn)(const void* arg);
+        _Alignas(16) uint8_t arg[RSX_CORE_CALL_ARG];
+    } calls[32];
+    u32 call_head;
+    u32 call_tail;
+    volatile u32 call_pos;
 } s;
+
+#define RSX_NO_CALL 0xFFFFFFFFu
 
 #define RSX_3D_REGS (0x2000u >> 2)
 static u16 s_next_core[RSX_3D_REGS + 1u];
@@ -314,7 +320,9 @@ typedef struct rsx_hold {
 
 static int rsx_idle_over(const rsx_hold* w)
 {
-    if (__atomic_load_n(&s.immediate_flip, __ATOMIC_RELAXED) || __atomic_load_n(&s.sync_pending, __ATOMIC_ACQUIRE) || (rsx_load(RSX_PUT_EA) & ~3u) != w->put || s.get != w->get) return 1;
+    if (__atomic_load_n(&s.immediate_flip, __ATOMIC_RELAXED) || __atomic_load_n(&s.call_pos, __ATOMIC_ACQUIRE) == s.get ||
+        (rsx_load(RSX_PUT_EA) & ~3u) != w->put || s.get != w->get)
+        return 1;
     return w->ea && rsx_load(w->ea) != w->word;
 }
 
@@ -431,36 +439,43 @@ static void rsx_flip(u32 buffer)
     for (u32 i = 0; i < 16u; i += 4u) rsx_store_label(RSX_SEMAPHORE_EA + 0x10u + i, 0);
 }
 
-static void rsx_service_sync(void)
+static void rsx_run_calls(void)
 {
-    AcquireSRWLockExclusive(&s.sync_lock);
-    void (*fn)(void*) = s.sync_fn;
-    void* arg = s.sync_arg;
-    ReleaseSRWLockExclusive(&s.sync_lock);
-    if (fn) fn(arg);
-    AcquireSRWLockExclusive(&s.sync_lock);
-    s.sync_fn = NULL;
-    s.sync_arg = NULL;
-    __atomic_store_n(&s.sync_pending, 0u, __ATOMIC_RELEASE);
-    WakeAllConditionVariable(&s.sync_cv);
-    ReleaseSRWLockExclusive(&s.sync_lock);
+    while (!s.method_left && __atomic_load_n(&s.call_pos, __ATOMIC_ACQUIRE) == s.get) {
+        AcquireSRWLockExclusive(&s.call_lock);
+        const struct rsx_call c = s.calls[s.call_head++ % 32u];
+        __atomic_store_n(&s.call_pos, s.call_head == s.call_tail ? RSX_NO_CALL : s.calls[s.call_head % 32u].pos, __ATOMIC_RELEASE);
+        ReleaseSRWLockExclusive(&s.call_lock);
+        c.fn(c.arg);
+    }
 }
 
-void rsx_core_run_on_thread(void (*fn)(void*), void* arg)
+static void rsx_drop_calls(void)
 {
-    if (!fn || !__atomic_load_n(&s.started, __ATOMIC_ACQUIRE)) return;
-    AcquireSRWLockExclusive(&s.sync_lock);
-    while (__atomic_load_n(&s.sync_pending, __ATOMIC_ACQUIRE))
-        SleepConditionVariableSRW(&s.sync_cv, &s.sync_lock, INFINITE, 0);
-    s.sync_fn = fn;
-    s.sync_arg = arg;
-    __atomic_store_n(&s.sync_pending, 1u, __ATOMIC_RELEASE);
-    ReleaseSRWLockExclusive(&s.sync_lock);
+    AcquireSRWLockExclusive(&s.call_lock);
+    s.call_head = s.call_tail;
+    __atomic_store_n(&s.call_pos, RSX_NO_CALL, __ATOMIC_RELEASE);
+    ReleaseSRWLockExclusive(&s.call_lock);
+}
+
+void rsx_core_call_ordered(void (*fn)(const void* arg), const void* arg, u32 size)
+{
+    if (!fn || size > RSX_CORE_CALL_ARG || !__atomic_load_n(&s.started, __ATOMIC_ACQUIRE)) return;
+    const u32 pos = rsx_load(RSX_PUT_EA) & ~3u;
+    AcquireSRWLockExclusive(&s.call_lock);
+    while (s.call_tail - s.call_head == 32u) {
+        ReleaseSRWLockExclusive(&s.call_lock);
+        rsx_core_doorbell();
+        Sleep(0);
+        AcquireSRWLockExclusive(&s.call_lock);
+    }
+    struct rsx_call* c = &s.calls[s.call_tail % 32u];
+    c->pos = pos;
+    c->fn = fn;
+    if (size) memcpy(c->arg, arg, size);
+    if (s.call_tail++ == s.call_head) __atomic_store_n(&s.call_pos, pos, __ATOMIC_RELEASE);
+    ReleaseSRWLockExclusive(&s.call_lock);
     rsx_core_doorbell();
-    AcquireSRWLockExclusive(&s.sync_lock);
-    while (__atomic_load_n(&s.sync_pending, __ATOMIC_ACQUIRE))
-        SleepConditionVariableSRW(&s.sync_cv, &s.sync_lock, INFINITE, 0);
-    ReleaseSRWLockExclusive(&s.sync_lock);
 }
 
 static void rsx_service_immediate(void)
@@ -703,7 +718,6 @@ static void rsx_park(u32 jump, u32 put)
     const rsx_hold w = { put, s.get, ea, jump };
     for (;;) {
         rsx_service_immediate();
-        if (__atomic_load_n(&s.sync_pending, __ATOMIC_ACQUIRE)) rsx_service_sync();
         if (rsx_idle_over(&w)) break;
         rsx_await(rsx_idle_over, &w, 1);
     }
@@ -763,6 +777,7 @@ static DWORD WINAPI rsx_fifo_thread(LPVOID unused)
     }
     for (;;) {
         rsx_service_immediate();
+        rsx_run_calls();
         const u32 put = rsx_load(RSX_PUT_EA) & ~3u;
         if (put != s.put_seen) {
             s.put_seen = put;
@@ -770,10 +785,6 @@ static DWORD WINAPI rsx_fifo_thread(LPVOID unused)
         }
         if (s.get == put) {
             rsx_publish_get();
-            if (__atomic_load_n(&s.sync_pending, __ATOMIC_ACQUIRE)) {
-                rsx_service_sync();
-                continue;
-            }
             rsx_flush();
             rsx_wait_change(put);
             continue;
@@ -790,7 +801,9 @@ static DWORD WINAPI rsx_fifo_thread(LPVOID unused)
             continue;
         }
         const u32 page_end = (page_id + 1u) << 20;
-        const u32 limit = (put > s.get && put < page_end) ? put : page_end;
+        const u32 call = __atomic_load_n(&s.call_pos, __ATOMIC_ACQUIRE);
+        u32 limit = (put > s.get && put < page_end) ? put : page_end;
+        if (call > s.get && call < limit) limit = call;
         const uint8_t* const page_ptr = vm_base + page_base;
         const rsx_renderer* const rend = s.renderer;
         void (*const rend_methods)(void*, u32, u32, const u32*, u32) = rend ? rend->methods : NULL;
@@ -874,8 +887,8 @@ void rsx_core_init(u32 local_size, u32 main_size)
     InitializeConditionVariable(&s.vblank_cv);
     InitializeSRWLock(&s.irq_lock);
     InitializeConditionVariable(&s.irq_cv);
-    InitializeSRWLock(&s.sync_lock);
-    InitializeConditionVariable(&s.sync_cv);
+    InitializeSRWLock(&s.call_lock);
+    s.call_pos = RSX_NO_CALL;
     static const u16 core_regs[] = { 0x0050, 0x0060, 0x0064, 0x0068, 0x006C, 0x0104, 0x0110,
                                      0x0180, 0x01A4, 0x01A8, 0x1D6C, 0x1D70, 0x1D74, 0x1800 };
     for (u32 i = 0; i <= RSX_3D_REGS; i++) s_next_core[i] = RSX_3D_REGS;
@@ -915,6 +928,7 @@ void rsx_core_start(void)
 
 void rsx_core_fifo_reset(u32 put, u32 get)
 {
+    rsx_drop_calls();
     s.get = get;
     s.ret = RSX_NO_RETURN;
     s.method_left = 0;

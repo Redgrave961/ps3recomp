@@ -8,6 +8,9 @@
 #include <utility>
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <sys/resource.h>
+#include <unistd.h>
 #endif
 
 namespace vk {
@@ -15,6 +18,17 @@ namespace vk {
 namespace {
 
 thread_local bool g_replay = false;
+
+constexpr unsigned k_urgent_workers = 2;
+
+void lowest_priority()
+{
+#ifdef _WIN32
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+#else
+    setpriority(PRIO_PROCESS, (id_t)gettid(), 10);
+#endif
+}
 
 constexpr VkPipelineCreateFlags k_library_flags =
     VK_PIPELINE_CREATE_LIBRARY_BIT_KHR | VK_PIPELINE_CREATE_RETAIN_LINK_TIME_OPTIMIZATION_INFO_BIT_EXT;
@@ -207,68 +221,64 @@ bool pipelines::create(vk_device& d, const std::string& cache_path)
     const size_t slash = m_cache_path.find_last_of("/\\");
     m_db_path = m_cache_path.substr(0, slash == std::string::npos ? 0 : slash + 1) + "vk_shaders.db";
     m_db = open_utf8(m_db_path, "ab+");
-    const unsigned n = std::max(3u, std::thread::hardware_concurrency());
-    const unsigned bg_base = std::max(2u, n > 2u ? n - 2u : 2u);
-    m_background_limit = d.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? std::min(2u, bg_base) : bg_base;
+    const unsigned n = std::max(k_urgent_workers + 1u, std::thread::hardware_concurrency());
+    m_background_limit = d.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 2u : n - k_urgent_workers;
     for (unsigned i = 0; i < n; i++)
         m_workers.emplace_back([this, i] {
-            ps3_thread_name("vk pipeline %u", i);
-#ifdef _WIN32
-            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-#endif
-            worker();
+            const bool urgent_only = i < k_urgent_workers;
+            ps3_thread_name(urgent_only ? "vk pipeline urgent %u" : "vk pipeline %u", i);
+            if (!urgent_only) lowest_priority();
+            worker(urgent_only);
         });
-    std::fprintf(stderr, "[vk] pipelines: %s, %u compile threads\n", m_libraries ? "libraries with fast link" : "monolithic", n);
+    std::fprintf(stderr, "[vk] pipelines: %s, %u urgent + %u background compile threads\n", m_libraries ? "libraries with fast link" : "monolithic",
+                 k_urgent_workers, n - k_urgent_workers);
     return true;
 }
 
-void pipelines::worker()
+void pipelines::worker(bool urgent_only)
 {
-#ifdef _WIN32
-    bool low_prio = true;
-#endif
     for (;;) {
         std::function<void()> task;
-        bool background;
+        bool urgent;
         {
             std::unique_lock<std::mutex> hold(m_work_lock);
-            m_work_cv.wait(hold, [this] {
-                return !m_urgent.empty() || (!m_background.empty() && m_background_running < m_background_limit) ||
-                       (m_stop && m_background.empty());
-            });
-            background = m_urgent.empty();
-            if (background && m_background.empty()) return;
-            std::deque<std::function<void()>>& q = background ? m_background : m_urgent;
+            const auto overflow = [this] { return !m_urgent.empty() && m_urgent_busy >= k_urgent_workers; };
+            if (urgent_only) {
+                m_urgent_cv.wait(hold, [this] { return !m_urgent.empty() || m_stop; });
+                if (m_urgent.empty()) return;
+            } else {
+                m_work_cv.wait(hold, [&] {
+                    return overflow() || (!m_background.empty() && m_background_running < m_background_limit) ||
+                           (m_stop && m_background.empty());
+                });
+                if (!overflow() && m_background.empty()) return;
+            }
+            urgent = urgent_only || overflow();
+            std::deque<std::function<void()>>& q = urgent ? m_urgent : m_background;
             task = std::move(q.front());
             q.pop_front();
-            m_background_running += background;
+            (urgent ? m_urgent_busy : m_background_running)++;
         }
-#ifdef _WIN32
-        if (low_prio != background) {
-            SetThreadPriority(GetCurrentThread(), background ? THREAD_PRIORITY_BELOW_NORMAL : THREAD_PRIORITY_NORMAL);
-            low_prio = background;
-        }
-#endif
         task();
-        m_cache_dirty.store(true, std::memory_order_relaxed);
-        save_cache_periodic();
-        if (background) {
-            {
-                std::lock_guard<std::mutex> hold(m_work_lock);
-                m_background_running--;
-            }
-            m_work_cv.notify_one();
+        if (!urgent_only) save_cache_periodic();
+        {
+            std::lock_guard<std::mutex> hold(m_work_lock);
+            (urgent ? m_urgent_busy : m_background_running)--;
         }
+        if (!urgent) m_work_cv.notify_one();
     }
 }
 
 void pipelines::work(std::function<void()> task, bool urgent)
 {
+    bool overflow;
     {
         std::lock_guard<std::mutex> hold(m_work_lock);
         (urgent ? m_urgent : m_background).push_back(std::move(task));
+        overflow = urgent && m_urgent_busy >= k_urgent_workers;
     }
-    m_work_cv.notify_one();
+    if (urgent) m_urgent_cv.notify_one();
+    if (!urgent || overflow) m_work_cv.notify_one();
 }
 
 void pipelines::destroy()
@@ -280,6 +290,7 @@ void pipelines::destroy()
         std::lock_guard<std::mutex> hold(m_work_lock);
         m_stop = true;
     }
+    m_urgent_cv.notify_all();
     m_work_cv.notify_all();
     for (std::thread& t : m_workers) t.join();
     m_workers.clear();
@@ -457,9 +468,6 @@ void pipelines::precompile(shader_cache& shaders)
     if (recs->empty()) return;
     m_precompile_thread = std::thread([this, &shaders, data, recs] {
         ps3_thread_name("vk precompile");
-#ifdef _WIN32
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-#endif
         auto pending = std::make_shared<std::atomic<size_t>>(0);
         auto done = std::make_shared<std::pair<std::mutex, std::condition_variable>>();
         auto run_matching = [&](auto&& pred, auto&& body) {
@@ -553,6 +561,18 @@ void pipelines::fill_output(const pipeline_key& k, VkPipelineColorBlendStateCrea
     ri.stencilAttachmentFormat = (depth == VK_FORMAT_D32_SFLOAT_S8_UINT || depth == VK_FORMAT_D24_UNORM_S8_UINT) ? depth : VK_FORMAT_UNDEFINED;
 }
 
+VkPipeline pipelines::create_pipeline(VkGraphicsPipelineCreateInfo pi) const
+{
+    VkPipelineCreationFeedback feedback{};
+    const VkPipelineCreationFeedbackCreateInfo fi{ VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO, pi.pNext, &feedback, 0, nullptr };
+    pi.pNext = &fi;
+    VkPipeline p = VK_NULL_HANDLE;
+    if (vkCreateGraphicsPipelines(m_d->dev, m_cache, 1, &pi, nullptr, &p) != VK_SUCCESS) return VK_NULL_HANDLE;
+    if (!(feedback.flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT))
+        m_cache_dirty.store(true, std::memory_order_relaxed);
+    return p;
+}
+
 VkPipeline pipelines::monolithic(const pipeline_key& k, const shader& vs, const shader& fs) const
 {
     VkPipelineShaderStageCreateInfo stages[2]{};
@@ -591,9 +611,7 @@ VkPipeline pipelines::monolithic(const pipeline_key& k, const shader& vs, const 
     pi.pColorBlendState = &cb;
     pi.pDynamicState = &dy;
     pi.layout = m_layout;
-    VkPipeline p = VK_NULL_HANDLE;
-    if (vkCreateGraphicsPipelines(m_d->dev, m_cache, 1, &pi, nullptr, &p) != VK_SUCCESS) return VK_NULL_HANDLE;
-    return p;
+    return create_pipeline(pi);
 }
 
 bool pipelines::shader_library(shader& s, VkShaderStageFlagBits stage)
@@ -631,8 +649,8 @@ bool pipelines::shader_library(shader& s, VkShaderStageFlagBits stage)
     }
     pi.pDynamicState = &dy;
     pi.layout = m_layout;
-    VK_TRY(vkCreateGraphicsPipelines(m_d->dev, m_cache, 1, &pi, nullptr, &s.library));
-    return true;
+    s.library = create_pipeline(pi);
+    return s.library != VK_NULL_HANDLE;
 }
 
 VkPipeline pipelines::input_library(uint32_t topology_class)
@@ -652,8 +670,7 @@ VkPipeline pipelines::input_library(uint32_t topology_class)
     pi.pVertexInputState = &vi;
     pi.pInputAssemblyState = &ia;
     pi.pDynamicState = &dy;
-    VkPipeline p = VK_NULL_HANDLE;
-    return vkCreateGraphicsPipelines(m_d->dev, m_cache, 1, &pi, nullptr, &p) == VK_SUCCESS ? p : VK_NULL_HANDLE;
+    return create_pipeline(pi);
 }
 
 VkPipeline pipelines::output_library(const pipeline_key& k)
@@ -682,8 +699,7 @@ VkPipeline pipelines::output_library(const pipeline_key& k)
     pi.pColorBlendState = &cb;
     pi.pMultisampleState = &ms;
     pi.pDynamicState = &dy;
-    VkPipeline p = VK_NULL_HANDLE;
-    if (vkCreateGraphicsPipelines(m_d->dev, m_cache, 1, &pi, nullptr, &p) != VK_SUCCESS) p = VK_NULL_HANDLE;
+    const VkPipeline p = create_pipeline(pi);
     m_output[o] = p;
     return p;
 }
@@ -699,8 +715,7 @@ VkPipeline pipelines::link(const pipeline_key& k, const shader& vs, const shader
     VkGraphicsPipelineCreateInfo pi{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &li };
     pi.flags = optimized ? VK_PIPELINE_CREATE_LINK_TIME_OPTIMIZATION_BIT_EXT : 0;
     pi.layout = m_layout;
-    VkPipeline p = VK_NULL_HANDLE;
-    return vkCreateGraphicsPipelines(m_d->dev, m_cache, 1, &pi, nullptr, &p) == VK_SUCCESS ? p : VK_NULL_HANDLE;
+    return create_pipeline(pi);
 }
 
 VkPipeline pipelines::get(const pipeline_key& key, const shader& vs, const shader& fs, bool sync)
@@ -753,7 +768,6 @@ VkPipeline pipelines::get(const pipeline_key& key, const shader& vs, const shade
     const bool direct_lto = m_libraries && g_replay;
     const VkPipeline p = !m_libraries ? monolithic(k, vs, fs) : link(k, vs, fs, direct_lto);
     if (!p) std::fprintf(stderr, "[vk] pipeline creation failed\n");
-    else m_cache_dirty.store(true, std::memory_order_relaxed);
     e->fast = (m_libraries && !direct_lto) ? p : VK_NULL_HANDLE;
     e->pipe.store(p, std::memory_order_release);
     e->done.store(true, std::memory_order_release);

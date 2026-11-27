@@ -181,7 +181,7 @@ VkSampler renderer::sampler_for(const VkSamplerCreateInfo& info, const VkSampler
     } else if (ci.anisotropyEnable) {
         ci.maxAnisotropy = std::clamp(ci.maxAnisotropy, 1.f, std::max(m_d->props.limits.maxSamplerAnisotropy, 1.f));
     }
-    if (allow_lod_bias && upscale_mode != RSX_VK_UPSCALE_OFF && !m_upscaled_this_frame && ci.maxLod > 0.f) {
+    if (allow_lod_bias && rendering_reduced() && ci.maxLod > 0.f) {
         const float rw = (float)resolution_scale.x.edge(1280u);
         const float dw = (float)display_scale.x.edge(1280u);
         if (rw > 0.f && dw > rw)

@@ -129,9 +129,7 @@ bool renderer::open(vk_device& d, VkSemaphore timeline, uint64_t* submitted, con
         !m_occlusion.create(d, timeline) || !m_depth_pack.create(d, m_pipelines.cache()) || !m_downscale.create(d, m_pipelines.cache()))
         return false;
     m_pipelines.precompile(m_shaders);
-#ifdef _WIN32
-    m_upscaler.create(d, m_pipelines.cache());
-#endif
+    m_upscaler.create(d, m_pipelines.cache(), cache_path);
     return true;
 }
 
@@ -535,7 +533,7 @@ void renderer::retire(surface* s)
 scale2d renderer::scale_for(u32 width, u32 height, u32 aa_u, u32 aa_v, bool depth, bool depth_only) const
 {
     if (depth && depth_only && width == height && width >= 512u) return {};
-    const scale2d& base = (m_upscaled_this_frame && !depth) ? display_scale : resolution_scale;
+    const scale2d& base = rendering_reduced() ? resolution_scale : display_scale;
     if (base.unit()) return {};
     if (std::max(width, height) < 128u || std::min(width, height) < 64u) return {};
     if (width <= 640u && height <= 360u) return {};
@@ -554,10 +552,15 @@ surface* renderer::surface_for(u32 ea, u32 pitch, u32 width, u32 height, u32 for
     for (size_t si = m_surfaces.size(); si-- > 0;) {
         surface* s = m_surfaces[si].get();
         if (s->ea != ea || s->depth != depth) continue;
-        if (s->gcm_format == format && s->pitch == pitch && s->aa_u == aa_u && s->aa_v == aa_v && s->scale == scale) {
-            if (s->width >= width && s->height >= height) return s;
-            if (!grow_from) grow_from = s;
+        if (s->gcm_format != format || s->pitch != pitch || s->aa_u != aa_u || s->aa_v != aa_v) continue;
+        if (s->scale != scale && s->width >= width && s->height >= height) {
+            end_rendering();
+            rescale_surface(cmd(), *s, scale);
+            m_binding_gen++;
         }
+        if (s->scale != scale) continue;
+        if (s->width >= width && s->height >= height) return s;
+        if (!grow_from) grow_from = s;
     }
     auto made = std::make_unique<surface>();
     surface* s = made.get();
@@ -1646,6 +1649,11 @@ bool renderer::run_upscale(const rsx_vk_upscale_frame& frame)
     const u32 out_w = dst_scale.x.edge(m_scene_color->width * m_scene_color->aa_u);
     const u32 out_h = dst_scale.y.edge(m_scene_color->height * m_scene_color->aa_v);
     if (!out_w || !out_h) return false;
+    if (m_scene_color->scale == dst_scale && resolution_scale != display_scale) {
+        m_upscaled_this_frame = true;
+        m_upscale_resync = true;
+        return true;
+    }
 
     const VkFormat src_fmt = m_scene_color->img.format;
     const bool need_conv = src_fmt != VK_FORMAT_R16G16B16A16_SFLOAT;
@@ -1676,6 +1684,7 @@ bool renderer::run_upscale(const rsx_vk_upscale_frame& frame)
         : view_for(m_scene_depth->img, VK_IMAGE_VIEW_TYPE_2D, m_scene_depth->img.format, VK_IMAGE_ASPECT_DEPTH_BIT, {});
 
     rsx_vk_upscale_frame f = frame;
+    if (std::exchange(m_upscale_resync, false)) f.reset = 1;
     VkImageView vel_view = m_dummy[0].view;
     if (m_scene_velocity && m_scene_velocity != m_scene_color && m_scene_velocity->state == SURFACE_VALID &&
         m_scene_velocity->img.handle && m_scene_velocity->img.width && m_scene_velocity->img.height) {
@@ -1765,28 +1774,29 @@ void renderer::rescale(scale2d scale)
     dirty |= rsx::D_TEXTURES;
     VkCommandBuffer c = cmd();
     end_rendering();
-    for (auto& p : m_surfaces) {
-        surface& s = *p;
-        const scale2d to = scale_for(s.width, s.height, s.aa_u, s.aa_v, s.depth, s.depth_only);
-        if (to == s.scale) continue;
-        image img{};
-        if (!create_image(img, s.img.format, to.x.edge(s.width * s.aa_u), to.y.edge(s.height * s.aa_v), surface_usage(s.depth), s.img.aspect)) {
-            discard(img);
-            continue;
-        }
-        if (s.state == SURFACE_VALID) {
-            if (!s.depth) scale_blit(c, s.img, img, supports_linear_blit(s.img.format) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
-            else if (!scale_depth(c, s.img, img)) s.state = SURFACE_UNINITIALIZED;
-        }
-        discard(s.img);
-        discard(s.snapshot);
-        discard(s.as_color);
-        if (to.unit()) discard(s.native);
-        s.img = img;
-        s.scale = to;
-        s.version = ++m_content_clock;
-        s.depth_version = s.version;
+    for (auto& p : m_surfaces) rescale_surface(c, *p, scale_for(p->width, p->height, p->aa_u, p->aa_v, p->depth, p->depth_only));
+}
+
+void renderer::rescale_surface(VkCommandBuffer c, surface& s, scale2d to)
+{
+    if (to == s.scale) return;
+    image img{};
+    if (!create_image(img, s.img.format, to.x.edge(s.width * s.aa_u), to.y.edge(s.height * s.aa_v), surface_usage(s.depth), s.img.aspect)) {
+        discard(img);
+        return;
     }
+    if (s.state == SURFACE_VALID) {
+        if (!s.depth) scale_blit(c, s.img, img, supports_linear_blit(s.img.format) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+        else if (!scale_depth(c, s.img, img)) s.state = SURFACE_UNINITIALIZED;
+    }
+    discard(s.img);
+    discard(s.snapshot);
+    discard(s.as_color);
+    if (to.unit()) discard(s.native);
+    s.img = img;
+    s.scale = to;
+    s.version = ++m_content_clock;
+    s.depth_version = s.version;
 }
 
 }

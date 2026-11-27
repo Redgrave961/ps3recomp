@@ -5,27 +5,184 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <string>
+#include <vector>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
-#ifndef _WINDOWS
-#define _WINDOWS
-#endif
 #include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
 #include <ffx_api.h>
-#include <ffx_api_loader.h>
 #include <ffx_upscale.h>
 #include <vk/ffx_api_vk.h>
 #include <nvsdk_ngx_vk.h>
 #include <nvsdk_ngx_helpers_vk.h>
-#endif
 
 namespace vk {
 
 namespace {
+
+namespace fs = std::filesystem;
+
+#ifdef _WIN32
+constexpr const char* k_ffx_module = "amd_fidelityfx_loader_vk.dll";
+constexpr const char* k_dlss_module = "nvngx_dlss.dll";
+constexpr const char* k_ngx_init = "NVSDK_NGX_VULKAN_Init_with_ProjectID";
+constexpr bool k_ffx_needs_descriptor_buffer = false;
+using ngx_init_fn = decltype(&NVSDK_NGX_VULKAN_Init_with_ProjectID);
+
+void* lib_open(const fs::path& p) { return LoadLibraryExW(p.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH); }
+void* lib_sym(void* m, const char* name) { return reinterpret_cast<void*>(GetProcAddress(static_cast<HMODULE>(m), name)); }
+void lib_close(void* m) { FreeLibrary(static_cast<HMODULE>(m)); }
+
+fs::path exe_dir()
+{
+    wchar_t buf[MAX_PATH];
+    const DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH);
+    return n && n < MAX_PATH ? fs::path(buf).parent_path() : fs::path(L".");
+}
+#else
+constexpr const char* k_ffx_module = "amd_fidelityfx_upscaler_vk.so";
+constexpr const char* k_dlss_module = "libnvidia-ngx-dlss.so";
+constexpr const char* k_ngx_init = "NVSDK_NGX_VULKAN_Init_ProjectID_Ext";
+constexpr bool k_ffx_needs_descriptor_buffer = true;
+using ngx_init_fn = NVSDK_NGX_Result (*)(const char*, NVSDK_NGX_EngineType, const char*, const wchar_t*, VkInstance, VkPhysicalDevice,
+                                         VkDevice, PFN_vkGetInstanceProcAddr, PFN_vkGetDeviceProcAddr, NVSDK_NGX_Version,
+                                         const NVSDK_NGX_FeatureCommonInfo*);
+
+void* lib_open(const fs::path& p) { return dlopen(p.c_str(), RTLD_NOW | RTLD_LOCAL); }
+void* lib_sym(void* m, const char* name) { return dlsym(m, name); }
+void lib_close(void* m) { dlclose(m); }
+
+fs::path exe_dir()
+{
+    std::error_code ec;
+    const fs::path p = fs::read_symlink("/proc/self/exe", ec);
+    return ec ? fs::path(".") : p.parent_path();
+}
+#endif
+
+fs::path upscaler_dir() { return exe_dir() / "upscalers"; }
+
+template <typename F>
+bool load(void* m, const char* name, F& out)
+{
+    out = reinterpret_cast<F>(lib_sym(m, name));
+    return out != nullptr;
+}
+
+void* open_bundled(const char* name)
+{
+#ifdef _WIN32
+    SetDllDirectoryW(upscaler_dir().c_str());
+#endif
+    for (const fs::path& dir : { upscaler_dir(), exe_dir() })
+        if (void* m = lib_open(dir / name)) return m;
+    return nullptr;
+}
+
+bool bundled(const char* prefix)
+{
+    for (const fs::path& dir : { upscaler_dir(), exe_dir() }) {
+        std::error_code ec;
+        for (const fs::directory_entry& e : fs::directory_iterator(dir, ec))
+            if (e.path().filename().string().rfind(prefix, 0) == 0) return true;
+    }
+    return false;
+}
+
+void* open_ngx_core()
+{
+#ifdef _WIN32
+    if (void* m = open_bundled("_nvngx.dll")) return m;
+    if (HMODULE m = LoadLibraryW(L"_nvngx.dll")) return m;
+    static const wchar_t* const k_keys[3] = {
+        L"System\\CurrentControlSet\\Services\\nvlddmkm\\Parameters\\NGXCore",
+        L"System\\CurrentControlSet\\Services\\nvlddmkm\\NGXCore",
+        L"SOFTWARE\\NVIDIA Corporation\\Global\\NGXCore",
+    };
+    for (const wchar_t* k : k_keys) {
+        HKEY hk = nullptr;
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, k, 0, KEY_READ, &hk) != ERROR_SUCCESS) continue;
+        for (const wchar_t* v : { L"NGXPath", L"FullPath" }) {
+            wchar_t path[MAX_PATH]{};
+            DWORD sz = sizeof path;
+            if (RegQueryValueExW(hk, v, nullptr, nullptr, reinterpret_cast<LPBYTE>(path), &sz) != ERROR_SUCCESS || !path[0]) continue;
+            if (void* m = lib_open(fs::path(path) / L"_nvngx.dll")) {
+                RegCloseKey(hk);
+                return m;
+            }
+        }
+        RegCloseKey(hk);
+    }
+    wchar_t sysdir[MAX_PATH]{};
+    if (!GetSystemDirectoryW(sysdir, MAX_PATH)) return nullptr;
+    std::error_code ec;
+    for (const fs::directory_entry& e :
+         fs::directory_iterator(fs::path(sysdir) / L"DriverStore" / L"FileRepository", fs::directory_options::skip_permission_denied, ec))
+        if (e.path().filename().wstring().rfind(L"nv_", 0) == 0)
+            if (void* m = lib_open(e.path() / L"_nvngx.dll")) return m;
+    return nullptr;
+#else
+    return dlopen("libnvidia-ngx.so.1", RTLD_NOW | RTLD_LOCAL);
+#endif
+}
+
+struct {
+    PfnFfxCreateContext create = nullptr;
+    PfnFfxDestroyContext destroy = nullptr;
+    PfnFfxQuery query = nullptr;
+    PfnFfxDispatch dispatch = nullptr;
+} g_ffx;
+
+struct {
+    ngx_init_fn init = nullptr;
+    decltype(&NVSDK_NGX_VULKAN_Shutdown1) shutdown = nullptr;
+    decltype(&NVSDK_NGX_VULKAN_GetCapabilityParameters) get_cap_params = nullptr;
+    decltype(&NVSDK_NGX_VULKAN_DestroyParameters) destroy_params = nullptr;
+    decltype(&NVSDK_NGX_VULKAN_CreateFeature1) create = nullptr;
+    decltype(&NVSDK_NGX_VULKAN_ReleaseFeature) release = nullptr;
+    decltype(&NVSDK_NGX_VULKAN_EvaluateFeature) eval = nullptr;
+    PFN_NVSDK_NGX_Parameter_SetUI set_ui = nullptr;
+    PFN_NVSDK_NGX_Parameter_SetI set_i = nullptr;
+    PFN_NVSDK_NGX_Parameter_SetF set_f = nullptr;
+    PFN_NVSDK_NGX_Parameter_SetVoidPointer set_ptr = nullptr;
+    PFN_NVSDK_NGX_Parameter_GetI get_i = nullptr;
+} g_ngx;
+
+bool load_ngx_params(void* m)
+{
+#ifdef _WIN32
+    return load(m, "NVSDK_NGX_Parameter_SetUI", g_ngx.set_ui) && load(m, "NVSDK_NGX_Parameter_SetI", g_ngx.set_i) &&
+           load(m, "NVSDK_NGX_Parameter_SetF", g_ngx.set_f) && load(m, "NVSDK_NGX_Parameter_SetVoidPointer", g_ngx.set_ptr) &&
+           load(m, "NVSDK_NGX_Parameter_GetI", g_ngx.get_i);
+#else
+    (void)m;
+    g_ngx.set_ui = [](NVSDK_NGX_Parameter* p, const char* n, unsigned int v) { p->Set(n, v); };
+    g_ngx.set_i = [](NVSDK_NGX_Parameter* p, const char* n, int v) { p->Set(n, v); };
+    g_ngx.set_f = [](NVSDK_NGX_Parameter* p, const char* n, float v) { p->Set(n, v); };
+    g_ngx.set_ptr = [](NVSDK_NGX_Parameter* p, const char* n, void* v) { p->Set(n, v); };
+    g_ngx.get_i = [](NVSDK_NGX_Parameter* p, const char* n, int* v) { return p->Get(n, v); };
+    return true;
+#endif
+}
+
+NVSDK_NGX_Result ngx_init(const vk_device& d, const wchar_t* data_dir, const NVSDK_NGX_FeatureCommonInfo* common)
+{
+    constexpr const char* k_project = "a9f4c2e1-7b38-4d5a-9c12-6e8f0a4b2c7d";
+#ifdef _WIN32
+    return g_ngx.init(k_project, NVSDK_NGX_ENGINE_TYPE_CUSTOM, "1.0", data_dir, d.instance, d.gpu, d.dev, vkGetInstanceProcAddr,
+                      vkGetDeviceProcAddr, common, NVSDK_NGX_Version_API);
+#else
+    return g_ngx.init(k_project, NVSDK_NGX_ENGINE_TYPE_CUSTOM, "1.0", data_dir, d.instance, d.gpu, d.dev, vkGetInstanceProcAddr,
+                      vkGetDeviceProcAddr, NVSDK_NGX_Version_API, common);
+#endif
+}
 
 float halton(uint32_t index, uint32_t base)
 {
@@ -65,129 +222,6 @@ bool is_dlss_mode(int mode)
     return mode >= RSX_VK_UPSCALE_DLAA && mode <= RSX_VK_UPSCALE_DLSS_PERFORMANCE;
 }
 
-void mat4_mul_transpose_f64(const float a[16], const float b[16], float out[16])
-{
-    for (int r = 0; r < 4; r++) {
-        for (int c = 0; c < 4; c++) {
-            double s = 0.0;
-            for (int k = 0; k < 4; k++)
-                s += (double)a[r * 4 + k] * (double)b[k * 4 + c];
-            out[c * 4 + r] = (float)s;
-        }
-    }
-}
-
-#ifdef _WIN32
-
-struct ffx_procs {
-    ffxFunctions fn{};
-};
-
-struct ngx_procs {
-    typedef NVSDK_NGX_Result(NVSDK_CONV* pfn_init_proj)(const char*, NVSDK_NGX_EngineType, const char*, const wchar_t*,
-                                                        VkInstance, VkPhysicalDevice, VkDevice, PFN_vkGetInstanceProcAddr,
-                                                        PFN_vkGetDeviceProcAddr, const NVSDK_NGX_FeatureCommonInfo*, NVSDK_NGX_Version);
-    typedef NVSDK_NGX_Result(NVSDK_CONV* pfn_shutdown1)(VkDevice);
-    typedef NVSDK_NGX_Result(NVSDK_CONV* pfn_get_cap_params)(NVSDK_NGX_Parameter**);
-    typedef NVSDK_NGX_Result(NVSDK_CONV* pfn_destroy_params)(NVSDK_NGX_Parameter*);
-    typedef NVSDK_NGX_Result(NVSDK_CONV* pfn_create1)(VkDevice, VkCommandBuffer, NVSDK_NGX_Feature, const NVSDK_NGX_Parameter*, NVSDK_NGX_Handle**);
-    typedef NVSDK_NGX_Result(NVSDK_CONV* pfn_release)(NVSDK_NGX_Handle*);
-    typedef NVSDK_NGX_Result(NVSDK_CONV* pfn_eval)(VkCommandBuffer, const NVSDK_NGX_Handle*, const NVSDK_NGX_Parameter*, PFN_NVSDK_NGX_ProgressCallback);
-
-    pfn_init_proj init_proj = nullptr;
-    pfn_shutdown1 shutdown1 = nullptr;
-    pfn_get_cap_params get_cap_params = nullptr;
-    pfn_destroy_params destroy_params = nullptr;
-    pfn_create1 create1 = nullptr;
-    pfn_release release = nullptr;
-    pfn_eval eval = nullptr;
-    PFN_NVSDK_NGX_Parameter_SetUI set_ui = nullptr;
-    PFN_NVSDK_NGX_Parameter_SetI set_i = nullptr;
-    PFN_NVSDK_NGX_Parameter_SetF set_f = nullptr;
-    PFN_NVSDK_NGX_Parameter_SetVoidPointer set_ptr = nullptr;
-    PFN_NVSDK_NGX_Parameter_GetI get_i = nullptr;
-};
-
-ffx_procs g_ffx;
-ngx_procs g_ngx;
-
-std::wstring exe_dir_w()
-{
-    wchar_t buf[MAX_PATH];
-    DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH);
-    if (!n || n >= MAX_PATH) return L".";
-    wchar_t* slash = wcsrchr(buf, L'\\');
-    if (slash) *slash = L'\0';
-    return std::wstring(buf);
-}
-
-std::wstring upscaler_dir_w()
-{
-    return exe_dir_w() + L"\\upscalers";
-}
-
-HMODULE load_dll_from_upscalers(const wchar_t* name)
-{
-    const std::wstring up_dir = upscaler_dir_w();
-    if (GetFileAttributesW(up_dir.c_str()) != INVALID_FILE_ATTRIBUTES)
-        SetDllDirectoryW(up_dir.c_str());
-    const std::wstring dirs[2] = { up_dir, exe_dir_w() };
-    for (const std::wstring& dir : dirs) {
-        const std::wstring full = dir + L"\\" + name;
-        HMODULE m = LoadLibraryExW(full.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
-        if (m) return m;
-    }
-    return nullptr;
-}
-
-HMODULE load_ngx_core_dll()
-{
-    if (HMODULE m = load_dll_from_upscalers(L"_nvngx.dll")) return m;
-    if (HMODULE m = LoadLibraryW(L"_nvngx.dll")) return m;
-    static const wchar_t* const k_keys[3] = {
-        L"System\\CurrentControlSet\\Services\\nvlddmkm\\Parameters\\NGXCore",
-        L"System\\CurrentControlSet\\Services\\nvlddmkm\\NGXCore",
-        L"SOFTWARE\\NVIDIA Corporation\\Global\\NGXCore",
-    };
-    static const wchar_t* const k_vals[2] = { L"NGXPath", L"FullPath" };
-    for (const wchar_t* k : k_keys) {
-        HKEY hk = nullptr;
-        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, k, 0, KEY_READ, &hk) != ERROR_SUCCESS) continue;
-        for (const wchar_t* v : k_vals) {
-            wchar_t path[MAX_PATH]{};
-            DWORD sz = sizeof path;
-            if (RegQueryValueExW(hk, v, nullptr, nullptr, reinterpret_cast<LPBYTE>(path), &sz) == ERROR_SUCCESS && path[0]) {
-                std::wstring full = std::wstring(path) + L"\\_nvngx.dll";
-                if (HMODULE m = LoadLibraryW(full.c_str())) {
-                    RegCloseKey(hk);
-                    return m;
-                }
-            }
-        }
-        RegCloseKey(hk);
-    }
-    wchar_t sysdir[MAX_PATH]{};
-    if (GetSystemDirectoryW(sysdir, MAX_PATH)) {
-        std::wstring repo = std::wstring(sysdir) + L"\\DriverStore\\FileRepository\\nv_*";
-        WIN32_FIND_DATAW fd{};
-        HANDLE h = FindFirstFileW(repo.c_str(), &fd);
-        if (h != INVALID_HANDLE_VALUE) {
-            do {
-                if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
-                std::wstring dll = std::wstring(sysdir) + L"\\DriverStore\\FileRepository\\" + fd.cFileName + L"\\_nvngx.dll";
-                if (GetFileAttributesW(dll.c_str()) != INVALID_FILE_ATTRIBUTES) {
-                    if (HMODULE m = LoadLibraryW(dll.c_str())) {
-                        FindClose(h);
-                        return m;
-                    }
-                }
-            } while (FindNextFileW(h, &fd));
-            FindClose(h);
-        }
-    }
-    return nullptr;
-}
-
 uint32_t fsr_quality_mode(int mode)
 {
     switch (mode) {
@@ -208,7 +242,17 @@ NVSDK_NGX_PerfQuality_Value dlss_quality_mode(int mode)
     }
 }
 
-#endif
+void mat4_mul_transpose_f64(const float a[16], const float b[16], float out[16])
+{
+    for (int r = 0; r < 4; r++) {
+        for (int c = 0; c < 4; c++) {
+            double s = 0.0;
+            for (int k = 0; k < 4; k++)
+                s += (double)a[r * 4 + k] * (double)b[k * 4 + c];
+            out[c * 4 + r] = (float)s;
+        }
+    }
+}
 
 void transition_image(VkCommandBuffer cmd, VkImage img, VkImageAspectFlags aspect,
                       VkImageLayout old_l, VkImageLayout new_l,
@@ -312,6 +356,32 @@ bool upscaler::ensure_mv_image(uint32_t width, uint32_t height)
     return true;
 }
 
+bool upscaler::ensure_exposure(VkCommandBuffer cmd)
+{
+    if (m_exposure_img) return true;
+    VkImageCreateInfo ii{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+    ii.imageType = VK_IMAGE_TYPE_2D;
+    ii.format = VK_FORMAT_R32_SFLOAT;
+    ii.extent = { 1, 1, 1 };
+    ii.mipLevels = 1;
+    ii.arrayLayers = 1;
+    ii.samples = VK_SAMPLE_COUNT_1_BIT;
+    ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ii.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    VmaAllocationCreateInfo ai{};
+    ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    if (vmaCreateImage(m_d->vma, &ii, &ai, &m_exposure_img, &m_exposure_mem, nullptr) != VK_SUCCESS) return false;
+    transition_image(cmd, m_exposure_img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                     VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    const VkClearColorValue one{ { 1.f, 1.f, 1.f, 1.f } };
+    const VkImageSubresourceRange range{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    vkCmdClearColorImage(cmd, m_exposure_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &one, 1, &range);
+    transition_image(cmd, m_exposure_img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    return true;
+}
+
 void upscaler::destroy_mv_image()
 {
     if (!m_d) return;
@@ -326,14 +396,9 @@ void upscaler::destroy_mv_image()
 
 bool upscaler::init_ffx()
 {
-#ifdef _WIN32
-    HMODULE mod = load_dll_from_upscalers(L"amd_fidelityfx_loader_vk.dll");
+    if (k_ffx_needs_descriptor_buffer && !m_d->caps.descriptor_buffer) return false;
+    void* mod = open_bundled(k_ffx_module);
     if (!mod) return false;
-    ffxLoadFunctions(&g_ffx.fn, mod);
-    if (!g_ffx.fn.CreateContext || !g_ffx.fn.DestroyContext || !g_ffx.fn.Dispatch || !g_ffx.fn.Query) {
-        FreeLibrary(mod);
-        return false;
-    }
     VkDeviceContext dev_ctx{ m_d->dev, m_d->gpu, vkGetDeviceProcAddr };
     uint64_t count = 0;
     ffxQueryDescGetVersions qv{};
@@ -341,41 +406,36 @@ bool upscaler::init_ffx()
     qv.createDescType = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
     qv.device = &dev_ctx;
     qv.outputCount = &count;
-    if (g_ffx.fn.Query(nullptr, &qv.header) != FFX_API_RETURN_OK || count == 0) {
-        FreeLibrary(mod);
+    if (!load(mod, "ffxCreateContext", g_ffx.create) || !load(mod, "ffxDestroyContext", g_ffx.destroy) ||
+        !load(mod, "ffxQuery", g_ffx.query) || !load(mod, "ffxDispatch", g_ffx.dispatch) ||
+        g_ffx.query(nullptr, &qv.header) != FFX_API_RETURN_OK || count == 0) {
+        lib_close(mod);
         return false;
     }
     std::vector<uint64_t> ids((size_t)count);
     std::vector<const char*> names((size_t)count);
     qv.versionIds = ids.data();
     qv.versionNames = names.data();
-    if (g_ffx.fn.Query(nullptr, &qv.header) == FFX_API_RETURN_OK && count > 0 && names[0] && names[0][0])
-        std::snprintf(m_fsr_version, sizeof m_fsr_version, "%s", names[0]);
+    if (g_ffx.query(nullptr, &qv.header) == FFX_API_RETURN_OK && names[0])
+        if (const char* v = std::strpbrk(names[0], "0123456789"))
+            std::snprintf(m_fsr_version, sizeof m_fsr_version, "%.*s", (int)std::strcspn(v, " "), v);
     m_ffx_mod = mod;
-    m_ffx_ok = true;
     return true;
-#else
-    return false;
-#endif
 }
 
 void upscaler::destroy_ffx_context()
 {
-#ifdef _WIN32
-    if (m_ffx_ctx && g_ffx.fn.DestroyContext) {
-        if (m_d) vkDeviceWaitIdle(m_d->dev);
+    if (m_ffx_ctx) {
+        vkDeviceWaitIdle(m_d->dev);
         ffxContext ctx = m_ffx_ctx;
-        g_ffx.fn.DestroyContext(&ctx, nullptr);
+        g_ffx.destroy(&ctx, nullptr);
     }
-#endif
     m_ffx_ctx = nullptr;
     m_ffx_rw = m_ffx_rh = m_ffx_dw = m_ffx_dh = 0;
 }
 
 bool upscaler::ensure_ffx_context(uint32_t render_w, uint32_t render_h, uint32_t display_w, uint32_t display_h)
 {
-#ifdef _WIN32
-    if (!m_ffx_ok) return false;
     if (m_ffx_ctx && m_ffx_rw == render_w && m_ffx_rh == render_h && m_ffx_dw == display_w && m_ffx_dh == display_h)
         return true;
     destroy_ffx_context();
@@ -394,14 +454,15 @@ bool upscaler::ensure_ffx_context(uint32_t render_w, uint32_t render_h, uint32_t
     desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
     desc.header.pNext = &ver.header;
     desc.flags = FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE;
+    desc.fpMessage = [](uint32_t, const wchar_t* message) { std::fprintf(stderr, "[ffx] %ls\n", message); };
     desc.maxRenderSize = { render_w, render_h };
     desc.maxUpscaleSize = { display_w, display_h };
 
     ffxContext ctx = nullptr;
-    ffxReturnCode_t rc = g_ffx.fn.CreateContext(&ctx, &desc.header, nullptr);
+    ffxReturnCode_t rc = g_ffx.create(&ctx, &desc.header, nullptr);
     if (rc != FFX_API_RETURN_OK || !ctx) {
         desc.header.pNext = &backend.header;
-        rc = g_ffx.fn.CreateContext(&ctx, &desc.header, nullptr);
+        rc = g_ffx.create(&ctx, &desc.header, nullptr);
     }
     if (rc != FFX_API_RETURN_OK || !ctx) return false;
     m_ffx_ctx = ctx;
@@ -410,87 +471,48 @@ bool upscaler::ensure_ffx_context(uint32_t render_w, uint32_t render_h, uint32_t
     m_ffx_dw = display_w;
     m_ffx_dh = display_h;
     return true;
-#else
-    (void)render_w; (void)render_h; (void)display_w; (void)display_h;
-    return false;
-#endif
 }
 
-bool upscaler::init_ngx()
+bool upscaler::init_ngx(const std::string& cache_path)
 {
-#ifdef _WIN32
-    if (m_d->props.vendorID != 0x10DEu) return false;
-    const std::wstring up_dir = upscaler_dir_w();
-    const std::wstring ex_dir = exe_dir_w();
-    const std::wstring dlss_a = up_dir + L"\\nvngx_dlss.dll";
-    const std::wstring dlss_b = ex_dir + L"\\nvngx_dlss.dll";
-    if (GetFileAttributesW(dlss_a.c_str()) == INVALID_FILE_ATTRIBUTES &&
-        GetFileAttributesW(dlss_b.c_str()) == INVALID_FILE_ATTRIBUTES)
-        return false;
-    HMODULE mod = load_ngx_core_dll();
+    if (m_d->props.vendorID != 0x10DEu || !bundled(k_dlss_module)) return false;
+    void* mod = open_ngx_core();
     if (!mod) return false;
-    g_ngx.init_proj = reinterpret_cast<ngx_procs::pfn_init_proj>(GetProcAddress(mod, "NVSDK_NGX_VULKAN_Init_with_ProjectID"));
-    g_ngx.shutdown1 = reinterpret_cast<ngx_procs::pfn_shutdown1>(GetProcAddress(mod, "NVSDK_NGX_VULKAN_Shutdown1"));
-    g_ngx.get_cap_params = reinterpret_cast<ngx_procs::pfn_get_cap_params>(GetProcAddress(mod, "NVSDK_NGX_VULKAN_GetCapabilityParameters"));
-    g_ngx.destroy_params = reinterpret_cast<ngx_procs::pfn_destroy_params>(GetProcAddress(mod, "NVSDK_NGX_VULKAN_DestroyParameters"));
-    g_ngx.create1 = reinterpret_cast<ngx_procs::pfn_create1>(GetProcAddress(mod, "NVSDK_NGX_VULKAN_CreateFeature1"));
-    g_ngx.release = reinterpret_cast<ngx_procs::pfn_release>(GetProcAddress(mod, "NVSDK_NGX_VULKAN_ReleaseFeature"));
-    g_ngx.eval = reinterpret_cast<ngx_procs::pfn_eval>(GetProcAddress(mod, "NVSDK_NGX_VULKAN_EvaluateFeature"));
-    g_ngx.set_ui = reinterpret_cast<PFN_NVSDK_NGX_Parameter_SetUI>(GetProcAddress(mod, "NVSDK_NGX_Parameter_SetUI"));
-    g_ngx.set_i = reinterpret_cast<PFN_NVSDK_NGX_Parameter_SetI>(GetProcAddress(mod, "NVSDK_NGX_Parameter_SetI"));
-    g_ngx.set_f = reinterpret_cast<PFN_NVSDK_NGX_Parameter_SetF>(GetProcAddress(mod, "NVSDK_NGX_Parameter_SetF"));
-    g_ngx.set_ptr = reinterpret_cast<PFN_NVSDK_NGX_Parameter_SetVoidPointer>(GetProcAddress(mod, "NVSDK_NGX_Parameter_SetVoidPointer"));
-    g_ngx.get_i = reinterpret_cast<PFN_NVSDK_NGX_Parameter_GetI>(GetProcAddress(mod, "NVSDK_NGX_Parameter_GetI"));
-    if (!g_ngx.init_proj || !g_ngx.shutdown1 || !g_ngx.get_cap_params || !g_ngx.destroy_params ||
-        !g_ngx.create1 || !g_ngx.release || !g_ngx.eval || !g_ngx.set_ui || !g_ngx.set_i || !g_ngx.set_f || !g_ngx.set_ptr || !g_ngx.get_i) {
-        FreeLibrary(mod);
-        return false;
-    }
-    const wchar_t* paths[2] = { up_dir.c_str(), ex_dir.c_str() };
+    const std::wstring data_dir = fs::path(reinterpret_cast<const char8_t*>(cache_path.c_str())).parent_path().wstring();
+    const std::wstring dirs[2] = { upscaler_dir().wstring(), exe_dir().wstring() };
+    const wchar_t* paths[2] = { dirs[0].c_str(), dirs[1].c_str() };
     NVSDK_NGX_FeatureCommonInfo common{};
     common.PathListInfo.Path = paths;
     common.PathListInfo.Length = 2;
-    const std::wstring& app_dir = GetFileAttributesW(up_dir.c_str()) != INVALID_FILE_ATTRIBUTES ? up_dir : ex_dir;
-    NVSDK_NGX_Result r = g_ngx.init_proj("a9f4c2e1-7b38-4d5a-9c12-6e8f0a4b2c7d", NVSDK_NGX_ENGINE_TYPE_CUSTOM, "1.0",
-                                         app_dir.c_str(), m_d->instance, m_d->gpu, m_d->dev,
-                                         vkGetInstanceProcAddr, vkGetDeviceProcAddr, &common, NVSDK_NGX_Version_API);
-    if (NVSDK_NGX_FAILED(r)) {
-        FreeLibrary(mod);
-        return false;
-    }
     NVSDK_NGX_Parameter* params = nullptr;
-    r = g_ngx.get_cap_params(&params);
-    if (NVSDK_NGX_FAILED(r) || !params) {
-        g_ngx.shutdown1(m_d->dev);
-        FreeLibrary(mod);
+    int dlss_avail = 0;
+    if (!load(mod, k_ngx_init, g_ngx.init) || !load(mod, "NVSDK_NGX_VULKAN_Shutdown1", g_ngx.shutdown) ||
+        !load(mod, "NVSDK_NGX_VULKAN_GetCapabilityParameters", g_ngx.get_cap_params) ||
+        !load(mod, "NVSDK_NGX_VULKAN_DestroyParameters", g_ngx.destroy_params) ||
+        !load(mod, "NVSDK_NGX_VULKAN_CreateFeature1", g_ngx.create) || !load(mod, "NVSDK_NGX_VULKAN_ReleaseFeature", g_ngx.release) ||
+        !load(mod, "NVSDK_NGX_VULKAN_EvaluateFeature", g_ngx.eval) || !load_ngx_params(mod) ||
+        NVSDK_NGX_FAILED(ngx_init(*m_d, data_dir.c_str(), &common))) {
+        lib_close(mod);
         return false;
     }
-    int dlss_avail = 0;
-    g_ngx.get_i(params, NVSDK_NGX_Parameter_SuperSampling_Available, &dlss_avail);
-    if (!dlss_avail) {
-        g_ngx.destroy_params(params);
-        g_ngx.shutdown1(m_d->dev);
-        FreeLibrary(mod);
+    if (NVSDK_NGX_FAILED(g_ngx.get_cap_params(&params)) || !params ||
+        NVSDK_NGX_FAILED(g_ngx.get_i(params, NVSDK_NGX_Parameter_SuperSampling_Available, &dlss_avail)) || !dlss_avail) {
+        if (params) g_ngx.destroy_params(params);
+        g_ngx.shutdown(m_d->dev);
+        lib_close(mod);
         return false;
     }
     m_ngx_mod = mod;
     m_ngx_params = params;
-    m_ngx_inited = true;
-    m_ngx_ok = true;
     return true;
-#else
-    return false;
-#endif
 }
 
 void upscaler::destroy_ngx_feature()
 {
-#ifdef _WIN32
-    if (m_ngx_handle && g_ngx.release) {
-        if (m_d) vkDeviceWaitIdle(m_d->dev);
+    if (m_ngx_handle) {
+        vkDeviceWaitIdle(m_d->dev);
         g_ngx.release(static_cast<NVSDK_NGX_Handle*>(m_ngx_handle));
     }
-#endif
     m_ngx_handle = nullptr;
     m_ngx_mode = 0;
     m_ngx_rw = m_ngx_rh = m_ngx_dw = m_ngx_dh = 0;
@@ -498,8 +520,6 @@ void upscaler::destroy_ngx_feature()
 
 bool upscaler::ensure_ngx_feature(VkCommandBuffer cmd, int mode, uint32_t render_w, uint32_t render_h, uint32_t display_w, uint32_t display_h)
 {
-#ifdef _WIN32
-    if (!m_ngx_ok || !m_ngx_params) return false;
     if (m_ngx_handle && m_ngx_mode == mode && m_ngx_rw == render_w && m_ngx_rh == render_h && m_ngx_dw == display_w && m_ngx_dh == display_h)
         return true;
     destroy_ngx_feature();
@@ -518,7 +538,7 @@ bool upscaler::ensure_ngx_feature(VkCommandBuffer cmd, int mode, uint32_t render
     g_ngx.set_i(p, NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, NVSDK_NGX_DLSS_Feature_Flags_MVLowRes);
     g_ngx.set_i(p, NVSDK_NGX_Parameter_DLSS_Enable_Output_Subrects, 0);
     NVSDK_NGX_Handle* handle = nullptr;
-    if (NVSDK_NGX_FAILED(g_ngx.create1(m_d->dev, cmd, NVSDK_NGX_Feature_SuperSampling, p, &handle)) || !handle)
+    if (NVSDK_NGX_FAILED(g_ngx.create(m_d->dev, cmd, NVSDK_NGX_Feature_SuperSampling, p, &handle)) || !handle)
         return false;
     m_ngx_handle = handle;
     m_ngx_mode = mode;
@@ -527,47 +547,53 @@ bool upscaler::ensure_ngx_feature(VkCommandBuffer cmd, int mode, uint32_t render
     m_ngx_dw = display_w;
     m_ngx_dh = display_h;
     return true;
-#else
-    (void)cmd; (void)mode; (void)render_w; (void)render_h; (void)display_w; (void)display_h;
-    return false;
-#endif
 }
 
-bool upscaler::create(vk_device& d, VkPipelineCache cache)
+bool upscaler::create(vk_device& d, VkPipelineCache cache, const std::string& cache_path)
 {
     m_d = &d;
-    if (!init_mv_pipeline(cache)) return false;
     init_ffx();
-    init_ngx();
-    std::fprintf(stderr, "[vk] upscalers: FSR %s (%d), DLSS 4 (%d)\n", m_fsr_version, (int)m_ffx_ok, (int)m_ngx_ok);
+    init_ngx(cache_path);
+    std::fprintf(stderr, "[vk] upscalers: FSR %s (%d), DLSS (%d)\n", m_fsr_version, m_ffx_mod != nullptr, m_ngx_mod != nullptr);
+    if ((m_ffx_mod || m_ngx_mod) && !init_mv_pipeline(cache)) {
+        destroy();
+        return false;
+    }
     return true;
+}
+
+void upscaler::release_ffx()
+{
+    destroy_ffx_context();
+    if (m_ffx_mod) lib_close(m_ffx_mod);
+    m_ffx_mod = nullptr;
+}
+
+void upscaler::release_ngx()
+{
+    destroy_ngx_feature();
+    if (m_ngx_mod) {
+        g_ngx.destroy_params(static_cast<NVSDK_NGX_Parameter*>(m_ngx_params));
+        g_ngx.shutdown(m_d->dev);
+        lib_close(m_ngx_mod);
+    }
+    m_ngx_params = nullptr;
+    m_ngx_mod = nullptr;
 }
 
 void upscaler::destroy()
 {
-    destroy_ffx_context();
-    destroy_ngx_feature();
-#ifdef _WIN32
-    if (m_ngx_params && g_ngx.destroy_params)
-        g_ngx.destroy_params(static_cast<NVSDK_NGX_Parameter*>(m_ngx_params));
-    if (m_ngx_inited && m_d && g_ngx.shutdown1)
-        g_ngx.shutdown1(m_d->dev);
-    if (m_ngx_mod) FreeLibrary(static_cast<HMODULE>(m_ngx_mod));
-    if (m_ffx_mod) FreeLibrary(static_cast<HMODULE>(m_ffx_mod));
-#endif
-    m_ngx_params = nullptr;
-    m_ngx_inited = false;
-    m_ngx_ok = false;
-    m_ngx_mod = nullptr;
-    m_ffx_ok = false;
-    m_ffx_mod = nullptr;
+    if (!m_d) return;
+    release_ffx();
+    release_ngx();
     destroy_mv_image();
-    if (m_d) {
-        if (m_mv_pipe) vkDestroyPipeline(m_d->dev, m_mv_pipe, nullptr);
-        if (m_mv_layout) vkDestroyPipelineLayout(m_d->dev, m_mv_layout, nullptr);
-        if (m_mv_set) vkDestroyDescriptorSetLayout(m_d->dev, m_mv_set, nullptr);
-        if (m_sampler) vkDestroySampler(m_d->dev, m_sampler, nullptr);
-    }
+    if (m_exposure_img) vmaDestroyImage(m_d->vma, m_exposure_img, m_exposure_mem);
+    m_exposure_img = VK_NULL_HANDLE;
+    m_exposure_mem = nullptr;
+    if (m_mv_pipe) vkDestroyPipeline(m_d->dev, m_mv_pipe, nullptr);
+    if (m_mv_layout) vkDestroyPipelineLayout(m_d->dev, m_mv_layout, nullptr);
+    if (m_mv_set) vkDestroyDescriptorSetLayout(m_d->dev, m_mv_set, nullptr);
+    if (m_sampler) vkDestroySampler(m_d->dev, m_sampler, nullptr);
     m_mv_pipe = VK_NULL_HANDLE;
     m_mv_layout = VK_NULL_HANDLE;
     m_mv_set = VK_NULL_HANDLE;
@@ -577,13 +603,12 @@ void upscaler::destroy()
 
 int upscaler::caps() const
 {
-    return (m_ffx_ok ? 1 : 0) | (m_ngx_ok ? 2 : 0);
+    return (m_ffx_mod ? RSX_VK_UPSCALE_CAP_FSR : 0) | (m_ngx_mod ? RSX_VK_UPSCALE_CAP_DLSS : 0);
 }
 
 void upscaler::render_size(uint32_t display_w, uint32_t display_h, int mode, uint32_t& out_w, uint32_t& out_h) const
 {
-#ifdef _WIN32
-    if (is_fsr_mode(mode) && m_ffx_ok && g_ffx.fn.Query) {
+    if (is_fsr_mode(mode) && m_ffx_mod) {
         uint32_t rw = 0, rh = 0;
         ffxQueryDescUpscaleGetRenderResolutionFromQualityMode q{};
         q.header.type = FFX_API_QUERY_DESC_TYPE_UPSCALE_GETRENDERRESOLUTIONFROMQUALITYMODE;
@@ -592,13 +617,12 @@ void upscaler::render_size(uint32_t display_w, uint32_t display_h, int mode, uin
         q.qualityMode = fsr_quality_mode(mode);
         q.pOutRenderWidth = &rw;
         q.pOutRenderHeight = &rh;
-        if (g_ffx.fn.Query(nullptr, &q.header) == FFX_API_RETURN_OK && rw && rh) {
+        if (g_ffx.query(nullptr, &q.header) == FFX_API_RETURN_OK && rw && rh) {
             out_w = rw;
             out_h = rh;
             return;
         }
     }
-#endif
     const float r = mode_ratio(mode);
     out_w = std::max(1u, (uint32_t)std::lround((double)display_w / r));
     out_h = std::max(1u, (uint32_t)std::lround((double)display_h / r));
@@ -610,15 +634,14 @@ void upscaler::jitter(int mode, uint32_t render_w, uint32_t display_w, uint32_t 
         out_jx = out_jy = 0.f;
         return;
     }
-#ifdef _WIN32
-    if (is_fsr_mode(mode) && m_ffx_ok && g_ffx.fn.Query) {
+    if (is_fsr_mode(mode) && m_ffx_mod) {
         int32_t phase_count = 0;
         ffxQueryDescUpscaleGetJitterPhaseCount qp{};
         qp.header.type = FFX_API_QUERY_DESC_TYPE_UPSCALE_GETJITTERPHASECOUNT;
         qp.renderWidth = render_w;
         qp.displayWidth = display_w;
         qp.pOutPhaseCount = &phase_count;
-        if (g_ffx.fn.Query(nullptr, &qp.header) == FFX_API_RETURN_OK && phase_count > 0) {
+        if (g_ffx.query(nullptr, &qp.header) == FFX_API_RETURN_OK && phase_count > 0) {
             float jx = 0.f, jy = 0.f;
             ffxQueryDescUpscaleGetJitterOffset qo{};
             qo.header.type = FFX_API_QUERY_DESC_TYPE_UPSCALE_GETJITTEROFFSET;
@@ -626,14 +649,13 @@ void upscaler::jitter(int mode, uint32_t render_w, uint32_t display_w, uint32_t 
             qo.phaseCount = phase_count;
             qo.pOutX = &jx;
             qo.pOutY = &jy;
-            if (g_ffx.fn.Query(nullptr, &qo.header) == FFX_API_RETURN_OK) {
+            if (g_ffx.query(nullptr, &qo.header) == FFX_API_RETURN_OK) {
                 out_jx = jx;
                 out_jy = jy;
                 return;
             }
         }
     }
-#endif
     const double ratio = (double)display_w / (double)render_w;
     const uint32_t phases = std::max(8u, (uint32_t)std::ceil(8.0 * ratio * ratio));
     const uint32_t idx = (frame_index % phases) + 1u;
@@ -649,10 +671,16 @@ bool upscaler::dispatch(VkCommandBuffer cmd, int mode,
                         uint32_t render_w, uint32_t render_h, uint32_t display_w, uint32_t display_h,
                         const rsx_vk_upscale_frame& frame)
 {
-    if (!m_d || !m_mv_pipe || mode == RSX_VK_UPSCALE_OFF) return false;
-    if (is_fsr_mode(mode) && !m_ffx_ok) return false;
-    if (is_dlss_mode(mode) && !m_ngx_ok) return false;
-    if (!ensure_mv_image(render_w, render_h)) return false;
+    const bool fsr = is_fsr_mode(mode) && m_ffx_mod;
+    const bool dlss = is_dlss_mode(mode) && m_ngx_mod;
+    if (!m_mv_pipe || !(fsr || dlss) || !ensure_mv_image(render_w, render_h)) return false;
+    if (fsr ? !ensure_ffx_context(render_w, render_h, display_w, display_h) || !ensure_exposure(cmd)
+            : !ensure_ngx_feature(cmd, mode, render_w, render_h, display_w, display_h)) {
+        std::fprintf(stderr, "[vk] %s unavailable on this device, disabling it\n", fsr ? "FSR" : "DLSS");
+        if (fsr) release_ffx();
+        else release_ngx();
+        return false;
+    }
 
     transition_image(cmd, m_mv_img, VK_IMAGE_ASPECT_COLOR_BIT,
                      VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
@@ -695,9 +723,7 @@ bool upscaler::dispatch(VkCommandBuffer cmd, int mode,
                      VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                      VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
 
-#ifdef _WIN32
-    if (is_fsr_mode(mode)) {
-        if (!ensure_ffx_context(render_w, render_h, display_w, display_h)) return false;
+    if (fsr) {
         auto make_res = [](VkImage img, VkFormat fmt, uint32_t width, uint32_t height, uint32_t usage, uint32_t state) {
             FfxApiResource r{};
             r.resource = img;
@@ -721,6 +747,7 @@ bool upscaler::dispatch(VkCommandBuffer cmd, int mode,
         dd.depth = make_res(depth_img, depth_fmt, render_w, render_h, depth_usage, FFX_API_RESOURCE_STATE_COMPUTE_READ);
         dd.motionVectors = make_res(m_mv_img, VK_FORMAT_R16G16_SFLOAT, render_w, render_h, FFX_API_RESOURCE_USAGE_READ_ONLY, FFX_API_RESOURCE_STATE_COMPUTE_READ);
         dd.output = make_res(out_img, out_fmt, display_w, display_h, FFX_API_RESOURCE_USAGE_UAV, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+        dd.exposure = make_res(m_exposure_img, VK_FORMAT_R32_SFLOAT, 1, 1, FFX_API_RESOURCE_USAGE_READ_ONLY, FFX_API_RESOURCE_STATE_COMPUTE_READ);
         dd.jitterOffset = { frame.jitter_x, frame.jitter_y };
         dd.motionVectorScale = { 1.f, 1.f };
         dd.renderSize = { render_w, render_h };
@@ -736,40 +763,30 @@ bool upscaler::dispatch(VkCommandBuffer cmd, int mode,
         dd.viewSpaceToMetersFactor = 0.02f;
         dd.flags = FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_SRGB;
         ffxContext ctx = m_ffx_ctx;
-        return g_ffx.fn.Dispatch(&ctx, &dd.header) == FFX_API_RETURN_OK;
+        return g_ffx.dispatch(&ctx, &dd.header) == FFX_API_RETURN_OK;
     }
 
-    if (is_dlss_mode(mode)) {
-        if (!ensure_ngx_feature(cmd, mode, render_w, render_h, display_w, display_h)) return false;
-        const VkImageSubresourceRange color_sr{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-        const VkImageSubresourceRange depth_sr{ VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 };
-        NVSDK_NGX_Resource_VK r_color = NVSDK_NGX_Create_ImageView_Resource_VK(color_view, color_img, color_sr, color_fmt, render_w, render_h, false);
-        NVSDK_NGX_Resource_VK r_depth = NVSDK_NGX_Create_ImageView_Resource_VK(depth_view, depth_img, depth_sr, depth_fmt, render_w, render_h, false);
-        NVSDK_NGX_Resource_VK r_mv = NVSDK_NGX_Create_ImageView_Resource_VK(m_mv_view, m_mv_img, color_sr, VK_FORMAT_R16G16_SFLOAT, render_w, render_h, false);
-        NVSDK_NGX_Resource_VK r_out = NVSDK_NGX_Create_ImageView_Resource_VK(out_view, out_img, color_sr, out_fmt, display_w, display_h, true);
-        auto* p = static_cast<NVSDK_NGX_Parameter*>(m_ngx_params);
-        g_ngx.set_ptr(p, NVSDK_NGX_Parameter_Color, &r_color);
-        g_ngx.set_ptr(p, NVSDK_NGX_Parameter_Output, &r_out);
-        g_ngx.set_ptr(p, NVSDK_NGX_Parameter_Depth, &r_depth);
-        g_ngx.set_ptr(p, NVSDK_NGX_Parameter_MotionVectors, &r_mv);
-        g_ngx.set_f(p, NVSDK_NGX_Parameter_Jitter_Offset_X, -frame.jitter_x);
-        g_ngx.set_f(p, NVSDK_NGX_Parameter_Jitter_Offset_Y, -frame.jitter_y);
-        g_ngx.set_f(p, NVSDK_NGX_Parameter_MV_Scale_X, 1.f);
-        g_ngx.set_f(p, NVSDK_NGX_Parameter_MV_Scale_Y, 1.f);
-        g_ngx.set_i(p, NVSDK_NGX_Parameter_Reset, frame.reset ? 1 : 0);
-        g_ngx.set_ui(p, NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, render_w);
-        g_ngx.set_ui(p, NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, render_h);
-        g_ngx.set_f(p, NVSDK_NGX_Parameter_DLSS_Pre_Exposure, 1.f);
-        g_ngx.set_f(p, NVSDK_NGX_Parameter_FrameTimeDeltaInMsec, std::max(frame.dt_ms, 0.1f));
-        return NVSDK_NGX_SUCCEED(g_ngx.eval(cmd, static_cast<NVSDK_NGX_Handle*>(m_ngx_handle), p, nullptr));
-    }
-#else
-    (void)color_img; (void)color_view; (void)color_fmt;
-    (void)depth_img; (void)depth_view; (void)depth_fmt;
-    (void)out_img; (void)out_view; (void)out_fmt;
-    (void)display_w; (void)display_h;
-#endif
-    return false;
+    const VkImageSubresourceRange color_sr{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    const VkImageSubresourceRange depth_sr{ VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 };
+    NVSDK_NGX_Resource_VK r_color = NVSDK_NGX_Create_ImageView_Resource_VK(color_view, color_img, color_sr, color_fmt, render_w, render_h, false);
+    NVSDK_NGX_Resource_VK r_depth = NVSDK_NGX_Create_ImageView_Resource_VK(depth_view, depth_img, depth_sr, depth_fmt, render_w, render_h, false);
+    NVSDK_NGX_Resource_VK r_mv = NVSDK_NGX_Create_ImageView_Resource_VK(m_mv_view, m_mv_img, color_sr, VK_FORMAT_R16G16_SFLOAT, render_w, render_h, false);
+    NVSDK_NGX_Resource_VK r_out = NVSDK_NGX_Create_ImageView_Resource_VK(out_view, out_img, color_sr, out_fmt, display_w, display_h, true);
+    auto* p = static_cast<NVSDK_NGX_Parameter*>(m_ngx_params);
+    g_ngx.set_ptr(p, NVSDK_NGX_Parameter_Color, &r_color);
+    g_ngx.set_ptr(p, NVSDK_NGX_Parameter_Output, &r_out);
+    g_ngx.set_ptr(p, NVSDK_NGX_Parameter_Depth, &r_depth);
+    g_ngx.set_ptr(p, NVSDK_NGX_Parameter_MotionVectors, &r_mv);
+    g_ngx.set_f(p, NVSDK_NGX_Parameter_Jitter_Offset_X, -frame.jitter_x);
+    g_ngx.set_f(p, NVSDK_NGX_Parameter_Jitter_Offset_Y, -frame.jitter_y);
+    g_ngx.set_f(p, NVSDK_NGX_Parameter_MV_Scale_X, 1.f);
+    g_ngx.set_f(p, NVSDK_NGX_Parameter_MV_Scale_Y, 1.f);
+    g_ngx.set_i(p, NVSDK_NGX_Parameter_Reset, frame.reset ? 1 : 0);
+    g_ngx.set_ui(p, NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, render_w);
+    g_ngx.set_ui(p, NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, render_h);
+    g_ngx.set_f(p, NVSDK_NGX_Parameter_DLSS_Pre_Exposure, 1.f);
+    g_ngx.set_f(p, NVSDK_NGX_Parameter_FrameTimeDeltaInMsec, std::max(frame.dt_ms, 0.1f));
+    return NVSDK_NGX_SUCCEED(g_ngx.eval(cmd, static_cast<NVSDK_NGX_Handle*>(m_ngx_handle), p, nullptr));
 }
 
 }

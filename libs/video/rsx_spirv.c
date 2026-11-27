@@ -905,8 +905,9 @@ static u32 vp_fetch_bits(vpc* c, u32 addr, u32 size, u32 esz, u32 ncomp, u32 len
     u32 bw = ushr(s, t, addr, cu(s, 2));
     u32 bb = uand(s, t, addr, cu(s, 3));
     u32 am = newl(s), la = newl(s), lu = newl(s);
+    u32 aligned = I(s, OpIEqual, tbool(s), bb, cu(s, 0));
     V(s, OpSelectionMerge, am, 0);
-    V(s, OpBranchConditional, I(s, OpIEqual, tbool(s), bb, cu(s, 0)), la, lu);
+    V(s, OpBranchConditional, aligned, la, lu);
 
     label(s, la);
     if (esz == 4) {
@@ -2546,8 +2547,9 @@ static u32 fp_tex(fpc* c, const fpi* i, u32 op, u32 s0, u32 s1, u32 s2)
             u32 pcf_rad = bc(s, TF, ex(s, tu(s), ts, 1));
             u32 rv = lvar(s, TF);
             u32 m = newl(s), tl = newl(s), fl = newl(s);
+            u32 use_pcf = I(s, OpFOrdGreaterThan, tbool(s), pcf_rad, cf(s, 0.0f));
             V(s, OpSelectionMerge, m, 0);
-            V(s, OpBranchConditional, I(s, OpFOrdGreaterThan, tbool(s), pcf_rad, cf(s, 0.0f)), tl, fl);
+            V(s, OpBranchConditional, use_pcf, tl, fl);
             label(s, tl);
             {
                 u32 sx = fmul(s, TF, exf(s, sc, 0), pcf_rad);
@@ -3436,7 +3438,7 @@ int rsx_spv_motion_vectors(rsx_spv_blob* out)
     sel_end(s, merge);
     sb_ins(s, BODY(s), OpReturn, k_none, 0);
     fn_end(s);
-    const u32 caps[2] = { 1, 44 };
+    const u32 caps[2] = { 1, 49 };
     return spv_finish(s, 5, caps, 2, mainid, NULL, 0, out);
 }
 

@@ -160,6 +160,7 @@ private:
     surface* surface_at(u32 ea, u32 pitch, u32 bpp, u32& x, u32& y);
     surface* scanout_surface(u32 ea, u32 pitch) const;
     scale2d scale_for(u32 width, u32 height, u32 aa_u, u32 aa_v, bool depth, bool depth_only = false) const;
+    void rescale_surface(VkCommandBuffer c, surface& s, scale2d to);
     surface* surface_for(u32 ea, u32 pitch, u32 width, u32 height, u32 format, bool depth, u32 aa_u, u32 aa_v,
                          const surface* const* keep = nullptr, u32 keep_count = 0, bool depth_only = false);
     bool create_image(image& img, VkFormat format, u32 width, u32 height, VkImageUsageFlags usage, VkImageAspectFlags aspect);
@@ -209,6 +210,8 @@ private:
     upscaler m_upscaler;
     bool m_upscaled_this_frame = false;
     bool m_last_frame_upscaled = false;
+    bool m_upscale_resync = false;
+    bool rendering_reduced() const { return m_last_frame_upscaled && !m_upscaled_this_frame; }
     surface* m_scene_color = nullptr;
     surface* m_scene_depth = nullptr;
     surface* m_scene_velocity = nullptr;
