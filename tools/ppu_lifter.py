@@ -3186,7 +3186,7 @@ class PPULifter:
             rb = _reg_idx(ops[2])
             return (f"{{ uint64_t ea = ({_xea(ra,rb)}) & ~3ULL; "
                     f"vmx_st(&ctx->vr[{vd}], _mm_setzero_si128()); "
-                    f"ctx->vr[{vd}].w[3u - (((uint32_t)ea & 12u) >> 2)] = vm_read32(ea); }}")
+                    f"vmx_sw((uint8_t*)&ctx->vr[{vd}], (int)(((uint32_t)ea & 12u) >> 2), vm_read32(ea)); }}")
 
         if mn == "lvebx" or mn == "lvehx":
             vd = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
@@ -3203,7 +3203,7 @@ class PPULifter:
             ra = _reg_idx(ops[1])
             rb = _reg_idx(ops[2])
             return (f"{{ uint64_t ea = ({_xea(ra,rb)}) & ~3ULL; "
-                    f"vm_write32(ea, ctx->vr[{vs}].w[3u - (((uint32_t)ea & 12u) >> 2)]); }}")
+                    f"vm_write32(ea, vmx_w((const uint8_t*)&ctx->vr[{vs}], (int)(((uint32_t)ea & 12u) >> 2))); }}")
 
         if mn == "stvebx" or mn == "stvehx":
             vs = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])

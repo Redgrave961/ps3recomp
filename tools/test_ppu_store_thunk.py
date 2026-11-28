@@ -296,7 +296,7 @@ def test_store_thunk():
                 assert r.returncode == 0, r.stdout + r.stderr
                 objs.append(str(obj))
             exe = td / ("t" + opt + (".exe" if os.name == "nt" else ""))
-            libs = ["-lsynchronization"] if os.name == "nt" else ["-lpthread", "-lm", "-rdynamic"]
+            libs = ["-static", "-lsynchronization"] if os.name == "nt" else ["-lpthread", "-lm", "-rdynamic"]
             r = subprocess.run([cxx, "-o", str(exe), *objs, *libs], capture_output=True, text=True)
             assert r.returncode == 0, r.stdout + r.stderr
             out = subprocess.run([str(exe)], capture_output=True, text=True)

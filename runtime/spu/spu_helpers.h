@@ -266,48 +266,50 @@ static inline void spu_ls_lzf_decompress(uint8_t* ls, uint32_t* p_src, uint32_t 
             dst = (uint32_t)(dp - ls);
             if (src >= src_end) break;
         }
-        const uint32_t ctrl = ls[src++ & 0x3FFFFu];
-        if (ctrl < 32u) {
-            const uint32_t len = ctrl + 1u;
-            const uint32_t s = src & 0x3FFFFu, d = dst & 0x3FFFFu;
-            if (__builtin_expect(s + len <= 0x40000u && d + len <= 0x40000u, 1)) {
-                if (__builtin_expect(d >= s + len || s >= d + len, 1))
-                    spu_copy_exact_nonoverlap(ls + d, ls + s, len);
-                else
-                    spu_ls_copy_fwd(ls, d, s, len);
-            } else {
-                for (uint32_t i = 0; i < len; ++i)
-                    ls[(dst + i) & 0x3FFFFu] = ls[(src + i) & 0x3FFFFu];
-            }
-            src += len;
-            dst += len;
-        } else {
-            uint32_t len = ctrl >> 5;
-            uint32_t ref = dst - ((ctrl & 31u) << 8) - 1u;
-            if (len == 7u) len += ls[src++ & 0x3FFFFu];
-            ref -= ls[src++ & 0x3FFFFu];
-            len += 2u;
-            const uint32_t s = ref & 0x3FFFFu, d = dst & 0x3FFFFu;
-            if (__builtin_expect(s + len <= 0x40000u && d + len <= 0x40000u, 1)) {
-                uint8_t* dp = ls + d;
-                const uint8_t* sp = ls + s;
-                const uint32_t dist = d - s;
-                if (dist >= len) {
-                    spu_copy_exact_nonoverlap(dp, sp, len);
-                } else if (dist == 1u) {
-                    memset(dp, sp[0], len);
-                } else if (dist >= 8u) {
-                    uint32_t i = 0;
-                    for (; i + 8u <= len; i += 8u) memcpy(dp + i, sp + i, 8);
-                    for (; i < len; ++i) dp[i] = sp[i];
+        {
+            const uint32_t ctrl = ls[src++ & 0x3FFFFu];
+            if (ctrl < 32u) {
+                const uint32_t len = ctrl + 1u;
+                const uint32_t s = src & 0x3FFFFu, d = dst & 0x3FFFFu;
+                if (__builtin_expect(s + len <= 0x40000u && d + len <= 0x40000u, 1)) {
+                    if (__builtin_expect(d >= s + len || s >= d + len, 1))
+                        spu_copy_exact_nonoverlap(ls + d, ls + s, len);
+                    else
+                        spu_ls_copy_fwd(ls, d, s, len);
                 } else {
-                    for (uint32_t i = 0; i < len; ++i) dp[i] = sp[i];
+                    for (uint32_t i = 0; i < len; ++i)
+                        ls[(dst + i) & 0x3FFFFu] = ls[(src + i) & 0x3FFFFu];
                 }
+                src += len;
+                dst += len;
             } else {
-                for (uint32_t i = 0; i < len; ++i)
-                    ls[(dst + i) & 0x3FFFFu] = ls[(ref + i) & 0x3FFFFu];
+                uint32_t len = ctrl >> 5;
+                uint32_t ref = dst - ((ctrl & 31u) << 8) - 1u;
+                if (len == 7u) len += ls[src++ & 0x3FFFFu];
+                ref -= ls[src++ & 0x3FFFFu];
+                len += 2u;
+                const uint32_t s = ref & 0x3FFFFu, d = dst & 0x3FFFFu;
+                if (__builtin_expect(s + len <= 0x40000u && d + len <= 0x40000u, 1)) {
+                    uint8_t* dp = ls + d;
+                    const uint8_t* sp = ls + s;
+                    const uint32_t dist = d - s;
+                    if (dist >= len) {
+                        spu_copy_exact_nonoverlap(dp, sp, len);
+                    } else if (dist == 1u) {
+                        memset(dp, sp[0], len);
+                    } else if (dist >= 8u) {
+                        uint32_t i = 0;
+                        for (; i + 8u <= len; i += 8u) memcpy(dp + i, sp + i, 8);
+                        for (; i < len; ++i) dp[i] = sp[i];
+                    } else {
+                        for (uint32_t i = 0; i < len; ++i) dp[i] = sp[i];
+                    }
+                } else {
+                    for (uint32_t i = 0; i < len; ++i)
+                        ls[(dst + i) & 0x3FFFFu] = ls[(ref + i) & 0x3FFFFu];
+                }
+                dst += len;
             }
-            dst += len;
         }
 next_outer:;
     }

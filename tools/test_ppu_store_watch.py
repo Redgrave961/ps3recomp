@@ -178,7 +178,7 @@ def test_store_watch():
                 assert r.returncode == 0, r.stdout + r.stderr
                 objs.append(str(obj))
             exe = td / ("t" + opt + (".exe" if os.name == "nt" else ""))
-            libs = [] if os.name == "nt" else ["-lpthread", "-lm"]
+            libs = ["-static"] if os.name == "nt" else ["-lpthread", "-lm"]
             r = subprocess.run([cxx, "-o", str(exe), *objs, *libs], capture_output=True, text=True)
             assert r.returncode == 0, r.stdout + r.stderr
             out = subprocess.run([str(exe)], capture_output=True, text=True)

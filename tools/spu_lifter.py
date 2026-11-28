@@ -145,6 +145,7 @@ _RRR_DEST_OPS = {"selb", "shufb", "mpya", "fnms", "fma", "fms"}
 _CLEAN_FLOAT = {"fa", "fs", "fm", "fma", "fms", "fnms"}
 _ZERO_SIGN_SAFE = {"fa", "fs", "fm", "fma", "fms", "fnms", "fcgt", "fceq", "fcmgt", "fcmeq", "cflts", "cfltu"}
 _CLEAN_MOVE = {"ori", "ai", "shlqbyi", "rotqbyi"}
+_WORD_SPLAT = (0x00010203, 0x04050607, 0x08090A0B, 0x0C0D0E0F, 0x10111213, 0x14151617, 0x18191A1B, 0x1C1D1E1F)
 _CLOBBER_ALL = {"brsl", "brasl", "bisl", "bisled", "stop", "stopd", "iret"}
 
 def _dest_reg(insn) -> int:
@@ -415,9 +416,9 @@ class SPULifter:
                 new.add(("c", d))
             elif mn == "shufb":
                 kv = const.get(r[3])
-                if kv in (0x00010203, 0x04050607, 0x08090A0B, 0x0C0D0E0F) and ("c", r[1]) in s:
+                if kv in _WORD_SPLAT[:4] and ("c", r[1]) in s:
                     new.add(("c", d))
-                elif kv in (0x10111213, 0x14151617, 0x18191A1B, 0x1C1D1E1F) and ("c", r[2]) in s:
+                elif kv in _WORD_SPLAT[4:] and ("c", r[2]) in s:
                     new.add(("c", d))
             return frozenset(f for f in s if f[1] != d) | new
 
@@ -444,7 +445,7 @@ class SPULifter:
                         work.append(j)
         return facts
 
-    def _zero_sign_needed(self, fins, entries) -> list:
+    def _zero_sign_needed(self, fins, facts) -> list:
         n = len(fins)
         if not n:
             return []
@@ -508,9 +509,12 @@ class SPULifter:
                 reads[k] = frozenset()
             elif mn in ("shufb", "selb") and len(o) >= 4:
                 m1, m2, m3 = reg_re.search(o[1]), reg_re.search(o[2]), reg_re.search(o[3])
-                if m1 and m2 and m3:
+                rc = int(m3.group(1)) if m3 else None
+                words = ("m", rc) in facts[k] if mn == "selb" else any(
+                    f[0] == "k" and f[1] == rc and f[2] in _WORD_SPLAT for f in facts[k])
+                if m1 and m2 and m3 and words:
                     prop_reads[k] = frozenset((int(m1.group(1)), int(m2.group(1))))
-                    reads[k] = frozenset((int(m3.group(1)),))
+                    reads[k] = frozenset((rc,))
                 else:
                     reads[k] = frozenset(rs)
             else:
@@ -745,7 +749,7 @@ class SPULifter:
             for _la, _ls in self._lzf_loops(fins, copies).items():
                 copies[_la] = _ls + copies.get(_la, "")
         facts = self._known_facts(fins, entry_starts)
-        zs_need = self._zero_sign_needed(fins, entry_starts)
+        zs_need = self._zero_sign_needed(fins, facts)
         for k, insn in enumerate(fins):
             self._facts = facts[k]
             self._zs_need = zs_need[k]

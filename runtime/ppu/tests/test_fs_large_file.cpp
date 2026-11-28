@@ -18,6 +18,9 @@ int sys_fs_translate_path(const char* g, char* h, int n)
     return snprintf(h, (size_t)n, "%s%s%s", ppu_vfs_root, *r == '/' ? "" : "/", r) < n;
 }
 void ps3_hle_register_ctx(uint32_t, const char*, void (*)(ppu_context*)) {}
+int vm_commit_host(const void*, size_t) { return 1; }
+void vm_io_begin(const void*, size_t) {}
+void vm_io_end(const void*, size_t) {}
 }
 #include "../../platform/ps3_dev_flash.c"
 #include "../../../libs/filesystem/npdrm.h"

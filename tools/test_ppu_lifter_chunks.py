@@ -42,7 +42,7 @@ def snapshot(out):
 
 def chunk_of(snap, name):
     return [f for f, (_, txt) in snap.items()
-            if f.startswith("ppu_recomp_") and f"void {name}(ppu_context* ctx) {{" in txt]
+            if f.startswith("ppu_recomp_") and f"void {name}(ppu_context* __restrict ctx) {{" in txt]
 
 
 def main() -> int:

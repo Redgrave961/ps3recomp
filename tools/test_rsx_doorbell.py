@@ -82,7 +82,9 @@ static void rsx_side(u32 i, u32* r)
     } else if (kind == 1u) {
         while (!rsx_idle_over(&park)) rsx_await(rsx_idle_over, &park, INFINITE);
     } else if (kind == 2u) {
+        __atomic_add_fetch(&s_sema_waiters, 1u, __ATOMIC_SEQ_CST);
         while (rsx_load(word_ea) != i) rsx_await(rsx_label_over, &sema, INFINITE);
+        __atomic_sub_fetch(&s_sema_waiters, 1u, __ATOMIC_RELEASE);
     } else if (kind == 3u) {
         rsx_core_wait_label(word_ea, word);
     } else {
@@ -141,6 +143,7 @@ int main(int argc, char** argv)
     (void)argc;
     ppu_hle_inject_base = 0x10000u;
     vm_base = (uint8_t*)calloc(1, 0x40000u);
+    s.call_pos = RSX_NO_CALL;
     for (u32 i = 0; i < 1000u; i++) rsx_core_doorbell();
     for (u32 i = 0; i < 1000u; i++) rsx_core_window_written();
     if (s.bell) { printf("doorbell bumped with no sleeper: %u\n", s.bell); return 5; }

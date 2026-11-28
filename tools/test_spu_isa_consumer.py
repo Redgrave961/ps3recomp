@@ -47,13 +47,19 @@ if(PS3RECOMP_HAS_MSSE41)
     target_compile_definitions(consumer_cxx PRIVATE SPU_CONSUMER_REQUIRE_SSE41=1)
 endif()
 ''')
+        packages=[]
+        for package,target in [('SDL3','SDL3::SDL3'),('VulkanHeaders','Vulkan::Headers'),('volk','volk::volk'),
+                               ('VulkanMemoryAllocator','GPUOpen::VulkanMemoryAllocator')]:
+            config=out/'packages'/package;config.mkdir(parents=True)
+            (config/(package+'Config.cmake')).write_text(f'add_library({target} INTERFACE IMPORTED)\n')
+            packages.append(f'-D{package}_DIR={config.as_posix()}')
         for label,extra in [('probed',[]),('probe-false',['-DPS3RECOMP_HAS_MSSE41:BOOL=OFF'])]:
             build=out/label
             run([a.cmake,'-S',str(out),'-B',str(build),'-G','Ninja',
                  '-DCMAKE_MAKE_PROGRAM='+a.ninja,'-DCMAKE_BUILD_TYPE=Release',
                  '-DCMAKE_C_COMPILER='+a.cc,'-DCMAKE_CXX_COMPILER='+a.cxx,
                  '-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded',
-                 *extra])
+                 *packages,*extra])
             cache=(build/'CMakeCache.txt').read_text()
             enabled=bool(re.search(r'^PS3RECOMP_HAS_MSSE41:(?:INTERNAL|BOOL)=(?:1|ON|TRUE)$',cache,re.M))
             commands=json.loads((build/'compile_commands.json').read_text())

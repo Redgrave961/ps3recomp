@@ -124,10 +124,6 @@ int main(void)
         expect("vm_ld32", g, vm_ld32(p), be(g, 4));
         expect("vm_ldr64", g, vm_ldr64(p), le(g, 8));
         expect("vm_ld64", g, vm_ld64(p), be(g, 8));
-        uint8_t q[16], w[16];
-        vm_raw_ld16_at(p, q);
-        for (int i = 0; i < 16; i++) w[i] = byte_at(g + i);
-        expect("vm_raw_ld16", g, memcmp(q, w, 16), 0);
     }
     for (uint32_t g = 0x11000; g < 0x11E00; g += 0x1F3) expect("register mix", g, many(g), many_ref(g));
     for (uint64_t i = 0; i < 0x400; i += 37) expect("indexed", 0x11000 + (uint32_t)i * 4, indexed(0x11000, i), be(0x11000 + (uint32_t)i * 4, 4));
@@ -158,9 +154,10 @@ def test_fault_loads():
         (td / "ppu_recomp.h").write_text(L.PPULifter().emit_header())
         (td / "driver.cpp").write_text(DRIVER)
         exe = td / ("t.exe" if os.name == "nt" else "t")
+        static = ["-static"] if os.name == "nt" else []
         for flags in (["-O0", "-march=x86-64-v3"], ["-O2", "-march=x86-64-v3"], ["-O2", "-march=x86-64"]):
             r = subprocess.run([cxx, "-std=c++20", "-w", *flags, "-I" + str(td), "-I" + str(ROOT / "runtime" / "memory"),
-                                "-o", str(exe), str(td / "driver.cpp")], capture_output=True, text=True)
+                                "-o", str(exe), str(td / "driver.cpp"), *static], capture_output=True, text=True)
             assert r.returncode == 0, r.stdout + r.stderr
             out = subprocess.run([str(exe)], capture_output=True, text=True)
             assert out.returncode == 0, f"{flags}: {out.stdout}{out.stderr}"

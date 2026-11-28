@@ -37,10 +37,8 @@ def _lift_one(mnemonic, operands):
     return "\n".join(ln for ln in func.body_lines if "return" not in ln)
 
 
-def _be(kind, vals):
-    if kind == "f":
-        return struct.pack(">4f", *vals)
-    return struct.pack(">4I", *vals)
+def _vr(kind, vals):
+    return struct.pack(">4f" if kind == "f" else ">4I", *vals)[::-1]
 
 
 CASES = [
@@ -78,8 +76,8 @@ def check_vcmp_record_sets_cr6(cc, mn, kind, a, b, cr6):
         "#include \"ppu_vmx.h\"",
         "typedef struct { uint8_t vr[32][16]; uint32_t cr; } ctx_t;",
         "int main(void) { static ctx_t c; ctx_t* ctx = &c;",
-        "  const unsigned char A[16] = {" + ",".join(str(x) for x in _be(kind, a)) + "};",
-        "  const unsigned char B[16] = {" + ",".join(str(x) for x in _be(kind, b)) + "};",
+        "  const unsigned char A[16] = {" + ",".join(str(x) for x in _vr(kind, a)) + "};",
+        "  const unsigned char B[16] = {" + ",".join(str(x) for x in _vr(kind, b)) + "};",
         "  memcpy(ctx->vr[1], A, 16); memcpy(ctx->vr[2], B, 16);",
         "  ctx->cr = 0xFFFFFFFFu;  /* stale CR6 = 0xF: must be overwritten */",
         body,

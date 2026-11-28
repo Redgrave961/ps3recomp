@@ -103,7 +103,7 @@ with tempfile.TemporaryDirectory(prefix="lift-jobmods-verified-") as tmp:
           "module is the initialised image (imageSize - 32)")
     for m in manifest:
         src = (tmp / "out" / m["name"] / "spu_recomp.c").read_text()
-        starts = {int(x, 16) for x in re.findall(r"^void \w*spu_func_([0-9A-F]{8})\(spu_context\* ctx\)\s*\{",
+        starts = {int(x, 16) for x in re.findall(r"^void \w*spu_func_([0-9A-F]{8})\(spu_context\* __restrict ctx\)\s*\{",
                                                   src, re.M)}
         check(starts and max(starts) < m["code_end"], f"{m['name']}: nothing lifted past code_end")
         check(m["entry"] in starts and BASE + 0x30 in starts, f"{m['name']}: entry and +0x30 lifted")
@@ -144,12 +144,9 @@ with tempfile.TemporaryDirectory(prefix="lift-jobmods-verified-") as tmp:
                           capture_output=True, text=True)
     check(both.returncode != 0, "--jobmods and --engine-elf are mutually exclusive")
 
-    if os.name == "nt":
-        print("SKIP runtime residency: fixture requires the POSIX compiler/linker")
-    else:
-        spu = ROOT / "runtime/spu"
-        driver = tmp / "driver.c"
-        driver.write_text(r'''
+    spu = ROOT / "runtime/spu"
+    driver = tmp / "driver.c"
+    driver.write_text(r'''
 #include "spu_interp.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -203,28 +200,29 @@ int main(void)
 }
 '''.replace("A_EA", hex(A_EA) + "u").replace("B_EA", hex(B_EA) + "u")
    .replace("A2_EA", hex(A2_EA) + "u").replace("A_CODE_END", hex(A_CODE_END)))
-        data = tmp / "modules.c"
-        data.write_text("".join(
-            f"const unsigned char {n}[] = {{{','.join(str(x) for x in raw)}}};\n"
-            f"const unsigned {n}_len = {len(raw)};\n" for n, raw in (("mod_a", A), ("mod_b", B))))
-        sources = ["spu_channels.c", "spu_drain.c", "spu_lockstep.c", "spu_coherency.c",
-                   "spu_workload.c", "spu_interp.c"]
-        lifted = [str(tmp / "out" / m["name"] / "spu_recomp.c") for m in manifest]
-        binary = tmp / "residency"
-        subprocess.run([os.environ.get("CC", "cc"), "-std=gnu17", "-O1", "-UNDEBUG", "-w",
-                        "-I" + str(ROOT / "include"), "-I" + str(spu),
-                        "-I" + str(ROOT / "runtime/platform"),
-                        str(driver), str(data), str(tmp / "out/jobmods_register.c"), *lifted,
-                        *[str(spu / s) for s in sources],
-                        str(ROOT / "runtime/platform/win32_compat.c"), str(ROOT / "runtime/platform/ps3_sync.c"), str(ROOT / "runtime/spu/tests/spu_fixture_ppu.c"), "-pthread", "-lm",
-                        "-o", str(binary)], check=True)
-        r = subprocess.run([str(binary)], capture_output=True, text=True, timeout=10, cwd=tmp,
-                           env={k: v for k, v in os.environ.items()
-                                if not k.startswith(("SPU_", "SPURS_"))})
-        print(r.stdout.strip())
-        if r.stderr.strip():
-            print(r.stderr.strip()[-2000:])
-        check(r.returncode == 0, "runtime residency with code-only spans")
+    data = tmp / "modules.c"
+    data.write_text("".join(
+        f"const unsigned char {n}[] = {{{','.join(str(x) for x in raw)}}};\n"
+        f"const unsigned {n}_len = {len(raw)};\n" for n, raw in (("mod_a", A), ("mod_b", B))))
+    sources = ["spu_channels.c", "spu_drain.c", "spu_lockstep.c", "spu_coherency.c",
+               "spu_workload.c", "spu_interp.c"]
+    lifted = [str(tmp / "out" / m["name"] / "spu_recomp.c") for m in manifest]
+    binary = tmp / ("residency.exe" if os.name == "nt" else "residency")
+    libs = ["-static", "-lsynchronization"] if os.name == "nt" else ["-pthread", "-lm"]
+    subprocess.run([os.environ.get("CC", "cc"), "-std=gnu17", "-O1", "-UNDEBUG", "-w",
+                    "-I" + str(ROOT / "include"), "-I" + str(spu),
+                    "-I" + str(ROOT / "runtime/platform"),
+                    str(driver), str(data), str(tmp / "out/jobmods_register.c"), *lifted,
+                    *[str(spu / s) for s in sources],
+                    str(ROOT / "runtime/platform/win32_compat.c"), str(ROOT / "runtime/platform/ps3_sync.c"), str(ROOT / "runtime/spu/tests/spu_fixture_ppu.c"), *libs,
+                    "-o", str(binary)], check=True)
+    r = subprocess.run([str(binary)], capture_output=True, text=True, timeout=10, cwd=tmp,
+                       env={k: v for k, v in os.environ.items()
+                            if not k.startswith(("SPU_", "SPURS_"))})
+    print(r.stdout.strip())
+    if r.stderr.strip():
+        print(r.stderr.strip()[-2000:])
+    check(r.returncode == 0, "runtime residency with code-only spans")
 
 if failures:
     raise SystemExit("FAILED: " + "; ".join(failures))

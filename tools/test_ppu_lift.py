@@ -828,18 +828,19 @@ extern "C" void vm_write64(uint64_t a, uint64_t v) { v = CONF_BSWAP64(v); memcpy
         out.append(f'    {{ /* vcase {i}: {nm} | {insn.mnemonic} {insn.operands} */')
         out.append("      memset(ctx, 0, sizeof(*ctx));")
         out.append(f"      {{ uint8_t _vb[16] = {{ {vb_hex} }}; "
-                    f"memcpy(&ctx->vr[{c['vb_reg']}], _vb, 16); }}")
+                    f"vmx_rev(&ctx->vr[{c['vb_reg']}], _vb); }}")
         if c.get("va_reg") is not None:
             va_hex = ", ".join(f"0x{b:02X}" for b in c["va_bytes"])
             out.append(f"      {{ uint8_t _va[16] = {{ {va_hex} }}; "
-                        f"memcpy(&ctx->vr[{c['va_reg']}], _va, 16); }}")
+                        f"vmx_rev(&ctx->vr[{c['va_reg']}], _va); }}")
         if c.get("vc_reg") is not None:
             vc_hex = ", ".join(f"0x{b:02X}" for b in c["vc_bytes"])
             out.append(f"      {{ uint8_t _vc[16] = {{ {vc_hex} }}; "
-                        f"memcpy(&ctx->vr[{c['vc_reg']}], _vc, 16); }}")
+                        f"vmx_rev(&ctx->vr[{c['vc_reg']}], _vc); }}")
         out.append(f"      {code}")
-        out.append(f"      {{ uint8_t _want[16] = {{ {want_hex} }}; "
-                    f'check_vr("{nm}", (const uint8_t*)&ctx->vr[{c["vd_reg"]}], _want); }}')
+        out.append(f"      {{ uint8_t _want[16] = {{ {want_hex} }}; uint8_t _got[16]; "
+                    f"vmx_rev(_got, &ctx->vr[{c['vd_reg']}]); "
+                    f'check_vr("{nm}", _got, _want); }}')
         out.append("    }")
 
     n_vector_memory = 0
@@ -861,15 +862,16 @@ extern "C" void vm_write64(uint64_t a, uint64_t v) { v = CONF_BSWAP64(v); memcpy
                     out.append("    { memset(ctx, 0, sizeof(*ctx));")
                     out.append("      memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));")
                     out.append("      for (int k=0; k<16; ++k) { "
-                               "((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); "
+                               "((uint8_t*)&ctx->vr[2])[15-k] = (uint8_t)(0x10+k); "
                                "g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }")
                     out.append(f"      ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; "
                                f"ctx->gpr[4]={ea if ra == 0 else ea-0x200};")
                     out.append(f"      {code}")
                     if load:
                         want = ",".join(str(0xA0+lane+k) for k in range(width))
-                        out.append(f"      const uint8_t want[] = {{{want}}};")
-                        check = f"memcmp((uint8_t*)&ctx->vr[2]+{lane}, want, {width}) == 0"
+                        out.append(f"      const uint8_t want[] = {{{want}}}; "
+                                   "uint8_t _g[16]; vmx_rev(_g, &ctx->vr[2]);")
+                        check = f"memcmp(_g+{lane}, want, {width}) == 0"
                     else:
                         want = [0xA0+k for k in range(16)]
                         want[lane:lane+width] = [0x10+lane+k for k in range(width)]

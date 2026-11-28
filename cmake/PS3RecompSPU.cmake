@@ -1,3 +1,5 @@
+set(PS3RECOMP_SPU_COMPILE_OPTIONS -fdenormal-fp-math=preserve-sign)
+
 function(ps3recomp_generate_spu output_dir)
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
     set(command "${Python3_EXECUTABLE}" "${PS3RECOMP_DIR}/tools/build_spu_workloads.py"

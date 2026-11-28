@@ -144,7 +144,7 @@ def test_store_protocol():
             assert r.returncode == 0, r.stdout + r.stderr
             objs.append(str(obj))
         exe = td / ("t.exe" if os.name == "nt" else "t")
-        libs = ["-lsynchronization"] if os.name == "nt" else ["-lpthread", "-lm"]
+        libs = ["-static", "-lsynchronization"] if os.name == "nt" else ["-lpthread", "-lm"]
         r = subprocess.run([cxx, "-o", str(exe), *objs, *libs], capture_output=True, text=True)
         assert r.returncode == 0, r.stdout + r.stderr
         out = subprocess.run([str(exe)], capture_output=True, text=True)

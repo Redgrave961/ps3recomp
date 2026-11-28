@@ -103,7 +103,7 @@ def lift(td, words, at, bounds):
 
 
 def body(src, addr):
-    m = re.search(r"^void func_%08X\(ppu_context\* ctx\) \{\n(.*?)^\}\n" % addr, src, re.M | re.S)
+    m = re.search(r"^void func_%08X\(ppu_context\* __restrict ctx\) \{\n(.*?)^\}\n" % addr, src, re.M | re.S)
     return m.group(1) if m else None
 
 

@@ -43,6 +43,8 @@ add_library(ps3recomp_runtime STATIC
     ${HLE_SOURCES}
     ${RUNTIME_SOURCES}
 )
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/PS3RecompSPU.cmake")
+set_source_files_properties(runtime/spu/spu_interp.c runtime/spu/spu_channels.c PROPERTIES COMPILE_OPTIONS "${PS3RECOMP_SPU_COMPILE_OPTIONS}")
 
 target_include_directories(ps3recomp_runtime PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include"

@@ -13,6 +13,7 @@ static inline int vm_emulate_load(uint64_t* r, uint64_t* rip, const uint8_t* vb,
     if (*p == 0x66) { o16 = 1; p++; }
     if ((*p & 0xF0) == 0x40) rex = *p++;
     if (p[0] == 0x0F && (p[1] == 0xB6 || p[1] == 0xB7)) { width = p[1] == 0xB6 ? 1 : 2; zx = 1; p += 2; }
+    else if (p[0] == 0x8A) { width = 1; p += 1; }
     else if (p[0] == 0x8B) { width = rex & 8 ? 8 : o16 ? 2 : 4; p += 1; }
     else if (p[0] == 0x0F && p[1] == 0x38 && p[2] == 0xF0) { width = rex & 8 ? 8 : o16 ? 2 : 4; swap = 1; p += 3; }
     else return 0;
@@ -40,7 +41,8 @@ static inline int vm_emulate_load(uint64_t* r, uint64_t* rip, const uint8_t* vb,
     read((uint32_t)g, width, b);
     uint64_t x = 0;
     for (int i = 0; i < width; i++) x |= (uint64_t)b[swap ? width - 1 - i : i] << (8 * i);
-    r[reg] = (width == 2 && !zx) ? (r[reg] & ~0xFFFFull) | x : x;
+    if (width == 1 && !zx && !rex && reg >= 4) r[reg - 4] = (r[reg - 4] & ~0xFF00ull) | x << 8;
+    else r[reg] = (width < 4 && !zx) ? (r[reg] & ~((1ull << (8 * width)) - 1)) | x : x;
     *rip = (uint64_t)(uintptr_t)p;
     return 1;
 }

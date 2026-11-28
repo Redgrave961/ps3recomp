@@ -268,7 +268,7 @@ def main():
                 if "_k(" not in f.read():
                     skipped += 1
             exe = os.path.join(pdir, ("m" if merge else "s") + ".exe")
-            b = subprocess.run([cc, "-std=gnu17", "-O2", "-march=x86-64-v3", "-w", "-I", out, "-I", pdir,
+            b = subprocess.run([cc, "-std=gnu17", "-O2", "-march=x86-64-v3", "-fdenormal-fp-math=preserve-sign", "-w", "-I", out, "-I", pdir,
                                 "-I", os.path.join(REPO, "include"), "-I", os.path.join(REPO, "runtime"),
                                 "-I", os.path.join(REPO, "runtime", "spu"), os.path.join(out, "spu_recomp.c"), harness,
                                 "-o", exe], capture_output=True, text=True)
