@@ -4,7 +4,7 @@
 #include <stdio.h>
 #include <string.h>
 
-void ps3_dev_flash_path(char* out, size_t cap, const char* roots, const char* rel)
+int ps3_dev_flash_path(char* out, size_t cap, const char* roots, const char* rel)
 {
 #ifdef _WIN32
     const char sep = ';';
@@ -20,9 +20,10 @@ void ps3_dev_flash_path(char* out, size_t cap, const char* roots, const char* re
         r = e ? e + 1 : NULL;
         if (!n) continue;
         if (!first_n) { first = entry; first_n = n; }
-        snprintf(out, cap, "%.*s/%s", (int)n, entry, rel);
+        const int len = snprintf(out, cap, "%.*s/%s", (int)n, entry, rel);
         ps3_host_stat_t st;
-        if (ps3_utf8_stat64(out, &st) == 0) return;
+        if (len >= 0 && (size_t)len < cap && ps3_utf8_stat64(out, &st) == 0) return 1;
     }
-    snprintf(out, cap, "%.*s/%s", (int)first_n, first, rel);
+    const int len = snprintf(out, cap, "%.*s/%s", (int)first_n, first, rel);
+    return len >= 0 && (size_t)len < cap;
 }

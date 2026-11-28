@@ -1,4 +1,5 @@
 #include "sysPrxForUser.h"
+#include "cellSaveData.h"
 #include <ps3emu/guest_call.h>
 #include "../../runtime/ppu/ppu_memory.h"
 #include <stdio.h>
@@ -13,6 +14,7 @@
 #else
 #include <pthread.h>
 #include <sched.h>
+#include <unistd.h>
 #endif
 
 #ifdef _WIN32
@@ -25,15 +27,46 @@ static void slot_lock(void)   { pthread_mutex_lock(&s_slot_lock); }
 static void slot_unlock(void) { pthread_mutex_unlock(&s_slot_lock); }
 #endif
 
-int g_sys_process_exit_called = 0;
-s32 g_sys_process_exit_code   = 0;
+#define PS3_EXIT_HOOKS 8
+
+static void (*s_exit_hooks[PS3_EXIT_HOOKS])(void);
+static int s_exit_hook_count;
+static int s_exiting;
+
+void ps3_process_at_exit(void (*hook)(void))
+{
+    const int slot = __atomic_fetch_add(&s_exit_hook_count, 1, __ATOMIC_ACQ_REL);
+    if (slot < PS3_EXIT_HOOKS) __atomic_store_n(&s_exit_hooks[slot], hook, __ATOMIC_RELEASE);
+}
+
+void ps3_process_exit(int code)
+{
+    if (__atomic_exchange_n(&s_exiting, 1, __ATOMIC_ACQ_REL)) {
+        for (;;) {
+#ifdef _WIN32
+            Sleep(INFINITE);
+#else
+            pause();
+#endif
+        }
+    }
+    ps3_savedata_shutdown();
+    const int registered = __atomic_load_n(&s_exit_hook_count, __ATOMIC_ACQUIRE);
+    for (int i = (registered < PS3_EXIT_HOOKS ? registered : PS3_EXIT_HOOKS) - 1; i >= 0; i--) {
+        void (*hook)(void) = __atomic_load_n(&s_exit_hooks[i], __ATOMIC_ACQUIRE);
+        if (hook) hook();
+    }
+    fflush(NULL);
+#ifdef _WIN32
+    TerminateProcess(GetCurrentProcess(), (UINT)code);
+#endif
+    _exit(code);
+}
 
 void sys_process_exit(s32 exitcode)
 {
-    g_sys_process_exit_code   = exitcode;
-    g_sys_process_exit_called = 1;
     printf("[sysPrxForUser] sys_process_exit(code=%d)\n", exitcode);
-    exit(exitcode);
+    ps3_process_exit(exitcode);
 }
 
 s32 sys_process_getpid(void)

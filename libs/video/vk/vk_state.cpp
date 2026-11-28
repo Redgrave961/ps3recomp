@@ -121,11 +121,6 @@ float half_to_float(uint16_t h)
     return out;
 }
 
-bool restart_capable(uint32_t prim)
-{
-    return prim == PRIM_TRIANGLE_STRIP || prim == PRIM_QUAD_STRIP || prim == PRIM_LINE_STRIP || prim == PRIM_TRIANGLE_FAN;
-}
-
 }
 
 void fill_pipeline_state(const frontend& f, const vk_device& d, const draw_target& t, uint32_t prim, pipeline_key& key)
@@ -227,7 +222,7 @@ void set_dynamic_state(VkCommandBuffer cmd, const frontend& f, const vk_device& 
     s.front = f.r(rsx::M_FRONT_FACE) == 0x901u ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
     bool emulated;
     s.topology = primitive_topology(prim, emulated);
-    s.restart = restart && restart_capable(prim);
+    s.restart = restart;
     s.polygon_mode = key.polygon_mode;
     s.depth_clamp = key.depth_clamp;
     s.depth_clip = key.depth_clip;

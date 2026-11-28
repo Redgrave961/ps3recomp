@@ -7,7 +7,6 @@
 #include <windows.h>
 #else
 #include "../../runtime/platform/win32_compat.h"
-#include <SDL3/SDL_messagebox.h>
 #include <time.h>
 #endif
 
@@ -689,6 +688,8 @@ static void rsx_run_args(u32 put)
         const u32 ea = rsx_io_to_ea(s.get);
         if (!ea) {
             rsx_fault("arguments unmapped", s.get, s.method_reg);
+            rsx_publish_get_fast();
+            rsx_wait_change(put);
             return;
         }
         u32 n = s.method_left;
@@ -765,16 +766,7 @@ static void rsx_control(u32 cmd, u32 put)
 static DWORD WINAPI rsx_fifo_thread(LPVOID unused)
 {
     (void)unused;
-    if (s.renderer && s.renderer->open && s.renderer->open(s.renderer->user) != 0) {
-        fprintf(stderr, "[rsx] renderer failed to open\n");
-        fflush(NULL);
-#ifdef _WIN32
-        MessageBoxA(NULL, "The Vulkan renderer failed to start. The console log has the reason.", "Renderer error", MB_OK | MB_ICONERROR);
-#else
-        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Renderer error", "The Vulkan renderer failed to start. The console log has the reason.", NULL);
-#endif
-        _Exit(1);
-    }
+    if (s.renderer && s.renderer->open) s.renderer->open(s.renderer->user);
     for (;;) {
         rsx_service_immediate();
         rsx_run_calls();

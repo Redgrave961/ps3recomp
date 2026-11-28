@@ -11,7 +11,7 @@
 #include "vk_smaa.h"
 #include "vk_trophy_toast.h"
 #include "../../input/pad_bindings.h"
-#include "../../system/cellSaveData.h"
+#include "../../system/sysPrxForUser.h"
 #include "ps3emu/thread_name.h"
 
 #include <SDL3/SDL.h>
@@ -28,14 +28,11 @@
 #include <string>
 #include <thread>
 
-#if defined(ASURA_PGO_GEN)
-extern "C" int __llvm_profile_write_file(void);
-#endif
-
 namespace {
 
 constexpr uint32_t k_slots = 4;
 constexpr uint32_t k_present_frames = 3;
+constexpr int k_exit_no_renderer = 9;
 
 
 int64_t now_ns()
@@ -70,6 +67,7 @@ struct swapchain {
     std::vector<VkImage> images;
     std::vector<VkImageView> views;
     std::vector<VkSemaphore> ready;
+    uint64_t presented = 0;
 };
 
 struct state {
@@ -78,7 +76,12 @@ struct state {
     std::string icon_path;
     std::mutex lock;
     std::condition_variable cv;
-    int status = 0;
+    bool ready = false;
+    std::thread::id window_thread;
+    std::atomic<uint32_t> fatal_event{ 0 };
+    std::once_flag failed_once;
+    std::atomic<int> failure{ VK_SUCCESS };
+    const char* failed_call = "";
     SDL_Window* window = nullptr;
     std::atomic<uint32_t> pixel_w{ 0 };
     std::atomic<uint32_t> pixel_h{ 0 };
@@ -88,7 +91,9 @@ struct state {
 
     vk_device d;
     VkSurfaceKHR surface = VK_NULL_HANDLE;
+    bool surface_lost = false;
     swapchain sc;
+    uint64_t present_id = 0;
     VkSemaphore timeline = VK_NULL_HANDLE;
     uint64_t submitted = 0;
     vk::renderer r;
@@ -151,6 +156,53 @@ double since_start()
 void mark(const char* what)
 {
     if (stats_on()) std::fprintf(stderr, "[vk] %.3f s %s\n", since_start(), what);
+}
+
+[[noreturn]] void fail_exit()
+{
+    const VkResult r = (VkResult)g.failure.load(std::memory_order_acquire);
+    const char* reason = r == VK_ERROR_DEVICE_LOST           ? "The graphics driver stopped responding."
+                         : r == VK_ERROR_OUT_OF_DEVICE_MEMORY ? "The graphics card ran out of video memory."
+                         : r == VK_ERROR_OUT_OF_HOST_MEMORY   ? "The graphics driver ran out of system memory."
+                                                              : "The graphics driver reported an unrecoverable error.";
+    char text[1024];
+    std::snprintf(text, sizeof text,
+                  "%s\n\n%s returned %d.\nGPU: %s\nDriver: %s %s\n\nThe game will now close. If this keeps happening, update the graphics driver.",
+                  reason, g.failed_call, (int)r, g.d.props.deviceName, g.d.driver.driverName, g.d.driver.driverInfo);
+    SDL_SetWindowRelativeMouseMode(g.window, false);
+    SDL_ShowCursor();
+    SDL_SetWindowFullscreen(g.window, false);
+    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, g.title.c_str(), text, g.window);
+    ps3_process_exit(EXIT_FAILURE);
+}
+
+[[noreturn]] void start_failed()
+{
+    const std::string reason = !g.d.unsupported.empty() ? g.d.unsupported
+                               : !g.window             ? "The game window could not be created: " + std::string(SDL_GetError()) + "\n"
+                                                       : "The graphics driver could not start Vulkan.\n";
+    std::fprintf(stderr, "[vk] renderer cannot start: %s", reason.c_str());
+    const std::string text = "Vajra cannot start its renderer.\n\n" + reason +
+                             "\nIt needs a graphics card and driver with Vulkan 1.3. Updating the graphics driver from NVIDIA, AMD or Intel usually fixes this.";
+    if (g.window) {
+        SDL_SetWindowFullscreen(g.window, false);
+        SDL_ShowCursor();
+    }
+    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, g.title.c_str(), text.c_str(), g.window);
+    ps3_process_exit(k_exit_no_renderer);
+}
+
+void device_failed(VkResult result, const char* call)
+{
+    vk::drop_caches_if_compiling();
+    std::call_once(g.failed_once, [&] {
+        g.failed_call = call;
+        g.failure.store(result, std::memory_order_release);
+    });
+    if (std::this_thread::get_id() == g.window_thread) fail_exit();
+    SDL_Event e{};
+    e.type = g.fatal_event;
+    SDL_PushEvent(&e);
 }
 
 void read_refresh()
@@ -265,6 +317,11 @@ bool is_present_format(VkFormat f)
            f == VK_FORMAT_B8G8R8A8_UNORM || f == VK_FORMAT_R8G8B8A8_UNORM;
 }
 
+bool ten_bit(VkFormat f)
+{
+    return f == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || f == VK_FORMAT_A2R10G10B10_UNORM_PACK32;
+}
+
 bool is_smaa_source_format(VkFormat f)
 {
     return f == VK_FORMAT_R16G16B16A16_UNORM || f == VK_FORMAT_R16G16B16A16_SFLOAT || is_present_format(f);
@@ -289,8 +346,7 @@ VkSurfaceFormatKHR pick_format()
     vkGetPhysicalDeviceSurfaceFormatsKHR(g.d.gpu, g.surface, &n, list.data());
     for (VkFormat want : { VK_FORMAT_A2B10G10R10_UNORM_PACK32, VK_FORMAT_A2R10G10B10_UNORM_PACK32,
                            VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM }) {
-        if ((want == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || want == VK_FORMAT_A2R10G10B10_UNORM_PACK32) && !format_supports_present(want))
-            continue;
+        if (ten_bit(want) && !format_supports_present(want)) continue;
         for (const VkSurfaceFormatKHR& f : list)
             if (f.format == want && f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) return f;
     }
@@ -326,25 +382,37 @@ void apply_plan()
                  !flips ? "59.94 Hz console clock" : !cap ? "uncapped" : "timer limited");
 }
 
-bool swapchain_build()
+void swapchain_destroy(VkSwapchainKHR handle)
+{
+    if (!handle) return;
+    VkResult r;
+    {
+        std::lock_guard<std::mutex> hold(g.d.queue_lock);
+        r = vkQueueWaitIdle(g.d.queue);
+    }
+    vk_must(g.d, r, "vkQueueWaitIdle");
+    for (VkImageView v : g.sc.views)
+        if (v) vkDestroyImageView(g.d.dev, v, nullptr);
+    g.sc.views.clear();
+    vkDestroySwapchainKHR(g.d.dev, handle, nullptr);
+}
+
+VkResult swapchain_build()
 {
     VkSurfaceCapabilitiesKHR caps;
-    VK_TRY(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g.d.gpu, g.surface, &caps));
+    VkResult r = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g.d.gpu, g.surface, &caps);
+    if (r != VK_SUCCESS) return r;
     VkExtent2D extent = caps.currentExtent;
     if (extent.width == UINT32_MAX) {
         extent.width = std::clamp(g.pixel_w.load(), caps.minImageExtent.width, caps.maxImageExtent.width);
         extent.height = std::clamp(g.pixel_h.load(), caps.minImageExtent.height, caps.maxImageExtent.height);
     }
     g.fit.store(0, std::memory_order_release);
-    if (!extent.width || !extent.height) {
-        g.sc.extent = extent;
-        return true;
-    }
+    g.sc.extent = { 0, 0 };
+    if (!extent.width || !extent.height) return VK_SUCCESS;
     if (g.sc.format.format == VK_FORMAT_UNDEFINED) {
         g.sc.format = pick_format();
-        const bool ten_bit = g.sc.format.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ||
-                             g.sc.format.format == VK_FORMAT_A2R10G10B10_UNORM_PACK32;
-        std::fprintf(stderr, "[vk] swapchain format %d (%s sRGB)\n", (int)g.sc.format.format, ten_bit ? "10-bit" : "8-bit");
+        std::fprintf(stderr, "[vk] swapchain format %d (%s sRGB)\n", (int)g.sc.format.format, ten_bit(g.sc.format.format) ? "10-bit" : "8-bit");
     }
     g.sc.mode = pick_mode();
     uint32_t count = std::max(caps.minImageCount + 1u, 3u);
@@ -364,48 +432,48 @@ bool swapchain_build()
         : VkCompositeAlphaFlagBitsKHR(caps.supportedCompositeAlpha & (0u - caps.supportedCompositeAlpha));
     ci.presentMode = g.sc.mode;
     ci.clipped = VK_TRUE;
-    for (VkImageView v : g.sc.views)
-        if (v) vkDestroyImageView(g.d.dev, v, nullptr);
-    g.sc.views.clear();
-    if (g.sc.handle) vkDestroySwapchainKHR(g.d.dev, g.sc.handle, nullptr);
-    g.sc.handle = VK_NULL_HANDLE;
-    g.sc.extent = { 0, 0 };
-    VkSwapchainKHR made;
-    VkResult sc_res = vkCreateSwapchainKHR(g.d.dev, &ci, nullptr, &made);
-    if (sc_res != VK_SUCCESS && (g.sc.format.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ||
-                                 g.sc.format.format == VK_FORMAT_A2R10G10B10_UNORM_PACK32)) {
+    ci.oldSwapchain = g.sc.handle;
+    VkSwapchainKHR made = VK_NULL_HANDLE;
+    r = vkCreateSwapchainKHR(g.d.dev, &ci, nullptr, &made);
+    if (r != VK_SUCCESS && ten_bit(g.sc.format.format)) {
         g.sc.format = { VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR };
         ci.imageFormat = g.sc.format.format;
         ci.imageColorSpace = g.sc.format.colorSpace;
-        std::fprintf(stderr, "[vk] 10-bit swapchain rejected (%d), falling back to 8-bit sRGB\n", (int)sc_res);
-        sc_res = vkCreateSwapchainKHR(g.d.dev, &ci, nullptr, &made);
+        ci.oldSwapchain = VK_NULL_HANDLE;
+        std::fprintf(stderr, "[vk] 10-bit swapchain rejected (%d), falling back to 8-bit sRGB\n", (int)r);
+        r = vkCreateSwapchainKHR(g.d.dev, &ci, nullptr, &made);
     }
-    VK_TRY(sc_res);
-    g.sc.handle = made;
-    g.sc.extent = extent;
+    swapchain_destroy(std::exchange(g.sc.handle, made));
+    g.sc.presented = 0;
+    if (r != VK_SUCCESS) return r;
     uint32_t n = 0;
-    vkGetSwapchainImagesKHR(g.d.dev, made, &n, nullptr);
+    r = vkGetSwapchainImagesKHR(g.d.dev, made, &n, nullptr);
+    if (r != VK_SUCCESS) return r;
     g.sc.images.resize(n);
-    vkGetSwapchainImagesKHR(g.d.dev, made, &n, g.sc.images.data());
-    g.sc.views.resize(n, VK_NULL_HANDLE);
+    r = vkGetSwapchainImagesKHR(g.d.dev, made, &n, g.sc.images.data());
+    if (r != VK_SUCCESS) return r;
+    g.sc.views.assign(n, VK_NULL_HANDLE);
     for (uint32_t i = 0; i < n; i++) {
         VkImageViewCreateInfo vi{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
         vi.image = g.sc.images[i];
         vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
         vi.format = g.sc.format.format;
         vi.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-        VK_TRY(vkCreateImageView(g.d.dev, &vi, nullptr, &g.sc.views[i]));
+        r = vkCreateImageView(g.d.dev, &vi, nullptr, &g.sc.views[i]);
+        if (r != VK_SUCCESS) return r;
     }
     while (g.sc.ready.size() < n) {
         VkSemaphoreCreateInfo si{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
         VkSemaphore s;
-        VK_TRY(vkCreateSemaphore(g.d.dev, &si, nullptr, &s));
+        r = vkCreateSemaphore(g.d.dev, &si, nullptr, &s);
+        if (r != VK_SUCCESS) return r;
         g.sc.ready.push_back(s);
     }
+    g.sc.extent = extent;
     const VkFormat f = g.sc.format.format;
     if (is_present_format(f))
         g.fit.store((uint64_t)extent.width << 40 | (uint64_t)extent.height << 20 | (uint64_t)f, std::memory_order_release);
-    return true;
+    return VK_SUCCESS;
 }
 
 bool timeline_create(VkSemaphore& out)
@@ -419,12 +487,7 @@ bool timeline_create(VkSemaphore& out)
 
 void timeline_wait(VkSemaphore s, uint64_t value)
 {
-    if (!value) return;
-    VkSemaphoreWaitInfo wi{ VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
-    wi.semaphoreCount = 1;
-    wi.pSemaphores = &s;
-    wi.pValues = &value;
-    vkWaitSemaphores(g.d.dev, &wi, UINT64_MAX);
+    if (value) vk_wait(g.d, s, value);
 }
 
 bool presenter_build()
@@ -461,29 +524,61 @@ bool presenter_build()
     return true;
 }
 
-bool create_surface()
+VkSurfaceKHR create_surface()
 {
     const SDL_PropertiesID props = SDL_GetWindowProperties(g.window);
+    VkSurfaceKHR made = VK_NULL_HANDLE;
 #ifdef _WIN32
     VkWin32SurfaceCreateInfoKHR ci{ VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR };
     ci.hinstance = static_cast<HINSTANCE>(SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WIN32_INSTANCE_POINTER, nullptr));
     ci.hwnd = static_cast<HWND>(SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr));
     auto make = reinterpret_cast<PFN_vkCreateWin32SurfaceKHR>(vkGetInstanceProcAddr(g.d.instance, "vkCreateWin32SurfaceKHR"));
-    return ci.hwnd && make && make(g.d.instance, &ci, nullptr, &g.surface) == VK_SUCCESS;
+    return ci.hwnd && make && make(g.d.instance, &ci, nullptr, &made) == VK_SUCCESS ? made : VK_NULL_HANDLE;
 #else
     if (void* display = SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WAYLAND_DISPLAY_POINTER, nullptr)) {
         VkWaylandSurfaceCreateInfoKHR ci{ VK_STRUCTURE_TYPE_WAYLAND_SURFACE_CREATE_INFO_KHR };
         ci.display = static_cast<wl_display*>(display);
         ci.surface = static_cast<wl_surface*>(SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WAYLAND_SURFACE_POINTER, nullptr));
         auto make = reinterpret_cast<PFN_vkCreateWaylandSurfaceKHR>(vkGetInstanceProcAddr(g.d.instance, "vkCreateWaylandSurfaceKHR"));
-        return ci.surface && make && make(g.d.instance, &ci, nullptr, &g.surface) == VK_SUCCESS;
+        return ci.surface && make && make(g.d.instance, &ci, nullptr, &made) == VK_SUCCESS ? made : VK_NULL_HANDLE;
     }
     VkXlibSurfaceCreateInfoKHR ci{ VK_STRUCTURE_TYPE_XLIB_SURFACE_CREATE_INFO_KHR };
     ci.dpy = static_cast<Display*>(SDL_GetPointerProperty(props, SDL_PROP_WINDOW_X11_DISPLAY_POINTER, nullptr));
     ci.window = (Window)SDL_GetNumberProperty(props, SDL_PROP_WINDOW_X11_WINDOW_NUMBER, 0);
     auto make = reinterpret_cast<PFN_vkCreateXlibSurfaceKHR>(vkGetInstanceProcAddr(g.d.instance, "vkCreateXlibSurfaceKHR"));
-    return ci.dpy && make && make(g.d.instance, &ci, nullptr, &g.surface) == VK_SUCCESS;
+    return ci.dpy && make && make(g.d.instance, &ci, nullptr, &made) == VK_SUCCESS ? made : VK_NULL_HANDLE;
 #endif
+}
+
+VkResult surface_rebuild()
+{
+    swapchain_destroy(std::exchange(g.sc.handle, VK_NULL_HANDLE));
+    g.sc.extent = { 0, 0 };
+    g.fit.store(0, std::memory_order_release);
+    const VkSurfaceKHR made = create_surface();
+    if (!made) return VK_ERROR_SURFACE_LOST_KHR;
+    vkDestroySurfaceKHR(g.d.instance, std::exchange(g.surface, made), nullptr);
+    g.sc.format.format = VK_FORMAT_UNDEFINED;
+    g.surface_lost = false;
+    VkBool32 supported = VK_FALSE;
+    const VkResult r = vkGetPhysicalDeviceSurfaceSupportKHR(g.d.gpu, g.d.family, g.surface, &supported);
+    return r != VK_SUCCESS ? r : supported ? VK_SUCCESS : VK_ERROR_SURFACE_LOST_KHR;
+}
+
+VkResult swapchain_rebuild()
+{
+    VkResult r = g.surface_lost ? surface_rebuild() : VK_SUCCESS;
+    if (r == VK_SUCCESS) r = swapchain_build();
+    if (r == VK_ERROR_SURFACE_LOST_KHR) g.surface_lost = true;
+    else if (r == VK_ERROR_DEVICE_LOST) vk_fatal(g.d, r, "vkCreateSwapchainKHR");
+    return r;
+}
+
+void swapchain_failed(VkResult r, const char* call)
+{
+    if (r == VK_ERROR_SURFACE_LOST_KHR) g.surface_lost = true;
+    else if (r != VK_ERROR_OUT_OF_DATE_KHR) vk_fatal(g.d, r, call);
+    g.resized = true;
 }
 
 VkImageMemoryBarrier2 to_transfer_dst(VkImage image, VkPipelineStageFlags2 src_stage, VkPipelineStageFlags2 dst_stage)
@@ -537,7 +632,7 @@ void record_present(VkCommandBuffer cmd, const slot& s, VkImage target, VkImageV
 {
     VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &bi);
+    vk_must(g.d, vkBeginCommandBuffer(cmd, &bi), "vkBeginCommandBuffer");
     VkImageMemoryBarrier2 b = to_transfer_dst(target, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT);
     barrier_one(cmd, b);
     const VkExtent2D out = g.sc.extent;
@@ -558,16 +653,7 @@ void record_present(VkCommandBuffer cmd, const slot& s, VkImage target, VkImageV
         b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
         barrier_one(cmd, b);
     }
-    vkEndCommandBuffer(cmd);
-}
-
-void rebuild_swapchain()
-{
-    {
-        std::lock_guard<std::mutex> hold(g.d.queue_lock);
-        vkDeviceWaitIdle(g.d.dev);
-    }
-    if (!swapchain_build()) std::fprintf(stderr, "[vk] swapchain rebuild failed\n");
+    vk_must(g.d, vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
 }
 
 bool swapchain_extent_changed()
@@ -592,17 +678,13 @@ bool present_image(slot& s)
     timeline_wait(g.present_timeline, f.done);
     uint32_t index = 0;
     const VkResult a = vkAcquireNextImageKHR(g.d.dev, g.sc.handle, 100000000ull, f.acquired, VK_NULL_HANDLE, &index);
-    if (a == VK_TIMEOUT || a == VK_NOT_READY) {
-        s.released = 0;
-        return false;
-    }
     if (a != VK_SUCCESS && a != VK_SUBOPTIMAL_KHR) {
-        g.resized = true;
+        if (a != VK_TIMEOUT && a != VK_NOT_READY) swapchain_failed(a, "vkAcquireNextImageKHR");
         s.released = 0;
         return false;
     }
     if (a == VK_SUBOPTIMAL_KHR && swapchain_extent_changed()) g.resized = true;
-    vkResetCommandPool(g.d.dev, f.pool, 0);
+    vk_must(g.d, vkResetCommandPool(g.d.dev, f.pool, 0), "vkResetCommandPool");
     record_present(f.cmd, s, g.sc.images[index], g.sc.views[index]);
 
     const uint64_t value = g.presented.load() + 1u;
@@ -628,18 +710,26 @@ bool present_image(slot& s)
     si.signalSemaphoreInfoCount = 2;
     si.pSignalSemaphoreInfos = signals;
 
-    VkPresentInfoKHR pi{ VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
+    const uint64_t id = ++g.present_id;
+    const VkPresentIdKHR present_id{ VK_STRUCTURE_TYPE_PRESENT_ID_KHR, nullptr, 1, &id };
+    VkPresentInfoKHR pi{ VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, g.d.caps.present_wait ? &present_id : nullptr };
     pi.waitSemaphoreCount = 1;
     pi.pWaitSemaphores = &g.sc.ready[index];
     pi.swapchainCount = 1;
     pi.pSwapchains = &g.sc.handle;
     pi.pImageIndices = &index;
+    timeline_wait(g.timeline, s.rendered);
+    if (g.d.caps.present_wait && g.sc.presented && g.sc.mode == VK_PRESENT_MODE_FIFO_KHR) {
+        const VkResult w = vkWaitForPresentKHR(g.d.dev, g.sc.handle, g.sc.presented, 100000000ull);
+        if (w < VK_SUCCESS) swapchain_failed(w, "vkWaitForPresentKHR");
+    }
+    vk_submit(g.d, si);
     VkResult r;
     {
         std::lock_guard<std::mutex> hold(g.d.queue_lock);
-        vkQueueSubmit2(g.d.queue, 1, &si, VK_NULL_HANDLE);
         r = vkQueuePresentKHR(g.d.queue, &pi);
     }
+    g.sc.presented = id;
     {
         static int64_t last, lo = INT64_MAX, hi, sum, sq;
         static uint32_t n;
@@ -677,8 +767,11 @@ bool present_image(slot& s)
     f.done = value;
     s.released.store(value, std::memory_order_release);
     g.frame_index = (g.frame_index + 1u) % k_present_frames;
-    if (r == VK_ERROR_OUT_OF_DATE_KHR || (r == VK_SUBOPTIMAL_KHR && swapchain_extent_changed())) g.resized = true;
-    else if (r != VK_SUCCESS) std::fprintf(stderr, "[vk] present failed: %d\n", (int)r);
+    if (r == VK_SUBOPTIMAL_KHR) {
+        if (swapchain_extent_changed()) g.resized = true;
+    } else if (r != VK_SUCCESS) {
+        swapchain_failed(r, "vkQueuePresentKHR");
+    }
 
     static bool first = true;
     if (first) {
@@ -691,16 +784,17 @@ bool present_image(slot& s)
 void present_main()
 {
     ps3_thread_name("vk present");
-    g.resized = false;
-    if (!swapchain_build()) std::fprintf(stderr, "[vk] swapchain creation failed\n");
-    mark("swapchain");
     uint64_t seen = 0;
-    bool rebuilt = false;
+    bool stale = true, rebuilt = false;
+    uint32_t failures = 0;
+    std::chrono::steady_clock::time_point retry{};
     for (;;) {
         uint64_t tick;
         {
             std::unique_lock<std::mutex> hold(g.queue_lock);
-            g.queue_cv.wait(hold, [&] { return g.tick != seen || g.resized.load() || g.display_changed.load() || g.replan.load(); });
+            const auto woken = [&] { return g.tick != seen || g.resized.load() || g.display_changed.load() || g.replan.load(); };
+            if (stale) g.queue_cv.wait_until(hold, retry, woken);
+            else g.queue_cv.wait(hold, woken);
             tick = g.tick;
         }
         if (g.display_changed.exchange(false)) {
@@ -709,8 +803,21 @@ void present_main()
         }
         if (g.replan.exchange(false)) apply_plan();
         if (g.resized.exchange(false)) {
-            rebuild_swapchain();
-            rebuilt = true;
+            stale = true;
+            retry = {};
+        }
+        if (stale && std::chrono::steady_clock::now() >= retry) {
+            const VkResult r = swapchain_rebuild();
+            stale = r != VK_SUCCESS;
+            if (!stale) {
+                failures = 0;
+                rebuilt = true;
+                mark("swapchain");
+            } else {
+                if (!failures) std::fprintf(stderr, "[vk] swapchain creation failed: %d, retrying\n", (int)r);
+                retry = std::chrono::steady_clock::now() + std::chrono::milliseconds(std::min(16u << std::min(failures, 6u), 1000u));
+                failures++;
+            }
         }
         if (tick == seen && !rebuilt) continue;
         seen = tick;
@@ -787,9 +894,11 @@ bool vulkan_open()
     const char* ext[] = { VK_KHR_SURFACE_EXTENSION_NAME, wayland ? VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME : VK_KHR_XLIB_SURFACE_EXTENSION_NAME };
 #endif
     mark("window");
+    g.d.fatal = device_failed;
     if (!vk_instance_create(g.d, ext, (uint32_t)std::size(ext))) return false;
     mark("instance");
-    if (!create_surface()) {
+    g.surface = create_surface();
+    if (!g.surface) {
         std::fprintf(stderr, "[vk] surface creation failed\n");
         return false;
     }
@@ -811,12 +920,14 @@ void update_hidden()
 void window_main()
 {
     ps3_thread_name("vk window");
-    int ok = -1;
+    g.window_thread = std::this_thread::get_id();
+    bool ok = false;
     since_start();
     if (SDL_InitSubSystem(SDL_INIT_VIDEO)) {
         mark("sdl video");
         g.display_event = SDL_RegisterEvents(1);
         g.resize_event = SDL_RegisterEvents(1);
+        g.fatal_event = SDL_RegisterEvents(1);
         g.window = SDL_CreateWindow(g.title.c_str(), 1280, 720, SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_HIDDEN);
         if (g.window) {
             if (SDL_Surface* icon = g.icon_path.empty() ? nullptr : SDL_LoadPNG(g.icon_path.c_str())) {
@@ -834,17 +945,16 @@ void window_main()
             g.pixel_w = (uint32_t)w;
             g.pixel_h = (uint32_t)h;
             if (const auto fn = g.resize_listener.load()) fn((u32)w, (u32)h);
-            if (vulkan_open()) ok = 1;
+            ok = vulkan_open();
         }
     }
-    if (ok < 0 && !g.d.dev) std::fprintf(stderr, "[vk] window: %s\n", SDL_GetError());
-    if (ok > 0) std::thread(present_main).detach();
+    if (!ok) start_failed();
+    std::thread(present_main).detach();
     {
         std::lock_guard<std::mutex> hold(g.lock);
-        g.status = ok;
+        g.ready = true;
     }
     g.cv.notify_all();
-    if (ok < 0) return;
     SDL_Event e;
     bool relative = false;
     for (;;) {
@@ -877,6 +987,7 @@ void window_main()
             g.mouse_wheel += e.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -e.wheel.integer_y : e.wheel.integer_y;
             continue;
         }
+        if (e.type == g.fatal_event) fail_exit();
         if (e.type == g.display_event) {
             apply_display();
             continue;
@@ -905,13 +1016,7 @@ void window_main()
         }
         switch (e.type) {
         case SDL_EVENT_QUIT:
-            ps3_savedata_shutdown();
-            g.r.save_caches();
-#if defined(ASURA_PGO_GEN)
-            __llvm_profile_write_file();
-#endif
-            std::fflush(nullptr);
-            std::_Exit(0);
+            ps3_process_exit(EXIT_SUCCESS);
         case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
             g.pixel_w = (uint32_t)e.window.data1;
             g.pixel_h = (uint32_t)e.window.data2;
@@ -980,11 +1085,10 @@ void window_main()
     }
 }
 
-int vk_open(void*)
+void vk_open(void*)
 {
     std::unique_lock<std::mutex> hold(g.lock);
-    g.cv.wait(hold, [] { return g.status != 0; });
-    return g.status > 0 ? 0 : -1;
+    g.cv.wait(hold, [] { return g.ready; });
 }
 
 std::atomic<int64_t> g_rsx_cpu_ns{ 0 };
@@ -1150,10 +1254,7 @@ int vk_present(void*, u32, const rsx_display_buffer* db)
         if (fitted) span.emplace(g.r, cmd, "present scale %ux%u to %ux%u", sw, sh, out.width, out.height);
         else span.emplace(g.r, cmd, "present copy %ux%u", sw, sh);
     }
-    if (g.smaa.has_staging()) {
-        uint64_t done = 0;
-        if (vkGetSemaphoreCounterValue(g.d.dev, g.timeline, &done) == VK_SUCCESS) g.smaa.retire_staging(done);
-    }
+    if (g.smaa.has_staging()) g.smaa.retire_staging(vk_reached(g.d, g.timeline));
     const bool aa_ok = !g.r.last_frame_upscaled() && aa_mode == RSX_VK_AA_SMAA && src->width == sw && src->height == sh && src->view && is_smaa_source_format(src->format);
     if (aa_mode == RSX_VK_AA_OFF || g.r.last_frame_upscaled()) g.smaa.release_targets();
     const VkExtent2D present_out = fitted ? out : VkExtent2D{ sw, sh };
@@ -1257,7 +1358,7 @@ int vk_present(void*, u32, const rsx_display_buffer* db)
             vkCmdPipelineBarrier2(cmd, &hd);
         }
     }
-    g.r.submit(VK_NULL_HANDLE, 0, VK_NULL_HANDLE);
+    g.r.flush();
     s.rendered = g.submitted;
     if (cap_buf) {
         timeline_wait(g.timeline, s.rendered);
@@ -1308,31 +1409,21 @@ int vk_present(void*, u32, const rsx_display_buffer* db)
     return 1;
 }
 
-void vk_close(void*)
-{
-    if (!g.d.dev) return;
-    g.r.flush();
-    {
-        std::lock_guard<std::mutex> hold(g.d.queue_lock);
-        vkDeviceWaitIdle(g.d.dev);
-    }
-    g.toast.destroy();
-    g.smaa.destroy();
-    g.r.close();
-}
-
 }
 
 extern "C" const rsx_renderer* rsx_vk_renderer(const char* title, const char* cache_path, const char* icon_path)
 {
     static const rsx_renderer renderer = {
-        nullptr, vk_open, vk_methods, vk_flush, vk_sync, vk_reset, vk_report, vk_defer, vk_present, vk_read_back, vk_settle, vk_wrote, vk_blit, vk_vblank, vk_close,
+        nullptr, vk_open, vk_methods, vk_flush, vk_sync, vk_reset, vk_report, vk_defer, vk_present, vk_read_back, vk_settle, vk_wrote, vk_blit, vk_vblank,
     };
     static std::once_flag started;
     std::call_once(started, [title, cache_path, icon_path] {
         g.title = title && *title ? title : "ps3recomp";
         g.cache_path = cache_path ? cache_path : "";
         g.icon_path = icon_path ? icon_path : "";
+        ps3_process_at_exit([] {
+            if (g.failure.load() == VK_SUCCESS) g.r.save_caches();
+        });
         std::thread(window_main).detach();
     });
     return &renderer;

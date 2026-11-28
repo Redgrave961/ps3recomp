@@ -70,17 +70,12 @@ bool vk_ring::hold(VkDeviceSize size, VmaVirtualAllocation& a, VkDeviceSize& off
 
 void vk_ring::wait_for(VkDeviceSize need)
 {
-    uint64_t reached = 0;
-    vkGetSemaphoreCounterValue(m_d->dev, m_timeline, &reached);
+    uint64_t reached = vk_reached(*m_d, m_timeline);
     while (!m_fences.empty()) {
         const fence f = m_fences.front();
         if (f.value > reached) {
             if (m_used + need < m_size) return;
-            VkSemaphoreWaitInfo wi{ VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
-            wi.semaphoreCount = 1;
-            wi.pSemaphores = &m_timeline;
-            wi.pValues = &f.value;
-            if (vkWaitSemaphores(m_d->dev, &wi, UINT64_MAX) != VK_SUCCESS) return;
+            vk_wait(*m_d, m_timeline, f.value);
             reached = f.value;
         }
         m_fences.pop_front();
@@ -91,7 +86,7 @@ void vk_ring::wait_for(VkDeviceSize need)
 
 vk_slice vk_ring::alloc(VkDeviceSize size, VkDeviceSize align)
 {
-    if (size >= m_size) return { VK_NULL_HANDLE, 0, nullptr };
+    if (!fits(size)) return { VK_NULL_HANDLE, 0, nullptr };
     if (m_used == 0) m_head = m_tail = 0;
     VkDeviceSize off = (m_head + align - 1) & ~(align - 1);
     VkDeviceSize consumed = off + size > m_size ? (m_size - m_head) + size : (off - m_head) + size;

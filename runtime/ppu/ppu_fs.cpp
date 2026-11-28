@@ -26,7 +26,7 @@ extern "C" uint32_t ppu_vm_size;
 extern "C" void     ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
 extern "C" void     vm_write32(uint64_t a, uint32_t v);
 extern "C" void     vm_write64(uint64_t a, uint64_t v);
-extern "C" void     sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size);
+extern "C" int      sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size);
 extern "C" unsigned long long ps3_ms_now(void);
 #include "ps3emu/log_first.h"
 
@@ -44,7 +44,9 @@ extern "C" unsigned long long ps3_ms_now(void);
 #define CELL_FS_EROFS        ((int32_t)0x80010026u)
 #define CELL_FS_ENOTDIR      ((int32_t)0x8001002Eu)
 #define CELL_FS_EXDEV        ((int32_t)0x80010030u)
+#define CELL_FS_ENAMETOOLONG ((int32_t)0x80010034u)
 #define CELL_FS_ENOTMOUNTED  ((int32_t)0x8001003Au)
+#define CELL_FS_MAX_FS_PATH_LENGTH 1024
 #define CELL_FS_S_IFDIR      0x4000u
 #define CELL_FS_S_IFREG      0x8000u
 #define CELL_FS_O_WRONLY     1
@@ -58,21 +60,28 @@ extern "C" unsigned long long ps3_ms_now(void);
 #define CELL_FS_TYPE_DIR     1
 #define CELL_FS_TYPE_REG     2
 
-static void guest_strcpy(char* dst, uint32_t gaddr, size_t cap)
+static bool guest_strcpy(char* dst, uint32_t gaddr, size_t cap)
 {
-    size_t i = 0;
-    for (; i < cap - 1; i++) {
-        if (ppu_vm_size && gaddr + i >= ppu_vm_size) break;
-        char c = (char)vm_base[gaddr + i];
-        if (!c) break;
-        dst[i] = c;
+    for (size_t i = 0; i < cap; i++) {
+        if (ppu_vm_size && gaddr + i >= ppu_vm_size) {
+            dst[i] = 0;
+            return true;
+        }
+        dst[i] = (char)vm_base[gaddr + i];
+        if (!dst[i]) return true;
     }
-    dst[i] = 0;
+    dst[cap - 1] = 0;
+    return false;
 }
 
-static void host_path(char* out, size_t cap, const char* guest)
+static bool host_path(char* out, size_t cap, const char* guest)
 {
-    sys_fs_translate_path(guest, out, (int)cap);
+    return sys_fs_translate_path(guest, out, (int)cap) != 0;
+}
+
+static bool guest_host_path(char* gpath, size_t gcap, uint32_t gaddr, char* hpath, size_t hcap)
+{
+    return guest_strcpy(gpath, gaddr, gcap) && host_path(hpath, hcap, gpath);
 }
 
 #define FS_MAX 256
@@ -139,11 +148,10 @@ extern "C" void ppu_fs_set_open_callback(void (*cb)(const char*))
 
 static void cellFsOpen(ppu_context* ctx)
 {
-    char gpath[1024], hpath[1100];
-    guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
+    char gpath[CELL_FS_MAX_FS_PATH_LENGTH], hpath[PS3_HOST_PATH_MAX];
     uint32_t flags  = (uint32_t)ctx->gpr[4];
     uint32_t fd_ptr = (uint32_t)ctx->gpr[5];
-    host_path(hpath, sizeof hpath, gpath);
+    if (!guest_host_path(gpath, sizeof gpath, (uint32_t)ctx->gpr[3], hpath, sizeof hpath)) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENAMETOOLONG; return; }
 
     int acc = flags & 0x3;
     int oflags = (acc == CELL_FS_O_RDWR)   ? O_RDWR
@@ -158,7 +166,7 @@ static void cellFsOpen(ppu_context* ctx)
         return;
     }
     ps3_vfile* f = nullptr;
-    int hfd = open(hpath, oflags | O_BINARY, 0666);
+    int hfd = ps3_utf8_open(hpath, oflags | O_BINARY, 0666);
     if (hfd >= 0) {
         const char* fmode = (acc == CELL_FS_O_RDWR)
                             ? ((flags & CELL_FS_O_APPEND) ? "ab+" : "rb+")
@@ -195,10 +203,9 @@ static void cellFsOpen(ppu_context* ctx)
 
 static void cellFsSdataOpen(ppu_context* ctx)
 {
-    char gpath[1024], hpath[1100];
-    guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
+    char gpath[CELL_FS_MAX_FS_PATH_LENGTH], hpath[PS3_HOST_PATH_MAX];
     uint32_t fd_ptr = (uint32_t)ctx->gpr[5];
-    host_path(hpath, sizeof hpath, gpath);
+    if (!guest_host_path(gpath, sizeof gpath, (uint32_t)ctx->gpr[3], hpath, sizeof hpath)) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENAMETOOLONG; return; }
     ps3_vfile* f = ps3_vfile_open(hpath, "rb");
     if (!f) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return; }
     npdrm_file* drm = nullptr;
@@ -324,10 +331,9 @@ static void write_stat(uint32_t sb, uint32_t mode, uint64_t size,
 
 static void cellFsStat(ppu_context* ctx)
 {
-    char gpath[1024], hpath[1100];
-    guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
+    char gpath[CELL_FS_MAX_FS_PATH_LENGTH], hpath[PS3_HOST_PATH_MAX];
     uint32_t sb = (uint32_t)ctx->gpr[4];
-    host_path(hpath, sizeof hpath, gpath);
+    if (!guest_host_path(gpath, sizeof gpath, (uint32_t)ctx->gpr[3], hpath, sizeof hpath)) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENAMETOOLONG; return; }
     ps3_vstat st;
     if (ps3_vfs_stat(hpath, &st) != 0) {
         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return;
@@ -352,10 +358,9 @@ static void cellFsFstat(ppu_context* ctx)
 
 static void cellFsOpendir(ppu_context* ctx)
 {
-    char gpath[1024], hpath[1100];
-    guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
+    char gpath[CELL_FS_MAX_FS_PATH_LENGTH], hpath[PS3_HOST_PATH_MAX];
     uint32_t fd_ptr = (uint32_t)ctx->gpr[4];
-    host_path(hpath, sizeof hpath, gpath);
+    if (!guest_host_path(gpath, sizeof gpath, (uint32_t)ctx->gpr[3], hpath, sizeof hpath)) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENAMETOOLONG; return; }
     ps3_vdir* d = ps3_vdir_open(hpath);
     if (!d) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return; }
     int fd = fd_alloc_dir(d);
@@ -398,25 +403,22 @@ static void cellFsClosedir(ppu_context* ctx)
 
 #define HOST_MKDIR(p) ps3_utf8_mkdir(p)
 
-static int host_mkdir_p(const char* path)
+static int host_mkdir_p(char* path)
 {
-    char tmp[1100];
-    snprintf(tmp, sizeof tmp, "%s", path);
-    size_t len = strlen(tmp);
-    while (len > 1 && (tmp[len-1] == '/' || tmp[len-1] == '\\')) tmp[--len] = 0;
-    for (char* p = tmp + 1; *p; p++) {
-        if (*p == '/' || *p == '\\') { char c = *p; *p = 0; HOST_MKDIR(tmp); *p = c; }
+    size_t len = strlen(path);
+    while (len > 1 && (path[len-1] == '/' || path[len-1] == '\\')) path[--len] = 0;
+    for (char* p = path + 1; *p; p++) {
+        if (*p == '/' || *p == '\\') { char c = *p; *p = 0; HOST_MKDIR(path); *p = c; }
     }
-    int r = HOST_MKDIR(tmp);
-    if (r != 0) { ps3_host_stat_t st; if (ps3_utf8_stat64(tmp, &st) == 0 && (st.st_mode & S_IFDIR)) r = 0; }
+    int r = HOST_MKDIR(path);
+    if (r != 0) { ps3_host_stat_t st; if (ps3_utf8_stat64(path, &st) == 0 && (st.st_mode & S_IFDIR)) r = 0; }
     return r;
 }
 
 static void cellFsMkdir(ppu_context* ctx)
 {
-    char gpath[1024], hpath[1100];
-    guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
-    host_path(hpath, sizeof hpath, gpath);
+    char gpath[CELL_FS_MAX_FS_PATH_LENGTH], hpath[PS3_HOST_PATH_MAX];
+    if (!guest_host_path(gpath, sizeof gpath, (uint32_t)ctx->gpr[3], hpath, sizeof hpath)) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENAMETOOLONG; return; }
     host_mkdir_p(hpath);
     ctx->gpr[3] = CELL_OK;
 }
@@ -431,17 +433,15 @@ static void cellFsRename(ppu_context* ctx)
 {
     const uint32_t from_ea = (uint32_t)ctx->gpr[3], to_ea = (uint32_t)ctx->gpr[4];
     if (!from_ea || !to_ea) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EFAULT; return; }
-    char gfrom[1024], gto[1024], hfrom[1100], hto[1100];
-    guest_strcpy(gfrom, from_ea, sizeof gfrom);
-    guest_strcpy(gto, to_ea, sizeof gto);
+    char gfrom[CELL_FS_MAX_FS_PATH_LENGTH], gto[CELL_FS_MAX_FS_PATH_LENGTH], hfrom[PS3_HOST_PATH_MAX], hto[PS3_HOST_PATH_MAX];
+    if (!guest_strcpy(gfrom, from_ea, sizeof gfrom) || !guest_strcpy(gto, to_ea, sizeof gto)) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENAMETOOLONG; return; }
     const size_t mf = fs_mount_len(gfrom), mt = fs_mount_len(gto);
     if (!mf || !mt) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOTMOUNTED; return; }
     if (mf != mt || strncmp(gfrom, gto, mf) != 0) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EXDEV; return; }
     if (strncmp(gfrom, "/dev_bdvd", mf) == 0 || strncmp(gfrom, "/dev_flash", mf) == 0) {
         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EROFS; return;
     }
-    host_path(hfrom, sizeof hfrom, gfrom);
-    host_path(hto, sizeof hto, gto);
+    if (!host_path(hfrom, sizeof hfrom, gfrom) || !host_path(hto, sizeof hto, gto)) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENAMETOOLONG; return; }
     ps3_vstat st;
     if (ps3_vfs_stat(hfrom, &st) != 0) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return; }
     if (ps3_vfs_stat(hto, &st) == 0) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EEXIST; return; }

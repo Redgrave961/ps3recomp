@@ -62,6 +62,7 @@ target_include_directories(test_ppu_thread_join PRIVATE
 )
 target_compile_options(test_ppu_thread_join PRIVATE -Wall -Wextra -Wno-unused-parameter -UNDEBUG)
 if(WIN32)
+    target_sources(test_ppu_thread_join PRIVATE "${PS3RECOMP_ROOT}/runtime/memory/vm_track.c")
     target_link_libraries(test_ppu_thread_join PRIVATE synchronization)
 else()
     target_sources(test_ppu_thread_join PRIVATE "${PS3RECOMP_ROOT}/runtime/platform/win32_compat.c")

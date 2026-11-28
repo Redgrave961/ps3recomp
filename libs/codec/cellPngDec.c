@@ -4,7 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size);
+int sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size);
 
 #include "../../runtime/ppu/ppu_memory.h"
 
@@ -68,9 +68,9 @@ static int pngdec_load_source(PngDecSubState* sub)
 
     if (sub->src.srcSelect == CELL_PNGDEC_FILE) {
         char host_path[1024];
-        sys_fs_translate_path(sub->src.fileName, host_path, (int)sizeof(host_path));
+        const int translated = sys_fs_translate_path(sub->src.fileName, host_path, (int)sizeof(host_path));
 
-        ps3_vfile* f = ps3_vfile_open(host_path, "rb");
+        ps3_vfile* f = translated ? ps3_vfile_open(host_path, "rb") : NULL;
         if (!f) {
             printf("[cellPngDec] Cannot open file: %s (host: %s)\n",
                    sub->src.fileName, host_path);

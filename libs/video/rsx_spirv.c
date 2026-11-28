@@ -516,27 +516,24 @@ static void demote_if(spv* s, u32 cond)
     sel_end(s, m);
 }
 
+static u32 sampler_type(spv* s, u32 dim, int depth)
+{
+    static const u32 dims[4] = { 1, 1, 3, 2 };
+    u32 img = intern(s, OpTypeImage, 0, (const u32[]){ tf(s), dims[dim & 3u], depth ? 1u : 0u, 0, 0, 1, 0 }, 7, 0);
+    return intern(s, OpTypeSampledImage, 0, &img, 1, 0);
+}
+
 static u32 sampler_var(spv* s, u32 dim, int depth, u32 set, u32 binding)
 {
-    static const u32 dims[4] = { 0, 1, 3, 2 };
-    u32 img = intern(s, OpTypeImage, 0, (const u32[]){ tf(s), dims[dim & 3u], depth ? 1u : 0u, 0, 0, 1, 0 }, 7, 0);
-    u32 si = intern(s, OpTypeSampledImage, 0, &img, 1, 0);
-    u32 v = gvar(s, si, SC_UniformConstant, 0);
+    u32 v = gvar(s, sampler_type(s, dim, depth), SC_UniformConstant, 0);
     deco1(s, v, DEC_DescriptorSet, set);
     deco1(s, v, DEC_Binding, binding);
     return v;
 }
 
-static u32 sampler_type(spv* s, u32 dim, int depth)
+static u32 coord_for_dim(spv* s, u32 v, u32 dim, u32 y)
 {
-    static const u32 dims[4] = { 0, 1, 3, 2 };
-    u32 img = intern(s, OpTypeImage, 0, (const u32[]){ tf(s), dims[dim & 3u], depth ? 1u : 0u, 0, 0, 1, 0 }, 7, 0);
-    return intern(s, OpTypeSampledImage, 0, &img, 1, 0);
-}
-
-static u32 coord_for_dim(spv* s, u32 v, u32 dim)
-{
-    if (dim == 0) return exf(s, v, 0);
+    if (dim == 0) return I(s, OpCompositeConstruct, tv2(s), exf(s, v, 0), y);
     if (dim == 1) return I(s, OpVectorShuffle, tv2(s), v, v, 0, 1);
     return I(s, OpVectorShuffle, tv3(s), v, v, 0, 1, 2);
 }
@@ -1253,7 +1250,7 @@ static u32 vp_txl(vpc* c, const vpi* i, u32 s0)
     u32 dim = (c->key->texture_dims >> (unit * 2u)) & 3u;
     if (!c->vtex[unit]) c->vtex[unit] = sampler_var(s, dim, 0, RSX_SPV_SET_TEXTURES, RSX_SPV_BIND_VERTEX_TEXTURE0 + unit);
     u32 img = ld(s, sampler_type(s, dim, 0), c->vtex[unit]);
-    u32 coord = coord_for_dim(s, s0, dim == 2 ? 2u : dim);
+    u32 coord = coord_for_dim(s, s0, dim, cf(s, 0.5f));
     return I(s, OpImageSampleExplicitLod, tv4(s), img, coord, IMG_Lod, exf(s, s0, 3));
 }
 
@@ -1613,14 +1610,9 @@ int rsx_spv_vertex(const u32* ucode, const rsx_spv_vp_key* key, rsx_spv_blob* ou
     vp_epilogue(c);
     sb_ins(s, BODY(s), OpReturn, k_none, 0);
     fn_end(s);
-    u32 caps[3];
+    u32 caps[2];
     u32 ncaps = 0;
     caps[ncaps++] = 1;
-    for (u32 u = 0; u < 4; u++)
-        if (c->vtex[u] && ((key->texture_dims >> (u * 2u)) & 3u) == 0) {
-            caps[ncaps++] = 43;
-            break;
-        }
     if ((key->output_mask & (0x3Fu * RSX_SPV_VPOUT_UC0)) && (c->written & 0x60u)) caps[ncaps++] = 32;
     int rc = spv_finish(s, 0, caps, ncaps, mainid, NULL, 0, out);
     if (info) {
@@ -2579,7 +2571,7 @@ static u32 fp_tex(fpc* c, const fpi* i, u32 op, u32 s0, u32 s1, u32 s2)
         return splat(s, res);
     }
     u32 cd;
-    if (dim == 0) cd = fmul(s, TF, exf(s, coord, 0), exf(s, fct, 0));
+    if (dim == 0) cd = I(s, OpCompositeConstruct, tv2(s), fmul(s, TF, exf(s, coord, 0), exf(s, fct, 0)), cf(s, 0.5f));
     else if (dim == 1) cd = fmul(s, tv2(s), I(s, OpVectorShuffle, tv2(s), coord, coord, 0, 1), fct);
     else if (dim == 2) cd = I(s, OpVectorShuffle, tv3(s), coord, coord, 0, 1, 2);
     else {
@@ -2595,8 +2587,8 @@ static u32 fp_tex(fpc* c, const fpi* i, u32 op, u32 s0, u32 s1, u32 s2)
         res = I(s, OpImageSampleExplicitLod, T4, img, cd, IMG_Lod, exf(s, s1, 0));
         break;
     case FP_TXD: {
-        u32 gx = coord_for_dim(s, s1, dim == 3 ? 2u : dim);
-        u32 gy = coord_for_dim(s, s2, dim == 3 ? 2u : dim);
+        u32 gx = coord_for_dim(s, s1, dim, cf(s, 0.f));
+        u32 gy = coord_for_dim(s, s2, dim, cf(s, 0.f));
         res = I(s, OpImageSampleExplicitLod, T4, img, cd, IMG_Grad, gx, gy);
         break;
     }
@@ -3017,15 +3009,10 @@ int rsx_spv_fragment(const u32* ucode, u32 max_words, const rsx_spv_fp_key* key,
         sb_ins(s, BODY(s), OpReturn, k_none, 0);
     }
     fn_end(s);
-    u32 caps[3];
+    u32 caps[2];
     u32 ncaps = 0;
     caps[ncaps++] = 1;
     if (s->used_demote) caps[ncaps++] = 5379;
-    for (u32 u = 0; u < 16; u++)
-        if (c->tex[u] && ((key->texture_dims >> (u * 2u)) & 3u) == 0) {
-            caps[ncaps++] = 43;
-            break;
-        }
     int rc = spv_finish(s, 4, caps, ncaps, mainid, modes, nmodes, out);
     fp_fill_info(c, info, depth);
     return rc;
@@ -3037,16 +3024,17 @@ static u32 depth_fetch(spv* s, u32 img, u32 x, u32 y)
     return exf(s, I(s, OpImageFetch, tv4(s), img, coord, IMG_Lod, ci(s, 0)), 0);
 }
 
-static u32 depth_unorm(spv* s, u32 z, float scale)
+static u32 depth_unorm(spv* s, u32 z, u32 max)
 {
     u32 c = X(s, tf(s), GL_NClamp, z, cf(s, 0.f), cf(s, 1.f));
-    return I(s, OpConvertFToU, tu(s), fadd(s, tf(s), fmul(s, tf(s), c, cf(s, scale)), cf(s, 0.5f)));
+    u32 u = I(s, OpConvertFToU, tu(s), fadd(s, tf(s), fmul(s, tf(s), c, cf(s, (float)max)), cf(s, 0.5f)));
+    return X(s, tu(s), GL_UMin, u, cu(s, max));
 }
 
 static u32 depth16(spv* s, u32 z, u32 is_float)
 {
     u32 half = uand(s, tu(s), X(s, tu(s), GL_PackHalf2x16, I(s, OpCompositeConstruct, tv2(s), z, cf(s, 0.f))), cu(s, 0xFFFFu));
-    return sel(s, tu(s), is_float, half, depth_unorm(s, z, 65535.f));
+    return sel(s, tu(s), is_float, half, depth_unorm(s, z, 0xFFFFu));
 }
 
 int rsx_spv_depth_pack(int d16, rsx_spv_blob* out)
@@ -3094,7 +3082,7 @@ int rsx_spv_depth_pack(int d16, rsx_spv_blob* out)
     } else {
         u32 z = depth_fetch(s, dimg, x, y);
         u32 f24 = uand(s, tu(s), ushr(s, tu(s), bc(s, tu(s), z), cu(s, 7)), cu(s, 0xFFFFFFu));
-        u32 d24 = sel(s, tu(s), I(s, OpIEqual, tbool(s), mode, cu(s, 1)), f24, depth_unorm(s, z, 16777215.f));
+        u32 d24 = sel(s, tu(s), I(s, OpIEqual, tbool(s), mode, cu(s, 1)), f24, depth_unorm(s, z, 0xFFFFFFu));
         u32 simg = I(s, OpImage, uimg, ld(s, usi, svar));
         u32 st8 = uand(s, tu(s), ex(s, tu(s), I(s, OpImageFetch, tu4(s), simg, coord, IMG_Lod, ci(s, 0)), 0), cu(s, 0xFFu));
         word = uor(s, tu(s), ushl(s, tu(s), d24, cu(s, 8)), st8);
@@ -3359,7 +3347,7 @@ int rsx_spv_motion_vectors(rsx_spv_blob* out)
     u32 src = sampler_var(s, 1, 0, 0, 0);
     u32 vel = sampler_var(s, 1, 0, 0, 2);
     const u32 fimg = intern(s, OpTypeImage, 0, (const u32[]){ tf(s), 1, 0, 0, 0, 1, 0 }, 7, 0);
-    const u32 oimg = intern(s, OpTypeImage, 0, (const u32[]){ tf(s), 1, 0, 0, 0, 2, 12 }, 7, 0);
+    const u32 oimg = intern(s, OpTypeImage, 0, (const u32[]){ tf(s), 1, 0, 0, 0, 2, 7 }, 7, 0);
     u32 dst = gvar(s, oimg, SC_UniformConstant, 0);
     deco1(s, dst, DEC_DescriptorSet, 0);
     deco1(s, dst, DEC_Binding, 1);

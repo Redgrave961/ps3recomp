@@ -88,14 +88,14 @@ s32 sceNpManagerGetAccountRegion(u32 countryCode, u32 language)
     return SCE_NP_ERROR_OFFLINE;
 }
 
-void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size);
+int sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size);
 
 static s32 np_drm_is_available(const u8* k_licensee, const char* drm_path)
 {
     const char* path = GUEST_PTR(drm_path, const char*);
     if (!path) return (s32)NPDRM_ERROR_INVALID_PARAM;
     char host[1024];
-    sys_fs_translate_path(path, host, (int)sizeof host);
+    if (!sys_fs_translate_path(path, host, (int)sizeof host)) return (s32)NPDRM_ERROR_IO;
     return (s32)npdrm_license_available(host, GUEST_PTR(k_licensee, const u8*));
 }
 

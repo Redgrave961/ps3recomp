@@ -12,6 +12,8 @@ namespace vk {
 namespace {
 
 constexpr u32 k_index_type_u32 = 0;
+constexpr u32 k_vertex_slack = 256;
+constexpr u32 k_gfx_pos_reg = 203;
 
 u32 host_size(u32 type, u32 size)
 {
@@ -34,7 +36,7 @@ u32 texture_dims(const rsx::texture_desc& d, bool valid)
     if (!valid) return RSX_SPV_TEX_2D;
     if (d.cube) return RSX_SPV_TEX_CUBE;
     if (d.dimension == 3u) return RSX_SPV_TEX_3D;
-    if (d.dimension == 1u) return RSX_SPV_TEX_NONE;
+    if (d.dimension == 1u) return RSX_SPV_TEX_1D;
     return RSX_SPV_TEX_2D;
 }
 
@@ -89,40 +91,69 @@ float half_bits(uint16_t h)
 
 bool renderer::create_dummies()
 {
-    for (u32 i = 0; i < 3; i++) {
+    for (u32 i = 0; i < std::size(m_dummy); i++) {
         image& img = m_dummy[i];
+        const bool depth = i >= k_dummy_shadow_2d;
+        const bool cube = i == k_dummy_cube || i == k_dummy_shadow_cube;
         VkImageCreateInfo ii{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
-        ii.imageType = i == 2 ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
-        ii.flags = i == 1 ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0;
-        ii.format = VK_FORMAT_R8G8B8A8_UNORM;
+        ii.imageType = i == k_dummy_3d ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
+        ii.flags = cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0;
+        ii.format = depth ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
         ii.extent = { 1, 1, 1 };
         ii.mipLevels = 1;
-        ii.arrayLayers = i == 1 ? 6u : 1u;
+        ii.arrayLayers = cube ? 6u : 1u;
         ii.samples = VK_SAMPLE_COUNT_1_BIT;
         ii.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         VmaAllocationCreateInfo ai{};
         ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
         VK_TRY(vmaCreateImage(m_d->vma, &ii, &ai, &img.handle, &img.mem, nullptr));
+        img.format = ii.format;
+        img.aspect = depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+        img.width = img.height = 1;
         VkImageViewCreateInfo vi{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
         vi.image = img.handle;
-        vi.viewType = i == 0 ? VK_IMAGE_VIEW_TYPE_2D : i == 1 ? VK_IMAGE_VIEW_TYPE_CUBE : VK_IMAGE_VIEW_TYPE_3D;
+        vi.viewType = cube ? VK_IMAGE_VIEW_TYPE_CUBE : i == k_dummy_3d ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D;
         vi.format = ii.format;
-        vi.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, ii.arrayLayers };
+        vi.subresourceRange = { img.aspect, 0, 1, 0, ii.arrayLayers };
         VK_TRY(vkCreateImageView(m_d->dev, &vi, nullptr, &img.view));
-        img.format = ii.format;
-        img.width = img.height = 1;
         VkCommandBuffer c = cmd();
         barrier(c, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
-        const VkClearColorValue white{ { 0.f, 0.f, 0.f, 1.f } };
-        const VkImageSubresourceRange range{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, ii.arrayLayers };
-        vkCmdClearColorImage(c, img.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &white, 1, &range);
+        const VkImageSubresourceRange range{ img.aspect, 0, 1, 0, ii.arrayLayers };
+        if (depth) {
+            const VkClearDepthStencilValue far_plane{ 1.f, 0u };
+            vkCmdClearDepthStencilImage(c, img.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &far_plane, 1, &range);
+        } else {
+            const VkClearColorValue opaque_black{ { 0.f, 0.f, 0.f, 1.f } };
+            vkCmdClearColorImage(c, img.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &opaque_black, 1, &range);
+        }
         barrier(c, img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
                 VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
     }
     VkSamplerCreateInfo si{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
     si.magFilter = si.minFilter = VK_FILTER_NEAREST;
     VK_TRY(vkCreateSampler(m_d->dev, &si, nullptr, &m_dummy_sampler));
+    si.compareEnable = VK_TRUE;
+    si.compareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+    VK_TRY(vkCreateSampler(m_d->dev, &si, nullptr, &m_dummy_shadow_sampler));
     return true;
+}
+
+VkDescriptorImageInfo renderer::dummy_image(u32 unit) const
+{
+    const u32 dims = texture_dims(m_units[unit].desc, m_units[unit].valid);
+    if (unit < rsx::TEXTURES && ((m_fp_tex_shadow >> unit) & 1u))
+        return { m_dummy_shadow_sampler, m_dummy[dims == RSX_SPV_TEX_CUBE ? k_dummy_shadow_cube : k_dummy_shadow_2d].view,
+                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+    const u32 i = dims == RSX_SPV_TEX_CUBE ? k_dummy_cube : dims == RSX_SPV_TEX_3D ? k_dummy_3d : k_dummy_2d;
+    return { m_dummy_sampler, m_dummy[i].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+}
+
+vk_slice renderer::ring_alloc(VkDeviceSize size, VkDeviceSize align)
+{
+    const vk_slice s = m_ring.alloc(size, align);
+    if (s.ptr || !m_ring.fits(size)) return s;
+    flush();
+    return m_ring.alloc(size, align);
 }
 
 bool renderer::create_buffer_set()
@@ -249,11 +280,10 @@ bool renderer::upload_vertices(const rsx::draw_clause& clause, u32 first, u32 co
         }
 
         const u32 off = r(rsx::M_VERTEX_ARRAY_OFFSET + k * 4u);
-        const u32 location = off >> 31;
-        const u32 ea = rsx_address(location ? RSX_DMA_MAIN : RSX_DMA_LOCAL, (base_offset + (off & 0x7FFFFFFFu)) & 0x7FFFFFFFu, 0);
-        if (!ea) continue;
+        const u32 dma = (off >> 31) ? RSX_DMA_MAIN : RSX_DMA_LOCAL;
         const u32 elem = host_size(type, size);
-        u32 e0 = first, n = count, format_bits = 0, f = 0;
+        uint64_t e0 = first, n = count;
+        u32 format_bits = 0, f = 0;
         if (!stride) {
             e0 = 0;
             n = 1;
@@ -264,19 +294,27 @@ bool renderer::upload_vertices(const rsx::draw_clause& clause, u32 first, u32 co
             f = freq;
         } else if (freq > 1u) {
             e0 = first / freq;
-            n = (first + count - 1u) / freq - e0 + 1u;
+            n = ((uint64_t)first + count - 1u) / freq - e0 + 1u;
             f = freq;
         }
-        const u32 start = ea + e0 * stride;
-        const u32 need = stride ? (n - 1u) * stride + elem : elem;
+        const uint64_t at = (uint64_t)((base_offset + (off & 0x7FFFFFFFu)) & 0x7FFFFFFFu) + e0 * stride;
+        const uint64_t need = (n - 1u) * stride + elem;
+        if (at + need + k_vertex_slack > 0xFFFFFFFFull) continue;
+        u32 span = (u32)need + k_vertex_slack;
+        u32 start = rsx_address(dma, (u32)at, span);
+        if (!start) {
+            span = (u32)need;
+            start = rsx_address(dma, (u32)at, span);
+        }
+        if (!start) continue;
         int region = -1;
         for (u32 i = 0; i < nregions; i++)
-            if (start >= regions[i].src && start + need <= regions[i].end) {
+            if (start >= regions[i].src && start + (u32)need <= regions[i].end) {
                 region = (int)i;
                 break;
             }
         if (region < 0) {
-            regions[nregions] = { start, start + need + 256u, 0 };
+            regions[nregions] = { start, start + span, 0 };
             region = (int)nregions++;
         }
         pend[npend++] = { k, type, size, stride, format_bits, f, region, start - regions[region].src };
@@ -316,7 +354,7 @@ bool renderer::upload_vertices(const rsx::draw_clause& clause, u32 first, u32 co
 
     u32 transient = 0;
     if (total) {
-        const vk_slice slice = m_ring.alloc(total, 16);
+        const vk_slice slice = ring_alloc(total, 16);
         if (!slice.ptr) return false;
         transient = (u32)slice.offset;
         if (inline_ptr) std::memcpy(slice.ptr, inline_ptr, inline_bytes);
@@ -402,11 +440,11 @@ bool renderer::upload(reused_upload& u, const void* data, u32 size, VkDescriptor
     } else {
         u.bytes.resize(size);
     }
-    const vk_slice s = m_ring.alloc(size, m_ubo_align);
+    const vk_slice s = ring_alloc(size, m_ubo_align);
     if (!s.ptr) return false;
     std::memcpy(s.ptr, data, size);
     std::memcpy(u.bytes.data() + diff, (const uint8_t*)data + diff, size - diff);
-    u.submission = submission;
+    u.submission = *m_submitted + 1u;
     u.info = { s.buffer, s.offset, size };
     out = u.info;
     return true;
@@ -443,7 +481,7 @@ bool renderer::cache_place(cached& e, u32 ea, u32 size, u32 bytes, u32& offset, 
         out = m_ring.data() + at;
         return true;
     }
-    const vk_slice s = m_ring.alloc(bytes, 16);
+    const vk_slice s = ring_alloc(bytes, 16);
     offset = (u32)s.offset;
     out = s.ptr;
     return s.ptr != nullptr;
@@ -462,7 +500,7 @@ void renderer::evict(u64 age)
     drop(m_index_cache);
     std::memset(m_vcache_l1, 0, sizeof m_vcache_l1);
     std::memset(m_icache_l1, 0, sizeof m_icache_l1);
-    vkGetSemaphoreCounterValue(m_d->dev, m_timeline, &m_reached);
+    m_reached = vk_reached(*m_d, m_timeline);
     release_held();
 }
 
@@ -700,24 +738,30 @@ bool renderer::draw_setup()
     return finish_fp(m_fp);
 }
 
-void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
+renderer::stage_result renderer::stage_draw(const rsx::draw_clause& clause, const rsx_spv_texture_state* textures, const qte_patch& qte,
+                                            staged_draw& staged)
 {
     const u32 prim = clause.primitive;
     bool emulated = false;
     primitive_topology(prim, emulated);
-    const bool restart = r(rsx::M_RESTART_INDEX_ENABLE) != 0;
-    const u32 restart_index = r(rsx::M_RESTART_INDEX);
-
 
     std::vector<draw_sub>& subs = m_subs;
     subs.clear();
-    VkIndexType index_type = VK_INDEX_TYPE_UINT32;
+    staged.index_type = VK_INDEX_TYPE_UINT32;
+    staged.restart = false;
     u32 e0 = 0, ecount = 0, vb = 0;
 
     if (clause.kind == rsx::draw_kind::indexed) {
         const u32 dma = r(rsx::M_INDEX_ARRAY_DMA);
         const bool wide = clause.immediate || ((dma >> 4) & 0xFu) == k_index_type_u32;
-        const u32 isize = wide ? 4u : 2u;
+        const index_format format = index_format_for(prim, wide, r(rsx::M_RESTART_INDEX_ENABLE) != 0, r(rsx::M_RESTART_INDEX));
+        const u32 isize = format.in_size(), osize = format.out_size();
+        uint64_t first_elem = ~0ull, end_elem = 0;
+        for (const rsx::draw_range& rg : clause.ranges) {
+            first_elem = std::min<uint64_t>(first_elem, rg.first);
+            end_elem = std::max<uint64_t>(end_elem, (uint64_t)rg.first + rg.count);
+        }
+        if (end_elem <= first_elem) return stage_result::empty;
         const uint8_t* base = nullptr;
         u32 source = 0;
         if (clause.immediate) {
@@ -737,22 +781,25 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
                 const u32 v = __builtin_bswap32(clause.elements[i]);
                 std::memcpy(m_index_scratch.data() + i * 4u, &v, 4u);
             }
-            base = m_index_scratch.data();
+            base = m_index_scratch.data() + first_elem * 4u;
         } else {
-            const u32 ea = rsx_address((dma & 0xFu) ? RSX_DMA_MAIN : RSX_DMA_LOCAL, r(rsx::M_INDEX_ARRAY_ADDRESS), 0);
-            if (!ea) return;
-            source = ea & ~(isize - 1u);
+            const uint64_t at = (uint64_t)(r(rsx::M_INDEX_ARRAY_ADDRESS) & ~(isize - 1u)) + first_elem * isize;
+            const uint64_t bytes = (end_elem - first_elem) * isize;
+            if (at + bytes > 0xFFFFFFFFull) return stage_result::empty;
+            source = rsx_address((dma & 0xFu) ? RSX_DMA_MAIN : RSX_DMA_LOCAL, (u32)at, (u32)bytes);
+            if (!source) return stage_result::empty;
             base = vm_base + source;
         }
-        index_type = wide ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
-        u32 total = 0;
-        for (const rsx::draw_range& rg : clause.ranges) total += expanded_index_count(prim, rg.count) + 1u;
+        staged.index_type = osize == 4u ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
+        staged.restart = format.sentinel;
+        uint64_t total = 0;
+        for (const rsx::draw_range& rg : clause.ranges) total += index_capacity(prim, rg.count) + 1u;
         cached* e = nullptr;
         u32 offset = 0;
         uint8_t* out = nullptr;
         if (source && clause.ranges.size() == 1) {
             const rsx::draw_range& rg = clause.ranges[0];
-            const index_key ik{ source, rg.first, rg.count, prim, restart_index, (u32)wide | (u32)restart << 1 };
+            const index_key ik{ source, rg.first, rg.count, prim, format.restart_index, (u32)format.wide | (u32)format.restart << 1 };
             const u32 l1_i = ((((ik.source >> 4) ^ (ik.first * 31u) ^ (ik.count * 131u) ^ ik.prim ^ ik.flags) * 0x9E3779B1u) >> 27) & 31u;
             icache_l1& slot = m_icache_l1[l1_i];
             if (slot.val && !std::memcmp(&slot.key, &ik, sizeof ik)) {
@@ -766,22 +813,22 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
                 }
                 m_icache_l1[l1_i] = { ik, e };
             }
-            if (!cache_place(*e, source + rg.first * isize, rg.count * isize, total * isize, offset, out)) return;
+            if (!cache_place(*e, source, rg.count * isize, (u32)(total * osize), offset, out)) return stage_result::failed;
         } else {
-            const vk_slice s = m_ring.alloc((VkDeviceSize)total * isize, 16);
-            if (!s.ptr) return;
+            const vk_slice s = ring_alloc(total * osize, 16);
+            if (!s.ptr) return stage_result::failed;
             offset = (u32)s.offset;
             out = s.ptr;
         }
         u32 lo = out ? 0xFFFFFFFFu : e->min, hi = out ? 0 : e->max;
         if (!out) {
-            subs.push_back({ offset / isize, e->count, 0, true });
+            subs.push_back({ offset / osize, e->count, 0, true });
         } else {
-            const u32 first = offset / isize;
+            const u32 first = offset / osize;
             u32 at = 0;
             for (const rsx::draw_range& rg : clause.ranges) {
-                const index_result res = convert_indices(prim, wide, base + (size_t)rg.first * isize, rg.count, restart, restart_index,
-                                                         out + (size_t)at * isize);
+                const index_result res = convert_indices(prim, format, base + (size_t)(rg.first - first_elem) * isize, rg.count,
+                                                         out + (size_t)at * osize);
                 if (!res.count || res.min > res.max) continue;
                 lo = std::min(lo, res.min);
                 hi = std::max(hi, res.max);
@@ -796,7 +843,7 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
                 e->max = hi;
             }
         }
-        if (subs.empty() || lo > hi) return;
+        if (subs.empty() || lo > hi) return stage_result::empty;
         const u32 base_index = r(rsx::M_VERTEX_BASE_INDEX);
         e0 = lo + base_index;
         ecount = hi - lo + 1u;
@@ -810,7 +857,7 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
                 const u32 fmt = r(rsx::M_VERTEX_ARRAY_FORMAT + k * 4u);
                 if ((fmt >> 4) & 0xFu) stride += host_size(fmt & 0xFu, (fmt >> 4) & 0xFu);
             }
-            if (!stride) return;
+            if (!stride) return stage_result::empty;
             last = (u32)clause.inline_words.size() * 4u / stride;
             subs.push_back({ 0u, last, 0, false });
         } else {
@@ -821,7 +868,7 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
                 subs.push_back({ rg.first, rg.count, 0, false });
             }
         }
-        if (subs.empty() || last <= first) return;
+        if (subs.empty() || last <= first) return stage_result::empty;
         e0 = first;
         ecount = last - first;
         vb = first;
@@ -844,7 +891,7 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
                 cached& e = *ep;
                 u32 offset = 0;
                 uint8_t* out = nullptr;
-                if (!cache_place(e, 0, 0, (n + 1u) * 4u, offset, out)) return;
+                if (!cache_place(e, 0, 0, (n + 1u) * 4u, offset, out)) return stage_result::failed;
                 if (out) generate_indices(prim, s.count, reinterpret_cast<u32*>(out));
                 s.vertex_offset = (int32_t)s.first;
                 s.first = offset / 4u;
@@ -855,7 +902,7 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
     }
 
     VkDescriptorBufferInfo vlayout{};
-    if (!upload_vertices(clause, e0, ecount, vb, vlayout)) return;
+    if (!upload_vertices(clause, e0, ecount, vb, vlayout)) return stage_result::failed;
 
     const uint64_t cur_sub = *m_submitted + 1u;
     if (dirty & rsx::D_VERTEX_CONSTANTS) {
@@ -878,8 +925,8 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
     }
     if (need_consts) {
         const u32 cbytes = vi.constants_relative ? (u32)sizeof constants : std::max<u32>(16u, (vi.max_const + 1u) * 16u);
-        vk_slice cs = m_ring.alloc(cbytes, m_ubo_align);
-        if (!cs.ptr) return;
+        const vk_slice cs = ring_alloc(cbytes, m_ubo_align);
+        if (!cs.ptr) return stage_result::failed;
         if (vi.constants_relative) {
             std::memcpy(cs.ptr, constants, sizeof constants);
             std::memset(m_constants_valid, 0xFF, sizeof m_constants_valid);
@@ -922,7 +969,7 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
                     m_fp_constants[i * 4u + w] = ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu);
                 }
 #endif
-            if (!upload(m_fp_constant_upload, m_fp_constants.data(), fi.constant_count * 16u, fp_consts)) return;
+            if (!upload(m_fp_constant_upload, m_fp_constants.data(), fi.constant_count * 16u, fp_consts)) return stage_result::failed;
             fcs = { m_fp, m_fp_ea, m_epoch, cur_sub, fp_consts };
         }
     } else {
@@ -958,83 +1005,27 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
     fs.wpos_scale = (bottom ? -(float)m_fb.scale.y.den : (float)m_fb.scale.y.den) / (float)m_fb.scale.y.num;
     fs.wpos_scale_x = (float)m_fb.scale.x.den / (float)m_fb.scale.x.num;
     fs.wpos_bias = bottom ? (float)(window & 0xFFFu) : 0.f;
-    VkDescriptorImageInfo images[rsx::TEXTURES + rsx::VERTEX_TEXTURES];
-    u8 unit0_tag = 0;
-    const u32 used_tex_mask = (m_fp->info.texture_mask & 0xFFFFu) | ((m_vp->info.texture_mask & 0xFu) << rsx::TEXTURES);
-    const u32 check_tex_mask = m_bound.valid ? used_tex_mask : ((1u << (rsx::TEXTURES + rsx::VERTEX_TEXTURES)) - 1u);
-    for (u32 bits = check_tex_mask; bits; bits &= bits - 1u) {
+    for (u32 bits = fi.texture_mask & 0xFFFFu; bits; bits &= bits - 1u) {
         const u32 u = (u32)__builtin_ctz(bits);
-        const bool vertex_unit = u >= rsx::TEXTURES;
-        const u32 unit = vertex_unit ? u - rsx::TEXTURES : u;
-        rsx_spv_texture_state scratch{};
-        rsx_spv_texture_state& st = vertex_unit ? scratch : fs.texture[u];
-        if ((used_tex_mask >> u) & 1u) {
-            st = {};
-            st.scale[0] = st.scale[1] = 1.f;
-            if (resolve_texture(unit, vertex_unit, images[u], st, u == 0 ? &unit0_tag : nullptr)) continue;
-        }
-        const u32 dims = texture_dims(m_units[u].desc, m_units[u].valid);
-        const image& dummy = m_dummy[dims == RSX_SPV_TEX_CUBE ? 1 : dims == RSX_SPV_TEX_3D ? 2 : 0];
-        images[u] = { m_dummy_sampler, dummy.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        fs.texture[u] = textures[u];
     }
-    if (__builtin_expect(unit0_tag >= 2u, 0)) {
-        if (m_qte_ring_epoch != m_epoch) {
-            m_qte_rings_prev = std::move(m_qte_rings_cur);
-            m_qte_rings_cur.clear();
-            m_qte_ring_epoch = m_epoch;
+    if (__builtin_expect(qte.snapped || qte.rotated, 0)) {
+        const vk_slice cs = ring_alloc(sizeof constants, m_ubo_align);
+        if (!cs.ptr) return stage_result::failed;
+        std::memcpy(cs.ptr, constants, sizeof constants);
+        if (qte.rotated) {
+            const float z = 0.f;
+            std::memcpy(cs.ptr + 200u * 16u + 0u, &qte.sx, 4);
+            std::memcpy(cs.ptr + 200u * 16u + 4u, &z, 4);
+            std::memcpy(cs.ptr + 201u * 16u + 0u, &z, 4);
+            std::memcpy(cs.ptr + 201u * 16u + 4u, &qte.sy, 4);
         }
-        constexpr u32 k_gfx_pos_reg = 203u;
-        if ((m_vp->info.constants_used[k_gfx_pos_reg / 32u] >> (k_gfx_pos_reg % 32u)) & 1u) {
-            float c203[4];
-            std::memcpy(c203, constants + k_gfx_pos_reg * 4u, sizeof c203);
-            const float cx = c203[0], cy = c203[1];
-            if (unit0_tag == 2u) {
-                m_qte_rings_cur.push_back({ cx, cy });
-            } else if (unit0_tag == 3u) {
-                auto find_ring = [&](const std::vector<qte_anchor>& list, float& rx, float& ry) -> bool {
-                    float best = 1e9f;
-                    bool found = false;
-                    for (const qte_anchor& a : list) {
-                        const float dx = std::fabs(cx - a.cx), dy = std::fabs(cy - a.cy);
-                        if (dx < 0.28f && dy < 0.38f && dx * dx + dy * dy < best) {
-                            best = dx * dx + dy * dy;
-                            rx = a.cx;
-                            ry = a.cy;
-                            found = true;
-                        }
-                    }
-                    return found;
-                };
-                float rx = cx, ry = cy;
-                const bool snapped = find_ring(m_qte_rings_cur, rx, ry) || find_ring(m_qte_rings_prev, rx, ry);
-                float c200[4], c201[4];
-                std::memcpy(c200, constants + 200u * 4u, sizeof c200);
-                std::memcpy(c201, constants + 201u * 4u, sizeof c201);
-                const bool rotated = std::fabs(c200[1]) > 1e-5f || std::fabs(c201[0]) > 1e-5f;
-                if (snapped || rotated) {
-                    vk_slice cs = m_ring.alloc(sizeof constants, m_ubo_align);
-                    if (cs.ptr) {
-                        std::memcpy(cs.ptr, constants, sizeof constants);
-                        if (rotated) {
-                            const float sx = std::hypot(c200[0], c200[1]);
-                            const float det = c200[0] * c201[1] - c200[1] * c201[0];
-                            const float sy = (det < 0.f ? -1.f : 1.f) * std::hypot(c201[0], c201[1]);
-                            const float z = 0.f;
-                            std::memcpy(cs.ptr + 200u * 16u + 0u, &sx, 4);
-                            std::memcpy(cs.ptr + 200u * 16u + 4u, &z, 4);
-                            std::memcpy(cs.ptr + 201u * 16u + 0u, &z, 4);
-                            std::memcpy(cs.ptr + 201u * 16u + 4u, &sy, 4);
-                        }
-                        if (snapped) {
-                            std::memcpy(cs.ptr + k_gfx_pos_reg * 16u, &rx, 4);
-                            std::memcpy(cs.ptr + k_gfx_pos_reg * 16u + 4u, &ry, 4);
-                        }
-                        m_constants_offset = (u32)cs.offset;
-                        m_constants_sub = 0;
-                    }
-                }
-            }
+        if (qte.snapped) {
+            std::memcpy(cs.ptr + k_gfx_pos_reg * 16u, &qte.x, 4);
+            std::memcpy(cs.ptr + k_gfx_pos_reg * 16u + 4u, &qte.y, 4);
         }
+        m_constants_offset = (u32)cs.offset;
+        m_constants_sub = 0;
     }
     if (!m_tcc_valid || (dirty & rsx::D_FRAGMENT_STATE)) {
         u32 tcc = 0;
@@ -1048,12 +1039,102 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
     }
     fs.texcoord_control = m_tcc;
     VkDescriptorBufferInfo fp_state{};
-    if (!upload(m_fp_state_upload, &fs, sizeof fs, fp_state)) return;
+    if (!upload(m_fp_state_upload, &fs, sizeof fs, fp_state)) return stage_result::failed;
+    staged.offsets[0] = m_constants_offset;
+    staged.offsets[1] = (u32)vlayout.offset;
+    staged.offsets[2] = (u32)fp_consts.offset;
+    staged.offsets[3] = (u32)fp_state.offset;
+    return stage_result::ok;
+}
+
+renderer::qte_patch renderer::qte_rings(u8 unit0_tag)
+{
+    qte_patch qte{};
+    if (m_qte_ring_epoch != m_epoch) {
+        m_qte_rings_prev = std::move(m_qte_rings_cur);
+        m_qte_rings_cur.clear();
+        m_qte_ring_epoch = m_epoch;
+    }
+    if (!((m_vp->info.constants_used[k_gfx_pos_reg / 32u] >> (k_gfx_pos_reg % 32u)) & 1u)) return qte;
+    float c203[4];
+    std::memcpy(c203, constants + k_gfx_pos_reg * 4u, sizeof c203);
+    const float cx = c203[0], cy = c203[1];
+    if (unit0_tag == 2u) {
+        m_qte_rings_cur.push_back({ cx, cy });
+        return qte;
+    }
+    if (unit0_tag != 3u) return qte;
+    auto find_ring = [&](const std::vector<qte_anchor>& list, float& rx, float& ry) -> bool {
+        float best = 1e9f;
+        bool found = false;
+        for (const qte_anchor& a : list) {
+            const float dx = std::fabs(cx - a.cx), dy = std::fabs(cy - a.cy);
+            if (dx < 0.28f && dy < 0.38f && dx * dx + dy * dy < best) {
+                best = dx * dx + dy * dy;
+                rx = a.cx;
+                ry = a.cy;
+                found = true;
+            }
+        }
+        return found;
+    };
+    qte.x = cx;
+    qte.y = cy;
+    qte.snapped = find_ring(m_qte_rings_cur, qte.x, qte.y) || find_ring(m_qte_rings_prev, qte.x, qte.y);
+    float c200[4], c201[4];
+    std::memcpy(c200, constants + 200u * 4u, sizeof c200);
+    std::memcpy(c201, constants + 201u * 4u, sizeof c201);
+    qte.rotated = std::fabs(c200[1]) > 1e-5f || std::fabs(c201[0]) > 1e-5f;
+    if (qte.rotated) {
+        const float det = c200[0] * c201[1] - c200[1] * c201[0];
+        qte.sx = std::hypot(c200[0], c200[1]);
+        qte.sy = (det < 0.f ? -1.f : 1.f) * std::hypot(c201[0], c201[1]);
+    }
+    return qte;
+}
+
+void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
+{
+    const u32 prim = clause.primitive;
+    VkDescriptorImageInfo images[rsx::TEXTURES + rsx::VERTEX_TEXTURES];
+    rsx_spv_texture_state textures[rsx::TEXTURES];
+    u8 unit0_tag = 0;
+    const u32 used_tex_mask = (m_fp->info.texture_mask & 0xFFFFu) | ((m_vp->info.texture_mask & 0xFu) << rsx::TEXTURES);
+    const u32 check_tex_mask = m_bound.valid ? used_tex_mask : ((1u << (rsx::TEXTURES + rsx::VERTEX_TEXTURES)) - 1u);
+    for (u32 bits = check_tex_mask; bits; bits &= bits - 1u) {
+        const u32 u = (u32)__builtin_ctz(bits);
+        const bool vertex_unit = u >= rsx::TEXTURES;
+        const u32 unit = vertex_unit ? u - rsx::TEXTURES : u;
+        rsx_spv_texture_state scratch{};
+        rsx_spv_texture_state& st = vertex_unit ? scratch : textures[u];
+        if ((used_tex_mask >> u) & 1u) {
+            st = {};
+            st.scale[0] = st.scale[1] = 1.f;
+            if (resolve_texture(unit, vertex_unit, images[u], st, u == 0 ? &unit0_tag : nullptr)) continue;
+        }
+        images[u] = dummy_image(u);
+    }
+    const qte_patch qte = __builtin_expect(unit0_tag >= 2u, 0) ? qte_rings(unit0_tag) : qte_patch{};
+
+    staged_draw staged;
+    const uint64_t before = *m_submitted;
+    stage_result result = stage_draw(clause, textures, qte, staged);
+    if (result == stage_result::ok && *m_submitted != before) {
+        const uint64_t flushed = *m_submitted;
+        result = stage_draw(clause, textures, qte, staged);
+        if (result == stage_result::ok && *m_submitted != flushed) result = stage_result::failed;
+    }
+    if (result == stage_result::empty) return;
+    if (result == stage_result::failed) {
+        m_occlusion.note_dropped();
+        if (m_trace) std::fprintf(m_trace, "[trace] %u dropped: draw data does not fit the upload ring\n", id);
+        return;
+    }
+    const std::vector<draw_sub>& subs = m_subs;
 
     constexpr u32 k_dyn_mask = rsx::D_SURFACE | rsx::D_VIEWPORT | rsx::D_RASTER | rsx::D_DEPTH_STENCIL | rsx::D_BLEND;
     constexpr u32 k_pipe_mask = rsx::D_SURFACE | rsx::D_RASTER | rsx::D_BLEND;
-    const bool restart_en = restart && clause.kind == rsx::draw_kind::indexed;
-    const bool dyn_changed = !m_dynamic.valid || m_dyn_dirty || (dirty & k_dyn_mask) || m_last_dyn_prim != prim || m_last_dyn_restart != restart_en;
+    const bool dyn_changed = !m_dynamic.valid || m_dyn_dirty || (dirty & k_dyn_mask) || m_last_dyn_prim != prim || m_last_dyn_restart != staged.restart;
     draw_target t{};
     if (dyn_changed) {
         t.width = m_fb.width;
@@ -1092,32 +1173,24 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
         m_bound.pipeline = pipe;
     }
     if (dyn_changed) {
-        set_dynamic_state(c, *this, *m_d, m_pipelines, t, prim, restart_en, key, m_dynamic);
+        set_dynamic_state(c, *this, *m_d, m_pipelines, t, prim, staged.restart, key, m_dynamic);
         m_dyn_dirty = 0;
         dirty &= ~k_dyn_mask;
         m_last_dyn_prim = prim;
-        m_last_dyn_restart = restart_en;
+        m_last_dyn_restart = staged.restart;
     }
 
     const bool all = !m_bound.valid;
-    const u32 offsets[4] = { m_constants_offset, (u32)vlayout.offset, (u32)fp_consts.offset, (u32)fp_state.offset };
-    if (all || std::memcmp(m_bound.offsets, offsets, sizeof offsets)) {
-        std::memcpy(m_bound.offsets, offsets, sizeof offsets);
-        vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelines.layout(), RSX_SPV_SET_BUFFERS, 1, &m_buffer_set, 4, offsets);
+    if (all || std::memcmp(m_bound.offsets, staged.offsets, sizeof staged.offsets)) {
+        std::memcpy(m_bound.offsets, staged.offsets, sizeof staged.offsets);
+        vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelines.layout(), RSX_SPV_SET_BUFFERS, 1, &m_buffer_set, 4, staged.offsets);
     }
     VkWriteDescriptorSet w[rsx::TEXTURES + rsx::VERTEX_TEXTURES];
     u32 nw = 0;
     const u32 bind_tex_mask = all ? ((1u << (rsx::TEXTURES + rsx::VERTEX_TEXTURES)) - 1u) : check_tex_mask;
     for (u32 bits = bind_tex_mask; bits; bits &= bits - 1u) {
         const u32 u = (u32)__builtin_ctz(bits);
-        VkDescriptorImageInfo img;
-        if ((check_tex_mask >> u) & 1u) {
-            img = images[u];
-        } else {
-            const u32 dims = texture_dims(m_units[u].desc, m_units[u].valid);
-            const image& dummy = m_dummy[dims == RSX_SPV_TEX_CUBE ? 1 : dims == RSX_SPV_TEX_3D ? 2 : 0];
-            img = { m_dummy_sampler, dummy.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-        }
+        const VkDescriptorImageInfo img = ((check_tex_mask >> u) & 1u) ? images[u] : dummy_image(u);
         VkDescriptorImageInfo& last = m_bound.images[u];
         if (!all && last.sampler == img.sampler && last.imageView == img.imageView && last.imageLayout == img.imageLayout) continue;
         last = img;
@@ -1132,9 +1205,9 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
     if (all) m_bound.index_type = VK_INDEX_TYPE_MAX_ENUM;
     if (nw) vkCmdPushDescriptorSetKHR(c, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelines.layout(), RSX_SPV_SET_TEXTURES, nw, w);
 
-    if (subs.front().indexed && m_bound.index_type != index_type) {
-        vkCmdBindIndexBuffer(c, m_ring.buffer(), 0, index_type);
-        m_bound.index_type = index_type;
+    if (subs.front().indexed && m_bound.index_type != staged.index_type) {
+        vkCmdBindIndexBuffer(c, m_ring.buffer(), 0, staged.index_type);
+        m_bound.index_type = staged.index_type;
     }
     for (const draw_sub& s : subs) {
         if (s.indexed) vkCmdDrawIndexed(c, s.count, 1, s.first, s.vertex_offset, 0);
@@ -1149,7 +1222,6 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
         }
     if (m_fb.depth && m_fb.depth_write) m_fb.depth->gpu_dirty = true;
     if (m_fb.depth && m_fb.z_write) m_fb.depth->depth_version = ++m_content_clock;
-    m_draw_counter++;
     stats.draws++;
     if (m_trace) {
         u32 n = 0;

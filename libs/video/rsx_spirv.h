@@ -40,7 +40,7 @@ enum rsx_spv_varying {
 };
 
 enum rsx_spv_tex_dim {
-    RSX_SPV_TEX_NONE = 0,
+    RSX_SPV_TEX_1D   = 0,
     RSX_SPV_TEX_2D   = 1,
     RSX_SPV_TEX_CUBE = 2,
     RSX_SPV_TEX_3D   = 3

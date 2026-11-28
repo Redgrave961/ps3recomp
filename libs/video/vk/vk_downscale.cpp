@@ -102,35 +102,6 @@ bool downscale::create(vk_device& d, VkPipelineCache cache)
     return true;
 }
 
-void downscale::destroy()
-{
-    if (!m_d) return;
-    for (const gfx_pipe& p : m_gfx_pipes)
-        if (p.pipe) vkDestroyPipeline(m_d->dev, p.pipe, nullptr);
-    m_gfx_pipes.clear();
-    for (VkShaderModule& m : m_fs) {
-        if (m) vkDestroyShaderModule(m_d->dev, m, nullptr);
-        m = VK_NULL_HANDLE;
-    }
-    if (m_vs) vkDestroyShaderModule(m_d->dev, m_vs, nullptr);
-    if (m_gfx_layout) vkDestroyPipelineLayout(m_d->dev, m_gfx_layout, nullptr);
-    if (m_gfx_set) vkDestroyDescriptorSetLayout(m_d->dev, m_gfx_set, nullptr);
-    if (m_linear) vkDestroySampler(m_d->dev, m_linear, nullptr);
-    m_vs = VK_NULL_HANDLE;
-    m_gfx_layout = VK_NULL_HANDLE;
-    m_gfx_set = VK_NULL_HANDLE;
-    m_linear = VK_NULL_HANDLE;
-    if (m_pipe) vkDestroyPipeline(m_d->dev, m_pipe, nullptr);
-    if (m_layout) vkDestroyPipelineLayout(m_d->dev, m_layout, nullptr);
-    if (m_set) vkDestroyDescriptorSetLayout(m_d->dev, m_set, nullptr);
-    if (m_sampler) vkDestroySampler(m_d->dev, m_sampler, nullptr);
-    m_pipe = VK_NULL_HANDLE;
-    m_layout = VK_NULL_HANDLE;
-    m_set = VK_NULL_HANDLE;
-    m_sampler = VK_NULL_HANDLE;
-    m_d = nullptr;
-}
-
 VkPipeline downscale::pipeline_for(VkFormat format, uint32_t scale)
 {
     for (const gfx_pipe& p : m_gfx_pipes)

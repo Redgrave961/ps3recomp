@@ -64,7 +64,8 @@ On Windows, `VirtualAlloc` with `MEM_RESERVE` reserves the 4 GB range without co
 | `0x00010000 – 0x0FFFFFFF` | 256 MB | User ELF text + data (main memory) | `vm_init()` |
 | `0x10000000 – 0x1FFFFFFF` | 256 MB | RSX mapped memory / PRX module space | On demand via `vm_commit()` |
 | `0x30000000 – 0x3001FFFF` | 8 × 256 KB | SPU local store windows (raw SPU) | `vm_commit()` |
-| `0xD0000000 – 0xDFFFFFFF` | 256 MB | Stack region | `vm_init()` |
+| `0x90000000 – 0x9EFFFFFF` | 240 MB | PPU thread stacks (`vm_stack_alloc`) | `vm_init()`; recommitted per stack by `vm_stack_allocate()` |
+| `0x9F000000 – 0x9FFFFFFF` | 16 MB | Guest callback stacks | `vm_init()` |
 
 ### Key Constants
 
@@ -76,9 +77,11 @@ On Windows, `VirtualAlloc` with `MEM_RESERVE` reserves the 4 GB range without co
 #define VM_RSX_SIZE         0x10000000u     // 256 MB RSX
 #define VM_SPU_BASE         0x30000000u     // SPU LS windows start
 #define VM_SPU_WINDOW_SIZE  0x00040000u     // 256 KB per SPU
-#define VM_STACK_BASE       0xD0000000u     // Stack region start
+#define VM_STACK_BASE       0x90000000u     // Stack region start
 #define VM_STACK_REGION     0x10000000u     // 256 MB for stacks
 #define VM_PPU_STACK_SIZE   0x00100000u     // 1 MB default per thread
+#define VM_CB_STACK_BASE    0x9F000000u     // Callback stacks: the top 16 MB of the stack region
+#define VM_STACK_BLOCKS_MAX 128u            // Live thread stacks the allocator tracks
 #define VM_PAGE_SIZE        0x00001000u     // 4 KB pages
 ```
 
@@ -110,7 +113,7 @@ Converts a PS3 guest address (32-bit) to a host pointer.
 
 ### Stack Allocator
 
-The `vm_stack_alloc` structure provides a bump allocator for PPU thread stacks within the `0xD0000000` region:
+The `vm_stack_alloc` structure hands out PPU thread stacks from `VM_STACK_BASE` up to `VM_CB_STACK_BASE` (`0x90000000 – 0x9F000000`) and takes them back when a thread's slot is released:
 
 ```c
 vm_stack_alloc sa;
@@ -118,11 +121,19 @@ vm_stack_alloc_init(&sa);
 
 // Allocate a 1 MB stack with guard page
 uint32_t stack_base = vm_stack_allocate(&sa, VM_PPU_STACK_SIZE);
-// stack_base points past the guard page
+// stack_base points past the guard page, 0 on failure
 // Usable stack top = stack_base + VM_PPU_STACK_SIZE
+
+// Return it; pass the size it was allocated with
+vm_stack_free(&sa, stack_base, VM_PPU_STACK_SIZE);
 ```
 
-Each allocation includes a **guard page** (4 KB, `PAGE_NOACCESS`) at the bottom of the stack to detect overflow. The allocator returns the address *above* the guard page.
+Each block is the stack size rounded up to the host page size, plus one **guard page** (no access) below it to catch overflow. The allocator returns the address *above* the guard page.
+
+- **Allocate:** takes the smallest freed range that fits (best fit), otherwise the space at `next_addr`. The block is committed with `vm_commit()` and its guard page protected with `vm_protect()`. Returns 0 when `VM_STACK_BLOCKS_MAX` (128) stacks are live, when no range fits, or when the commit fails.
+- **Free:** decommits the block, guard page included (Windows `VirtualFree(MEM_DECOMMIT)`, POSIX `madvise(MADV_DONTNEED)`), so a reused stack reads as zeros. The block merges with freed ranges on either side; a range that ends at `next_addr` lowers `next_addr` instead of staying on the free list, so freeing everything returns the allocator to `VM_STACK_BASE` with no free ranges.
+- **Locking:** the allocator has no lock of its own. `sys_ppu_thread.c` owns the global `g_vm_stack_alloc` and calls it under its thread-table lock.
+- **Windows linking:** `vm_commit()` commits through `vm_commit_host()` in `runtime/memory/vm_track.c`, so a test or tool that allocates stacks must link that file.
 
 ---
 

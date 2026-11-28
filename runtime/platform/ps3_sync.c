@@ -199,6 +199,8 @@ void ps3_brief_wake(volatile uint32_t* addr)
     }
 }
 
+#define PS3_SLEEP_CREDIT_MAX_NS 2000000ull
+
 void ps3_sleep_us(uint64_t us)
 {
     if (!us) return;
@@ -225,7 +227,8 @@ void ps3_sleep_us(uint64_t us)
     while (nanosleep(&ts, &ts) != 0) {}
 #endif
     const uint64_t slept = ps3_sync_now_ns() - start;
-    t_credit_ns = slept > need ? slept - need : 0;
+    const uint64_t over = slept > need ? slept - need : 0;
+    t_credit_ns = over < PS3_SLEEP_CREDIT_MAX_NS ? over : PS3_SLEEP_CREDIT_MAX_NS;
 }
 
 void ps3_lock_slow(ps3_lock* l, unsigned spin)

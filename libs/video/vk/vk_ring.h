@@ -15,6 +15,7 @@ public:
     bool create(vk_device& d, VkDeviceSize size, VkDeviceSize persistent, VkSemaphore timeline);
     void destroy();
     vk_slice alloc(VkDeviceSize size, VkDeviceSize align);
+    bool fits(VkDeviceSize size) const { return size < m_size; }
     bool hold(VkDeviceSize size, VmaVirtualAllocation& a, VkDeviceSize& offset);
     void release(VmaVirtualAllocation a) { vmaVirtualFree(m_heap, a); }
     void flush();

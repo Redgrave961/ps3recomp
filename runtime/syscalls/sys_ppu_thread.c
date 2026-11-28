@@ -14,9 +14,6 @@ static __thread int     s_exit_armed = 0;
 #include <stdlib.h>
 #include "ps3emu/log_first.h"
 #include "ps3emu/thread_name.h"
-#ifndef _WIN32
-#include <errno.h>
-#endif
 
 #define PPU_HOST_STACK_BYTES  (256u * 1024u * 1024u)
 
@@ -141,6 +138,22 @@ static void wait_first_block(const ppu_thread_info* t, uint64_t tid)
     }
 }
 
+static void release_slot(ppu_thread_info* t)
+{
+    vm_stack_free(&g_vm_stack_alloc, t->stack_addr, t->stack_size);
+    t->state = PPU_THREAD_STATE_FREE;
+}
+
+static int run_guest_entry(ppu_thread_info* info)
+{
+    s_exit_armed = 1;
+    if (setjmp(s_exit_jmp) != 0) return 1;
+    g_ppu_thread_entry_trampoline(&info->ctx);
+    s_exit_armed = 0;
+    info->exit_status = (int64_t)info->ctx.gpr[3];
+    return 0;
+}
+
 #ifdef _WIN32
 static DWORD WINAPI ppu_host_thread_proc(LPVOID param)
 #else
@@ -163,13 +176,9 @@ static void* ppu_host_thread_proc(void* param)
             (unsigned long long)info->entry_addr, (unsigned long)GetCurrentThreadId());
 
     if (g_ppu_thread_entry_trampoline) {
-        s_exit_armed = 1;
-        if (setjmp(s_exit_jmp) == 0)
-            g_ppu_thread_entry_trampoline(&info->ctx);
-        else
+        if (run_guest_entry(info))
             fprintf(stderr, "[THREAD %llu] unwound out of sys_ppu_thread_exit\n",
                     (unsigned long long)info->ctx.thread_id);
-        s_exit_armed = 0;
         fprintf(stderr, "[THREAD %llu] entry RETURNED (r3=0x%llX) -- thread finished\n",
                 (unsigned long long)info->ctx.thread_id,
                 (unsigned long long)info->ctx.gpr[3]);
@@ -179,12 +188,8 @@ static void* ppu_host_thread_proc(void* param)
           if (ps3_intr_is_handler(info->ctx.thread_id)) {
               fprintf(stderr, "[intr] thread %llu is an interrupt handler -- \n",
                       (unsigned long long)info->ctx.thread_id);
-              while (ps3_intr_wait(info->ctx.thread_id)) {
-                  s_exit_armed = 1;
-                  if (setjmp(s_exit_jmp) == 0)
-                      g_ppu_thread_entry_trampoline(&info->ctx);
-                  s_exit_armed = 0;
-              }
+              while (ps3_intr_wait(info->ctx.thread_id))
+                  run_guest_entry(info);
           } }
     } else {
         fprintf(stderr, "[THREAD %llu] g_ppu_thread_entry_trampoline is NULL — thread is a no-op!\n",
@@ -194,40 +199,56 @@ static void* ppu_host_thread_proc(void* param)
     ps3_tprof_thread_exit();
     ppu_thread_note_block(info->ctx.thread_id);
     table_lock();
-    info->exit_status = (int64_t)info->ctx.gpr[3];
-
-    if (!info->joinable) {
-#ifdef _WIN32
-        if (info->finish_event) CloseHandle(info->finish_event);
-        if (info->host_thread) CloseHandle(info->host_thread);
-        info->finish_event = NULL;
-        info->host_thread = NULL;
-#else
-        pthread_mutex_destroy(&info->finish_mutex);
-        pthread_cond_destroy(&info->finish_cond);
-#endif
-        info->state = PPU_THREAD_STATE_FREE;
-        table_unlock();
-#ifdef _WIN32
-        return 0;
-#else
-        return NULL;
-#endif
+    if (info->joinable) {
+        __atomic_store_n(&info->state, PPU_THREAD_STATE_FINISHED, __ATOMIC_RELEASE);
+        ps3_futex_wake_all((volatile uint32_t*)&info->state);
+    } else {
+        release_slot(info);
     }
-    info->state = PPU_THREAD_STATE_FINISHED;
     table_unlock();
-
 #ifdef _WIN32
-    SetEvent(info->finish_event);
     return 0;
 #else
-    pthread_mutex_lock(&info->finish_mutex);
-    info->finished = 1;
-    pthread_cond_signal(&info->finish_cond);
-    pthread_mutex_unlock(&info->finish_mutex);
     return NULL;
 #endif
 }
+
+#ifdef _WIN32
+static int spawn_host_thread(ppu_thread_info* t)
+{
+    HANDLE h = (HANDLE)_beginthreadex(NULL, PPU_HOST_STACK_BYTES,
+                                      (unsigned (__stdcall*)(void*))ppu_host_thread_proc, t,
+                                      STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+    if (!h) return 0;
+    if (t->priority < 256)
+        SetThreadPriority(h, THREAD_PRIORITY_ABOVE_NORMAL);
+    CloseHandle(h);
+    return 1;
+}
+#else
+static int start_detached_host_thread(ppu_thread_info* t, size_t stack_bytes)
+{
+    pthread_attr_t attr;
+    pthread_t host;
+    pthread_attr_init(&attr);
+    int rc = pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    if (rc == 0 && stack_bytes) rc = pthread_attr_setstacksize(&attr, stack_bytes);
+    if (rc == 0) rc = pthread_create(&host, &attr, ppu_host_thread_proc, t);
+    pthread_attr_destroy(&attr);
+    return rc;
+}
+
+static int spawn_host_thread(ppu_thread_info* t)
+{
+    const int rc = start_detached_host_thread(t, PPU_HOST_STACK_BYTES);
+    if (rc == 0) return 1;
+    fprintf(stderr, "[SYS] tid=%llu: no %zu MB host stack (%d), "
+                    "falling back to the default\n",
+            (unsigned long long)t->ctx.thread_id,
+            (size_t)(PPU_HOST_STACK_BYTES / (1024 * 1024)), rc);
+    return start_detached_host_thread(t, 0) == 0;
+}
+#endif
 
 uint64_t ppu_thread_register_main(void)
 {
@@ -243,12 +264,6 @@ uint64_t ppu_thread_register_main(void)
         ps3_ft_name(1, "main");
         ps3_tprof_thread('P', 1);
         ps3_thread_name("P1 main");
-#ifdef _WIN32
-        t->finish_event = CreateEventA(NULL, TRUE, FALSE, NULL);
-#else
-        pthread_mutex_init(&t->finish_mutex, NULL);
-        pthread_cond_init(&t->finish_cond, NULL);
-#endif
     }
     table_unlock();
     return 1;
@@ -273,14 +288,6 @@ ppu_context* ppu_thread_adopt(const char* name, uint32_t stack_size, int32_t pri
     t->stack_addr = stack_addr;
     t->stack_size = stack_size;
     strncpy(t->name, name, sizeof(t->name) - 1);
-#ifdef _WIN32
-    t->host_tid = GetCurrentThreadId();
-    t->finish_event = CreateEventA(NULL, TRUE, FALSE, NULL);
-#else
-    t->host_thread = pthread_self();
-    pthread_mutex_init(&t->finish_mutex, NULL);
-    pthread_cond_init(&t->finish_cond, NULL);
-#endif
     table_unlock();
     ps3_ft_name((uint32_t)slot + 1u, t->name);
     ps3_thread_name("P%u %s", (unsigned)slot + 1u, t->name);
@@ -361,14 +368,6 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
         ps3_ft_name((uint32_t)(t - g_ppu_threads) + 1u, t->name);
     }
 
-#ifdef _WIN32
-    t->finish_event = CreateEventA(NULL, TRUE, FALSE, NULL);
-#else
-    pthread_mutex_init(&t->finish_mutex, NULL);
-    pthread_cond_init(&t->finish_cond, NULL);
-    t->finished = 0;
-#endif
-
     if (tid_out_addr != 0) {
         uint64_t* out = (uint64_t*)vm_to_host(tid_out_addr);
         uint64_t be_id = thread_id;
@@ -388,46 +387,11 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
     fprintf(stderr, "[SYS] sys_ppu_thread_create tid=%llu name=\"%s\" entry=0x%08llX arg=0x%llX stack=0x%X prio=%d flags=0x%llX\n",
             (unsigned long long)thread_id, t->name, (unsigned long long)entry, (unsigned long long)arg,
             stack_size, priority, (unsigned long long)flags);
-#ifdef _WIN32
-    t->host_thread = (HANDLE)_beginthreadex(NULL, 256u * 1024 * 1024,
-                                  (unsigned (__stdcall*)(void*))ppu_host_thread_proc, t,
-                                  STACK_SIZE_PARAM_IS_A_RESERVATION, (unsigned*)&t->host_tid);
-    if (t->host_thread == NULL) {
-        t->state = PPU_THREAD_STATE_FREE;
-        CloseHandle(t->finish_event);
+    if (!spawn_host_thread(t)) {
+        release_slot(t);
         table_unlock();
         return (int64_t)(int32_t)CELL_EAGAIN;
     }
-    if (priority < 256)
-        SetThreadPriority(t->host_thread, THREAD_PRIORITY_ABOVE_NORMAL);
-#else
-    int rc;
-    {
-        pthread_attr_t attr;
-        pthread_attr_init(&attr);
-        if (pthread_attr_setstacksize(&attr, PPU_HOST_STACK_BYTES) == 0) {
-            rc = pthread_create(&t->host_thread, &attr, ppu_host_thread_proc, t);
-        } else {
-            rc = EINVAL;
-        }
-        pthread_attr_destroy(&attr);
-        if (rc != 0) {
-            fprintf(stderr, "[SYS] tid=%llu: no %zu MB host stack (%d), "
-                            "falling back to the default\n",
-                    (unsigned long long)thread_id,
-                    (size_t)(PPU_HOST_STACK_BYTES / (1024 * 1024)), rc);
-            rc = pthread_create(&t->host_thread, NULL, ppu_host_thread_proc, t);
-        }
-    }
-    if (rc != 0) {
-        t->state = PPU_THREAD_STATE_FREE;
-        pthread_mutex_destroy(&t->finish_mutex);
-        pthread_cond_destroy(&t->finish_cond);
-        table_unlock();
-        return (int64_t)(int32_t)CELL_EAGAIN;
-    }
-    if (!t->joinable) pthread_detach(t->host_thread);
-#endif
 
     const int preempts = prio_start_enabled() && priority < creator_priority(ctx->thread_id);
     table_unlock();
@@ -446,17 +410,8 @@ int64_t sys_ppu_thread_exit(ppu_context* ctx)
     ppu_thread_info* t = find_thread(tid);
     if (t) {
         t->exit_status = (int64_t)status;
-        if (t->joinable || t == &g_ppu_threads[0])
+        if (t == &g_ppu_threads[0])
             t->state = PPU_THREAD_STATE_FINISHED;
-
-#ifdef _WIN32
-        SetEvent(t->finish_event);
-#else
-        pthread_mutex_lock(&t->finish_mutex);
-        t->finished = 1;
-        pthread_cond_signal(&t->finish_cond);
-        pthread_mutex_unlock(&t->finish_mutex);
-#endif
     }
     table_unlock();
 
@@ -480,31 +435,21 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
         table_unlock();
         return (int64_t)(int32_t)CELL_ESRCH;
     }
-    if (!t->joinable || t->joining || t->state == PPU_THREAD_STATE_DETACHED) {
+    if (!t->joinable || t->joining) {
         table_unlock();
         return (int64_t)(int32_t)CELL_EINVAL;
     }
     t->joining = 1;
+    for (int state; (state = t->state) != PPU_THREAD_STATE_FINISHED;) {
+        table_unlock();
+        ps3_futex_wait((volatile uint32_t*)&t->state, (uint32_t)state, 0);
+        table_lock();
+    }
+    const int64_t es = t->exit_status;
+    release_slot(t);
     table_unlock();
 
-#ifdef _WIN32
-    WaitForSingleObject(t->finish_event, INFINITE);
-    if (t->host_thread && WaitForSingleObject(t->host_thread, 5000) == WAIT_TIMEOUT) {
-        static int s_warned = 0;
-        if (s_warned++ < 4)
-            fprintf(stderr, "[SYS] ppu_thread_join(tid=%llu): host thread still running 5 s "
-                            "after exit -- freeing the slot anyway\n", (unsigned long long)tid);
-    }
-#else
-    pthread_mutex_lock(&t->finish_mutex);
-    while (!t->finished) {
-        pthread_cond_wait(&t->finish_cond, &t->finish_mutex);
-    }
-    pthread_mutex_unlock(&t->finish_mutex);
-#endif
-
     if (status_addr != 0) {
-        int64_t es = t->exit_status;
         int64_t* out = (int64_t*)vm_to_host(status_addr);
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
         uint64_t u = (uint64_t)es;
@@ -522,32 +467,6 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
 #endif
     }
 
-#ifdef _WIN32
-    table_lock();
-    CloseHandle(t->host_thread);
-    CloseHandle(t->finish_event);
-    t->host_thread = NULL;
-    t->finish_event = NULL;
-#else
-    {
-        struct timespec ts;
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        ts.tv_sec += 5;
-        if (pthread_clockjoin_np(t->host_thread, NULL, CLOCK_MONOTONIC, &ts) == ETIMEDOUT) {
-            static int s_warned = 0;
-            if (s_warned++ < 4)
-                fprintf(stderr, "[SYS] ppu_thread_join(tid=%llu): host thread still running 5 s "
-                                "after exit -- freeing the slot anyway\n", (unsigned long long)tid);
-            pthread_detach(t->host_thread);
-        }
-    }
-    table_lock();
-    pthread_mutex_destroy(&t->finish_mutex);
-    pthread_cond_destroy(&t->finish_cond);
-#endif
-    t->state = PPU_THREAD_STATE_FREE;
-    table_unlock();
-
     return CELL_OK;
 }
 
@@ -562,33 +481,20 @@ int64_t sys_ppu_thread_detach(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
     }
 
-    if (t->state == PPU_THREAD_STATE_FINISHED) {
-#ifdef _WIN32
-        HANDLE h = t->host_thread;
-        t->joining = 1;
+    if (!t->joinable) {
         table_unlock();
-        if (h) WaitForSingleObject(h, 5000);
-        table_lock();
-        if (t->state != PPU_THREAD_STATE_FINISHED || t->host_thread != h) {
-            table_unlock();
-            return CELL_OK;
-        }
-        CloseHandle(t->host_thread);
-        CloseHandle(t->finish_event);
-        t->host_thread  = NULL;
-        t->finish_event = NULL;
-#else
-        pthread_detach(t->host_thread);
-        pthread_mutex_destroy(&t->finish_mutex);
-        pthread_cond_destroy(&t->finish_cond);
-#endif
-        t->state = PPU_THREAD_STATE_FREE;
+        return (int64_t)(int32_t)CELL_EINVAL;
+    }
+    if (t->joining) {
+        table_unlock();
+        return (int64_t)(int32_t)CELL_EBUSY;
+    }
+
+    if (t->state == PPU_THREAD_STATE_FINISHED) {
+        release_slot(t);
     } else {
         t->state = PPU_THREAD_STATE_DETACHED;
         t->joinable = 0;
-#ifndef _WIN32
-        pthread_detach(t->host_thread);
-#endif
     }
 
     table_unlock();

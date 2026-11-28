@@ -25,23 +25,28 @@ static char s_version[16]   = "01.00";
 static char s_system_ver[16] = "00.0000";
 static char s_app_ver[16]   = "01.00";
 
-static char s_content_path[CELL_GAME_PATH_MAX] = "./gamedata/dev_hdd0/game";
+#define CELL_GAME_HOST_SUFFIX_MAX (sizeof(s_title_id) + sizeof("/USRDIR/EBOOT.BIN"))
+
+static char s_content_path[PS3_HOST_PATH_MAX] = "./gamedata/dev_hdd0/game";
 static int  s_content_path_resolved = 0;
 
-void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size);
+int sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size);
 
 static const char* content_root(void)
 {
     if (!s_content_path_resolved) {
         s_content_path_resolved = 1;
-        sys_fs_translate_path("/dev_hdd0/game", s_content_path, (int)sizeof s_content_path);
+        char root[PS3_HOST_PATH_MAX];
+        if (sys_fs_translate_path("/dev_hdd0/game", root, (int)(sizeof root - CELL_GAME_HOST_SUFFIX_MAX)))
+            memcpy(s_content_path, root, sizeof root);
+        else
+            printf("[cellGame] host /dev_hdd0/game path is too long; keeping %s\n", s_content_path);
         printf("[cellGame] content root (host /dev_hdd0/game): %s\n", s_content_path);
     }
     return s_content_path;
 }
-static char s_content_info_path[CELL_GAME_PATH_MAX] = "";
-static char s_usrdir_path[CELL_GAME_PATH_MAX] = "";
-static char s_tmp_path[CELL_GAME_PATH_MAX] = "";
+static char s_content_info_path[PS3_HOST_PATH_MAX] = "";
+static char s_usrdir_path[PS3_HOST_PATH_MAX] = "";
 
 static u32  s_game_type = CELL_GAME_GAMETYPE_DISC;
 
@@ -50,9 +55,10 @@ static char s_check_dir[64] = "";
 
 static void ensure_dirs(const char* path)
 {
-    char tmp[CELL_GAME_PATH_MAX];
-    strncpy(tmp, path, sizeof(tmp) - 1);
-    tmp[sizeof(tmp) - 1] = '\0';
+    const size_t n = strlen(path) + 1;
+    char* tmp = n > 1 ? (char*)malloc(n) : NULL;
+    if (!tmp) return;
+    memcpy(tmp, path, n);
 
     for (char* p = tmp + 1; *p; p++) {
         if (*p == '/' || *p == '\\') {
@@ -63,6 +69,7 @@ static void ensure_dirs(const char* path)
         }
     }
     HOST_MKDIR(tmp);
+    free(tmp);
 }
 
 static int dir_exists(const char* path)
@@ -79,7 +86,7 @@ static int dir_exists(const char* path)
 
 static s32 content_free_kb(void)
 {
-    char path[CELL_GAME_PATH_MAX];
+    char path[PS3_HOST_PATH_MAX];
     snprintf(path, sizeof(path), "%s", s_content_path[0] ? s_content_path : ".");
     for (;;) {
 #ifdef _WIN32
@@ -162,23 +169,22 @@ static int sfo_read_string(const char* sfo_path, const char* key,
     if (d[0]==0x00 && d[1]==0x50 && d[2]==0x53 && d[3]==0x46) {
         #define SFO_RD32(o) ((u32)d[o] | ((u32)d[(o)+1]<<8) | ((u32)d[(o)+2]<<16) | ((u32)d[(o)+3]<<24))
         #define SFO_RD16(o) ((u16)d[o] | ((u16)d[(o)+1]<<8))
-        u32 key_tab  = SFO_RD32(0x08);
-        u32 data_tab = SFO_RD32(0x0C);
-        u32 n        = SFO_RD32(0x10);
-        for (u32 i = 0; i < n; i++) {
-            u32 e = 0x14 + i * 0x10;
-            if (e + 0x10 > (u32)sz) break;
-            u32 key_off  = SFO_RD16(e + 0x00);
-            u32 data_len = SFO_RD32(e + 0x04);
-            u32 data_off = SFO_RD32(e + 0x0C);
-            if (key_tab + key_off >= (u32)sz) continue;
-            if (strcmp((const char*)(d + key_tab + key_off), key) != 0) continue;
-            u32 src = data_tab + data_off;
-            if (src >= (u32)sz) break;
-            int copy = (int)data_len;
-            if (copy > (int)((u32)sz - src)) copy = (int)((u32)sz - src);
-            if (copy >= out_size) copy = out_size - 1;
-            if (copy < 0) copy = 0;
+        const u64 size     = (u64)sz;
+        const u64 key_tab  = SFO_RD32(0x08);
+        const u64 data_tab = SFO_RD32(0x0C);
+        const u32 n        = SFO_RD32(0x10);
+        for (u32 i = 0; i < n && key_tab < size && data_tab < size; i++) {
+            const u64 e = 0x14 + (u64)i * 0x10;
+            if (e + 0x10 > size) break;
+            const u64 key_pos = key_tab + SFO_RD16(e + 0x00);
+            const u64 data_len = SFO_RD32(e + 0x04);
+            const u64 src = data_tab + SFO_RD32(e + 0x0C);
+            if (key_pos >= size || !memchr(d + key_pos, 0, (size_t)(size - key_pos))) continue;
+            if (strcmp((const char*)(d + key_pos), key) != 0) continue;
+            if (src >= size) break;
+            u64 copy = data_len;
+            if (copy > size - src) copy = size - src;
+            if (copy > (u64)out_size - 1) copy = (u64)out_size - 1;
             memcpy(out, d + src, (size_t)copy);
             out[copy] = '\0';
             ret = 0;
@@ -254,21 +260,21 @@ void cellGame_init_boot(const char* vfs_root)
         "%s/PARAM.SFO",
     };
     const size_t n_layouts = sizeof(layouts) / sizeof(layouts[0]);
-    char sfo[1100];
+    char sfo[PS3_HOST_PATH_MAX];
     size_t i;
     for (i = 0; i < n_layouts; i++) {
-        snprintf(sfo, sizeof(sfo), layouts[i], vfs_root);
-        if (file_exists(sfo))
+        if (ps3_path_format(sfo, sizeof(sfo), layouts[i], vfs_root) && file_exists(sfo))
             break;
     }
-    if (i == n_layouts)
-        snprintf(sfo, sizeof(sfo), layouts[0], vfs_root);
-    cellGame_init_from_paramsfo(sfo);
+    if (i < n_layouts || ps3_path_format(sfo, sizeof(sfo), layouts[0], vfs_root))
+        cellGame_init_from_paramsfo(sfo);
+    else
+        printf("[cellGame] PARAM.SFO path under '%s' is too long; keeping title id '%s'\n", vfs_root, s_title_id);
 
     if (s_game_type != CELL_GAME_GAMETYPE_DISC)
         return;
 
-    char patch_sfo[1100], patch_eboot[1100], tmp[256];
+    char patch_sfo[PS3_HOST_PATH_MAX], patch_eboot[PS3_HOST_PATH_MAX], tmp[256];
     snprintf(patch_sfo, sizeof(patch_sfo), "%s/%s/PARAM.SFO", content_root(), s_title_id);
     snprintf(patch_eboot, sizeof(patch_eboot), "%s/%s/USRDIR/EBOOT.BIN", content_root(), s_title_id);
     if (!file_exists(patch_eboot))
@@ -304,13 +310,10 @@ s32 cellGameBootCheck(u32* type, u32* attributes, CellGameContentSize* size,
              "%s/%s", content_root(), s_title_id);
     snprintf(s_usrdir_path, sizeof(s_usrdir_path),
              "%s/%s/USRDIR", content_root(), s_title_id);
-    snprintf(s_tmp_path, sizeof(s_tmp_path),
-             "%s/%s_TMP", content_root(), s_title_id);
 
 #ifdef _WIN32
     for (char* p = s_content_info_path; *p; p++) if (*p == '/') *p = '\\';
     for (char* p = s_usrdir_path; *p; p++) if (*p == '/') *p = '\\';
-    for (char* p = s_tmp_path; *p; p++) if (*p == '/') *p = '\\';
 #endif
 
     uint32_t type_ea = (uint32_t)(uintptr_t)type;
@@ -350,10 +353,10 @@ s32 cellGameContentPermit(char* contentInfoPath, char* usrdirPath)
         ensure_dirs(s_content_info_path);
         ensure_dirs(s_usrdir_path);
         {
-            char gpath[CELL_GAME_PATH_MAX], vpath[CELL_GAME_PATH_MAX];
+            char gpath[CELL_GAME_PATH_MAX], vpath[PS3_HOST_PATH_MAX];
             snprintf(gpath, sizeof gpath, "/dev_hdd0/game/%s/USRDIR", s_check_dir);
-            sys_fs_translate_path(gpath, vpath, (int)sizeof vpath);
-            ensure_dirs(vpath);
+            if (sys_fs_translate_path(gpath, vpath, (int)sizeof vpath))
+                ensure_dirs(vpath);
         }
     }
 
@@ -386,8 +389,8 @@ s32 cellGameDataCheck(u32 type, const char* dirName, CellGameContentSize* size)
     strncpy(s_check_dir, check_dir, sizeof(s_check_dir) - 1);
     s_check_dir[sizeof(s_check_dir) - 1] = '\0';
 
-    char path[CELL_GAME_PATH_MAX];
-    snprintf(path, sizeof(path), "%s/%s", content_root(), check_dir);
+    char path[PS3_HOST_PATH_MAX];
+    const int path_fits = ps3_path_format(path, sizeof(path), "%s/%s", content_root(), check_dir);
 
     uint32_t size_ea = (uint32_t)(uintptr_t)size;
     if (size_ea) {
@@ -399,7 +402,7 @@ s32 cellGameDataCheck(u32 type, const char* dirName, CellGameContentSize* size)
     if (type == 1)
         return CELL_OK;
 
-    if (dir_exists(path)) {
+    if (path_fits && dir_exists(path)) {
         return CELL_OK;
     }
 
@@ -448,12 +451,12 @@ s32 cellGameCreateGameData(CellGameSetInitParams* init, char* tmp_contentInfoPat
 
     const char* create_dir = s_check_dir[0] ? s_check_dir : s_title_id;
 
-    char path[CELL_GAME_PATH_MAX];
+    char path[PS3_HOST_PATH_MAX];
     snprintf(path, sizeof(path), "%s/%s", content_root(), create_dir);
 
     ensure_dirs(path);
 
-    char usrdir[CELL_GAME_PATH_MAX];
+    char usrdir[PS3_HOST_PATH_MAX];
     snprintf(usrdir, sizeof(usrdir), "%s/USRDIR", path);
     ensure_dirs(usrdir);
 

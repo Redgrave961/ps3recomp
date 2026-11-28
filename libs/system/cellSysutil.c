@@ -11,7 +11,7 @@
 #include <sys/stat.h>
 
 #include "../../runtime/platform/ps3_utf8_fs.h"
-void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size);
+int sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size);
 
 extern void vm_write8(uint64_t addr, uint8_t v);
 extern void vm_write32(uint64_t addr, uint32_t v);
@@ -417,11 +417,11 @@ s32 cellSysCacheMount(char* param)
     { const char* root = getenv("PS3_HDD1_ROOT");
       if (root && *root) {
           char gpath[512], hpath[1024];
-          sys_fs_translate_path("/dev_hdd1/cache", hpath, (int)sizeof hpath);
-          ps3_utf8_mkdir(hpath);
+          if (sys_fs_translate_path("/dev_hdd1/cache", hpath, (int)sizeof hpath)) ps3_utf8_mkdir(hpath);
           snprintf(gpath, sizeof gpath, "/dev_hdd1/cache/%s", cache_id);
-          sys_fs_translate_path(gpath, hpath, (int)sizeof hpath);
-          if (ps3_utf8_mkdir(hpath) == 0 || errno == EEXIST)
+          if (!sys_fs_translate_path(gpath, hpath, (int)sizeof hpath))
+              printf("[cellSysutil] SysCacheMount: host path for %s is too long\n", gpath);
+          else if (ps3_utf8_mkdir(hpath) == 0 || errno == EEXIST)
               printf("[cellSysutil] SysCacheMount: host cache dir %s ready\n", hpath);
           else
               printf("[cellSysutil] SysCacheMount: host cache dir %s NOT created (errno=%d)\n",

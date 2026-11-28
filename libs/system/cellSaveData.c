@@ -49,7 +49,7 @@ static void save_unlock(void) { pthread_mutex_unlock(&s_save_lock); }
 #endif
 
 static volatile int s_shutting_down = 0;
-static char s_save_root[1024] = "./gamedata/dev_hdd0/home/00000001/savedata";
+static const char* s_save_root = "./gamedata/dev_hdd0/home/00000001/savedata";
 static ps3_savedata_load_cb s_on_save_load = NULL;
 
 void cellSaveData_set_load_callback(ps3_savedata_load_cb cb)
@@ -64,9 +64,20 @@ void ps3_savedata_shutdown(void)
     save_unlock();
 }
 
+static int save_file_path(char* out, size_t cap, const char* save_path, const char* name, const char* suffix)
+{
+    if (!ps3_path_format(out, cap, "%s/%s%s", save_path, name, suffix)) return 0;
+#ifdef _WIN32
+    for (char* p = out; *p; p++) {
+        if (*p == '/') *p = '\\';
+    }
+#endif
+    return 1;
+}
+
 static int atomic_write_file(const char* path, const void* data, size_t size)
 {
-    char tmp_path[1040];
+    char tmp_path[PS3_HOST_PATH_MAX];
     int n = snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
     if (n <= 0 || (size_t)n >= sizeof(tmp_path)) return -1;
     FILE* fp = ps3_utf8_fopen(tmp_path, "wb");
@@ -83,8 +94,6 @@ static void pfd_add(const char* save_path, const char* name);
 
 typedef struct {
     char name[CELL_SAVEDATA_FILENAME_SIZE];
-    char final_path[1024];
-    char tmp_path[1040];
     u32  file_type;
     int  is_delete;
 } staged_file;
@@ -120,26 +129,30 @@ static int copy_existing_to_tmp(const char* src_path, const char* tmp_path)
     return failed ? -1 : 0;
 }
 
-static void tx_abort(save_tx* tx)
+static void tx_abort(save_tx* tx, const char* save_path)
 {
+    char tmp_path[PS3_HOST_PATH_MAX];
     for (u32 i = 0; i < tx->count; i++) {
-        if (!tx->items[i].is_delete && tx->items[i].tmp_path[0])
-            ps3_utf8_remove(tx->items[i].tmp_path);
+        if (!tx->items[i].is_delete && save_file_path(tmp_path, sizeof(tmp_path), save_path, tx->items[i].name, ".tmp"))
+            ps3_utf8_remove(tmp_path);
     }
     tx->count = 0;
 }
 
 static int tx_commit(save_tx* tx, const char* save_path)
 {
+    char final_path[PS3_HOST_PATH_MAX], tmp_path[PS3_HOST_PATH_MAX];
     for (u32 i = 0; i < tx->count; i++) {
         staged_file* sf = &tx->items[i];
+        if (!save_file_path(final_path, sizeof(final_path), save_path, sf->name, "") ||
+            !save_file_path(tmp_path, sizeof(tmp_path), save_path, sf->name, ".tmp"))
+            return -1;
         if (sf->is_delete) {
-            ps3_utf8_remove(sf->final_path);
+            ps3_utf8_remove(final_path);
             continue;
         }
-        if (ps3_utf8_replace_file(sf->tmp_path, sf->final_path) != 0)
+        if (ps3_utf8_replace_file(tmp_path, final_path) != 0)
             return -1;
-        sf->tmp_path[0] = '\0';
         if (sf->file_type == CELL_SAVEDATA_FILETYPE_SECUREFILE)
             pfd_add(save_path, sf->name);
     }
@@ -153,15 +166,20 @@ static void adopt_gamedata_root(void)
     if (s_done) return;
     s_done = 1;
     const char* env = getenv("PS3_GAMEDATA_ROOT");
-    if (env && *env)
-        snprintf(s_save_root, sizeof(s_save_root), "%s/dev_hdd0/home/00000001/savedata", env);
+    if (!env || !*env) return;
+    const size_t n = strlen(env) + sizeof("/dev_hdd0/home/00000001/savedata");
+    char* root = (char*)malloc(n);
+    if (!root) return;
+    snprintf(root, n, "%s/dev_hdd0/home/00000001/savedata", env);
+    s_save_root = root;
 }
 
 static void ensure_dirs(const char* path)
 {
-    char tmp[1024];
-    strncpy(tmp, path, sizeof(tmp) - 1);
-    tmp[sizeof(tmp) - 1] = '\0';
+    const size_t n = strlen(path) + 1;
+    char* tmp = (char*)malloc(n);
+    if (!tmp) return;
+    memcpy(tmp, path, n);
 
     for (char* p = tmp + 1; *p; p++) {
         if (*p == '/' || *p == '\\') {
@@ -172,17 +190,22 @@ static void ensure_dirs(const char* path)
         }
     }
     HOST_MKDIR(tmp);
+    free(tmp);
 }
 
-static void build_save_path(char* buf, size_t buf_size, const char* dirName)
+#define SAVEDATA_PATH_SUFFIX_MAX (1 + CELL_SAVEDATA_FILENAME_SIZE + sizeof(".tmp"))
+
+static int build_save_path(char* buf, size_t buf_size, const char* dirName)
 {
     adopt_gamedata_root();
-    snprintf(buf, buf_size, "%s/%s", s_save_root, dirName);
+    const int n = snprintf(buf, buf_size, "%s/%s", s_save_root, dirName);
+    if (n < 0 || (size_t)n + SAVEDATA_PATH_SUFFIX_MAX > buf_size) return 0;
 #ifdef _WIN32
     for (char* p = buf; *p; p++) {
         if (*p == '/') *p = '\\';
     }
 #endif
+    return 1;
 }
 
 static const char* savedata_host_str(const char* p)
@@ -208,10 +231,9 @@ static int dir_exists(const char* path)
 static int dir_has_save(const char* path)
 {
     if (!dir_exists(path)) return 0;
-    char sfo[1024];
-    snprintf(sfo, sizeof(sfo), "%s/PARAM.SFO", path);
+    char sfo[PS3_HOST_PATH_MAX];
     HOST_STAT_T st;
-    return HOST_STAT(sfo, &st) == 0;
+    return save_file_path(sfo, sizeof(sfo), path, "PARAM.SFO", "") && HOST_STAT(sfo, &st) == 0;
 }
 
 #define SAVEDATA_SCRATCH_BASE  0x024E0000u
@@ -378,18 +400,10 @@ static u32 savedata_content_type(const char* name)
     return CELL_SAVEDATA_FILETYPE_NORMALFILE;
 }
 
-static void pfd_path(const char* save_path, char* out, size_t n)
-{
-    snprintf(out, n, "%s/PARAM.PFD", save_path);
-#ifdef _WIN32
-    for (char* p = out; *p; p++) if (*p == '/') *p = '\\';
-#endif
-}
-
 static int pfd_has(const char* save_path, const char* name)
 {
-    char path[1024], line[64];
-    pfd_path(save_path, path, sizeof(path));
+    char path[PS3_HOST_PATH_MAX], line[64];
+    if (!save_file_path(path, sizeof(path), save_path, "PARAM.PFD", "")) return 0;
     FILE* fp = ps3_utf8_fopen(path, "rb");
     if (!fp) return 0;
     int found = 0;
@@ -403,9 +417,8 @@ static int pfd_has(const char* save_path, const char* name)
 
 static void pfd_add(const char* save_path, const char* name)
 {
-    if (pfd_has(save_path, name)) return;
-    char path[1024];
-    pfd_path(save_path, path, sizeof(path));
+    char path[PS3_HOST_PATH_MAX];
+    if (pfd_has(save_path, name) || !save_file_path(path, sizeof(path), save_path, "PARAM.PFD", "")) return;
     char buf[4096];
     size_t used = 0;
     FILE* fp = ps3_utf8_fopen(path, "rb");
@@ -438,8 +451,9 @@ static u32 enumerate_save_files(const char* save_path,
 
 #ifdef _WIN32
     {
-        char search[1024];
-        snprintf(search, sizeof(search), "%s\\*", save_path);
+        char search[PS3_HOST_PATH_MAX];
+        if (!save_file_path(search, sizeof(search), save_path, "*", ""))
+            return 0;
         wchar_t sbuf[512];
         wchar_t* wsearch = ps3_utf8_to_wide(search, sbuf, 512);
         if (!wsearch)
@@ -486,10 +500,9 @@ static u32 enumerate_save_files(const char* save_path,
         while ((de = readdir(dp)) != NULL) {
             if (de->d_name[0] == '.' || savedata_system_file(de->d_name))
                 continue;
-            char full[1024];
-            snprintf(full, sizeof(full), "%s/%s", save_path, de->d_name);
+            char full[PS3_HOST_PATH_MAX];
             HOST_STAT_T st;
-            if (HOST_STAT(full, &st) != 0)
+            if (!save_file_path(full, sizeof(full), save_path, de->d_name, "") || HOST_STAT(full, &st) != 0)
                 continue;
             if (S_ISDIR(st.st_mode))
                 continue;
@@ -539,18 +552,15 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set, save
         strchr(name, '/') || strchr(name, '\\') || !strcmp(name, ".") || !strcmp(name, "..") ||
         (set->fileOperation != CELL_SAVEDATA_FILEOP_DELETE && !set->fileBuf))
         return CELL_SAVEDATA_ERROR_PARAM;
-    char file_path[1024];
-    snprintf(file_path, sizeof(file_path), "%s/%s", save_path, name);
-#ifdef _WIN32
-    for (char* p = file_path; *p; p++) {
-        if (*p == '/') *p = '\\';
-    }
-#endif
+    char file_path[PS3_HOST_PATH_MAX], tmp_path[PS3_HOST_PATH_MAX];
+    if (!save_file_path(file_path, sizeof(file_path), save_path, name, "") ||
+        !save_file_path(tmp_path, sizeof(tmp_path), save_path, name, ".tmp"))
+        return CELL_SAVEDATA_ERROR_ACCESS_ERROR;
 
     switch (set->fileOperation) {
     case CELL_SAVEDATA_FILEOP_READ: {
         staged_file* sf = tx ? tx_find(tx, name) : NULL;
-        const char* read_path = (sf && !sf->is_delete && sf->tmp_path[0]) ? sf->tmp_path : file_path;
+        const char* read_path = (sf && !sf->is_delete) ? tmp_path : file_path;
         FILE* fp = ps3_utf8_fopen(read_path, "rb");
         if (!fp) {
             printf("[cellSaveData] file read: cannot open '%s'\n", read_path);
@@ -586,27 +596,22 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set, save
             sf = &tx->items[tx->count++];
             memset(sf, 0, sizeof(*sf));
             strncpy(sf->name, name, sizeof(sf->name) - 1);
-            strncpy(sf->final_path, file_path, sizeof(sf->final_path) - 1);
-            int n = snprintf(sf->tmp_path, sizeof(sf->tmp_path), "%s.tmp", file_path);
-            if (n <= 0 || (size_t)n >= sizeof(sf->tmp_path)) return CELL_SAVEDATA_ERROR_INTERNAL;
             sf->file_type = set->fileType;
             first_touch = 1;
         } else if (sf->is_delete) {
             sf->is_delete = 0;
             sf->file_type = set->fileType;
-            int n = snprintf(sf->tmp_path, sizeof(sf->tmp_path), "%s.tmp", file_path);
-            if (n <= 0 || (size_t)n >= sizeof(sf->tmp_path)) return CELL_SAVEDATA_ERROR_INTERNAL;
             first_touch = 1;
         }
         const int truncate = (set->fileOperation == CELL_SAVEDATA_FILEOP_WRITE && set->fileOffset == 0);
         if (first_touch && !truncate) {
-            if (copy_existing_to_tmp(file_path, sf->tmp_path) != 0)
+            if (copy_existing_to_tmp(file_path, tmp_path) != 0)
                 return CELL_SAVEDATA_ERROR_ACCESS_ERROR;
         }
-        FILE* fp = ps3_utf8_fopen(sf->tmp_path, truncate ? "wb" : "r+b");
-        if (!fp && !truncate) fp = ps3_utf8_fopen(sf->tmp_path, "wb");
+        FILE* fp = ps3_utf8_fopen(tmp_path, truncate ? "wb" : "r+b");
+        if (!fp && !truncate) fp = ps3_utf8_fopen(tmp_path, "wb");
         if (!fp) {
-            printf("[cellSaveData] file write: cannot open '%s'\n", sf->tmp_path);
+            printf("[cellSaveData] file write: cannot open '%s'\n", tmp_path);
             return CELL_SAVEDATA_ERROR_ACCESS_ERROR;
         }
         if (set->fileOffset > 0) {
@@ -626,14 +631,12 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set, save
     case CELL_SAVEDATA_FILEOP_DELETE: {
         staged_file* sf = tx ? tx_find(tx, name) : NULL;
         if (sf) {
-            if (!sf->is_delete && sf->tmp_path[0]) ps3_utf8_remove(sf->tmp_path);
-            sf->tmp_path[0] = '\0';
+            if (!sf->is_delete) ps3_utf8_remove(tmp_path);
             sf->is_delete = 1;
         } else if (tx && tx->count < 32u) {
             sf = &tx->items[tx->count++];
             memset(sf, 0, sizeof(*sf));
             strncpy(sf->name, name, sizeof(sf->name) - 1);
-            strncpy(sf->final_path, file_path, sizeof(sf->final_path) - 1);
             sf->is_delete = 1;
         } else {
             ps3_utf8_remove(file_path);
@@ -648,15 +651,8 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set, save
 
 static void write_param_sfo(const char* save_path, const CellSaveDataSystemFileParam* param)
 {
-    if (!param) return;
-
-    char sfo_path[1024];
-    snprintf(sfo_path, sizeof(sfo_path), "%s/PARAM.SFO", save_path);
-#ifdef _WIN32
-    for (char* p = sfo_path; *p; p++) {
-        if (*p == '/') *p = '\\';
-    }
-#endif
+    char sfo_path[PS3_HOST_PATH_MAX];
+    if (!param || !save_file_path(sfo_path, sizeof(sfo_path), save_path, "PARAM.SFO", "")) return;
 
     const char* dir = save_path;
     for (const char* q = save_path; *q; q++)
@@ -680,14 +676,8 @@ static void read_param_sfo(const char* save_path, CellSaveDataSystemFileParam* p
     if (!param) return;
     memset(param, 0, sizeof(CellSaveDataSystemFileParam));
 
-    char sfo_path[1024];
-    snprintf(sfo_path, sizeof(sfo_path), "%s/PARAM.SFO", save_path);
-#ifdef _WIN32
-    for (char* p = sfo_path; *p; p++) {
-        if (*p == '/') *p = '\\';
-    }
-#endif
-
+    char sfo_path[PS3_HOST_PATH_MAX];
+    if (!save_file_path(sfo_path, sizeof(sfo_path), save_path, "PARAM.SFO", "")) return;
     FILE* fp = ps3_utf8_fopen(sfo_path, "rb");
     if (!fp) return;
 
@@ -734,8 +724,11 @@ static s32 savedata_execute_locked(const char* dirName, int is_save,
     if (!dirName || !funcStat)
         return CELL_SAVEDATA_ERROR_PARAM;
 
-    char save_path[1024];
-    build_save_path(save_path, sizeof(save_path), dirName);
+    char save_path[PS3_HOST_PATH_MAX];
+    if (!build_save_path(save_path, sizeof(save_path), dirName)) {
+        printf("[cellSaveData] save path for dir='%s' under '%s' is too long\n", dirName, s_save_root);
+        return CELL_SAVEDATA_ERROR_ACCESS_ERROR;
+    }
 
     int is_new = !dir_has_save(save_path);
 
@@ -830,7 +823,7 @@ static s32 savedata_execute_locked(const char* dirName, int is_save,
                    fileSet.fileOperation, fileSet.fileType,
                    fileSet.fileName ? fileSet.fileName : "", fileSet.fileOffset,
                    fileSet.fileSize, fileSet.fileBufSize, exc);
-            if (exc < 0) { tx_abort(&tx); free(fileList); return exc; }
+            if (exc < 0) { tx_abort(&tx, save_path); free(fileList); return exc; }
             exc_size = (u32)exc;
         }
     }
@@ -838,14 +831,14 @@ static s32 savedata_execute_locked(const char* dirName, int is_save,
     free(fileList);
 
     if (cbResult.result < 0) {
-        tx_abort(&tx);
+        tx_abort(&tx, save_path);
         if (cbResult.result == CELL_SAVEDATA_CBRESULT_ERR_NODATA)
             return CELL_SAVEDATA_ERROR_NODATA;
         return CELL_SAVEDATA_ERROR_CBRESULT;
     }
 
     if (tx_commit(&tx, save_path) != 0) {
-        tx_abort(&tx);
+        tx_abort(&tx, save_path);
         return CELL_SAVEDATA_ERROR_ACCESS_ERROR;
     }
 

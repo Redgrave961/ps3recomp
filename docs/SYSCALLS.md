@@ -97,7 +97,13 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
 
 ### Implementation Strategy
 
-PS3 PPU threads map 1:1 to host OS threads. Each thread gets its own `ppu_context`, a 1 MB stack in the guest VM, and a native thread handle.
+PS3 PPU threads map 1:1 to host OS threads. Each thread gets a slot in a 64-entry table (`g_ppu_threads`, slot 0 is the main thread) holding its `ppu_context`, and a guarded stack in the guest VM from `vm_stack_allocate()`. The thread ID is the slot index + 1; free slots are taken round robin, so a just-released ID is not reused straight away. Host threads are created detached; no host handle is kept.
+
+A thread holds its slot and its stack until the slot is released:
+- **Non-joinable or detached:** when its entry function returns or it calls `sys_ppu_thread_exit`.
+- **Joinable:** the thread ends in the `FINISHED` state and keeps both until `sys_ppu_thread_join` returns, or until `sys_ppu_thread_detach` is called on the finished thread.
+
+Releasing a slot frees the stack with `vm_stack_free()` and marks the slot `FREE`, both under the thread-table lock.
 
 ### Syscalls
 
@@ -110,25 +116,26 @@ Creates a new PPU thread with its own register context and stack.
 - `r4`: Entry point address (guest address of the function to call)
 - `r5`: Argument passed to the entry function (placed in r3 of new thread)
 - `r6`: Thread priority (0 = highest, 3071 = lowest)
-- `r7`: Stack size in bytes (rounded up to 4 KB alignment)
+- `r7`: Stack size in bytes (0 means 1 MB, anything below 16 KB is raised to 16 KB, the allocation rounds up to the host page size)
 - `r8`: Flags (e.g., `SYS_PPU_THREAD_CREATE_JOINABLE`)
 - `r9`: Thread name string (guest address, may be NULL)
 
 **Implementation:**
-1. Allocates a new `ppu_context` from a static pool (max 64 threads)
+1. Takes a free slot from the thread table (max 64 threads)
 2. Allocates a guest stack via `vm_stack_allocate()`
 3. Sets up the new context: `r1` = stack top, `r3` = arg, `cia` = entry
-4. Creates a host thread:
-   - Windows: `CreateThread(NULL, 0, thread_wrapper, ctx, 0, NULL)`
-   - POSIX: `pthread_create(&handle, NULL, thread_wrapper, ctx)`
-5. Writes the thread ID to the output pointer
+4. Writes the thread ID to the output pointer
+5. Starts a detached host thread with a 256 MB host stack:
+   - Windows: `_beginthreadex` with `STACK_SIZE_PARAM_IS_A_RESERVATION`; the handle is closed at once
+   - POSIX: `pthread_create` with `PTHREAD_CREATE_DETACHED`, retried with the default stack size if the 256 MB stack is refused
+   - If the host thread cannot be started, the slot and stack are released again
 6. With `PS3_PRIO_START=1` (off by default), if the new thread's priority is higher (a lower number) than the creator's, waits until the new thread reaches a blocking call, as lv2's scheduler would run it first. The blocking calls report themselves through `ppu_thread_note_block` (event queue receive, event flag, semaphore, cond and lwcond waits, a contended lwmutex, thread join, the sleeps). The wait is capped at 200 ms and logs once per thread that hits the cap. Main counts as priority 1000 until it sets its own.
 
-**Returns:** `CELL_OK` on success, `CELL_EAGAIN` if thread limit reached, `CELL_ENOMEM` if stack allocation fails.
+**Returns:** `CELL_OK` on success, `CELL_EAGAIN` if no slot is free or the host thread cannot be started, `CELL_ENOMEM` if stack allocation fails (the slot stays free).
 
 #### `sys_ppu_thread_exit` (42)
 
-Terminates the calling thread. The exit code is in `r3`.
+Terminates the calling thread. The exit code is in `r3`. It is stored as the thread's exit status and the thread unwinds back to its host thread wrapper, which ends it the same way as a return from the entry function (a return stores `r3` as the exit status).
 
 #### `sys_ppu_thread_yield` (43)
 
@@ -138,11 +145,15 @@ Yields the current thread's time slice.
 
 #### `sys_ppu_thread_join` (44)
 
-Blocks until the specified thread exits. Stores the exit code.
+Blocks until the specified thread is `FINISHED` (a futex wait on the slot state, woken by the ending thread), stores the exit status, then releases the slot and stack.
+
+**Returns:** `CELL_EDEADLK` for the calling thread itself, `CELL_ESRCH` if no such thread, `CELL_EINVAL` if the thread is not joinable (created without `SYS_PPU_THREAD_CREATE_JOINABLE`, or detached) or another join is already waiting on it.
 
 #### `sys_ppu_thread_detach` (45)
 
-Detaches a thread so its resources are auto-cleaned on exit.
+Makes a joinable thread non-joinable. If it has already finished, its slot and stack are released now; otherwise it is marked `DETACHED` and releases them itself when it ends.
+
+**Returns:** `CELL_ESRCH` if no such thread, `CELL_EINVAL` if the thread is not joinable (created non-joinable or already detached), `CELL_EBUSY` if a join is waiting on it.
 
 #### `sys_ppu_thread_get_join_state` (46)
 
@@ -577,7 +588,8 @@ The `sys_memory_allocate` bump allocator uses the following address space layout
 0x00A00000 - 0x10000000    CRT malloc heap (game project's bump allocator)
 0x10000000 - 0x20000000    RSX region (ELF rodata + RSX local memory)
 0x20000000 - 0x30000000    sys_memory_allocate region (GPU memory, etc.)
-0xD0000000 - 0xD0200000    Stack region (vm_stack_alloc)
+0x90000000 - 0x9F000000    PPU thread stacks (vm_stack_alloc)
+0x9F000000 - 0xA0000000    Guest callback stacks
 0x0F000000 - 0x0F100000    TLS allocation region
 ```
 

@@ -29,6 +29,7 @@
 #define CELL_EIO                        0x8001002B
 #define CELL_EMFILE                     0x8001002C
 #define CELL_ENOTDIR                    0x8001002E
+#define CELL_ENAMETOOLONG               0x80010034
 #define CELL_ENOTEMPTY                  0x80010036
 
 #define CELL_EMUTEX_UNLOCK_NOT_OWNED    0x80010122

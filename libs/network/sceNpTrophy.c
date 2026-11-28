@@ -24,10 +24,10 @@
 #define TRP_HEADER_SIZE 0x40u
 #define RTC_TICK_UNIX_EPOCH 62135596800000000ull
 
-void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size);
+int sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size);
 
 static int s_trophy_initialized = 0;
-static char s_storage_path[512] = "gamedata/trophies";
+static const char* s_storage_path = "gamedata/trophies";
 
 static void trophy_adopt_gamedata_root(void)
 {
@@ -35,8 +35,12 @@ static void trophy_adopt_gamedata_root(void)
     if (s_done) return;
     s_done = 1;
     const char* env = getenv("PS3_GAMEDATA_ROOT");
-    if (env && *env)
-        snprintf(s_storage_path, sizeof(s_storage_path), "%s/trophies", env);
+    if (!env || !*env) return;
+    const size_t n = strlen(env) + sizeof("/trophies");
+    char* path = (char*)malloc(n);
+    if (!path) return;
+    snprintf(path, n, "%s/trophies", env);
+    s_storage_path = path;
 }
 
 typedef struct {
@@ -161,10 +165,11 @@ static u32 grade_of(char ttype)
 
 static void trophy_ensure_dir(void)
 {
-    char tmp[512];
     trophy_adopt_gamedata_root();
-    strncpy(tmp, s_storage_path, sizeof(tmp) - 1);
-    tmp[sizeof(tmp) - 1] = '\0';
+    const size_t n = strlen(s_storage_path) + 1;
+    char* tmp = (char*)malloc(n);
+    if (!tmp) return;
+    memcpy(tmp, s_storage_path, n);
     for (char* p = tmp + 1; *p; p++) {
         if (*p == '/' || *p == '\\') {
             *p = '\0';
@@ -173,54 +178,70 @@ static void trophy_ensure_dir(void)
         }
     }
     mkdir_p(tmp);
+    free(tmp);
 }
 
-static void trophy_get_filepath(const TrophyContext* ctx, char* buf, size_t bufsize)
+static char* trophy_filepath(const TrophyContext* ctx, const char* suffix)
 {
     trophy_adopt_gamedata_root();
-    snprintf(buf, bufsize, "%s/%s.json", s_storage_path, ctx->name);
+    const size_t n = strlen(s_storage_path) + strlen(ctx->name) + strlen(suffix) + sizeof("/.json");
+    char* path = (char*)malloc(n);
+    if (path) snprintf(path, n, "%s/%s.json%s", s_storage_path, ctx->name, suffix);
+    return path;
 }
 
 static int trophy_installed(const TrophyContext* ctx)
 {
-    char path[1024];
-    trophy_get_filepath(ctx, path, sizeof(path));
-    FILE* fp = ps3_utf8_fopen(path, "r");
+    char* path = trophy_filepath(ctx, "");
+    FILE* fp = path ? ps3_utf8_fopen(path, "r") : NULL;
+    free(path);
     if (!fp) return 0;
     fclose(fp);
     return 1;
 }
 
-static int trophy_save(const TrophyContext* ctx)
+static int trophy_write(FILE* fp, const TrophyContext* ctx)
 {
-    char filepath[1024];
-    trophy_ensure_dir();
-    trophy_get_filepath(ctx, filepath, sizeof(filepath));
-    FILE* fp = ps3_utf8_fopen(filepath, "w");
-    if (!fp) {
-        printf("[sceNpTrophy] could not save trophies to %s\n", filepath);
-        return 0;
-    }
     int first = 1;
-    fprintf(fp, "{\n  \"trophies\": [");
+    if (fprintf(fp, "{\n  \"trophies\": [") < 0) return 0;
     for (int i = 0; i < ctx->set.n; i++) {
         const int id = ctx->set.t[i].id;
         if (id < 0 || id >= SCE_NP_TROPHY_MAX_NUM_TROPHIES || !ctx->unlocked[id]) continue;
-        fprintf(fp, "%s\n    { \"id\": %d, \"tick\": %llu }", first ? "" : ",", id,
-                (unsigned long long)ctx->tick[id]);
+        if (fprintf(fp, "%s\n    { \"id\": %d, \"tick\": %llu }", first ? "" : ",", id,
+                    (unsigned long long)ctx->tick[id]) < 0)
+            return 0;
         first = 0;
     }
-    fprintf(fp, "\n  ]\n}\n");
-    fclose(fp);
-    return 1;
+    return fprintf(fp, "\n  ]\n}\n") >= 0;
+}
+
+static int trophy_save(const TrophyContext* ctx)
+{
+    trophy_ensure_dir();
+    char* filepath = trophy_filepath(ctx, "");
+    char* tmp_path = trophy_filepath(ctx, ".tmp");
+    int saved = 0;
+    if (filepath && tmp_path) {
+        FILE* fp = ps3_utf8_fopen(tmp_path, "w");
+        if (fp) {
+            saved = trophy_write(fp, ctx) && ps3_file_sync(fp) == 0;
+            if (fclose(fp) != 0) saved = 0;
+            if (saved) saved = ps3_utf8_replace_file(tmp_path, filepath) == 0;
+            if (!saved) ps3_utf8_remove(tmp_path);
+        }
+        if (!saved) printf("[sceNpTrophy] could not save trophies to %s\n", filepath);
+    }
+    free(filepath);
+    free(tmp_path);
+    return saved;
 }
 
 static void trophy_load(TrophyContext* ctx)
 {
-    char filepath[1024];
     char line[256];
-    trophy_get_filepath(ctx, filepath, sizeof(filepath));
-    FILE* fp = ps3_utf8_fopen(filepath, "r");
+    char* filepath = trophy_filepath(ctx, "");
+    FILE* fp = filepath ? ps3_utf8_fopen(filepath, "r") : NULL;
+    free(filepath);
     if (!fp) return;
     while (fgets(line, sizeof(line), fp)) {
         const char* id_pos = strstr(line, "\"id\":");
@@ -253,8 +274,7 @@ static int trophy_pack_open(TrophyContext* ctx)
         char guest[640], host[1024];
         snprintf(guest, sizeof(guest), "%sTROPDIR/%s/TROPHY.TRP",
                  pass == 0 ? app : "/dev_bdvd/PS3_GAME/", ctx->name);
-        sys_fs_translate_path(guest, host, (int)sizeof(host));
-        if (trp_open(host, &ctx->pack)) {
+        if (sys_fs_translate_path(guest, host, (int)sizeof(host)) && trp_open(host, &ctx->pack)) {
             printf("[sceNpTrophy] trophy pack %s\n", guest);
             return 1;
         }

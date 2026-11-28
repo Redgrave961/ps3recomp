@@ -9,7 +9,6 @@ namespace vk {
 class downscale {
 public:
     bool create(vk_device& d, VkPipelineCache cache = VK_NULL_HANDLE);
-    void destroy();
     void record(VkCommandBuffer cmd, VkImageView src, VkImageView dst, uint32_t width, uint32_t height, uint32_t src_width,
                 uint32_t src_height) const;
     bool record_direct(VkCommandBuffer cmd, VkImageView src, VkImageView dst, VkFormat dst_format, uint32_t width, uint32_t height,

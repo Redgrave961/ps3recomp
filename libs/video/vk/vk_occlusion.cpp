@@ -3,13 +3,13 @@
 
 #include <algorithm>
 #include <cstring>
+#include <thread>
 #include <utility>
 
 namespace vk {
 
 namespace {
 
-constexpr uint32_t k_queries = 8192;
 constexpr uint64_t k_pages = 1ull << 20;
 
 void write_report(uint32_t ea, uint64_t count)
@@ -34,36 +34,33 @@ bool occlusion::create(vk_device& d, VkSemaphore timeline)
 {
     m_d = &d;
     m_timeline = timeline;
-    VkQueryPoolCreateInfo qi{ VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
-    qi.queryType = VK_QUERY_TYPE_OCCLUSION;
-    qi.queryCount = k_queries;
-    VK_TRY(vkCreateQueryPool(d.dev, &qi, nullptr, &m_pool));
-    vkResetQueryPool(d.dev, m_pool, 0, k_queries);
     m_control = d.features.features.occlusionQueryPrecise ? VK_QUERY_CONTROL_PRECISE_BIT : 0;
-    m_free.reserve(k_queries);
-    for (uint32_t i = k_queries; i-- > 0;) m_free.push_back(i);
+    if (!grow()) return false;
     m_pages = std::make_unique<std::atomic<uint32_t>[]>(k_pages);
-    m_thread = std::thread(&occlusion::worker, this);
+    std::thread(&occlusion::worker, this).detach();
     return true;
 }
 
-void occlusion::destroy()
+bool occlusion::grow()
 {
-    if (!m_pool) return;
-    {
-        std::lock_guard<std::mutex> hold(m_lock);
-        m_stop = true;
-    }
-    m_work.notify_one();
-    if (m_thread.joinable()) m_thread.join();
-    vkDestroyQueryPool(m_d->dev, m_pool, nullptr);
-    m_pool = VK_NULL_HANDLE;
+    if (m_pool_count == k_pool_limit) return false;
+    VkQueryPoolCreateInfo qi{ VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
+    qi.queryType = VK_QUERY_TYPE_OCCLUSION;
+    qi.queryCount = k_pool_queries;
+    VkQueryPool pool = VK_NULL_HANDLE;
+    VK_TRY(vkCreateQueryPool(m_d->dev, &qi, nullptr, &pool));
+    vkResetQueryPool(m_d->dev, pool, 0, k_pool_queries);
+    const uint32_t base = m_pool_count * k_pool_queries;
+    m_pools[m_pool_count++] = pool;
+    m_free.reserve(m_free.size() + k_pool_queries);
+    for (uint32_t i = k_pool_queries; i-- > 0;) m_free.push_back(base + i);
+    return true;
 }
 
 uint32_t occlusion::allocate()
 {
-    std::unique_lock<std::mutex> hold(m_lock);
-    m_freed.wait(hold, [this] { return !m_free.empty(); });
+    std::lock_guard<std::mutex> hold(m_lock);
+    if (m_free.empty() && !grow()) return k_no_query;
     const uint32_t q = m_free.back();
     m_free.pop_back();
     return q;
@@ -72,14 +69,19 @@ uint32_t occlusion::allocate()
 void occlusion::begin(VkCommandBuffer cmd, const scale2d& scale)
 {
     const uint32_t q = allocate();
-    vkCmdBeginQuery(cmd, m_pool, q, m_control);
+    if (q == k_no_query) {
+        note_dropped();
+        return;
+    }
+    vkCmdBeginQuery(cmd, pool_of(q), slot_of(q), m_control);
     m_segments.push_back({ q, scale });
     m_active = true;
 }
 
 void occlusion::end(VkCommandBuffer cmd)
 {
-    vkCmdEndQuery(cmd, m_pool, m_segments.back().query);
+    const uint32_t q = m_segments.back().query;
+    vkCmdEndQuery(cmd, pool_of(q), slot_of(q));
     m_active = false;
 }
 
@@ -218,8 +220,7 @@ void occlusion::worker()
         job j;
         {
             std::unique_lock<std::mutex> hold(m_lock);
-            m_work.wait(hold, [this] { return m_stop || !m_jobs.empty(); });
-            if (m_jobs.empty()) return;
+            m_work.wait(hold, [this] { return !m_jobs.empty(); });
             j = std::move(m_jobs.front());
             m_jobs.pop_front();
             if (!j.release) {
@@ -230,20 +231,13 @@ void occlusion::worker()
             }
         }
         if (j.value > done) {
-            VkSemaphoreWaitInfo wi{ VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
-            wi.semaphoreCount = 1;
-            wi.pSemaphores = &m_timeline;
-            wi.pValues = &j.value;
-            vkWaitSemaphores(m_d->dev, &wi, UINT64_MAX);
+            vk_wait(*m_d, m_timeline, j.value);
             done = j.value;
         }
         if (j.release) {
-            for (const segment& g : j.queries) vkResetQueryPool(m_d->dev, m_pool, g.query, 1);
-            {
-                std::lock_guard<std::mutex> hold(m_lock);
-                for (const segment& g : j.queries) m_free.push_back(g.query);
-            }
-            m_freed.notify_all();
+            for (const segment& g : j.queries) vkResetQueryPool(m_d->dev, pool_of(g.query), slot_of(g.query), 1);
+            std::lock_guard<std::mutex> hold(m_lock);
+            for (const segment& g : j.queries) m_free.push_back(g.query);
             continue;
         }
         if (j.run) {
@@ -252,7 +246,10 @@ void occlusion::worker()
             uint64_t sum = 0;
             for (const segment& g : j.queries) {
                 uint64_t n = 0;
-                vkGetQueryPoolResults(m_d->dev, m_pool, g.query, 1, sizeof n, &n, sizeof n, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+                vk_must(*m_d,
+                        vkGetQueryPoolResults(m_d->dev, pool_of(g.query), slot_of(g.query), 1, sizeof n, &n, sizeof n,
+                                              VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT),
+                        "vkGetQueryPoolResults");
                 const uint64_t area = (uint64_t)g.scale.x.num * g.scale.y.num, unit = (uint64_t)g.scale.x.den * g.scale.y.den;
                 sum += n ? std::max<uint64_t>((n * unit + area / 2u) / area, 1u) : 0u;
             }

@@ -283,6 +283,19 @@ void transition_image(VkCommandBuffer cmd, VkImage img, VkImageAspectFlags aspec
 
 }
 
+void upscaler::retire(std::function<void()> release)
+{
+    m_retired.emplace_back(*m_submitted + 1u, std::move(release));
+}
+
+void upscaler::collect(uint64_t reached)
+{
+    while (!m_retired.empty() && m_retired.front().first <= reached) {
+        m_retired.front().second();
+        m_retired.pop_front();
+    }
+}
+
 bool upscaler::init_mv_pipeline(VkPipelineCache cache)
 {
     VkSamplerCreateInfo si{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
@@ -363,10 +376,11 @@ bool upscaler::ensure_mv_image(uint32_t width, uint32_t height)
 
 void upscaler::destroy_mv_image()
 {
-    if (!m_d) return;
-    if (m_mv_view || m_mv_img) vkDeviceWaitIdle(m_d->dev);
-    if (m_mv_view) vkDestroyImageView(m_d->dev, m_mv_view, nullptr);
-    if (m_mv_img) vmaDestroyImage(m_d->vma, m_mv_img, m_mv_mem);
+    if (m_mv_img)
+        retire([this, view = m_mv_view, img = m_mv_img, mem = m_mv_mem] {
+            if (view) vkDestroyImageView(m_d->dev, view, nullptr);
+            vmaDestroyImage(m_d->vma, img, mem);
+        });
     m_mv_view = VK_NULL_HANDLE;
     m_mv_img = VK_NULL_HANDLE;
     m_mv_mem = nullptr;
@@ -403,11 +417,7 @@ bool upscaler::init_ffx()
 
 void upscaler::destroy_ffx_context()
 {
-    if (m_ffx_ctx) {
-        vkDeviceWaitIdle(m_d->dev);
-        ffxContext ctx = m_ffx_ctx;
-        g_ffx.destroy(&ctx, nullptr);
-    }
+    if (m_ffx_ctx) retire([ctx = static_cast<ffxContext>(m_ffx_ctx)]() mutable { g_ffx.destroy(&ctx, nullptr); });
     m_ffx_ctx = nullptr;
     m_ffx_dw = m_ffx_dh = 0;
 }
@@ -487,10 +497,7 @@ bool upscaler::init_ngx(const std::string& cache_path)
 
 void upscaler::destroy_ngx_feature()
 {
-    if (m_ngx_handle) {
-        vkDeviceWaitIdle(m_d->dev);
-        g_ngx.release(static_cast<NVSDK_NGX_Handle*>(m_ngx_handle));
-    }
+    if (m_ngx_handle) retire([handle = static_cast<NVSDK_NGX_Handle*>(m_ngx_handle)] { g_ngx.release(handle); });
     m_ngx_handle = nullptr;
     m_ngx_mode = 0;
     m_ngx_rw = m_ngx_rh = m_ngx_dw = m_ngx_dh = 0;
@@ -527,9 +534,10 @@ bool upscaler::ensure_ngx_feature(VkCommandBuffer cmd, int mode, uint32_t render
     return true;
 }
 
-bool upscaler::create(vk_device& d, VkPipelineCache cache, const std::string& cache_path)
+bool upscaler::create(vk_device& d, VkPipelineCache cache, const std::string& cache_path, const uint64_t* submitted)
 {
     m_d = &d;
+    m_submitted = submitted;
     init_ffx();
     init_ngx(cache_path);
     std::fprintf(stderr, "[vk] upscalers: FSR %s (%d), DLSS (%d)\n", m_fsr_version, m_ffx_mod != nullptr, m_ngx_mod != nullptr);
@@ -543,18 +551,19 @@ bool upscaler::create(vk_device& d, VkPipelineCache cache, const std::string& ca
 void upscaler::release_ffx()
 {
     destroy_ffx_context();
-    if (m_ffx_mod) lib_close(m_ffx_mod);
+    if (m_ffx_mod) retire([mod = m_ffx_mod] { lib_close(mod); });
     m_ffx_mod = nullptr;
 }
 
 void upscaler::release_ngx()
 {
     destroy_ngx_feature();
-    if (m_ngx_mod) {
-        g_ngx.destroy_params(static_cast<NVSDK_NGX_Parameter*>(m_ngx_params));
-        g_ngx.shutdown(m_d->dev);
-        lib_close(m_ngx_mod);
-    }
+    if (m_ngx_mod)
+        retire([this, mod = m_ngx_mod, params = static_cast<NVSDK_NGX_Parameter*>(m_ngx_params)] {
+            g_ngx.destroy_params(params);
+            g_ngx.shutdown(m_d->dev);
+            lib_close(mod);
+        });
     m_ngx_params = nullptr;
     m_ngx_mod = nullptr;
 }
@@ -565,6 +574,7 @@ void upscaler::destroy()
     release_ffx();
     release_ngx();
     destroy_mv_image();
+    collect(UINT64_MAX);
     if (m_mv_pipe) vkDestroyPipeline(m_d->dev, m_mv_pipe, nullptr);
     if (m_mv_layout) vkDestroyPipelineLayout(m_d->dev, m_mv_layout, nullptr);
     if (m_mv_set) vkDestroyDescriptorSetLayout(m_d->dev, m_mv_set, nullptr);
@@ -639,14 +649,10 @@ void upscaler::jitter(int mode, uint32_t render_w, uint32_t display_w, uint32_t 
     out_jy = halton(idx, 3u) - 0.5f;
 }
 
-bool upscaler::dispatch(VkCommandBuffer cmd, int mode,
-                        VkImage color_img, VkImageView color_view, VkFormat color_fmt,
-                        VkImage depth_img, VkImageView depth_view, VkFormat depth_fmt,
-                        VkImageView vel_view,
-                        VkImage out_img, VkImageView out_view, VkFormat out_fmt,
-                        uint32_t render_w, uint32_t render_h, uint32_t display_w, uint32_t display_h,
-                        const rsx_vk_upscale_frame& frame)
+bool upscaler::dispatch(VkCommandBuffer cmd, int mode, const upscale_image& color, const upscale_image& depth, VkImageView velocity,
+                        const upscale_image& output, const rsx_vk_upscale_frame& frame)
 {
+    const uint32_t render_w = color.width, render_h = color.height, display_w = output.width, display_h = output.height;
     if (m_dropped & RSX_VK_UPSCALE_CAP_FSR) release_ffx();
     if (m_dropped & RSX_VK_UPSCALE_CAP_DLSS) release_ngx();
     m_dropped = 0;
@@ -685,9 +691,9 @@ bool upscaler::dispatch(VkCommandBuffer cmd, int mode,
     pc.djy = frame.reset ? 0.f : (frame.prev_jitter_y - frame.jitter_y);
 
     const VkDescriptorImageInfo imgs[3] = {
-        { m_sampler, depth_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
+        { m_sampler, depth.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
         { VK_NULL_HANDLE, m_mv_view, VK_IMAGE_LAYOUT_GENERAL },
-        { m_sampler, vel_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
+        { m_sampler, velocity, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
     };
     VkWriteDescriptorSet w[3]{};
     w[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 0, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &imgs[0] };
@@ -704,13 +710,13 @@ bool upscaler::dispatch(VkCommandBuffer cmd, int mode,
                      VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
 
     if (fsr) {
-        auto make_res = [](VkImage img, VkFormat fmt, uint32_t width, uint32_t height, uint32_t usage, uint32_t state) {
+        auto make_res = [](const upscale_image& img, uint32_t usage, uint32_t state) {
             FfxApiResource r{};
-            r.resource = img;
+            r.resource = img.image;
             r.description.type = FFX_API_RESOURCE_TYPE_TEXTURE2D;
-            r.description.format = ffxApiGetSurfaceFormatVK(fmt);
-            r.description.width = width;
-            r.description.height = height;
+            r.description.format = ffxApiGetSurfaceFormatVK(img.format);
+            r.description.width = img.width;
+            r.description.height = img.height;
             r.description.depth = 1;
             r.description.mipCount = 1;
             r.description.flags = FFX_API_RESOURCE_FLAGS_NONE;
@@ -721,12 +727,13 @@ bool upscaler::dispatch(VkCommandBuffer cmd, int mode,
         ffxDispatchDescUpscale dd{};
         dd.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
         dd.commandList = cmd;
-        dd.color = make_res(color_img, color_fmt, render_w, render_h, FFX_API_RESOURCE_USAGE_READ_ONLY, FFX_API_RESOURCE_STATE_COMPUTE_READ);
+        dd.color = make_res(color, FFX_API_RESOURCE_USAGE_READ_ONLY, FFX_API_RESOURCE_STATE_COMPUTE_READ);
         const uint32_t depth_usage = FFX_API_RESOURCE_USAGE_READ_ONLY | FFX_API_RESOURCE_USAGE_DEPTHTARGET |
-                                     (ffxApiIsStencilFormat(depth_fmt) ? FFX_API_RESOURCE_USAGE_STENCILTARGET : 0u);
-        dd.depth = make_res(depth_img, depth_fmt, render_w, render_h, depth_usage, FFX_API_RESOURCE_STATE_COMPUTE_READ);
-        dd.motionVectors = make_res(m_mv_img, VK_FORMAT_R16G16_SFLOAT, render_w, render_h, FFX_API_RESOURCE_USAGE_READ_ONLY, FFX_API_RESOURCE_STATE_COMPUTE_READ);
-        dd.output = make_res(out_img, out_fmt, display_w, display_h, FFX_API_RESOURCE_USAGE_UAV, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+                                     (ffxApiIsStencilFormat(depth.format) ? FFX_API_RESOURCE_USAGE_STENCILTARGET : 0u);
+        dd.depth = make_res(depth, depth_usage, FFX_API_RESOURCE_STATE_COMPUTE_READ);
+        dd.motionVectors = make_res({ m_mv_img, m_mv_view, VK_FORMAT_R16G16_SFLOAT, m_mv_w, m_mv_h }, FFX_API_RESOURCE_USAGE_READ_ONLY,
+                                    FFX_API_RESOURCE_STATE_COMPUTE_READ);
+        dd.output = make_res(output, FFX_API_RESOURCE_USAGE_UAV, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
         dd.jitterOffset = { frame.jitter_x, frame.jitter_y };
         dd.motionVectorScale = { 1.f, 1.f };
         dd.renderSize = { render_w, render_h };
@@ -750,10 +757,10 @@ bool upscaler::dispatch(VkCommandBuffer cmd, int mode,
 
     const VkImageSubresourceRange color_sr{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
     const VkImageSubresourceRange depth_sr{ VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 };
-    NVSDK_NGX_Resource_VK r_color = NVSDK_NGX_Create_ImageView_Resource_VK(color_view, color_img, color_sr, color_fmt, render_w, render_h, false);
-    NVSDK_NGX_Resource_VK r_depth = NVSDK_NGX_Create_ImageView_Resource_VK(depth_view, depth_img, depth_sr, depth_fmt, render_w, render_h, false);
+    NVSDK_NGX_Resource_VK r_color = NVSDK_NGX_Create_ImageView_Resource_VK(color.view, color.image, color_sr, color.format, color.width, color.height, false);
+    NVSDK_NGX_Resource_VK r_depth = NVSDK_NGX_Create_ImageView_Resource_VK(depth.view, depth.image, depth_sr, depth.format, depth.width, depth.height, false);
     NVSDK_NGX_Resource_VK r_mv = NVSDK_NGX_Create_ImageView_Resource_VK(m_mv_view, m_mv_img, color_sr, VK_FORMAT_R16G16_SFLOAT, m_mv_w, m_mv_h, false);
-    NVSDK_NGX_Resource_VK r_out = NVSDK_NGX_Create_ImageView_Resource_VK(out_view, out_img, color_sr, out_fmt, display_w, display_h, true);
+    NVSDK_NGX_Resource_VK r_out = NVSDK_NGX_Create_ImageView_Resource_VK(output.view, output.image, color_sr, output.format, output.width, output.height, true);
     auto* p = static_cast<NVSDK_NGX_Parameter*>(m_ngx_params);
     g_ngx.set_ptr(p, NVSDK_NGX_Parameter_Color, &r_color);
     g_ngx.set_ptr(p, NVSDK_NGX_Parameter_Output, &r_out);

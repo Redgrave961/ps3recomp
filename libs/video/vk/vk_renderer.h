@@ -70,7 +70,7 @@ struct surface {
     bool gpu_dirty = false;
     image img;
     image snapshot;
-    u64 snapshot_draw = ~0ull;
+    u64 snapshot_version = ~0ull;
     image as_color;
     u64 as_color_version = ~0ull;
     u64 version = 0;
@@ -109,14 +109,12 @@ struct submission {
 class renderer final : public rsx::frontend {
 public:
     bool open(vk_device& d, VkSemaphore timeline, uint64_t* submitted, const char* cache_path);
-    void close();
 
     void flush();
     void save_caches() { m_pipelines.save_cache(); }
     VkPipelineCache pipeline_cache() const { return m_pipelines.cache(); }
     void present_source(u32 ea, u32 width, u32 height, u32 pitch, image*& out, scale2d& scale, VkCommandBuffer& cmd);
     u64 content(u32 ea, u32 pitch) const;
-    void submit(VkSemaphore wait, VkPipelineStageFlags2 wait_stage, VkSemaphore signal);
     void read_back(u32 ea, u32 size);
     void settle(u32 ea, u32 size);
     void drain();
@@ -156,6 +154,7 @@ protected:
 
 private:
     VkCommandBuffer cmd();
+    void submit();
     void end_rendering();
     bool bind_framebuffer(u32 context);
     void begin_rendering(u32 clear_color_mask = 0, const VkClearValue* clear_color = nullptr,
@@ -173,6 +172,9 @@ private:
     void load_surface(surface& s);
     void scale_blit(VkCommandBuffer c, image& src, image& dst, VkFilter filter);
     bool scale_depth(VkCommandBuffer c, image& src, image& dst);
+    bool fit_scratch(image& img, VkFormat format, u32 width, u32 height);
+    void release_depth_copy();
+    bool memory_tight();
     void download_surface(surface& s);
     void download(u32 ea, u32 size);
     void await_writes(u32 ea, u32 size);
@@ -188,7 +190,6 @@ private:
     u32 m_submission = 0;
     bool m_recording = false;
     bool m_rendering = false;
-    u64 m_draw_counter = 0;
     framebuffer m_fb;
     bool m_fb_valid = false;
     bool m_fb_dirty = true;
@@ -207,6 +208,15 @@ private:
     };
     bool create_scratch(scratch& s, VkDeviceSize size, VkBufferUsageFlags usage);
     std::vector<std::pair<uint64_t, scratch>> m_scratch_garbage;
+    struct depth_copy {
+        image from;
+        image to;
+    };
+    std::array<depth_copy, 3> m_depth_copy;
+    scratch m_depth_buffer;
+    u64 m_depth_copy_flip = 0;
+    u32 m_vram_heap = 0;
+    bool m_memory_tight = false;
     image m_display;
     occlusion m_occlusion;
     depth_pack m_depth_pack;
@@ -231,8 +241,25 @@ private:
     image m_box;
     image* depth_as_color(surface& s);
 
+    enum class stage_result { ok, empty, failed };
+    struct staged_draw {
+        VkIndexType index_type;
+        bool restart;
+        u32 offsets[4];
+    };
+    struct qte_patch {
+        bool snapped = false;
+        bool rotated = false;
+        float x = 0.f;
+        float y = 0.f;
+        float sx = 0.f;
+        float sy = 0.f;
+    };
     bool draw_setup();
+    stage_result stage_draw(const rsx::draw_clause& clause, const rsx_spv_texture_state* textures, const qte_patch& qte, staged_draw& staged);
+    qte_patch qte_rings(u8 unit0_tag);
     void draw_execute(const rsx::draw_clause& clause, u32 id);
+    vk_slice ring_alloc(VkDeviceSize size, VkDeviceSize align);
     void trace_draw(u32 id, u32 prim, u32 count, bool indexed) const;
     std::FILE* m_trace = nullptr;
     bool m_trace_timed = false;
@@ -251,12 +278,15 @@ private:
     u32 m_trace_pass_first = 0;
     bool upload_vertices(const rsx::draw_clause& clause, u32 first, u32 count, u32 vertex_base, VkDescriptorBufferInfo& layout);
     bool create_dummies();
+    VkDescriptorImageInfo dummy_image(u32 unit) const;
     bool create_buffer_set();
 
     pipelines m_pipelines;
     shader_cache m_shaders;
-    image m_dummy[3];
+    enum : u32 { k_dummy_2d, k_dummy_cube, k_dummy_3d, k_dummy_shadow_2d, k_dummy_shadow_cube, k_dummy_count };
+    image m_dummy[k_dummy_count];
     VkSampler m_dummy_sampler = VK_NULL_HANDLE;
+    VkSampler m_dummy_shadow_sampler = VK_NULL_HANDLE;
     u32 m_vertex_dims = 0;
     u32 m_fp_tex_dims = 0;
     u32 m_fp_tex_shadow = 0;
@@ -431,6 +461,7 @@ private:
         rsx::texture_regs regs{};
         rsx::texture_desc desc{};
         VkSampler sampler = VK_NULL_HANDLE;
+        VkFormat sampler_format = VK_FORMAT_UNDEFINED;
     };
 
     void describe_units(u32 first, u32 last);

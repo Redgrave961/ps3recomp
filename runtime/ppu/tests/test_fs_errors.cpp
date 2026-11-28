@@ -12,10 +12,10 @@ unsigned long long ps3_ms_now(void) { return 0; }
 void vm_write32(uint64_t a, uint32_t v) { uint32_t be = __builtin_bswap32(v); memcpy(vm_base + a, &be, 4); }
 void vm_write64(uint64_t a, uint64_t v) { uint64_t be = __builtin_bswap64(v); memcpy(vm_base + a, &be, 8); }
 const char* ppu_vfs_root = ".";
-void sys_fs_translate_path(const char* g, char* h, int n)
+int sys_fs_translate_path(const char* g, char* h, int n)
 {
     const char* r = strncmp(g, "/dev_hdd1", 9) == 0 ? g + 9 : g;
-    snprintf(h, (size_t)n, "%s%s%s", ppu_vfs_root, *r == '/' ? "" : "/", r);
+    return snprintf(h, (size_t)n, "%s%s%s", ppu_vfs_root, *r == '/' ? "" : "/", r) < n;
 }
 void ps3_hle_register_ctx(uint32_t, const char*, void (*)(ppu_context*)) {}
 }

@@ -13,6 +13,7 @@ using namespace rsx;
 
 static int g_checks = 0;
 static int g_fails = 0;
+static const texture_support k_support{ 4096, 512, 4096, true, true };
 
 #define CHECK(c)                                                                  \
     do {                                                                          \
@@ -31,6 +32,7 @@ enum kind {
     K_W16,
     K_W32,
     K_655,
+    K_5551,
     K_D24,
     K_D24F,
     K_D16F,
@@ -53,7 +55,7 @@ struct ref_fmt {
 static const ref_fmt g_ref[] = {
     { 0x81, "B8", 1, 1, 1, K_B8, 1, VK_FORMAT_R8_UNORM },
     { 0x82, "A1R5G5B5", 2, 1, 1, K_S16, 2, VK_FORMAT_A1R5G5B5_UNORM_PACK16 },
-    { 0x83, "A4R4G4B4", 2, 1, 1, K_S16, 2, VK_FORMAT_R4G4B4A4_UNORM_PACK16 },
+    { 0x83, "A4R4G4B4", 2, 1, 1, K_S16, 2, VK_FORMAT_B4G4R4A4_UNORM_PACK16 },
     { 0x84, "R5G6B5", 2, 1, 1, K_S16, 2, VK_FORMAT_R5G6B5_UNORM_PACK16 },
     { 0x85, "A8R8G8B8", 4, 1, 1, K_S32, 4, VK_FORMAT_B8G8R8A8_UNORM },
     { 0x86, "DXT1", 8, 4, 4, K_DXT, 8, VK_FORMAT_BC1_RGBA_UNORM_BLOCK },
@@ -69,7 +71,7 @@ static const ref_fmt g_ref[] = {
     { 0x93, "DEPTH16_FLOAT", 2, 1, 1, K_D16F, 4, VK_FORMAT_D32_SFLOAT },
     { 0x94, "X16", 2, 1, 1, K_S16, 2, VK_FORMAT_R16_UNORM },
     { 0x95, "Y16_X16", 4, 1, 1, K_S16X2, 4, VK_FORMAT_R16G16_UNORM },
-    { 0x97, "R5G5B5A1", 2, 1, 1, K_S16, 2, VK_FORMAT_R5G5B5A1_UNORM_PACK16 },
+    { 0x97, "R5G5B5A1", 2, 1, 1, K_5551, 2, VK_FORMAT_A1R5G5B5_UNORM_PACK16 },
     { 0x98, "HILO8", 2, 1, 1, K_S16, 2, VK_FORMAT_R8G8_UNORM },
     { 0x99, "HILO_S8", 2, 1, 1, K_S16, 2, VK_FORMAT_R8G8_SNORM },
     { 0x9A, "W16Z16Y16X16_F", 8, 1, 1, K_W16, 8, VK_FORMAT_R16G16B16A16_SFLOAT },
@@ -140,6 +142,13 @@ static void ref_texel(kind k, const uint8_t* p, uint32_t sub, uint8_t* o)
         const uint32_t v = (uint32_t(p[0]) << 8) | p[1];
         const uint32_t r6 = v >> 10, g5 = (v >> 5) & 31, b5 = v & 31;
         const uint32_t out = ((r6 >> 1) << 11) | (g5 << 6) | b5;
+        o[0] = uint8_t(out);
+        o[1] = uint8_t(out >> 8);
+        break;
+    }
+    case K_5551: {
+        const uint32_t v = (uint32_t(p[0]) << 8) | p[1];
+        const uint32_t out = (v >> 1) | ((v & 1) << 15);
         o[0] = uint8_t(out);
         o[1] = uint8_t(out >> 8);
         break;
@@ -306,10 +315,11 @@ static int run_conversion_case(const ref_fmt& f, bool linear, uint32_t dim, bool
     const int before = g_fails;
     const texture_regs regs = make_regs(f.fmt, linear, dim, cube, w, h, d, mips, pitch, border);
     texture_desc desc;
-    const bool ok = texture_describe(regs, false, desc);
+    const bool ok = texture_describe(regs, false, k_support, desc);
     CHECK(ok);
     if (!ok) return 1;
     CHECK(desc.gcm_format == f.fmt);
+    CHECK(desc.format == f.vk);
     CHECK(desc.linear == linear);
     CHECK(desc.layers == (cube ? 6u : 1u));
     CHECK(desc.location == 0);
@@ -424,7 +434,7 @@ static std::vector<uint8_t> convert_one(uint32_t fmt, const std::vector<uint8_t>
     const uint32_t pitch = linear ? (w + f->bw - 1) / f->bw * f->bpb : 0;
     const texture_regs regs = make_regs(fmt, linear, 2, false, w, h, 1, 1, pitch, false);
     texture_desc desc;
-    CHECK(texture_describe(regs, false, desc));
+    CHECK(texture_describe(regs, false, k_support, desc));
     CHECK(desc.guest_size == guest.size());
     std::vector<uint8_t> staging(texture_staging_size(desc));
     std::vector<texture_copy> copies;
@@ -565,7 +575,7 @@ static texture_desc describe_with(uint32_t fmt, uint32_t control1, uint32_t addr
     r.filter = filter;
     r.control0 |= control0_extra;
     texture_desc d;
-    CHECK(texture_describe(r, vertex, d));
+    CHECK(texture_describe(r, vertex, k_support, d));
     return d;
 }
 
@@ -583,7 +593,8 @@ static void test_remap_and_ops()
     CHECK(map_eq(describe_with(0x85, 0x00E4, addr, filt).swizzle, ZERO, ZERO, ZERO, ZERO));
     CHECK(map_eq(describe_with(0x81, 0xAAE4, addr, filt).swizzle, R, R, R, ONE));
     CHECK(map_eq(describe_with(0x8B, 0xAAE4, addr, filt).swizzle, R, G, R, G));
-    CHECK(map_eq(describe_with(0x83, 0xAAE4, addr, filt).swizzle, G, B, A, R));
+    CHECK(map_eq(describe_with(0x83, 0xAAE4, addr, filt).swizzle, G, R, A, B));
+    CHECK(map_eq(describe_with(0x97, 0xAAE4, addr, filt).swizzle, R, G, B, A));
     CHECK(map_eq(describe_with(0x86, 0xAAE4, addr, filt).swizzle, R, G, B, A));
     CHECK(map_eq(describe_with(0x9E, 0xAAE4, addr, filt).swizzle, R, G, B, ONE));
     CHECK(map_eq(describe_with(0x9D, 0xAAE4, addr, filt).swizzle, R, G, B, ONE));
@@ -686,11 +697,11 @@ static void test_remap_and_ops()
     {
         texture_regs r = make_regs(0x85 | 0x40, false, 2, false, 16, 16, 1, 1, 0, false);
         texture_desc d;
-        CHECK(texture_describe(r, false, d) && d.ops.unnormalized == 1 && d.gcm_format == 0x85);
+        CHECK(texture_describe(r, false, k_support, d) && d.ops.unnormalized == 1 && d.gcm_format == 0x85);
         r.address = 0x00030303u;
-        CHECK(texture_describe(r, true, d) && d.ops.unnormalized == 0);
+        CHECK(texture_describe(r, true, k_support, d) && d.ops.unnormalized == 0);
         r.address = 0x00030101u;
-        CHECK(texture_describe(r, true, d) && d.ops.unnormalized == 1);
+        CHECK(texture_describe(r, true, k_support, d) && d.ops.unnormalized == 1);
     }
     {
         const texture_desc d = describe_with(0x85, 0xAAE4, addr | (0x7u << 20), filt | 0xF0000000u, true);
@@ -704,64 +715,89 @@ static void test_describe_rules()
     const int before = g_fails;
     texture_desc d;
     texture_regs r = make_regs(0x85, false, 2, false, 256, 64, 1, 15, 0, false);
-    CHECK(texture_describe(r, false, d) && d.levels == 9 && d.width == 256 && d.height == 64 && d.dimension == 2);
+    CHECK(texture_describe(r, false, k_support, d) && d.levels == 9 && d.width == 256 && d.height == 64 && d.dimension == 2);
     r = make_regs(0x86, false, 2, false, 256, 64, 1, 15, 0, false);
-    CHECK(texture_describe(r, false, d) && d.levels == 5 && d.compressed);
-    CHECK(texture_describe(r, true, d) && d.levels == 9);
+    CHECK(texture_describe(r, false, k_support, d) && d.levels == 5 && d.compressed);
+    CHECK(texture_describe(r, true, k_support, d) && d.levels == 9);
     r = make_regs(0x85, false, 2, false, 256, 64, 1, 3, 0, false);
-    CHECK(texture_describe(r, false, d) && d.levels == 3);
+    CHECK(texture_describe(r, false, k_support, d) && d.levels == 3);
     r = make_regs(0x85, true, 2, false, 64, 16, 1, 1, 128, false);
-    CHECK(texture_describe(r, false, d) && d.width == 32 && d.pitch == 128);
+    CHECK(texture_describe(r, false, k_support, d) && d.width == 32 && d.pitch == 128);
     r = make_regs(0x85, true, 2, false, 64, 16, 1, 1, 0, false);
-    CHECK(texture_describe(r, false, d) && d.height == 1 && d.pitch == 256 && d.guest_size == 256);
+    CHECK(texture_describe(r, false, k_support, d) && d.height == 1 && d.pitch == 256 && d.guest_size == 256);
     r = make_regs(0x85, false, 2, false, 64, 16, 1, 1, 0, false);
     r.format = (r.format & ~3u) | 2u;
-    CHECK(texture_describe(r, false, d) && d.location == 1);
+    CHECK(texture_describe(r, false, k_support, d) && d.location == 1);
     r = make_regs(0x85, false, 2, false, 16, 16, 1, 1, 0, false);
     r.control0 &= 0x7FFFFFFFu;
-    CHECK(!texture_describe(r, false, d));
+    CHECK(!texture_describe(r, false, k_support, d));
     r = make_regs(0x85, false, 2, false, 16, 16, 1, 1, 0, false);
     r.format &= ~3u;
-    CHECK(!texture_describe(r, false, d));
+    CHECK(!texture_describe(r, false, k_support, d));
     r.format |= 3u;
-    CHECK(!texture_describe(r, false, d));
+    CHECK(!texture_describe(r, false, k_support, d));
     r = make_regs(0x85, false, 0, false, 16, 16, 1, 1, 0, false);
-    CHECK(!texture_describe(r, false, d));
+    CHECK(!texture_describe(r, false, k_support, d));
     r = make_regs(0x85, false, 4, false, 16, 16, 1, 1, 0, false);
-    CHECK(!texture_describe(r, false, d));
+    CHECK(!texture_describe(r, false, k_support, d));
     r = make_regs(0x89, false, 2, false, 16, 16, 1, 1, 0, false);
-    CHECK(!texture_describe(r, false, d));
+    CHECK(!texture_describe(r, false, k_support, d));
     r = make_regs(0x96, false, 2, false, 16, 16, 1, 1, 0, false);
-    CHECK(!texture_describe(r, false, d));
+    CHECK(!texture_describe(r, false, k_support, d));
     r = make_regs(0x85, false, 2, false, 16, 16, 1, 0, 0, false);
-    CHECK(!texture_describe(r, false, d));
+    CHECK(!texture_describe(r, false, k_support, d));
     r = make_regs(0x85, false, 2, false, 0, 16, 1, 1, 0, false);
-    CHECK(!texture_describe(r, false, d));
+    CHECK(!texture_describe(r, false, k_support, d));
     r = make_regs(0x85, false, 3, false, 16, 16, 0, 1, 0, false);
-    CHECK(!texture_describe(r, false, d));
+    CHECK(!texture_describe(r, false, k_support, d));
     r = make_regs(0x85, false, 2, true, 16, 8, 1, 1, 0, false);
-    CHECK(!texture_describe(r, false, d));
+    CHECK(!texture_describe(r, false, k_support, d));
     r = make_regs(0x85, false, 1, false, 16, 77, 1, 15, 0, false);
-    CHECK(texture_describe(r, false, d) && d.height == 1 && d.dimension == 1 && d.levels == 5);
+    CHECK(texture_describe(r, false, k_support, d) && d.height == 1 && d.dimension == 1 && d.levels == 5);
     r = make_regs(0x85, false, 2, true, 32, 32, 1, 1, 0, false);
-    CHECK(texture_describe(r, false, d) && d.cube && d.layers == 6 && d.guest_size == 5 * 4096 + 4096);
+    CHECK(texture_describe(r, false, k_support, d) && d.cube && d.layers == 6 && d.guest_size == 5 * 4096 + 4096);
     r = make_regs(0x81, false, 2, true, 4, 4, 1, 3, 0, false);
-    CHECK(texture_describe(r, false, d) && d.guest_size == 5 * 128 + 21);
+    CHECK(texture_describe(r, false, k_support, d) && d.guest_size == 5 * 128 + 21);
     r = make_regs(0x81, true, 2, true, 4, 4, 1, 3, 4, false);
-    CHECK(texture_describe(r, false, d) && d.guest_size == 6 * (16 + 8 + 4));
+    CHECK(texture_describe(r, false, k_support, d) && d.guest_size == 6 * (16 + 8 + 4));
     r = make_regs(0x85, false, 3, false, 16, 16, 8, 15, 0, false);
-    CHECK(texture_describe(r, false, d) && d.depth_slices == 8 && d.levels == 5 &&
+    CHECK(texture_describe(r, false, k_support, d) && d.depth_slices == 8 && d.levels == 5 &&
           d.guest_size == 4 * (16 * 16 * 8 + 8 * 8 * 4 + 4 * 4 * 2 + 2 * 2 * 1 + 1));
     r = make_regs(0x85, false, 2, false, 16, 16, 1, 1, 0, true);
-    CHECK(texture_describe(r, false, d) && d.border && d.guest_size == 32 * 32 * 4);
-    CHECK(texture_describe(r, true, d) && !d.border && d.guest_size == 16 * 16 * 4);
+    CHECK(texture_describe(r, false, k_support, d) && d.border && d.guest_size == 32 * 32 * 4);
+    CHECK(texture_describe(r, true, k_support, d) && !d.border && d.guest_size == 16 * 16 * 4);
+    r = make_regs(0x85, false, 2, false, 4096, 4096, 1, 1, 0, false);
+    CHECK(texture_describe(r, false, k_support, d));
+    r = make_regs(0x85, false, 2, false, 8192, 16, 1, 1, 0, false);
+    CHECK(!texture_describe(r, false, k_support, d));
+    r = make_regs(0x85, false, 1, false, 8192, 1, 1, 1, 0, false);
+    CHECK(!texture_describe(r, false, k_support, d));
+    r = make_regs(0x85, false, 3, false, 16, 16, 1024, 1, 0, false);
+    CHECK(!texture_describe(r, false, k_support, d));
+    r = make_regs(0x85, false, 2, true, 8192, 8192, 1, 1, 0, false);
+    CHECK(!texture_describe(r, false, k_support, d));
+    {
+        const texture_support small{ 1024, 64, 512, false, false };
+        r = make_regs(0x85, false, 2, true, 1024, 1024, 1, 1, 0, false);
+        CHECK(!texture_describe(r, false, small, d));
+        r = make_regs(0x85, false, 3, false, 64, 64, 128, 1, 0, false);
+        CHECK(!texture_describe(r, false, small, d));
+        r = make_regs(0x81, false, 2, false, 16, 16, 1, 1, 0, false);
+        r.address |= 0x7u << 20;
+        CHECK(texture_describe(r, false, small, d) && d.format == VK_FORMAT_R8_UNORM && d.ops.gamma_mask == 0x7);
+        CHECK(texture_describe(r, false, k_support, d) && d.format == VK_FORMAT_R8_SRGB && d.ops.gamma_mask == 0);
+        r = make_regs(0x8B, false, 2, false, 16, 16, 1, 1, 0, false);
+        r.address |= 0x7u << 20;
+        CHECK(texture_describe(r, false, small, d) && d.format == VK_FORMAT_R8G8_UNORM && d.ops.gamma_mask == 0x7);
+        CHECK(texture_describe(r, false, k_support, d) && d.format == VK_FORMAT_R8G8_SRGB && d.ops.gamma_mask == 0);
+    }
     std::printf("describe validation, levels, pitch and size rules: %s\n", g_fails == before ? "ok" : "MISMATCH");
 }
 
 static void sample(const texture_regs& r, bool vertex, float cap, VkSamplerCreateInfo& info, VkSamplerCustomBorderColorCreateInfoEXT& b,
                    texture_desc& d)
 {
-    CHECK(texture_describe(r, vertex, d));
+    CHECK(texture_describe(r, vertex, k_support, d));
     texture_sampler(r, vertex, d, cap, info, b);
 }
 
@@ -916,7 +952,7 @@ static void test_sampler()
         r.border = 0x80FF4000u;
         sample(r, false, 16.f, info, bc, d);
         CHECK(info.borderColor == VK_BORDER_COLOR_FLOAT_CUSTOM_EXT);
-        CHECK(bc.sType == VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT && bc.format == VK_FORMAT_B8G8R8A8_UNORM);
+        CHECK(bc.sType == VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT);
         CHECK(bc.customBorderColor.float32[0] == 1.f && bc.customBorderColor.float32[1] == 64.f / 255.f &&
               bc.customBorderColor.float32[2] == 0.f && bc.customBorderColor.float32[3] == 128.f / 255.f);
         r.control1 = 0xAA1Bu;
@@ -984,7 +1020,7 @@ static void test_sampler()
 static double bench_convert(const texture_regs& r, int iters, double& mbps_guest, double& mbps_staging)
 {
     texture_desc d;
-    texture_describe(r, false, d);
+    texture_describe(r, false, k_support, d);
     std::vector<uint8_t> guest(d.guest_size);
     for (auto& b : guest) b = uint8_t(g_rng());
     std::vector<uint8_t> staging(texture_staging_size(d));
@@ -1052,7 +1088,7 @@ static void benchmarks()
         const auto t0 = std::chrono::steady_clock::now();
         for (int i = 0; i < n; ++i) {
             r.offset = uint32_t(i);
-            texture_describe(r, false, d);
+            texture_describe(r, false, k_support, d);
             acc += d.guest_size + d.offset;
         }
         const auto t1 = std::chrono::steady_clock::now();

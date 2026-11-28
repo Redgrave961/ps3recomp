@@ -79,11 +79,14 @@ typedef struct ps3_obj {
 } ps3_obj;
 
 static pthread_mutex_t s_lock  = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t  s_multi = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t  s_multi;
+static pthread_once_t  s_multi_once = PTHREAD_ONCE_INIT;
 static int             s_multi_waiters;
 static ps3_obj*        s_threads;
 
 static _Thread_local ps3_obj* t_current_thread;
+
+static void multi_init(void) { ps3_cond_init(&s_multi); }
 
 static ps3_obj* obj_new(int kind)
 {
@@ -92,7 +95,7 @@ static ps3_obj* obj_new(int kind)
     o->magic = OBJ_MAGIC;
     o->kind  = kind;
     o->refs  = 1;
-    pthread_cond_init(&o->cv, NULL);
+    ps3_cond_init(&o->cv);
     return o;
 }
 
@@ -190,12 +193,7 @@ static int wait_until_locked(pthread_cond_t* cv, unsigned long long deadline_ns,
     if (deadline_ns && now >= deadline_ns) return ETIMEDOUT;
     if (now >= target) return 0;
 
-    unsigned long long remain = target - now;
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_sec  += (time_t)(remain / 1000000000ull);
-    ts.tv_nsec += (long)(remain % 1000000000ull);
-    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+    const struct timespec ts = ps3_wait_deadline_ns(target - now);
     int rc = pthread_cond_timedwait(cv, &s_lock, &ts);
     if (rc == ETIMEDOUT && (!deadline_ns || mono_ns() < deadline_ns)) rc = 0;
     return rc;
@@ -1088,6 +1086,7 @@ DWORD WaitForMultipleObjects(DWORD count, const HANDLE* handles, BOOL wait_all, 
     unsigned long long deadline = deadline_from_ms(ms);
     DWORD result = WAIT_TIMEOUT;
 
+    pthread_once(&s_multi_once, multi_init);
     pthread_mutex_lock(&s_lock);
     for (DWORD i = 0; i < count; i++) objs[i]->refs++;
     s_multi_waiters++;
@@ -1141,7 +1140,7 @@ static void pl_init(void)
 {
     for (int i = 0; i < PL_BUCKETS; i++) {
         pthread_mutex_init(&s_pl[i].m, NULL);
-        pthread_cond_init(&s_pl[i].c, NULL);
+        ps3_cond_init(&s_pl[i].c);
     }
 }
 static unsigned pl_bucket(const volatile void* a)
@@ -1174,7 +1173,7 @@ BOOL WaitOnAddress(volatile VOID* address, PVOID compare, SIZE_T size, DWORD ms)
     if (pl_equal(address, compare, size)) {
         int rc;
         if (ms == INFINITE) rc = pthread_cond_wait(&s_pl[b].c, &s_pl[b].m);
-        else { struct timespec ts = ps3__deadline_ms(ms); rc = pthread_cond_timedwait(&s_pl[b].c, &s_pl[b].m, &ts); }
+        else { struct timespec ts = ps3_wait_deadline_ns((unsigned long long)ms * 1000000ull); rc = pthread_cond_timedwait(&s_pl[b].c, &s_pl[b].m, &ts); }
         if (rc == ETIMEDOUT && pl_equal(address, compare, size)) ok = FALSE;
     }
     pthread_mutex_unlock(&s_pl[b].m);

@@ -192,20 +192,4 @@ const fragment_program* shader_cache::find_fragment(uint64_t hash)
     return it != m_fragment.end() ? it->second.get() : nullptr;
 }
 
-void shader_cache::destroy()
-{
-    if (!m_d) return;
-    auto release = [this](shader& s) {
-        if (s.library) vkDestroyPipeline(m_d->dev, s.library, nullptr);
-        if (s.module) vkDestroyShaderModule(m_d->dev, s.module, nullptr);
-    };
-    for (auto& [h, p] : m_vertex)
-        if (p) release(p->code);
-    for (auto& [h, p] : m_fragment)
-        if (p) release(p->code);
-    m_vertex.clear();
-    m_fragment.clear();
-    m_d = nullptr;
-}
-
 }

@@ -1,11 +1,13 @@
 #include "../runtime/syscalls/sys_ppu_thread.c"
 #include <assert.h>
-#include <time.h>
 
 uint8_t* vm_base;
-uint32_t ppu_vm_size = 0x10000;
+uint32_t ppu_vm_size;
 int ps3_intr_is_handler(unsigned long long tid) { (void)tid; return 0; }
 int ps3_intr_wait(unsigned long long tid) { (void)tid; return 0; }
+PPU_THREAD_LOCAL ppu_context* g_active_ctx;
+
+#define OUT_TID (VM_MAIN_MEM_BASE + 0x100)
 
 enum { BODY_WRITE_THEN_BLOCK = 1, BODY_WRITE_THEN_RETURN, BODY_SPIN_UNTIL_RELEASED };
 
@@ -14,8 +16,8 @@ enum { BODY_WRITE_THEN_BLOCK = 1, BODY_WRITE_THEN_RETURN, BODY_SPIN_UNTIL_RELEAS
 static int g_published;
 static int g_release;
 
-static void sleep_ms(long ms) { struct timespec ts = { ms / 1000, (ms % 1000) * 1000000L }; nanosleep(&ts, NULL); }
-static long long now_ms(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec * 1000LL + ts.tv_nsec / 1000000; }
+static void sleep_ms(long ms) { Sleep((DWORD)ms); }
+static long long now_ms(void) { return (long long)(ps3_sync_now_ns() / 1000000ull); }
 
 static void guest_entry(ppu_context* ctx)
 {
@@ -44,7 +46,7 @@ static long long create(int32_t priority, uint64_t body)
 {
     ppu_context ctx; memset(&ctx, 0, sizeof(ctx));
     ctx.thread_id = 1;
-    ctx.gpr[3] = 0x100;
+    ctx.gpr[3] = OUT_TID;
     ctx.gpr[4] = 0x10000;
     ctx.gpr[5] = body;
     ctx.gpr[6] = (uint64_t)(int64_t)priority;
@@ -75,6 +77,9 @@ static void finish_case(void)
         if (!live) break;
         sleep_ms(1);
     }
+    table_lock();
+    EXPECT(g_vm_stack_alloc.live == 0 && g_vm_stack_alloc.next_addr == VM_STACK_BASE);
+    table_unlock();
     __atomic_store_n(&g_release, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&g_published, 0, __ATOMIC_RELAXED);
 }
@@ -82,9 +87,8 @@ static void finish_case(void)
 int main(void)
 {
     const int on = getenv("PS3_PRIO_START") != NULL;
-    vm_base = calloc(1, 0x10000); assert(vm_base);
-    g_vm_stack_alloc.next_addr = 0x10000000u;
-    g_vm_stack_alloc.region_end = 0xA0000000u;
+    assert(vm_init() == CELL_OK);
+    vm_stack_alloc_init(&g_vm_stack_alloc);
     g_ppu_thread_entry_trampoline = guest_entry;
     ppu_thread_register_main();
 
@@ -128,7 +132,7 @@ int main(void)
     EXPECT(__atomic_load_n(&g_published, __ATOMIC_RELAXED) == on);
     finish_case();
 
-    free(vm_base);
+    vm_shutdown();
     if (g_fails) { fprintf(stderr, "%d check(s) failed (PS3_PRIO_START %s)\n", g_fails, on ? "on" : "off"); return 1; }
     printf("PASS: PS3_PRIO_START %s\n", on ? "on: a higher-priority thread runs until it blocks"
                                           : "off: sys_ppu_thread_create never waits");

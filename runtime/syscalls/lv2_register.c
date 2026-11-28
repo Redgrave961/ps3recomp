@@ -1226,10 +1226,10 @@ static int64_t sys_spu_image_open_handler(ppu_context* ctx)
     }
 
     const char* ps3_path = (const char*)(vm_base + path_ea);
-    char host_path[1024];
-    sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
+    char host_path[SYS_FS_HOST_PATH_MAX];
+    const int translated = sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
 
-    ps3_vfile* f = ps3_vfile_open(host_path, "rb");
+    ps3_vfile* f = translated ? ps3_vfile_open(host_path, "rb") : NULL;
     if (!f) {
         fprintf(stderr, "[SPU] image_open img=0x%08X path='%s' (host: %s) — open failed\n",
                 img_ea, ps3_path, host_path);

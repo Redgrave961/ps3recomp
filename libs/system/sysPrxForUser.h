@@ -8,6 +8,8 @@
 extern "C" {
 #endif
 
+void ps3_process_at_exit(void (*hook)(void));
+__attribute__((noreturn)) void ps3_process_exit(int code);
 void sys_process_exit(s32 exitcode);
 s32 sys_process_getpid(void);
 s32 sys_process_is_spu_lock_line_reservation_address(u32 addr, u64 flags);

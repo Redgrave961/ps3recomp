@@ -332,34 +332,6 @@ bool trophy_toast::create(vk_device& d, VkPipelineCache cache)
     return true;
 }
 
-void trophy_toast::destroy()
-{
-    if (m_chime_stream) {
-        SDL_DestroyAudioStream(m_chime_stream);
-        m_chime_stream = nullptr;
-    }
-    if (!m_d) return;
-    retire_current();
-    for (retired_tex& r : m_retired) {
-        if (r.view) vkDestroyImageView(m_d->dev, r.view, nullptr);
-        if (r.img) vmaDestroyImage(m_d->vma, r.img, r.mem);
-        if (r.stage) vmaDestroyBuffer(m_d->vma, r.stage, r.stage_mem);
-    }
-    m_retired.clear();
-    if (m_pipe) vkDestroyPipeline(m_d->dev, m_pipe, nullptr);
-    if (m_vs) vkDestroyShaderModule(m_d->dev, m_vs, nullptr);
-    if (m_fs) vkDestroyShaderModule(m_d->dev, m_fs, nullptr);
-    if (m_layout) vkDestroyPipelineLayout(m_d->dev, m_layout, nullptr);
-    if (m_set) vkDestroyDescriptorSetLayout(m_d->dev, m_set, nullptr);
-    if (m_sampler) vkDestroySampler(m_d->dev, m_sampler, nullptr);
-    m_pipe = VK_NULL_HANDLE;
-    m_vs = m_fs = VK_NULL_HANDLE;
-    m_layout = VK_NULL_HANDLE;
-    m_set = VK_NULL_HANDLE;
-    m_sampler = VK_NULL_HANDLE;
-    m_d = nullptr;
-}
-
 bool trophy_toast::ensure_pipeline(VkFormat format)
 {
     if (m_pipe && m_pipe_format == format) return true;

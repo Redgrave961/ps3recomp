@@ -51,6 +51,7 @@ enum conv_kind : uint8_t {
     CONV_SWAP16X2,
     CONV_SWAP32,
     CONV_RGB655,
+    CONV_RGBA5551,
     CONV_D24,
     CONV_D24F,
     CONV_D16F,
@@ -92,7 +93,7 @@ constexpr std::array<format_info, 32> make_formats()
     };
     set(FMT_B8, VK_FORMAT_R8_UNORM, 1, 1, 1, 1, CONV_COPY8, all, 0xE, O, R, R, R);
     set(FMT_A1R5G5B5, VK_FORMAT_A1R5G5B5_UNORM_PACK16, 2, 1, 1, 2, CONV_SWAP16, all, 0xF, A, R, G, B);
-    set(FMT_A4R4G4B4, VK_FORMAT_R4G4B4A4_UNORM_PACK16, 2, 1, 1, 2, CONV_SWAP16, all, 0xF, R, G, B, A);
+    set(FMT_A4R4G4B4, VK_FORMAT_B4G4R4A4_UNORM_PACK16, 2, 1, 1, 2, CONV_SWAP16, all, 0xF, B, G, R, A);
     set(FMT_R5G6B5, VK_FORMAT_R5G6B5_UNORM_PACK16, 2, 1, 1, 2, CONV_SWAP16, all, 0xE, A, R, G, B);
     set(FMT_A8R8G8B8, VK_FORMAT_B8G8R8A8_UNORM, 4, 1, 1, 4, CONV_SWAP32, all, 0xF, A, R, G, B);
     set(FMT_DXT1, VK_FORMAT_BC1_RGBA_UNORM_BLOCK, 8, 4, 4, 8, CONV_DXT, all, 0xF, A, R, G, B);
@@ -108,7 +109,7 @@ constexpr std::array<format_info, 32> make_formats()
     set(FMT_DEPTH16_FLOAT, VK_FORMAT_D32_SFLOAT, 2, 1, 1, 4, CONV_D16F, FEAT_BIASED, 0xF, R, R, R, R);
     set(FMT_X16, VK_FORMAT_R16_UNORM, 2, 1, 1, 2, CONV_SWAP16, FEAT_BIASED, 0xF, R, O, R, O);
     set(FMT_Y16_X16, VK_FORMAT_R16G16_UNORM, 4, 1, 1, 4, CONV_SWAP16X2, FEAT_SIGNED | FEAT_BIASED, 0xF, G, R, G, R);
-    set(FMT_R5G5B5A1, VK_FORMAT_R5G5B5A1_UNORM_PACK16, 2, 1, 1, 2, CONV_SWAP16, all, 0xF, A, R, G, B);
+    set(FMT_R5G5B5A1, VK_FORMAT_A1R5G5B5_UNORM_PACK16, 2, 1, 1, 2, CONV_RGBA5551, all, 0xF, A, R, G, B);
     set(FMT_HILO8, VK_FORMAT_R8G8_UNORM, 2, 1, 1, 2, CONV_SWAP16, FEAT_BIASED, 0xF, R, G, R, G);
     set(FMT_HILO_S8, VK_FORMAT_R8G8_SNORM, 2, 1, 1, 2, CONV_SWAP16, 0, 0xF, R, G, R, G);
     set(FMT_W16_Z16_Y16_X16_FLOAT, VK_FORMAT_R16G16B16A16_SFLOAT, 8, 1, 1, 8, CONV_SWAP16X2, 0, 0xF, A, R, G, B);
@@ -246,6 +247,22 @@ struct op_rgb655 {
         for (size_t i = 0; i < n; ++i) {
             const uint16_t v = bswap16(load16(s + i * 2));
             store16(d + i * 2, static_cast<uint16_t>((v & 0xF81Fu) | ((v & 0x3E0u) << 1)));
+        }
+    }
+};
+
+struct op_rgba5551 {
+    static constexpr uint32_t in = 2, out = 2, simd = 2;
+    static __m128i vec(__m128i v)
+    {
+        v = vswap16(v);
+        return _mm_or_si128(_mm_srli_epi16(v, 1), _mm_slli_epi16(v, 15));
+    }
+    static void run(const uint8_t* s, uint8_t* d, size_t n)
+    {
+        for (size_t i = 0; i < n; ++i) {
+            const uint16_t v = bswap16(load16(s + i * 2));
+            store16(d + i * 2, static_cast<uint16_t>((v >> 1) | (v << 15)));
         }
     }
 };
@@ -662,6 +679,7 @@ void convert_level(const format_info& fi, const uint8_t* src, uint64_t avail, ui
     case CONV_SWAP16X2: convert_plain<op_swap16x2>(src, avail, dst, L, bpb, linear); break;
     case CONV_SWAP32: convert_plain<op_swap32>(src, avail, dst, L, bpb, linear); break;
     case CONV_RGB655: convert_plain<op_rgb655>(src, avail, dst, L, bpb, linear); break;
+    case CONV_RGBA5551: convert_plain<op_rgba5551>(src, avail, dst, L, bpb, linear); break;
     case CONV_D24: convert_plain<op_d24>(src, avail, dst, L, bpb, linear); break;
     case CONV_D24F: convert_plain<op_d24f>(src, avail, dst, L, bpb, linear); break;
     case CONV_D16F: convert_plain<op_d16f>(src, avail, dst, L, bpb, linear); break;
@@ -744,11 +762,11 @@ inline VkFormat snorm_variant(VkFormat f)
     }
 }
 
-inline VkFormat srgb_variant(VkFormat f)
+inline VkFormat srgb_variant(VkFormat f, const texture_support& support)
 {
     switch (f) {
-    case VK_FORMAT_R8_UNORM: return VK_FORMAT_R8_SRGB;
-    case VK_FORMAT_R8G8_UNORM: return VK_FORMAT_R8G8_SRGB;
+    case VK_FORMAT_R8_UNORM: return support.r8_srgb ? VK_FORMAT_R8_SRGB : VK_FORMAT_UNDEFINED;
+    case VK_FORMAT_R8G8_UNORM: return support.r8g8_srgb ? VK_FORMAT_R8G8_SRGB : VK_FORMAT_UNDEFINED;
     case VK_FORMAT_R8G8B8A8_UNORM: return VK_FORMAT_R8G8B8A8_SRGB;
     case VK_FORMAT_B8G8R8A8_UNORM: return VK_FORMAT_B8G8R8A8_SRGB;
     case VK_FORMAT_BC1_RGBA_UNORM_BLOCK: return VK_FORMAT_BC1_RGBA_SRGB_BLOCK;
@@ -825,7 +843,7 @@ inline VkCompareOp vk_compare_reversed(uint32_t f)
 
 }
 
-bool texture_describe(const texture_regs& regs, bool vertex_unit, texture_desc& out)
+bool texture_describe(const texture_regs& regs, bool vertex_unit, const texture_support& support, texture_desc& out)
 {
     out = {};
     if (!(regs.control0 >> 31)) return false;
@@ -868,6 +886,8 @@ bool texture_describe(const texture_regs& regs, bool vertex_unit, texture_desc& 
     } else {
         pitch = (border ? next_pow2(wb0 + 8) : wb0) * fi.block_bytes;
     }
+    const uint32_t max_extent = dim == 3 ? support.max_3d : cube ? support.max_cube : support.max_2d;
+    if (width > max_extent || height > max_extent || depth > max_extent) return false;
 
     uint32_t max_levels;
     if (is_dxt(fi) && !vertex_unit) {
@@ -882,6 +902,7 @@ bool texture_describe(const texture_regs& regs, bool vertex_unit, texture_desc& 
     out.linear = linear;
     out.cube = cube;
     out.compressed = is_dxt(fi);
+    out.converted = fi.conv == CONV_RGB655 || fi.conv == CONV_RGBA5551 || is_422(fi);
     out.depth = fmt >= FMT_DEPTH24_D8 && fmt <= FMT_DEPTH16_FLOAT;
     out.border = border;
     out.dimension = (dim == 1 && out.compressed) ? 2 : dim;
@@ -922,7 +943,7 @@ bool texture_describe(const texture_regs& regs, bool vertex_unit, texture_desc& 
                     sign = 0;
                 }
             } else if (regs.control1 == REMAP_IDENTITY && gamma == 0xE) {
-                const VkFormat f = srgb_variant(format);
+                const VkFormat f = srgb_variant(format, support);
                 if (f != VK_FORMAT_UNDEFINED) {
                     format = f;
                     gamma = 0;
@@ -1156,7 +1177,6 @@ void texture_sampler(const texture_regs& regs, bool vertex_unit, const texture_d
         info.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
     } else {
         info.borderColor = VK_BORDER_COLOR_FLOAT_CUSTOM_EXT;
-        border.format = desc.format;
         border.customBorderColor.float32[0] = r;
         border.customBorderColor.float32[1] = g;
         border.customBorderColor.float32[2] = b;

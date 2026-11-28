@@ -6,6 +6,7 @@
 #include "../../include/ps3emu/ps3types.h"
 #include "../../include/ps3emu/error_codes.h"
 #include "../../libs/filesystem/ps3_vfs.h"
+#include "../platform/ps3_utf8_fs.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -23,6 +24,7 @@ extern "C" {
 
 #define SYS_FS_FD_MAX   256
 #define SYS_FS_DIR_MAX  64
+#define SYS_FS_HOST_PATH_MAX PS3_HOST_PATH_MAX
 
 #define CELL_FS_S_IFDIR   0040000
 #define CELL_FS_S_IFREG   0100000
@@ -47,7 +49,6 @@ extern "C" {
 typedef struct sys_fs_fd_info {
     int    active;
     ps3_vfile* fp;
-    char   path[512];
     int    flags;
 } sys_fs_fd_info;
 
@@ -61,7 +62,7 @@ extern sys_fs_dir_info g_sys_fs_dirs[SYS_FS_DIR_MAX];
 
 extern const char* ppu_vfs_root;
 
-void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size);
+int sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size);
 
 int64_t sys_fs_open(ppu_context* ctx);
 int64_t sys_fs_read(ppu_context* ctx);

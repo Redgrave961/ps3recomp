@@ -75,7 +75,7 @@ typedef struct rsx_write {
 
 typedef struct rsx_renderer {
     void* user;
-    int  (*open)(void* user);
+    void (*open)(void* user);
     void (*methods)(void* user, u32 reg, u32 inc, const u32* be_args, u32 count);
     void (*flush)(void* user);
     void (*sync)(void* user);
@@ -88,7 +88,6 @@ typedef struct rsx_renderer {
     void (*wrote)(void* user, u32 ea, u32 size);
     int  (*blit)(void* user, const rsx_blit* b);
     void (*vblank)(void* user, u64 count);
-    void (*close)(void* user);
 } rsx_renderer;
 
 typedef void (*rsx_event_sink)(enum rsx_event event, u32 arg);

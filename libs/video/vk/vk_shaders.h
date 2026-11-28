@@ -27,7 +27,6 @@ struct fragment_program {
 class shader_cache {
 public:
     void init(vk_device& d, pipelines& p) { m_d = &d; m_pipes = &p; }
-    void destroy();
     const vertex_program* vertex(const uint32_t* program, const rsx_spv_vp_key& key, uint64_t program_hash, bool async);
     const fragment_program* fragment(const uint32_t* ucode, uint32_t max_words, const rsx_spv_fp_key& key, bool async,
                                      uint32_t alphakill_units = 0xFFFFu);

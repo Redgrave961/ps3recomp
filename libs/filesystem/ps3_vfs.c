@@ -202,6 +202,17 @@ static char* normalize(const char* path)
     return out;
 }
 
+static char* join_path(const char* dir, const char* name)
+{
+    const size_t a = strlen(dir), b = strlen(name);
+    char* out = (char*)malloc(a + b + 2);
+    if (!out) return NULL;
+    memcpy(out, dir, a);
+    out[a] = '/';
+    memcpy(out + a + 1, name, b + 1);
+    return out;
+}
+
 static int entry_cmp(const void* a, const void* b)
 {
     return strcmp(((const vfs_entry*)a)->key, ((const vfs_entry*)b)->key);
@@ -237,13 +248,12 @@ static int finish_mount(vfs_mount* m)
 {
     const size_t files = m->count;
     for (size_t i = 0; i < files; i++) {
-        for (const char* s = strchr(m->entries[i].path, '/'); s; s = strchr(s + 1, '/')) {
-            char parent[1024];
-            const size_t n = (size_t)(s - m->entries[i].path);
-            if (n >= sizeof parent) return -1;
-            memcpy(parent, m->entries[i].path, n);
-            parent[n] = 0;
-            if (add_entry(m, parent, 0, 0, 1)) return -1;
+        char* path = m->entries[i].path;
+        for (char* s = strchr(path, '/'); s; s = strchr(s + 1, '/')) {
+            *s = 0;
+            const int rc = add_entry(m, path, 0, 0, 1);
+            *s = '/';
+            if (rc) return -1;
         }
     }
     qsort(m->entries, m->count, sizeof *m->entries, entry_cmp);
@@ -286,9 +296,11 @@ static vfs_mount* open_image(const char* host_dir, const char* image)
     vfs_mount* m = (vfs_mount*)calloc(1, sizeof *m);
     if (!m) return NULL;
 #ifdef _WIN32
-    wchar_t wide[1024];
-    if (!MultiByteToWideChar(CP_UTF8, 0, image, -1, wide, 1024) ||
-        (m->h = CreateFileW(wide, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_RANDOM_ACCESS, NULL)) == INVALID_HANDLE_VALUE) {
+    wchar_t* wide = ps3_utf8_to_wide_path(image);
+    m->h = wide ? CreateFileW(wide, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_RANDOM_ACCESS, NULL)
+                : INVALID_HANDLE_VALUE;
+    free(wide);
+    if (m->h == INVALID_HANDLE_VALUE) {
         free(m);
         return NULL;
     }
@@ -346,7 +358,7 @@ static int iso_walk(vfs_mount* m, uint32_t lba, uint32_t size, const char* dir, 
         pos += len;
         const uint8_t name_len = r[32];
         if (33u + name_len > len || (name_len == 1 && r[33] <= 1)) continue;
-        char name[256], path[1024];
+        char name[256];
         if (joliet) {
             size_t o = 0;
             for (uint8_t i = 0; i + 1 < name_len && o + 3 < sizeof name; i += 2) {
@@ -364,7 +376,12 @@ static int iso_walk(vfs_mount* m, uint32_t lba, uint32_t size, const char* dir, 
         if (semi) *semi = 0;
         size_t nl = strlen(name);
         if (nl && name[nl - 1] == '.') name[--nl] = 0;
-        snprintf(path, sizeof path, "%s%s%s", dir, *dir ? "/" : "", name);
+        char* joined = join_path(dir, name);
+        if (!joined) {
+            rc = -1;
+            break;
+        }
+        const char* path = *dir ? joined : joined + 1;
         if (r[25] & 2) {
             rc = add_entry(m, path, 0, 0, 1);
             if (!rc) rc = iso_walk(m, le32(r + 2), le32(r + 10), path, depth + 1, joliet);
@@ -373,6 +390,7 @@ static int iso_walk(vfs_mount* m, uint32_t lba, uint32_t size, const char* dir, 
         } else {
             rc = add_entry(m, path, (uint64_t)le32(r + 2) * 2048, le32(r + 10), 0);
         }
+        free(joined);
     }
     free(data);
     return rc;
@@ -444,12 +462,13 @@ static vfs_mount* open_pkg(const char* game_dir, const char* dir_name, const cha
     memcpy(cid, h + 0x30, 36);
     cid[36] = 0;
     if (content_id) memcpy(content_id, cid, 37);
-    char prefix[1100];
-    if (dir_name && *dir_name) snprintf(prefix, sizeof prefix, "%s/%s", game_dir, dir_name);
-    else snprintf(prefix, sizeof prefix, "%s/%.9s", game_dir, cid + 7);
+    char title_id[10];
+    snprintf(title_id, sizeof title_id, "%.9s", cid + 7);
+    char* prefix = join_path(game_dir, dir_name && *dir_name ? dir_name : title_id);
     free(m->prefix);
-    m->prefix = normalize(prefix);
+    m->prefix = prefix ? normalize(prefix) : NULL;
     m->prefix_len = m->prefix ? strlen(m->prefix) : 0;
+    free(prefix);
     const uint64_t table = (uint64_t)items * 0x20;
     uint8_t* t = table <= data_size && items < 100000 ? (uint8_t*)malloc(table ? (size_t)table : 1) : NULL;
     int rc = m->prefix && t && (!table || !pkg_read(m, 0, t, (size_t)table)) ? 0 : -1;
@@ -514,11 +533,12 @@ int ps3_vfs_enum_last_mount(void (*cb)(const char* full_path, void* user), void*
 {
     if (!cb || g_mount_count <= 0) return -1;
     const vfs_mount* m = g_mounts[g_mount_count - 1];
-    char full[1400];
     for (size_t i = 0; i < m->count; i++) {
         if (m->entries[i].is_dir) continue;
-        snprintf(full, sizeof full, "%s/%s", m->prefix, m->entries[i].path);
+        char* full = join_path(m->prefix, m->entries[i].path);
+        if (!full) return -1;
         cb(full, user);
+        free(full);
     }
     return 0;
 }
@@ -705,11 +725,11 @@ ps3_vdir* ps3_vdir_open(const char* path)
     if (h) {
         exists = 1;
         for (struct dirent* e; (e = readdir(h));) {
-            char full[1300];
-            snprintf(full, sizeof full, "%s/%s", path, e->d_name);
             const int dot = e->d_name[0] == '.' && (!e->d_name[1] || (e->d_name[1] == '.' && !e->d_name[2]));
+            char* full = dot ? NULL : join_path(path, e->d_name);
             host_stat_t st;
-            vdir_add(d, e->d_name, dot || (ps3_utf8_stat64(full, &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR), &cap);
+            vdir_add(d, e->d_name, dot || (full && ps3_utf8_stat64(full, &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR), &cap);
+            free(full);
         }
         closedir(h);
     }

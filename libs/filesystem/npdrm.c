@@ -171,7 +171,7 @@ static void rap_to_rif(const uint8_t rap[16], uint8_t key[16])
     }
 }
 
-void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size);
+int sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size);
 
 static int hex_val(int c)
 {
@@ -350,9 +350,8 @@ static int unlock_with_exdata(npdrm_file* d, const char* exdata_dir, uint8_t* ra
     uint8_t cand_rap[16], cand_key[16];
     if (!rap_out && rap_cache_get(cid, cand_key) && try_rif_key(d, cand_key)) return 1;
 
-    char path[1400];
-    snprintf(path, sizeof path, "%s/%s.rap", exdata_dir, cid);
-    if (read_rap_file(path, cand_rap)) {
+    char path[PS3_HOST_PATH_MAX];
+    if (ps3_path_format(path, sizeof path, "%s/%s.rap", exdata_dir, cid) && read_rap_file(path, cand_rap)) {
         rap_to_rif(cand_rap, cand_key);
         if (try_rif_key(d, cand_key)) {
             rap_cache_put(cid, cand_key);
@@ -368,8 +367,7 @@ static int unlock_with_exdata(npdrm_file* d, const char* exdata_dir, uint8_t* ra
             if (!ci_ends_with_rap(e->d_name)) continue;
             const int name_match = ci_contains(e->d_name, cid);
             if ((pass == 0) != name_match) continue;
-            snprintf(path, sizeof path, "%s/%s", exdata_dir, e->d_name);
-            if (!read_rap_file(path, cand_rap)) continue;
+            if (!ps3_path_format(path, sizeof path, "%s/%s", exdata_dir, e->d_name) || !read_rap_file(path, cand_rap)) continue;
             rap_to_rif(cand_rap, cand_key);
             if (try_rif_key(d, cand_key)) {
                 closedir(dir);
@@ -431,10 +429,10 @@ PS3_AES_TARGET static npdrm_file* npdrm_open_ex(ps3_vfile* f, const char* exdata
         if (!found || !try_rif_key(d, d->key)) goto fail;
         return d;
     }
-    char exdata_buf[1100];
+    char exdata_buf[PS3_HOST_PATH_MAX];
     const char* exdata = exdata_override;
     if (!exdata || !*exdata) {
-        sys_fs_translate_path("/dev_hdd0/home/00000001/exdata", exdata_buf, (int)sizeof exdata_buf);
+        if (!sys_fs_translate_path("/dev_hdd0/home/00000001/exdata", exdata_buf, (int)sizeof exdata_buf)) goto fail;
         exdata = exdata_buf;
     }
     if (!unlock_with_exdata(d, exdata, rap_out)) goto fail;

@@ -41,24 +41,7 @@ typedef struct ppu_thread_info {
     uint32_t     stack_addr;
     uint32_t     stack_size;
     uint64_t     entry_addr;
-    uint64_t     tls_addr;
     int          blocked;
-
-#ifdef _WIN32
-    HANDLE       host_thread;
-    DWORD        host_tid;
-#else
-    pthread_t    host_thread;
-#endif
-
-#ifdef _WIN32
-    HANDLE       finish_event;
-#else
-    pthread_mutex_t finish_mutex;
-    pthread_cond_t  finish_cond;
-    int             finished;
-#endif
-
 } ppu_thread_info;
 
 extern ppu_thread_info g_ppu_threads[PPU_THREAD_MAX];

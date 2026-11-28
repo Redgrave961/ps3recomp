@@ -14,7 +14,6 @@ namespace vk {
 class trophy_toast {
 public:
     bool create(vk_device& d, VkPipelineCache cache = VK_NULL_HANDLE);
-    void destroy();
 
     bool record(VkCommandBuffer cmd, VkImage target, VkImageView target_view, VkExtent2D extent, VkFormat format);
 

@@ -95,6 +95,42 @@ VkImageUsageFlags surface_usage(bool depth, bool storage = false)
            (storage ? VK_IMAGE_USAGE_STORAGE_BIT : 0u);
 }
 
+constexpr VkFormat k_bgra8_views[] = { VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_B8G8R8A8_SRGB };
+constexpr VkFormat k_rgba8_views[] = { VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_SRGB };
+constexpr VkFormat k_8bit_views[] = { VK_FORMAT_R8_UNORM, VK_FORMAT_R8_SNORM, VK_FORMAT_R8_SRGB };
+constexpr VkFormat k_16bit_views[] = {
+    VK_FORMAT_A1R5G5B5_UNORM_PACK16, VK_FORMAT_B4G4R4A4_UNORM_PACK16, VK_FORMAT_R5G6B5_UNORM_PACK16,
+    VK_FORMAT_R8G8_UNORM, VK_FORMAT_R8G8_SNORM, VK_FORMAT_R8G8_SRGB, VK_FORMAT_R16_UNORM, VK_FORMAT_R16_SNORM, VK_FORMAT_R16_SFLOAT,
+    VK_FORMAT_R16_UINT,
+};
+constexpr VkFormat k_32bit_views[] = {
+    VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_B8G8R8A8_SNORM, VK_FORMAT_B8G8R8A8_SRGB, VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_SNORM,
+    VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_R16G16_UNORM, VK_FORMAT_R16G16_SNORM, VK_FORMAT_R16G16_SFLOAT, VK_FORMAT_R32_SFLOAT, VK_FORMAT_R32_UINT,
+};
+
+template <size_t N>
+uint32_t listed(const VkFormat (&list)[N], const VkFormat*& out)
+{
+    out = list;
+    return (uint32_t)N;
+}
+
+uint32_t sampled_views(VkFormat format, const VkFormat*& out)
+{
+    switch (format) {
+    case VK_FORMAT_B8G8R8A8_UNORM: return listed(k_bgra8_views, out);
+    case VK_FORMAT_R8G8B8A8_UNORM: return listed(k_rgba8_views, out);
+    case VK_FORMAT_R8_UNORM: return listed(k_8bit_views, out);
+    case VK_FORMAT_A1R5G5B5_UNORM_PACK16:
+    case VK_FORMAT_R5G6B5_UNORM_PACK16:
+    case VK_FORMAT_R8G8_UNORM:
+    case VK_FORMAT_R16_UINT: return listed(k_16bit_views, out);
+    case VK_FORMAT_R32_SFLOAT:
+    case VK_FORMAT_R32_UINT: return listed(k_32bit_views, out);
+    default: return 0;
+    }
+}
+
 }
 
 bool framebuffer::same_pass(const framebuffer& o) const
@@ -124,75 +160,21 @@ bool renderer::open(vk_device& d, VkSemaphore timeline, uint64_t* submitted, con
     }
     m_ubo_align = std::max<VkDeviceSize>(16, d.props.limits.minUniformBufferOffsetAlignment);
     m_shaders.init(d, m_pipelines);
-    const VkDeviceSize ring_half = d.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? (128ull << 20) : (256ull << 20);
+    const VkPhysicalDeviceMemoryProperties* memory = nullptr;
+    vmaGetMemoryProperties(d.vma, &memory);
+    for (u32 i = 0; i < memory->memoryHeapCount; i++) {
+        const VkMemoryHeap& h = memory->memoryHeaps[i];
+        const VkMemoryHeap& best = memory->memoryHeaps[m_vram_heap];
+        if ((h.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && (!(best.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) || h.size > best.size)) m_vram_heap = i;
+    }
+    const VkDeviceSize ring_want = d.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? (128ull << 20) : (256ull << 20);
+    const VkDeviceSize ring_half = std::min(ring_want, ((VkDeviceSize)d.props.limits.maxStorageBufferRange / 2u) & ~VkDeviceSize(0xFFFF));
     if (!m_ring.create(d, ring_half, ring_half, timeline) || !m_pipelines.create(d, cache_path) || !create_buffer_set() || !create_dummies() ||
         !m_occlusion.create(d, timeline) || !m_depth_pack.create(d, m_pipelines.cache()) || !m_downscale.create(d, m_pipelines.cache()))
         return false;
     m_pipelines.precompile(m_shaders);
-    m_upscaler.create(d, m_pipelines.cache(), cache_path);
+    m_upscaler.create(d, m_pipelines.cache(), cache_path, m_submitted);
     return true;
-}
-
-void renderer::close()
-{
-    if (!m_d) return;
-    {
-        std::lock_guard<std::mutex> hold(m_d->queue_lock);
-        vkQueueWaitIdle(m_d->queue);
-    }
-    if (m_trace) {
-        std::fclose(m_trace);
-        m_trace = nullptr;
-    }
-    if (m_trace_pool) vkDestroyQueryPool(m_d->dev, m_trace_pool, nullptr);
-    m_trace_pool = VK_NULL_HANDLE;
-    m_occlusion.destroy();
-    m_depth_pack.destroy();
-    m_downscale.destroy();
-    m_upscaler.destroy();
-    for (auto& g : m_scratch_garbage) vmaDestroyBuffer(m_d->vma, g.second.buffer, g.second.mem);
-    m_scratch_garbage.clear();
-    destroy_image(m_upscale_src);
-    destroy_image(m_upscale_out);
-    destroy_image(m_box);
-    for (auto& s : m_surfaces) {
-        destroy_image(s->img);
-        destroy_image(s->snapshot);
-        destroy_image(s->as_color);
-        destroy_image(s->native);
-        destroy_image(s->alt);
-    }
-    for (auto& g : m_garbage) destroy_image(g.second);
-    destroy_image(m_display);
-    m_surfaces.clear();
-    m_garbage.clear();
-    for (image& i : m_dummy) destroy_image(i);
-    m_textures.erase_if([this](uint64_t, const std::unique_ptr<texture_entry>& e) {
-        destroy_image(e->img);
-        return true;
-    });
-    m_samplers.erase_if([this](uint64_t, VkSampler s) {
-        if (s) vkDestroySampler(m_d->dev, s, nullptr);
-        return true;
-    });
-    for (unit_binding& b : m_units) b.sampler = VK_NULL_HANDLE;
-    m_sampler_count = 0;
-    m_custom_border_count = 0;
-    if (m_dummy_sampler) vkDestroySampler(m_d->dev, m_dummy_sampler, nullptr);
-    if (m_buffer_pool) vkDestroyDescriptorPool(m_d->dev, std::exchange(m_buffer_pool, VK_NULL_HANDLE), nullptr);
-    m_pipelines.destroy();
-    m_shaders.destroy();
-    if (m_readback) {
-        vmaDestroyBuffer(m_d->vma, m_readback, m_readback_alloc);
-        m_readback = VK_NULL_HANDLE;
-        m_readback_alloc = nullptr;
-        m_readback_map = nullptr;
-        m_readback_size = 0;
-    }
-    m_ring.destroy();
-    for (submission& s : m_submissions)
-        if (s.pool) vkDestroyCommandPool(m_d->dev, s.pool, nullptr);
-    m_d = nullptr;
 }
 
 constexpr VkAccessFlags2 k_writes = VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
@@ -336,19 +318,15 @@ VkCommandBuffer renderer::cmd()
 {
     submission& s = m_submissions[m_submission];
     if (m_recording) return s.cmd;
-    if (s.done > m_reached) vkGetSemaphoreCounterValue(m_d->dev, m_timeline, &m_reached);
+    if (s.done > m_reached) m_reached = vk_reached(*m_d, m_timeline);
     if (s.done > m_reached) {
-        VkSemaphoreWaitInfo wi{ VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
-        wi.semaphoreCount = 1;
-        wi.pSemaphores = &m_timeline;
-        wi.pValues = &s.done;
-        vkWaitSemaphores(m_d->dev, &wi, UINT64_MAX);
+        vk_wait(*m_d, m_timeline, s.done);
         m_reached = s.done;
     }
-    vkResetCommandPool(m_d->dev, s.pool, 0);
+    vk_must(*m_d, vkResetCommandPool(m_d->dev, s.pool, 0), "vkResetCommandPool");
     VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(s.cmd, &bi);
+    vk_must(*m_d, vkBeginCommandBuffer(s.cmd, &bi), "vkBeginCommandBuffer");
     invalidate_graphics_state();
     m_recording = true;
     return s.cmd;
@@ -362,36 +340,25 @@ void renderer::invalidate_graphics_state()
     m_bound.pipeline = VK_NULL_HANDLE;
 }
 
-void renderer::submit(VkSemaphore wait, VkPipelineStageFlags2 wait_stage, VkSemaphore signal)
+void renderer::submit()
 {
-    if (!m_recording && !wait && !signal) return;
     VkCommandBuffer c = cmd();
     end_rendering();
-    vkEndCommandBuffer(c);
+    vk_must(*m_d, vkEndCommandBuffer(c), "vkEndCommandBuffer");
     const uint64_t value = ++*m_submitted;
-    VkSemaphoreSubmitInfo waits{ VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
-    waits.semaphore = wait;
-    waits.stageMask = wait_stage;
-    VkSemaphoreSubmitInfo signals[2] = { { VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO }, { VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO } };
-    signals[0].semaphore = m_timeline;
-    signals[0].value = value;
-    signals[0].stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-    signals[1].semaphore = signal;
-    signals[1].stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    VkSemaphoreSubmitInfo signal{ VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
+    signal.semaphore = m_timeline;
+    signal.value = value;
+    signal.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
     VkCommandBufferSubmitInfo cb{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
     cb.commandBuffer = c;
     VkSubmitInfo2 si{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
-    si.waitSemaphoreInfoCount = wait ? 1u : 0u;
-    si.pWaitSemaphoreInfos = &waits;
     si.commandBufferInfoCount = 1;
     si.pCommandBufferInfos = &cb;
-    si.signalSemaphoreInfoCount = signal ? 2u : 1u;
-    si.pSignalSemaphoreInfos = signals;
+    si.signalSemaphoreInfoCount = 1;
+    si.pSignalSemaphoreInfos = &signal;
     m_ring.flush();
-    {
-        std::lock_guard<std::mutex> hold(m_d->queue_lock);
-        vkQueueSubmit2(m_d->queue, 1, &si, VK_NULL_HANDLE);
-    }
+    vk_submit(*m_d, si);
     m_submissions[m_submission].done = value;
     m_submission = (m_submission + 1u) % (u32)m_submissions.size();
     m_recording = false;
@@ -401,8 +368,9 @@ void renderer::submit(VkSemaphore wait, VkPipelineStageFlags2 wait_stage, VkSema
     m_ring.close(value);
     m_occlusion.submitted(value);
 
-    vkGetSemaphoreCounterValue(m_d->dev, m_timeline, &m_reached);
+    m_reached = vk_reached(*m_d, m_timeline);
     release_held();
+    m_upscaler.collect(m_reached);
     auto keep = std::remove_if(m_garbage.begin(), m_garbage.end(), [&](std::pair<uint64_t, image>& g) {
         if (g.first > m_reached) return false;
         destroy_image(g.second);
@@ -419,27 +387,17 @@ void renderer::submit(VkSemaphore wait, VkPipelineStageFlags2 wait_stage, VkSema
 
 void renderer::flush()
 {
-    if (m_recording) submit(VK_NULL_HANDLE, 0, VK_NULL_HANDLE);
+    if (m_recording) submit();
 }
 
 bool renderer::create_image(image& img, VkFormat format, u32 width, u32 height, VkImageUsageFlags usage, VkImageAspectFlags aspect)
 {
     VkImageCreateInfo ii{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
-    VkFormat view_formats[2]{};
-    VkImageFormatListCreateInfo fmt_list{ VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO };
-    if (aspect == VK_IMAGE_ASPECT_COLOR_BIT) {
-        if (format == VK_FORMAT_R16G16B16A16_SFLOAT || format == VK_FORMAT_R16G16B16A16_UNORM || format == VK_FORMAT_R32G32B32A32_SFLOAT) {
-            ii.flags = 0;
-        } else if (format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_R8G8B8A8_UNORM) {
-            ii.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
-            view_formats[0] = format;
-            view_formats[1] = format == VK_FORMAT_B8G8R8A8_UNORM ? VK_FORMAT_B8G8R8A8_SRGB : VK_FORMAT_R8G8B8A8_SRGB;
-            fmt_list.viewFormatCount = 2;
-            fmt_list.pViewFormats = view_formats;
-            ii.pNext = &fmt_list;
-        } else {
-            ii.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
-        }
+    VkImageFormatListCreateInfo views{ VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO };
+    if (usage & VK_IMAGE_USAGE_SAMPLED_BIT) views.viewFormatCount = sampled_views(format, views.pViewFormats);
+    if (views.viewFormatCount) {
+        ii.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+        ii.pNext = &views;
     }
     ii.imageType = VK_IMAGE_TYPE_2D;
     ii.format = format;
@@ -656,44 +614,68 @@ void renderer::scale_blit(VkCommandBuffer c, image& src, image& dst, VkFilter fi
     vkCmdBlitImage(c, src.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, filter);
 }
 
+bool renderer::fit_scratch(image& img, VkFormat format, u32 width, u32 height)
+{
+    if (img.handle && img.width >= width && img.height >= height) return true;
+    const u32 w = std::max(width, img.width), h = std::max(height, img.height);
+    discard(img);
+    return create_image(img, format, w, h, VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+}
+
+void renderer::release_depth_copy()
+{
+    for (depth_copy& t : m_depth_copy) {
+        discard(t.from);
+        discard(t.to);
+    }
+    if (m_depth_buffer.buffer) m_scratch_garbage.emplace_back(*m_submitted + 1u, m_depth_buffer);
+    m_depth_buffer = {};
+}
+
 bool renderer::scale_depth(VkCommandBuffer c, image& src, image& dst)
 {
     constexpr VkPipelineStageFlags2 xfer = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
-    constexpr VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    constexpr VkFormat k_formats[3] = { VK_FORMAT_R8_UINT, VK_FORMAT_R16_UINT, VK_FORMAT_R32_UINT };
+    const VkDeviceSize bytes = 4u * std::max((VkDeviceSize)src.width * src.height, (VkDeviceSize)dst.width * dst.height);
+    if (m_depth_buffer.size < bytes) {
+        if (m_depth_buffer.buffer) m_scratch_garbage.emplace_back(*m_submitted + 1u, m_depth_buffer);
+        m_depth_buffer = {};
+        if (!create_scratch(m_depth_buffer, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT)) return false;
+    }
+    m_depth_copy_flip = m_flips;
+    const VkBuffer buffer = m_depth_buffer.buffer;
     for (const VkImageAspectFlags aspect : { VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_ASPECT_STENCIL_BIT }) {
         if (!(src.aspect & aspect)) continue;
-        const bool d16 = src.format == VK_FORMAT_D16_UNORM, stencil = aspect == VK_IMAGE_ASPECT_STENCIL_BIT;
-        const VkFormat format = stencil ? VK_FORMAT_R8_UINT : d16 ? VK_FORMAT_R16_UINT : VK_FORMAT_R32_UINT;
-        const VkDeviceSize texel = stencil ? 1u : d16 ? 2u : 4u;
-        image from{}, to{};
-        scratch buffer{};
-        const bool made = create_scratch(buffer, texel * std::max(src.width * src.height, dst.width * dst.height),
-                                         VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT) &&
-                          create_image(from, format, src.width, src.height, usage, VK_IMAGE_ASPECT_COLOR_BIT) &&
-                          create_image(to, format, dst.width, dst.height, usage, VK_IMAGE_ASPECT_COLOR_BIT);
-        if (made) {
-            VkBufferImageCopy region{};
-            region.imageSubresource = { aspect, 0, 0, 1 };
-            region.imageExtent = { src.width, src.height, 1 };
-            barrier(c, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
-            vkCmdCopyImageToBuffer(c, src.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer.buffer, 1, &region);
-            memory_barrier(c, xfer, VK_ACCESS_2_TRANSFER_WRITE_BIT, xfer, VK_ACCESS_2_TRANSFER_READ_BIT);
-            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            barrier(c, from, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
-            vkCmdCopyBufferToImage(c, buffer.buffer, from.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-            scale_blit(c, from, to, VK_FILTER_NEAREST);
-            region.imageExtent = { dst.width, dst.height, 1 };
-            barrier(c, to, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
-            vkCmdCopyImageToBuffer(c, to.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer.buffer, 1, &region);
-            memory_barrier(c, xfer, VK_ACCESS_2_TRANSFER_WRITE_BIT, xfer, VK_ACCESS_2_TRANSFER_READ_BIT);
-            region.imageSubresource.aspectMask = aspect;
-            barrier(c, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
-            vkCmdCopyBufferToImage(c, buffer.buffer, dst.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-        }
-        discard(from);
-        discard(to);
-        if (buffer.buffer) m_scratch_garbage.emplace_back(*m_submitted + 1u, buffer);
-        if (!made) return false;
+        const u32 kind = aspect == VK_IMAGE_ASPECT_STENCIL_BIT ? 0u : src.format == VK_FORMAT_D16_UNORM ? 1u : 2u;
+        depth_copy& t = m_depth_copy[kind];
+        if (!fit_scratch(t.from, k_formats[kind], src.width, src.height) || !fit_scratch(t.to, k_formats[kind], dst.width, dst.height))
+            return false;
+        memory_barrier(c, xfer, VK_ACCESS_2_TRANSFER_WRITE_BIT, xfer, VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        VkBufferImageCopy region{};
+        region.imageSubresource = { aspect, 0, 0, 1 };
+        region.imageExtent = { src.width, src.height, 1 };
+        barrier(c, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+        vkCmdCopyImageToBuffer(c, src.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 1, &region);
+        memory_barrier(c, xfer, VK_ACCESS_2_TRANSFER_WRITE_BIT, xfer, VK_ACCESS_2_TRANSFER_READ_BIT);
+        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier(c, t.from, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        vkCmdCopyBufferToImage(c, buffer, t.from.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        barrier(c, t.from, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+        barrier(c, t.to, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        VkImageBlit blit{};
+        blit.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        blit.srcOffsets[1] = { (int32_t)src.width, (int32_t)src.height, 1 };
+        blit.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        blit.dstOffsets[1] = { (int32_t)dst.width, (int32_t)dst.height, 1 };
+        vkCmdBlitImage(c, t.from.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, t.to.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+                       VK_FILTER_NEAREST);
+        region.imageExtent = { dst.width, dst.height, 1 };
+        barrier(c, t.to, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+        vkCmdCopyImageToBuffer(c, t.to.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 1, &region);
+        memory_barrier(c, xfer, VK_ACCESS_2_TRANSFER_WRITE_BIT, xfer, VK_ACCESS_2_TRANSFER_READ_BIT);
+        region.imageSubresource.aspectMask = aspect;
+        barrier(c, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        vkCmdCopyBufferToImage(c, buffer, dst.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
     }
     return true;
 }
@@ -860,13 +842,8 @@ void renderer::download_surface(surface& s)
     }
     if (conv.handle) discard(conv);
     stats.downloads++;
-    submit(VK_NULL_HANDLE, 0, VK_NULL_HANDLE);
-    const uint64_t value = *m_submitted;
-    VkSemaphoreWaitInfo wi{ VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
-    wi.semaphoreCount = 1;
-    wi.pSemaphores = &m_timeline;
-    wi.pValues = &value;
-    vkWaitSemaphores(m_d->dev, &wi, UINT64_MAX);
+    submit();
+    vk_wait(*m_d, m_timeline, *m_submitted);
     vmaInvalidateAllocation(m_d->vma, m_readback_alloc, 0, bytes);
     await_writes(s.ea, s.pitch * h);
     uint8_t* dst = vm_base + s.ea;
@@ -1265,7 +1242,6 @@ void renderer::on_clear(u32 mask)
         if (cmask || dmask) {
             begin_rendering(cmask, cmask ? &cval : nullptr, dmask, dmask ? &dval : nullptr);
             stats.clears++;
-            m_draw_counter++;
             return;
         }
     }
@@ -1275,7 +1251,6 @@ void renderer::on_clear(u32 mask)
     const VkClearRect rect{ { { (int32_t)rx, (int32_t)ry }, { sc.x.edge(x1 * m_fb.aa_u) - rx, sc.y.edge(y1 * m_fb.aa_v) - ry } }, 0, 1 };
     vkCmdClearAttachments(cmd(), count, att, 1, &rect);
     stats.clears++;
-    m_draw_counter++;
 }
 
 void renderer::on_draw(const rsx::draw_clause& clause)
@@ -1650,17 +1625,34 @@ void renderer::flip_reset()
     m_fb_valid = false;
     m_fb_dirty = true;
     m_dyn_dirty = ~0u;
-    if ((++m_flips & 255u) == 0) {
-        m_textures.erase_if([this](uint64_t, const std::unique_ptr<texture_entry>& e) {
-            if (m_flips - e->used <= 1800u) return false;
+    const bool tight = (++m_flips & 15u) == 0 && memory_tight();
+    if (tight || (m_flips & 255u) == 0) {
+        const u64 texture_age = tight ? 60u : 1800u, alt_age = tight ? 8u : 256u;
+        m_textures.erase_if([&](uint64_t, const std::unique_ptr<texture_entry>& e) {
+            if (m_flips - e->used <= texture_age) return false;
             discard(e->img);
             m_binding_gen++;
             return true;
         });
         for (auto& p : m_surfaces)
-            if (m_flips - p->alt_flip > 256u) discard(p->alt);
+            if (m_flips - p->alt_flip > alt_age) discard(p->alt);
+        if (m_flips - m_depth_copy_flip > alt_age) release_depth_copy();
     }
     if ((m_flips & 63u) == 0) evict(64);
+}
+
+bool renderer::memory_tight()
+{
+    vmaSetCurrentFrameIndex(m_d->vma, (uint32_t)m_flips);
+    VmaBudget budgets[VK_MAX_MEMORY_HEAPS];
+    vmaGetHeapBudgets(m_d->vma, budgets);
+    const VmaBudget& b = budgets[m_vram_heap];
+    const bool tight = b.usage > b.budget / 10u * 9u;
+    if (tight && !m_memory_tight)
+        std::fprintf(stderr, "[vk] video memory %llu of %llu MB in use, releasing idle textures early\n", (unsigned long long)(b.usage >> 20),
+                     (unsigned long long)(b.budget >> 20));
+    m_memory_tight = tight;
+    return tight;
 }
 
 bool renderer::upscale_failed(upscale_result r)
@@ -1678,7 +1670,8 @@ bool renderer::run_upscale(const rsx_vk_upscale_frame& frame)
     if (m_scene_color->state != SURFACE_VALID || m_scene_depth->state != SURFACE_VALID || !m_scene_color->img.handle ||
         !m_scene_depth->img.handle)
         return upscale_failed(UP_INVALID);
-    if (m_scene_depth->img.width < m_scene_color->img.width || m_scene_depth->img.height < m_scene_color->img.height)
+    if (m_scene_depth->scale != m_scene_color->scale || m_scene_depth->img.width < m_scene_color->img.width ||
+        m_scene_depth->img.height < m_scene_color->img.height)
         return upscale_failed(UP_DEPTH_SIZE);
 
     const bool wide = (m_scene_color->width * m_scene_color->aa_u) * 10u >= (m_scene_color->height * m_scene_color->aa_v) * 15u;
@@ -1754,12 +1747,9 @@ bool renderer::run_upscale(const rsx_vk_upscale_frame& frame)
             VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
 
     const bool ok = m_upscaler.dispatch(
-        c, upscale_mode,
-        color_in->handle, color_in->view, color_in->format,
-        m_scene_depth->img.handle, depth_view, m_scene_depth->img.format,
-        vel_view,
-        out->handle, out->view, out->format,
-        color_in->width, color_in->height, out_w, out_h, f);
+        c, upscale_mode, { color_in->handle, color_in->view, color_in->format, color_in->width, color_in->height },
+        { m_scene_depth->img.handle, depth_view, m_scene_depth->img.format, m_scene_depth->img.width, m_scene_depth->img.height }, vel_view,
+        { out->handle, out->view, out->format, out->width, out->height }, f);
 
     invalidate_graphics_state();
     if (!ok) {

@@ -14,7 +14,6 @@
 #include <memory>
 #include <mutex>
 #include <string>
-#include <thread>
 #include <vector>
 
 namespace vk {
@@ -64,7 +63,6 @@ struct shader {
 class pipelines {
 public:
     bool create(vk_device& d, const std::string& cache_path);
-    void destroy();
     void save_cache();
     void precompile(shader_cache& shaders);
     VkPipelineLayout layout() const { return m_layout; }
@@ -92,6 +90,8 @@ private:
     };
 
     void worker(bool urgent_only);
+    bool open_db();
+    bool usable(const pipeline_key& k) const;
     void record(char type, const void* a, size_t an, const void* b, size_t bn);
     VkPipeline create_pipeline(VkGraphicsPipelineCreateInfo pi) const;
     VkPipeline monolithic(const pipeline_key& k, const shader& vs, const shader& fs) const;
@@ -143,10 +143,6 @@ private:
     unsigned m_background_running = 0;
     unsigned m_background_limit = 1;
     unsigned m_urgent_busy = 0;
-    std::vector<std::thread> m_workers;
-    std::thread m_precompile_thread;
-    bool m_stop = false;
-    std::atomic<bool> m_stopping{ false };
     mutable std::atomic<bool> m_cache_dirty{ false };
     std::mutex m_save_lock;
     std::chrono::steady_clock::time_point m_saved{};

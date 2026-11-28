@@ -20,8 +20,7 @@ u32 texel_bytes(VkFormat f)
     switch (f) {
     case VK_FORMAT_R8_UNORM: case VK_FORMAT_R8_SNORM: case VK_FORMAT_R8_SRGB: return 1;
     case VK_FORMAT_R8G8_UNORM: case VK_FORMAT_R8G8_SNORM: case VK_FORMAT_R8G8_SRGB: case VK_FORMAT_R5G6B5_UNORM_PACK16:
-    case VK_FORMAT_A1R5G5B5_UNORM_PACK16: case VK_FORMAT_R5G5B5A1_UNORM_PACK16: case VK_FORMAT_R4G4B4A4_UNORM_PACK16:
-    case VK_FORMAT_R16_UNORM: case VK_FORMAT_R16_SNORM: case VK_FORMAT_R16_SFLOAT: return 2;
+    case VK_FORMAT_A1R5G5B5_UNORM_PACK16: case VK_FORMAT_B4G4R4A4_UNORM_PACK16: case VK_FORMAT_R16_UNORM: case VK_FORMAT_R16_SNORM: case VK_FORMAT_R16_SFLOAT: return 2;
     case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_B8G8R8A8_SRGB: case VK_FORMAT_B8G8R8A8_SNORM: case VK_FORMAT_R8G8B8A8_UNORM:
     case VK_FORMAT_R8G8B8A8_SRGB: case VK_FORMAT_R8G8B8A8_SNORM: case VK_FORMAT_R32_SFLOAT: case VK_FORMAT_R16G16_UNORM:
     case VK_FORMAT_R16G16_SNORM: case VK_FORMAT_R16G16_SFLOAT: return 4;
@@ -217,6 +216,7 @@ VkSampler renderer::sampler_for(const VkSamplerCreateInfo& info, const VkSampler
     const uint64_t h = hash_sampler(ci, border);
     if (const VkSampler* found = m_samplers.find(h)) return *found;
 
+    const VkSampler fallback = ci.compareEnable ? m_dummy_shadow_sampler : m_dummy_sampler;
     const u32 limit = m_d->props.limits.maxSamplerAllocationCount > 64u ? m_d->props.limits.maxSamplerAllocationCount - 64u : 64u;
     if (m_sampler_count >= limit) {
         ci.mipLodBias = 0.f;
@@ -225,7 +225,7 @@ VkSampler renderer::sampler_for(const VkSamplerCreateInfo& info, const VkSampler
             ci.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
         const uint64_t fh = hash_sampler(ci, nullptr);
         if (const VkSampler* found = m_samplers.find(fh)) return *found;
-        return m_dummy_sampler;
+        return fallback;
     }
 
     ci.pNext = border;
@@ -243,7 +243,7 @@ VkSampler renderer::sampler_for(const VkSamplerCreateInfo& info, const VkSampler
                 return s;
             }
         }
-        return m_dummy_sampler;
+        return fallback;
     }
     m_samplers[h] = s;
     m_sampler_count++;
@@ -253,6 +253,9 @@ VkSampler renderer::sampler_for(const VkSamplerCreateInfo& info, const VkSampler
 
 void renderer::describe_units(u32 first, u32 last)
 {
+    const VkPhysicalDeviceLimits& lim = m_d->props.limits;
+    const rsx::texture_support support{ lim.maxImageDimension2D, lim.maxImageDimension3D, lim.maxImageDimensionCube, m_d->caps.r8_srgb,
+                                        m_d->caps.r8g8_srgb };
     for (u32 u = first; u < last; u++) {
         unit_binding& b = m_units[u];
         const rsx::texture_regs g = unit_regs(u);
@@ -263,7 +266,7 @@ void renderer::describe_units(u32 first, u32 last)
         const rsx::texture_desc old_desc = b.desc;
         b.regs = g;
         b.described = true;
-        b.valid = rsx::texture_describe(g, vertex, b.desc);
+        b.valid = rsx::texture_describe(g, vertex, support, b.desc);
         const bool keep_sampler = had_sampler && b.valid &&
             old_regs.address == g.address && old_regs.control0 == g.control0 &&
             old_regs.control1 == g.control1 && old_regs.control3 == g.control3 &&
@@ -305,6 +308,7 @@ image* renderer::depth_as_color(surface& s)
 {
     image& dst = s.as_color;
     const bool d16 = s.bpp == 2;
+    if (d16 && !m_d->caps.r16_uint_storage) return nullptr;
     const VkFormat packed = d16 ? VK_FORMAT_R16_UINT : VK_FORMAT_R32_UINT;
     if (dst.width != s.img.width || dst.height != s.img.height || dst.format != packed) {
         discard(dst);
@@ -464,18 +468,18 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
     }
     cached.valid = false;
 
-    VkSampler sampler = b.sampler;
-    if (!sampler) {
+    const auto unit_sampler = [&](VkFormat view) {
+        if (b.sampler && (b.sampler_format == VK_FORMAT_UNDEFINED || b.sampler_format == view)) return b.sampler;
         VkSamplerCustomBorderColorCreateInfoEXT border{ VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT };
         VkSamplerCreateInfo si{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
         rsx::texture_sampler(b.regs, vertex, d, m_d->props.limits.maxSamplerAnisotropy, si, border);
         const bool custom = si.borderColor == VK_BORDER_COLOR_FLOAT_CUSTOM_EXT || si.borderColor == VK_BORDER_COLOR_INT_CUSTOM_EXT;
-        if (custom && !m_d->caps.custom_border_color) si.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
-        if (custom && m_d->caps.custom_border_without_format) border.format = VK_FORMAT_UNDEFINED;
-        sampler = sampler_for(si, custom && m_d->caps.custom_border_color ? &border : nullptr, !vertex);
-        if (!sampler) return false;
-        b.sampler = sampler;
-    }
+        const bool formatted = custom && m_d->caps.custom_border_color && !m_d->caps.custom_border_without_format;
+        border.format = formatted ? view : VK_FORMAT_UNDEFINED;
+        b.sampler = sampler_for(si, custom ? &border : nullptr, !vertex);
+        b.sampler_format = border.format;
+        return b.sampler;
+    };
 
     u32 control = (u32)(d.ops.gamma_mask & 0xFu) << RSX_SPV_TEXC_GAMMA_SHIFT;
     control |= (u32)(d.ops.bx2_mask & 0xFu) << RSX_SPV_TEXC_EXPAND_SHIFT;
@@ -498,6 +502,7 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
         if (s->ea != ea) continue;
         if (s->state != SURFACE_VALID) { skipped = "memory: surface not valid"; continue; }
         if (d.cube || d.dimension == 3) { skipped = "memory: surface sampled as cube/3D"; continue; }
+        if (d.converted) { skipped = "memory: surface sampled through a converted format"; continue; }
         if (s->depth && !d.depth) {
             if (d.compressed || s->bpp != texel_bytes(d.format)) {
                 skipped = "memory: depth surface sampled as color of another size";
@@ -512,7 +517,7 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
             const VkImageView view = view_for(*packed, VK_IMAGE_VIEW_TYPE_2D, d.format, VK_IMAGE_ASPECT_COLOR_BIT, d.swizzle);
             if (!view) return false;
             path = "depth packed as color";
-            out = { sampler, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+            out = { unit_sampler(d.format), view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
             cached = { true, 0, 0, b.regs, ea, 0, m_binding_gen, nullptr, s, packed, s->depth_version, m_fb.scale, out, state };
             return true;
         }
@@ -540,11 +545,13 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
             if (snap.width != s->img.width || snap.height != s->img.height || snap.format != s->img.format) {
                 discard(snap);
                 if (!create_image(snap, s->img.format, s->img.width, s->img.height,
-                                  VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, s->img.aspect))
+                                  VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                  s->img.aspect))
                     return false;
-                s->snapshot_draw = ~0ull;
+                s->snapshot_version = ~0ull;
             }
-            if (s->snapshot_draw != m_draw_counter) {
+            const u64 content = s->depth ? s->depth_version : s->version;
+            if (s->snapshot_version != content) {
                 end_rendering();
                 const trace_span span(*this, c, "snapshot %ux%u", s->img.width, s->img.height);
                 barrier(c, s->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
@@ -555,7 +562,7 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
                 region.extent = { s->img.width, s->img.height, 1 };
                 vkCmdCopyImage(c, s->img.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, snap.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
                                &region);
-                s->snapshot_draw = m_draw_counter;
+                s->snapshot_version = content;
             }
             source = &snap;
         }
@@ -567,7 +574,8 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
         if (!readable(*source, read_stage)) end_rendering();
         barrier(c, *source, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                 read_stage, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
-        const VkImageView view = view_for(*source, VK_IMAGE_VIEW_TYPE_2D, (s->depth || promoted || listed_snorm) ? s->img.format : d.format, aspect, d.swizzle);
+        const VkFormat view_format = (s->depth || promoted || listed_snorm) ? s->img.format : d.format;
+        const VkImageView view = view_for(*source, VK_IMAGE_VIEW_TYPE_2D, view_format, aspect, d.swizzle);
         path = "dummy: surface view failed";
         if (!view) return false;
         if (promoted) {
@@ -584,7 +592,7 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
             std::memcpy(&state.remap, &pcf_rad, sizeof pcf_rad);
         }
         path = source == &s->native ? "surface rescaled" : bound ? "surface snapshot" : "surface";
-        out = { sampler, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        out = { unit_sampler(view_format), view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
         if (!bound)
             cached = { true, 0, 0, b.regs, ea, 0, m_binding_gen, nullptr, s, source, s->depth ? s->depth_version : s->version, m_fb.scale, out, state };
         return true;
@@ -631,13 +639,9 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
     if (upload) {
         stats.uploads++;
         const uint64_t bytes = rsx::texture_staging_size(d);
-        vk_slice slice = m_ring.alloc(bytes, 16);
-        if (!slice.ptr) {
-            flush();
-            c = cmd();
-            slice = m_ring.alloc(bytes, 16);
-            if (!slice.ptr) return false;
-        }
+        const vk_slice slice = ring_alloc(bytes, 16);
+        if (!slice.ptr) return false;
+        c = cmd();
         m_copies.clear();
         e->stamp = m_stamp;
         e->checked_stamp = m_stamp;
@@ -675,7 +679,7 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
     const VkImageView view = view_for(e->img, type, d.format, d.aspect & VK_IMAGE_ASPECT_DEPTH_BIT ? VK_IMAGE_ASPECT_DEPTH_BIT : d.aspect, d.swizzle);
     if (!view) return false;
     path = skipped ? skipped : "memory";
-    out = { sampler, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+    out = { unit_sampler(d.format), view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
     if (patch_tag) *patch_tag = e->patch_tag;
     if (!skipped) cached = { true, e->patch_tag, e->variant, b.regs, ea, m_epoch, m_binding_gen, e, nullptr, nullptr, 0, {}, out, state };
     return true;

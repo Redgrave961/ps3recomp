@@ -4,6 +4,7 @@
 #include <cstring>
 #include <immintrin.h>
 #include <limits>
+#include <type_traits>
 
 namespace vk {
 
@@ -18,38 +19,30 @@ T load_be(const uint8_t* p)
     else return __builtin_bswap32(v);
 }
 
-bool disjoint(uint32_t prim)
+bool restart_topology(VkPrimitiveTopology t)
 {
-    switch (prim) {
-    case PRIM_LINE_LOOP: case PRIM_LINE_STRIP: case PRIM_POLYGON: case PRIM_QUAD_STRIP:
-    case PRIM_TRIANGLE_FAN: case PRIM_TRIANGLE_STRIP:
-        return false;
-    default:
-        return true;
-    }
+    return t == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP || t == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP || t == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
 }
 
-template <typename T>
-index_result convert(uint32_t prim, const uint8_t* src, uint32_t count, bool restart, uint32_t restart_index, T* dst)
+template <typename S, typename D>
+index_result convert(uint32_t prim, const index_format& f, const uint8_t* src, uint32_t count, D* dst)
 {
-    constexpr T limit = std::numeric_limits<T>::max();
-    if (sizeof(T) == 2 && restart_index > 0xFFFFu) restart = false;
-    const T ri = (T)restart_index;
-    T lo = limit, hi = 0;
+    constexpr D limit = std::numeric_limits<D>::max();
+    const S ri = (S)f.restart_index;
+    D lo = limit, hi = 0;
     uint32_t n = 0;
-    auto track = [&](T v) {
+    auto track = [&](D v) {
         lo = v < lo ? v : lo;
         hi = v > hi ? v : hi;
         return v;
     };
 
-    switch (prim) {
-    case PRIM_QUADS: {
-        T quad[4];
+    if (prim == PRIM_QUADS) {
+        D quad[4];
         uint32_t k = 0;
         for (uint32_t i = 0; i < count; i++) {
-            const T v = load_be<T>(src + (size_t)i * sizeof(T));
-            if (restart && v == ri) {
+            const S v = load_be<S>(src + (size_t)i * sizeof(S));
+            if (f.restart && v == ri) {
                 k = 0;
                 continue;
             }
@@ -64,13 +57,11 @@ index_result convert(uint32_t prim, const uint8_t* src, uint32_t count, bool res
                 k = 0;
             }
         }
-        break;
-    }
-    default: {
-        if (!restart) {
-            uint32_t i = 0;
+    } else if (!f.restart) {
+        uint32_t i = 0;
 #ifdef __AVX2__
-            if constexpr (sizeof(T) == 2) {
+        if constexpr (std::is_same_v<S, D>) {
+            if constexpr (sizeof(D) == 2) {
                 if (count >= 16u) {
                     const __m256i shuf = _mm256_setr_epi8(
                         1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14,
@@ -117,18 +108,39 @@ index_result convert(uint32_t prim, const uint8_t* src, uint32_t count, bool res
                     hi = (uint32_t)_mm_cvtsi128_si32(hi128);
                 }
             }
+        }
 #endif
-            for (; i < count; i++) dst[i] = track(load_be<T>(src + (size_t)i * sizeof(T)));
-            n = count;
-        } else if (disjoint(prim)) {
-            for (uint32_t i = 0; i < count; i++) {
-                const T v = load_be<T>(src + (size_t)i * sizeof(T));
-                if (v != ri) dst[n++] = track(v);
+        for (; i < count; i++) dst[i] = track(load_be<S>(src + (size_t)i * sizeof(S)));
+        n = count;
+        if (prim == PRIM_LINE_LOOP && count) dst[n++] = load_be<S>(src);
+    } else if (!f.sentinel) {
+        for (uint32_t i = 0; i < count; i++) {
+            const S v = load_be<S>(src + (size_t)i * sizeof(S));
+            if (v != ri) dst[n++] = track(v);
+        }
+    } else if (prim == PRIM_LINE_LOOP) {
+        D head = 0;
+        bool open = false;
+        for (uint32_t i = 0; i < count; i++) {
+            const S v = load_be<S>(src + (size_t)i * sizeof(S));
+            if (v == ri || (D)v == limit) {
+                if (open) dst[n++] = head;
+                open = false;
+                continue;
             }
-        } else {
-            uint32_t i = 0;
+            if (!open) {
+                if (n) dst[n++] = limit;
+                head = v;
+                open = true;
+            }
+            dst[n++] = track(v);
+        }
+        if (open) dst[n++] = head;
+    } else {
+        uint32_t i = 0;
 #ifdef __AVX2__
-            if constexpr (sizeof(T) == 2) {
+        if constexpr (std::is_same_v<S, D>) {
+            if constexpr (sizeof(D) == 2) {
                 if (count >= 16u) {
                     const __m256i shuf = _mm256_setr_epi8(
                         1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14,
@@ -139,7 +151,7 @@ index_result convert(uint32_t prim, const uint8_t* src, uint32_t count, bool res
                     __m256i vhi = _mm256_setzero_si256();
                     for (; i + 16u <= count; i += 16u) {
                         const __m256i v = _mm256_shuffle_epi8(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + (size_t)i * 2u)), shuf);
-                        const __m256i eq = _mm256_cmpeq_epi16(v, vri);
+                        const __m256i eq = _mm256_or_si256(_mm256_cmpeq_epi16(v, vri), _mm256_cmpeq_epi16(v, vlim));
                         _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + i), _mm256_or_si256(v, eq));
                         vlo = _mm256_min_epu16(vlo, _mm256_or_si256(v, eq));
                         vhi = _mm256_max_epu16(vhi, _mm256_andnot_si256(eq, v));
@@ -166,7 +178,7 @@ index_result convert(uint32_t prim, const uint8_t* src, uint32_t count, bool res
                     __m256i vhi = _mm256_setzero_si256();
                     for (; i + 8u <= count; i += 8u) {
                         const __m256i v = _mm256_shuffle_epi8(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + (size_t)i * 4u)), shuf);
-                        const __m256i eq = _mm256_cmpeq_epi32(v, vri);
+                        const __m256i eq = _mm256_or_si256(_mm256_cmpeq_epi32(v, vri), _mm256_cmpeq_epi32(v, vlim));
                         _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + i), _mm256_or_si256(v, eq));
                         vlo = _mm256_min_epu32(vlo, _mm256_or_si256(v, eq));
                         vhi = _mm256_max_epu32(vhi, _mm256_andnot_si256(eq, v));
@@ -181,16 +193,13 @@ index_result convert(uint32_t prim, const uint8_t* src, uint32_t count, bool res
                     hi = (uint32_t)_mm_cvtsi128_si32(hi128);
                 }
             }
-#endif
-            for (; i < count; i++) {
-                const T v = load_be<T>(src + (size_t)i * sizeof(T));
-                dst[i] = v == ri ? limit : track(v);
-            }
-            n = count;
         }
-        if (prim == PRIM_LINE_LOOP && count) dst[n++] = load_be<T>(src);
-        break;
-    }
+#endif
+        for (; i < count; i++) {
+            const S v = load_be<S>(src + (size_t)i * sizeof(S));
+            dst[i] = (v == ri || (D)v == limit) ? limit : track(v);
+        }
+        n = count;
     }
     return { n, (uint32_t)lo, (uint32_t)hi };
 }
@@ -230,6 +239,11 @@ uint32_t expanded_index_count(uint32_t prim, uint32_t count)
     }
 }
 
+uint32_t index_capacity(uint32_t prim, uint32_t count)
+{
+    return prim == PRIM_LINE_LOOP ? count * 2u : expanded_index_count(prim, count);
+}
+
 void generate_indices(uint32_t prim, uint32_t count, uint32_t* dst)
 {
     switch (prim) {
@@ -254,11 +268,23 @@ void generate_indices(uint32_t prim, uint32_t count, uint32_t* dst)
     }
 }
 
-index_result convert_indices(uint32_t prim, bool wide, const uint8_t* src_be, uint32_t count, bool restart, uint32_t restart_index,
-                             void* dst)
+index_format index_format_for(uint32_t prim, bool wide, bool restart, uint32_t restart_index)
 {
-    if (wide) return convert<uint32_t>(prim, src_be, count, restart, restart_index, static_cast<uint32_t*>(dst));
-    return convert<uint16_t>(prim, src_be, count, restart, restart_index, static_cast<uint16_t*>(dst));
+    bool emulated;
+    index_format f{};
+    f.wide = wide;
+    f.restart = restart && (wide || restart_index <= 0xFFFFu);
+    f.sentinel = f.restart && restart_topology(primitive_topology(prim, emulated));
+    f.promote = f.sentinel && !wide && restart_index != 0xFFFFu;
+    f.restart_index = restart_index;
+    return f;
+}
+
+index_result convert_indices(uint32_t prim, const index_format& format, const uint8_t* src_be, uint32_t count, void* dst)
+{
+    if (format.wide) return convert<uint32_t, uint32_t>(prim, format, src_be, count, static_cast<uint32_t*>(dst));
+    if (format.promote) return convert<uint16_t, uint32_t>(prim, format, src_be, count, static_cast<uint32_t*>(dst));
+    return convert<uint16_t, uint16_t>(prim, format, src_be, count, static_cast<uint16_t*>(dst));
 }
 
 }

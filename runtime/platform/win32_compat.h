@@ -24,6 +24,7 @@
 #include <sys/syscall.h>
 #if defined(__linux__)
 #include <linux/membarrier.h>
+#include <sys/mman.h>
 #endif
 
 #ifdef __cplusplus
@@ -180,12 +181,31 @@ static inline void* ps3_lazy_obj(void** slot, size_t sz,
     return expected;
 }
 
-static inline struct timespec ps3__deadline_ms(DWORD ms)
+#if defined(__APPLE__)
+#define PS3_WAIT_CLOCK CLOCK_REALTIME
+#else
+#define PS3_WAIT_CLOCK CLOCK_MONOTONIC
+#endif
+
+static inline void ps3_cond_init(pthread_cond_t* c)
+{
+#if defined(__APPLE__)
+    pthread_cond_init(c, NULL);
+#else
+    pthread_condattr_t attr;
+    pthread_condattr_init(&attr);
+    pthread_condattr_setclock(&attr, PS3_WAIT_CLOCK);
+    pthread_cond_init(c, &attr);
+    pthread_condattr_destroy(&attr);
+#endif
+}
+
+static inline struct timespec ps3_wait_deadline_ns(unsigned long long ns)
 {
     struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_sec  += (time_t)(ms / 1000u);
-    ts.tv_nsec += (long)(ms % 1000u) * 1000000L;
+    clock_gettime(PS3_WAIT_CLOCK, &ts);
+    ts.tv_sec  += (time_t)(ns / 1000000000ull);
+    ts.tv_nsec += (long)(ns % 1000000000ull);
     if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
     return ts;
 }
@@ -298,14 +318,43 @@ static inline void   WriteRelease(volatile LONG* p, LONG v)       { __atomic_sto
 static inline void MemoryBarrier(void)     { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
 static inline void _ReadWriteBarrier(void) { __asm__ __volatile__("" ::: "memory"); }
 #if defined(__linux__)
+static inline int ps3__membarrier_cmd(void)
+{
+    static int resolved = -1;
+    int cmd = __atomic_load_n(&resolved, __ATOMIC_ACQUIRE);
+    if (cmd >= 0) return cmd;
+    const long supported = syscall(__NR_membarrier, MEMBARRIER_CMD_QUERY, 0, 0);
+    if (supported > 0 && (supported & MEMBARRIER_CMD_PRIVATE_EXPEDITED) &&
+        syscall(__NR_membarrier, MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED, 0, 0) == 0)
+        cmd = MEMBARRIER_CMD_PRIVATE_EXPEDITED;
+    else if (supported > 0 && (supported & MEMBARRIER_CMD_GLOBAL))
+        cmd = MEMBARRIER_CMD_GLOBAL;
+    else
+        cmd = 0;
+    __atomic_store_n(&resolved, cmd, __ATOMIC_RELEASE);
+    return cmd;
+}
+
+static inline void ps3__tlb_shootdown_barrier(void)
+{
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    static void* page;
+    const size_t size = (size_t)sysconf(_SC_PAGESIZE);
+    pthread_mutex_lock(&lock);
+    if (!page) {
+        page = mmap(NULL, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (page == MAP_FAILED) abort();
+    }
+    mprotect(page, size, PROT_READ | PROT_WRITE);
+    __atomic_add_fetch((volatile int*)page, 1, __ATOMIC_SEQ_CST);
+    mprotect(page, size, PROT_NONE);
+    pthread_mutex_unlock(&lock);
+}
+
 static inline void FlushProcessWriteBuffers(void)
 {
-    static int registered;
-    if (!__atomic_load_n(&registered, __ATOMIC_ACQUIRE)) {
-        if (syscall(__NR_membarrier, MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED, 0, 0)) abort();
-        __atomic_store_n(&registered, 1, __ATOMIC_RELEASE);
-    }
-    if (syscall(__NR_membarrier, MEMBARRIER_CMD_PRIVATE_EXPEDITED, 0, 0)) abort();
+    const int cmd = ps3__membarrier_cmd();
+    if (!cmd || syscall(__NR_membarrier, cmd, 0, 0) != 0) ps3__tlb_shootdown_barrier();
 }
 #endif
 
@@ -362,7 +411,7 @@ static inline void ps3__cv_init(void* p)
 {
     ps3_condvar* cv = (ps3_condvar*)p;
     pthread_mutex_init(&cv->m, NULL);
-    pthread_cond_init(&cv->c, NULL);
+    ps3_cond_init(&cv->c);
     cv->gen = 0;
 }
 static inline ps3_condvar* ps3_cv(CONDITION_VARIABLE* c)
@@ -399,7 +448,7 @@ static inline BOOL ps3__cv_sleep(ps3_condvar* cv, DWORD ms,
     if (ms == INFINITE) {
         while (cv->gen == g && rc == 0) rc = pthread_cond_wait(&cv->c, &cv->m);
     } else {
-        struct timespec ts = ps3__deadline_ms(ms);
+        struct timespec ts = ps3_wait_deadline_ns((unsigned long long)ms * 1000000ull);
         while (cv->gen == g && rc == 0) rc = pthread_cond_timedwait(&cv->c, &cv->m, &ts);
     }
     BOOL woke = (cv->gen != g);

@@ -219,33 +219,105 @@ static inline int32_t vm_protect(uint32_t addr, uint32_t size, int read, int wri
     return CELL_OK;
 }
 
+#define VM_STACK_BLOCKS_MAX 128u
+
+typedef struct vm_stack_range {
+    uint32_t addr;
+    uint32_t size;
+} vm_stack_range;
+
 typedef struct vm_stack_alloc {
-    uint32_t next_addr;
-    uint32_t region_end;
+    uint32_t       next_addr;
+    uint32_t       region_end;
+    uint32_t       live;
+    uint32_t       free_count;
+    vm_stack_range free_ranges[VM_STACK_BLOCKS_MAX];
 } vm_stack_alloc;
 
 static inline void vm_stack_alloc_init(vm_stack_alloc* sa)
 {
+    memset(sa, 0, sizeof(*sa));
     sa->next_addr  = VM_STACK_BASE;
     sa->region_end = VM_CB_STACK_BASE;
 }
 
+static inline uint64_t vm_stack_block_bytes(uint32_t stack_size)
+{
+    const uint64_t pg = vm_host_page_size();
+    return (((uint64_t)stack_size + pg - 1u) & ~(pg - 1u)) + pg;
+}
+
+static inline void vm_stack_decommit(uint32_t addr, uint32_t size)
+{
+#ifdef _WIN32
+    VirtualFree(vm_base + addr, size, MEM_DECOMMIT);
+#else
+    madvise(vm_base + addr, size, MADV_DONTNEED);
+#endif
+}
+
 static inline uint32_t vm_stack_allocate(vm_stack_alloc* sa, uint32_t stack_size)
 {
-    uint32_t pg = vm_host_page_size();
-    stack_size = VM_ALIGN_UP(stack_size, pg);
+    const uint32_t pg = vm_host_page_size();
+    const uint64_t total = vm_stack_block_bytes(stack_size);
+    if (sa->live >= VM_STACK_BLOCKS_MAX) return 0;
 
-    uint32_t total = stack_size + pg;
-
-    if (sa->next_addr + total > sa->region_end)
+    uint32_t best = sa->free_count;
+    for (uint32_t i = 0; i < sa->free_count; i++) {
+        const uint32_t size = sa->free_ranges[i].size;
+        if (size >= total && (best == sa->free_count || size < sa->free_ranges[best].size))
+            best = i;
+    }
+    if (best == sa->free_count && total > (uint64_t)(sa->region_end - sa->next_addr))
         return 0;
 
-    uint32_t base = sa->next_addr;
-    sa->next_addr += total;
+    const uint32_t base = best < sa->free_count ? sa->free_ranges[best].addr : sa->next_addr;
+    if (vm_commit(base, (uint32_t)total) != CELL_OK) return 0;
+    if (vm_protect(base, pg, 0, 0, 0) != CELL_OK) {
+        vm_stack_decommit(base, (uint32_t)total);
+        return 0;
+    }
 
-    vm_protect(base, pg, 0, 0, 0);
-
+    if (best < sa->free_count) {
+        vm_stack_range* r = &sa->free_ranges[best];
+        r->addr += (uint32_t)total;
+        r->size -= (uint32_t)total;
+        if (!r->size) *r = sa->free_ranges[--sa->free_count];
+    } else {
+        sa->next_addr += (uint32_t)total;
+    }
+    sa->live++;
     return base + pg;
+}
+
+static inline void vm_stack_free(vm_stack_alloc* sa, uint32_t stack_addr, uint32_t stack_size)
+{
+    uint32_t addr = stack_addr - vm_host_page_size();
+    uint32_t size = (uint32_t)vm_stack_block_bytes(stack_size);
+    vm_stack_decommit(addr, size);
+    sa->live--;
+
+    for (uint32_t i = 0; i < sa->free_count;) {
+        const vm_stack_range r = sa->free_ranges[i];
+        if (r.addr + r.size == addr) {
+            addr = r.addr;
+            size += r.size;
+        } else if (addr + size == r.addr) {
+            size += r.size;
+        } else {
+            i++;
+            continue;
+        }
+        sa->free_ranges[i] = sa->free_ranges[--sa->free_count];
+    }
+
+    if (addr + size == sa->next_addr) {
+        sa->next_addr = addr;
+    } else {
+        sa->free_ranges[sa->free_count].addr = addr;
+        sa->free_ranges[sa->free_count].size = size;
+        sa->free_count++;
+    }
 }
 
 static inline void* vm_to_host(uint32_t addr)

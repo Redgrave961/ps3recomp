@@ -35,6 +35,7 @@ struct texture_desc {
     bool linear;
     bool cube;
     bool compressed;
+    bool converted;
     bool depth;
     bool border;
     uint32_t dimension;
@@ -51,6 +52,14 @@ struct texture_desc {
     texture_shader_ops ops;
 };
 
+struct texture_support {
+    uint32_t max_2d;
+    uint32_t max_3d;
+    uint32_t max_cube;
+    bool r8_srgb;
+    bool r8g8_srgb;
+};
+
 struct texture_copy {
     uint32_t level;
     uint32_t layer;
@@ -62,7 +71,7 @@ struct texture_copy {
     uint32_t rows;
 };
 
-bool texture_describe(const texture_regs& regs, bool vertex_unit, texture_desc& out);
+bool texture_describe(const texture_regs& regs, bool vertex_unit, const texture_support& support, texture_desc& out);
 uint64_t texture_staging_size(const texture_desc& desc);
 void texture_convert(const texture_desc& desc, const uint8_t* guest, uint8_t* staging, std::vector<texture_copy>& copies);
 void texture_sampler(const texture_regs& regs, bool vertex_unit, const texture_desc& desc, float max_anisotropy,

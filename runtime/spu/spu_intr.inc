@@ -19,7 +19,8 @@ int ps3_intr_establish(uint32_t tag, uint64_t thread)
 {
     for (int i = 0; i < PS3_INTR_MAX; i++) {
         if (s_intr[i].used && s_intr[i].tag == tag) {
-            s_intr[i].thread = thread;
+            __atomic_store_n(&s_intr[i].thread, thread, __ATOMIC_RELAXED);
+            ps3_intr_signal();
             return 0;
         }
     }
@@ -65,6 +66,8 @@ int ps3_intr_wait(uint64_t thread)
     if (!b) return 0;
     for (;;) {
         const uint32_t seq = __atomic_load_n(&s_intr_seq, __ATOMIC_ACQUIRE);
+        if (!__atomic_load_n(&b->used, __ATOMIC_ACQUIRE) || __atomic_load_n(&b->thread, __ATOMIC_RELAXED) != thread)
+            return 0;
         if (ps3_intr_level(b->tag)) return 1;
         ps3_futex_wait(&s_intr_seq, seq, 0);
     }
@@ -85,7 +88,8 @@ static int64_t sc_interrupt_thread_disestablish(ppu_context* ctx)
     uint32_t tag    = (uint32_t)ctx->gpr[3];
     uint32_t out_ea = (uint32_t)ctx->gpr[4];
     for (int i = 0; i < PS3_INTR_MAX; i++)
-        if (s_intr[i].used && s_intr[i].tag == tag) { s_intr[i].used = 0; break; }
+        if (s_intr[i].used && s_intr[i].tag == tag) { __atomic_store_n(&s_intr[i].used, 0, __ATOMIC_RELEASE); break; }
+    ps3_intr_signal();
     if (out_ea) { be32_store(out_ea, 0); be32_store(out_ea + 4, 0); }
     return CELL_OK;
 }

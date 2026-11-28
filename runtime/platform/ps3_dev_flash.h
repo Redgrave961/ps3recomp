@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-void ps3_dev_flash_path(char* out, size_t cap, const char* roots, const char* rel);
+int ps3_dev_flash_path(char* out, size_t cap, const char* roots, const char* rel);
 
 #ifdef __cplusplus
 }

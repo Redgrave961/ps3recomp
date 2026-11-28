@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <thread>
 #include <unordered_set>
 #include <utility>
 #ifdef _WIN32
@@ -21,8 +22,33 @@ namespace {
 thread_local bool g_replay = false;
 thread_local unsigned t_compiling = 0;
 std::string g_cache_files[2];
+std::atomic<bool> g_dropped{ false };
 
 constexpr unsigned k_urgent_workers = 2;
+
+constexpr char k_db_magic[8] = { 'V', 'K', 'S', 'H', 'A', 'D', 'E', 'R' };
+constexpr uint32_t k_db_version = 1;
+
+struct db_header {
+    char magic[8];
+    uint64_t features;
+    uint32_t version;
+    uint32_t vendor;
+    uint32_t device;
+    uint32_t driver_version;
+    uint32_t driver_id;
+    uint32_t api_version;
+    uint8_t cache_uuid[VK_UUID_SIZE];
+};
+static_assert(sizeof(db_header) == 56);
+
+bool format_has(VkPhysicalDevice gpu, VkFormat f, VkFormatFeatureFlags need)
+{
+    if (f == VK_FORMAT_UNDEFINED) return true;
+    VkFormatProperties fp{};
+    vkGetPhysicalDeviceFormatProperties(gpu, f, &fp);
+    return (fp.optimalTilingFeatures & need) == need;
+}
 
 void lowest_priority()
 {
@@ -102,9 +128,10 @@ compile_guard::~compile_guard() { t_compiling--; }
 void drop_caches_if_compiling()
 {
     if (!t_compiling) return;
+    g_dropped.store(true, std::memory_order_relaxed);
     for (const std::string& f : g_cache_files)
         if (!f.empty()) truncate_utf8(f);
-    std::fprintf(stderr, "[vk] crashed while compiling shaders: shader caches discarded, they rebuild on the next launch\n");
+    std::fprintf(stderr, "[vk] failed while compiling shaders: shader caches discarded, they rebuild on the next launch\n");
 }
 
 bool pipelines::create(vk_device& d, const std::string& cache_path)
@@ -147,19 +174,6 @@ bool pipelines::create(vk_device& d, const std::string& cache_path)
     m_db_path = m_cache_path.substr(0, slash == std::string::npos ? 0 : slash + 1) + "vk_shaders.db";
     g_cache_files[0] = m_cache_path;
     g_cache_files[1] = m_db_path;
-    std::vector<uint8_t> blob;
-    read_file(m_cache_path, blob);
-    VkPipelineCacheCreateInfo ci{ VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
-    ci.initialDataSize = blob.size();
-    ci.pInitialData = blob.empty() ? nullptr : blob.data();
-    {
-        const compile_guard guard;
-        if (vkCreatePipelineCache(d.dev, &ci, nullptr, &m_cache) != VK_SUCCESS) {
-            ci.initialDataSize = 0;
-            ci.pInitialData = nullptr;
-            VK_TRY(vkCreatePipelineCache(d.dev, &ci, nullptr, &m_cache));
-        }
-    }
 
     m_dynamic = {
         VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT, VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT, VK_DYNAMIC_STATE_LINE_WIDTH,
@@ -198,6 +212,21 @@ bool pipelines::create(vk_device& d, const std::string& cache_path)
         }
     }
 
+    std::vector<uint8_t> blob;
+    if (open_db()) read_file(m_cache_path, blob);
+    else truncate_utf8(m_cache_path);
+    VkPipelineCacheCreateInfo ci{ VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
+    ci.initialDataSize = blob.size();
+    ci.pInitialData = blob.empty() ? nullptr : blob.data();
+    {
+        const compile_guard guard;
+        if (vkCreatePipelineCache(d.dev, &ci, nullptr, &m_cache) != VK_SUCCESS) {
+            ci.initialDataSize = 0;
+            ci.pInitialData = nullptr;
+            VK_TRY(vkCreatePipelineCache(d.dev, &ci, nullptr, &m_cache));
+        }
+    }
+
     m_saved = std::chrono::steady_clock::now();
 
     if (d.caps.pipeline_library) {
@@ -212,21 +241,15 @@ bool pipelines::create(vk_device& d, const std::string& cache_path)
             if (!(m_input[c] = input_library(c))) m_libraries = false;
     }
     if (m_libraries) {
-        auto fmt_ok = [&](VkFormat f, VkFormatFeatureFlags need) {
-            if (f == VK_FORMAT_UNDEFINED) return true;
-            VkFormatProperties fp{};
-            vkGetPhysicalDeviceFormatProperties(d.gpu, f, &fp);
-            return (fp.optimalTilingFeatures & need) == need;
-        };
         const VkFormat colors[] = { VK_FORMAT_UNDEFINED, VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM,
                                     VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R16G16B16A16_UNORM, VK_FORMAT_R32_SFLOAT,
                                     VK_FORMAT_R32G32B32A32_SFLOAT, VK_FORMAT_R8_UNORM, VK_FORMAT_R8G8_UNORM };
         const VkFormat depths[] = { VK_FORMAT_UNDEFINED, VK_FORMAT_D32_SFLOAT, VK_FORMAT_D32_SFLOAT_S8_UINT };
         for (VkFormat cf : colors) {
-            if (!fmt_ok(cf, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)) continue;
+            if (!format_has(d.gpu, cf, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)) continue;
             for (VkFormat df : depths) {
                 if (cf == VK_FORMAT_UNDEFINED && df == VK_FORMAT_UNDEFINED) continue;
-                if (!fmt_ok(df, VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)) continue;
+                if (!format_has(d.gpu, df, VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)) continue;
                 pipeline_key ok{};
                 ok.color_format[0] = cf;
                 ok.depth_format = df;
@@ -241,10 +264,10 @@ bool pipelines::create(vk_device& d, const std::string& cache_path)
         };
         for (const auto& m : mrts) {
             bool all_ok = true;
-            for (VkFormat cf : m) all_ok = all_ok && fmt_ok(cf, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT);
+            for (VkFormat cf : m) all_ok = all_ok && format_has(d.gpu, cf, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT);
             if (!all_ok) continue;
             for (VkFormat df : depths) {
-                if (!fmt_ok(df, VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)) continue;
+                if (!format_has(d.gpu, df, VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)) continue;
                 pipeline_key ok{};
                 for (uint32_t i = 0; i < 4; i++) ok.color_format[i] = m[i];
                 ok.depth_format = df;
@@ -253,16 +276,15 @@ bool pipelines::create(vk_device& d, const std::string& cache_path)
         }
     }
 
-    m_db = open_utf8(m_db_path, "ab+");
     const unsigned n = std::max(k_urgent_workers + 1u, std::thread::hardware_concurrency());
     m_background_limit = d.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 2u : n - k_urgent_workers;
     for (unsigned i = 0; i < n; i++)
-        m_workers.emplace_back([this, i] {
+        std::thread([this, i] {
             const bool urgent_only = i < k_urgent_workers;
             ps3_thread_name(urgent_only ? "vk pipeline urgent %u" : "vk pipeline %u", i);
             if (!urgent_only) lowest_priority();
             worker(urgent_only);
-        });
+        }).detach();
     std::fprintf(stderr, "[vk] pipelines: %s, %u urgent + %u background compile threads\n", m_libraries ? "libraries with fast link" : "monolithic",
                  k_urgent_workers, n - k_urgent_workers);
     return true;
@@ -276,16 +298,10 @@ void pipelines::worker(bool urgent_only)
         {
             std::unique_lock<std::mutex> hold(m_work_lock);
             const auto overflow = [this] { return !m_urgent.empty() && m_urgent_busy >= k_urgent_workers; };
-            if (urgent_only) {
-                m_urgent_cv.wait(hold, [this] { return !m_urgent.empty() || m_stop; });
-                if (m_urgent.empty()) return;
-            } else {
-                m_work_cv.wait(hold, [&] {
-                    return overflow() || (!m_background.empty() && m_background_running < m_background_limit) ||
-                           (m_stop && m_background.empty());
-                });
-                if (!overflow() && m_background.empty()) return;
-            }
+            if (urgent_only)
+                m_urgent_cv.wait(hold, [this] { return !m_urgent.empty(); });
+            else
+                m_work_cv.wait(hold, [&] { return overflow() || (!m_background.empty() && m_background_running < m_background_limit); });
             urgent = urgent_only || overflow();
             std::deque<std::function<void()>>& q = urgent ? m_urgent : m_background;
             task = std::move(q.front());
@@ -314,39 +330,6 @@ void pipelines::work(std::function<void()> task, bool urgent)
     if (!urgent || overflow) m_work_cv.notify_one();
 }
 
-void pipelines::destroy()
-{
-    if (!m_d) return;
-    m_stopping.store(true, std::memory_order_relaxed);
-    if (m_precompile_thread.joinable()) m_precompile_thread.join();
-    {
-        std::lock_guard<std::mutex> hold(m_work_lock);
-        m_stop = true;
-    }
-    m_urgent_cv.notify_all();
-    m_work_cv.notify_all();
-    for (std::thread& t : m_workers) t.join();
-    m_workers.clear();
-    save_cache();
-    m_map.erase_if([this](const pipeline_key&, const std::unique_ptr<entry>& e) {
-        const VkPipeline p = e->pipe.load();
-        if (p) vkDestroyPipeline(m_d->dev, p, nullptr);
-        if (e->fast && e->fast != p) vkDestroyPipeline(m_d->dev, e->fast, nullptr);
-        return true;
-    });
-    m_output.erase_if([this](const pipeline_key&, VkPipeline p) {
-        vkDestroyPipeline(m_d->dev, p, nullptr);
-        return true;
-    });
-    for (VkPipeline& p : m_input)
-        if (p) vkDestroyPipeline(m_d->dev, std::exchange(p, VK_NULL_HANDLE), nullptr);
-    if (m_db) std::fclose(std::exchange(m_db, nullptr));
-    vkDestroyPipelineCache(m_d->dev, m_cache, nullptr);
-    vkDestroyPipelineLayout(m_d->dev, m_layout, nullptr);
-    for (VkDescriptorSetLayout s : m_sets) vkDestroyDescriptorSetLayout(m_d->dev, s, nullptr);
-    m_d = nullptr;
-}
-
 void pipelines::save_cache_periodic()
 {
     if (!m_cache_dirty.load(std::memory_order_relaxed)) return;
@@ -359,6 +342,7 @@ void pipelines::save_cache_periodic()
 
 void pipelines::save_cache()
 {
+    if (g_dropped.load(std::memory_order_relaxed)) return;
     std::lock_guard<std::mutex> hold(m_save_lock);
     if (m_db) {
         std::lock_guard<std::mutex> db_hold(m_db_lock);
@@ -422,9 +406,60 @@ pipeline_key pipelines::normalize(const pipeline_key& key) const{
     return k;
 }
 
+bool pipelines::open_db()
+{
+    db_header want{};
+    std::memcpy(want.magic, k_db_magic, sizeof want.magic);
+    const uint32_t features[] = { m_dynamic_blend, m_dynamic_polygon, m_dynamic_clamp, m_dynamic_clip, m_dynamic_logic,
+                                  m_d->caps.depth_clip_enable, m_d->caps.provoking_vertex, m_d->caps.rgba16_unorm,
+                                  (uint32_t)sizeof(pipeline_key), (uint32_t)sizeof(rsx_spv_vp_key), (uint32_t)sizeof(rsx_spv_fp_key),
+                                  RSX_SPV_VP_SLOTS };
+    want.features = shader_cache::hash(features, sizeof features, k_db_version);
+    want.version = k_db_version;
+    want.vendor = m_d->props.vendorID;
+    want.device = m_d->props.deviceID;
+    want.driver_version = m_d->props.driverVersion;
+    want.driver_id = (uint32_t)m_d->driver.driverID;
+    want.api_version = m_d->props.apiVersion;
+    std::memcpy(want.cache_uuid, m_d->props.pipelineCacheUUID, VK_UUID_SIZE);
+    bool stale = false, kept = false;
+    if (FILE* f = open_utf8(m_db_path, "rb")) {
+        db_header have{};
+        if (std::fread(&have, sizeof have, 1, f) == 1) {
+            kept = !std::memcmp(&have, &want, sizeof want);
+            stale = !kept;
+        }
+        std::fclose(f);
+    }
+    if (!kept) {
+        if (stale) std::fprintf(stderr, "[vk] shader cache does not match this GPU, driver or build, rebuilding it\n");
+        if (FILE* f = open_utf8(m_db_path, "wb")) {
+            std::fwrite(&want, sizeof want, 1, f);
+            std::fclose(f);
+        }
+    }
+    m_db = open_utf8(m_db_path, "ab+");
+    return kept;
+}
+
+bool pipelines::usable(const pipeline_key& k) const
+{
+    const pipeline_key n = normalize(k);
+    if (std::memcmp(&n, &k, sizeof k) || k.topology_class > 2u || k.polygon_mode > (uint32_t)VK_POLYGON_MODE_POINT) return false;
+    const VkPhysicalDeviceFeatures& f = m_d->features.features;
+    if ((k.polygon_mode != (uint32_t)VK_POLYGON_MODE_FILL && !f.fillModeNonSolid) || (k.depth_clamp && !f.depthClamp) ||
+        (k.logic_enable && !f.logicOp))
+        return false;
+    for (uint32_t i = 0; i < 4; i++) {
+        const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | (k.blend[i].enable ? VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT : 0u);
+        if (!format_has(m_d->gpu, (VkFormat)k.color_format[i], need)) return false;
+    }
+    return format_has(m_d->gpu, (VkFormat)k.depth_format, VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT);
+}
+
 void pipelines::record(char type, const void* a, size_t an, const void* b, size_t bn)
 {
-    if (g_replay || !m_db) return;
+    if (g_replay || !m_db || g_dropped.load(std::memory_order_relaxed)) return;
     const uint32_t sizes[2] = { (uint32_t)an, (uint32_t)bn };
     std::lock_guard<std::mutex> hold(m_db_lock);
     std::fputc(type, m_db);
@@ -458,9 +493,14 @@ void pipelines::precompile(shader_cache& shaders)
         data->resize(size > 0 ? (size_t)size : 0u);
         if (!data->empty() && std::fread(data->data(), 1, data->size(), m_db) != data->size()) data->clear();
         std::fseek(m_db, 0, SEEK_END);
+        const auto usable_key = [this](const uint8_t* raw) {
+            pipeline_key k;
+            std::memcpy(&k, raw, sizeof k);
+            return usable(k);
+        };
         std::unordered_set<uint64_t> seen;
         size_t total_raw = 0;
-        size_t at = 0;
+        size_t at = sizeof(db_header);
         while (at + 9 <= data->size()) {
             rec r{ (char)(*data)[at] };
             std::memcpy(&r.an, data->data() + at + 1, 4);
@@ -473,7 +513,7 @@ void pipelines::precompile(shader_cache& shaders)
             const bool valid =
                 (r.type == 'V' && r.an == sizeof(rsx_spv_vp_key) && r.bn == RSX_SPV_VP_SLOTS * 16u) ||
                 (r.type == 'F' && r.an == sizeof(rsx_spv_fp_key) && r.bn % 4u == 0) ||
-                (r.type == 'P' && r.an == sizeof(pipeline_key) && r.bn == 0);
+                (r.type == 'P' && r.an == sizeof(pipeline_key) && r.bn == 0 && usable_key(r.a));
             if (!valid) continue;
             uint64_t h = shader_cache::hash(r.a, r.an, (uint64_t)(unsigned char)r.type * 0x9E3779B97F4A7C15ull);
             if (r.bn) h = shader_cache::hash(r.b, r.bn, h);
@@ -482,7 +522,7 @@ void pipelines::precompile(shader_cache& shaders)
         if (recs->size() < total_raw || at < data->size()) {
             const std::string tmp = m_db_path + ".tmp";
             if (FILE* f = open_utf8(tmp, "wb")) {
-                bool ok = true;
+                bool ok = std::fwrite(data->data(), 1, sizeof(db_header), f) == sizeof(db_header);
                 for (const rec& r : *recs) {
                     const uint32_t sizes[2] = { r.an, r.bn };
                     ok = ok && std::fputc(r.type, f) != EOF &&
@@ -500,18 +540,17 @@ void pipelines::precompile(shader_cache& shaders)
         }
     }
     if (recs->empty()) return;
-    m_precompile_thread = std::thread([this, &shaders, data, recs] {
+    std::thread([this, &shaders, data, recs] {
         ps3_thread_name("vk precompile");
         auto pending = std::make_shared<std::atomic<size_t>>(0);
         auto done = std::make_shared<std::pair<std::mutex, std::condition_variable>>();
         auto run_matching = [&](auto&& pred, auto&& body) {
             for (const rec& r : *recs) {
-                if (m_stopping.load(std::memory_order_relaxed)) break;
                 if (!pred(r.type)) continue;
                 pending->fetch_add(1);
-                work([this, r, body, pending, done] {
+                work([r, body, pending, done] {
                     g_replay = true;
-                    if (!m_stopping.load(std::memory_order_relaxed)) body(r);
+                    body(r);
                     g_replay = false;
                     if (pending->fetch_sub(1) == 1) {
                         std::lock_guard<std::mutex> hold(done->first);
@@ -546,7 +585,7 @@ void pipelines::precompile(shader_cache& shaders)
             if (vs && fs) get(k, vs->code, fs->code);
         });
         std::fprintf(stderr, "[vk] precompiled %zu shaders and pipelines\n", recs->size());
-    });
+    }).detach();
 }
 
 void pipelines::fill_raster(const pipeline_key& k, VkPipelineRasterizationStateCreateInfo& rs, VkPipelineRasterizationDepthClipStateCreateInfoEXT& clip,
@@ -602,7 +641,9 @@ VkPipeline pipelines::create_pipeline(VkGraphicsPipelineCreateInfo pi) const
     pi.pNext = &fi;
     VkPipeline p = VK_NULL_HANDLE;
     const compile_guard guard;
-    if (vkCreateGraphicsPipelines(m_d->dev, m_cache, 1, &pi, nullptr, &p) != VK_SUCCESS) return VK_NULL_HANDLE;
+    const VkResult r = vkCreateGraphicsPipelines(m_d->dev, m_cache, 1, &pi, nullptr, &p);
+    if (r == VK_ERROR_DEVICE_LOST) vk_fatal(*m_d, r, "vkCreateGraphicsPipelines");
+    if (r != VK_SUCCESS) return VK_NULL_HANDLE;
     if (!(feedback.flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT))
         m_cache_dirty.store(true, std::memory_order_relaxed);
     return p;
@@ -793,7 +834,7 @@ VkPipeline pipelines::get(const pipeline_key& key, const shader& vs, const shade
     record('P', &k, sizeof k, nullptr, 0);
     if (!m_libraries && !g_replay && !sync) {
         work([this, k, v = vs, f = fs, e] {
-            const VkPipeline p = m_stopping.load(std::memory_order_relaxed) ? VK_NULL_HANDLE : monolithic(k, v, f);
+            const VkPipeline p = monolithic(k, v, f);
             e->pipe.store(p, std::memory_order_release);
             e->done.store(true, std::memory_order_release);
             e->done.notify_all();
@@ -809,7 +850,6 @@ VkPipeline pipelines::get(const pipeline_key& key, const shader& vs, const shade
     e->done.notify_all();
     if (m_libraries && !direct_lto && p)
         work([this, k, v = vs, f = fs, e] {
-            if (m_stopping.load(std::memory_order_relaxed)) return;
             if (VkPipeline opt = link(k, v, f, true)) e->pipe.store(opt, std::memory_order_release);
         }, false);
     return p;

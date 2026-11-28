@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #define VK_TRY(expr) \
@@ -27,8 +28,13 @@ struct vk_caps {
     bool memory_budget;
     bool buffer_address;
     bool fifo_latest_ready;
+    bool present_id;
+    bool present_wait;
     bool mirror_clamp_to_edge;
     bool rgba16_unorm;
+    bool r8_srgb;
+    bool r8g8_srgb;
+    bool r16_uint_storage;
     uint32_t max_custom_border_samplers;
 };
 
@@ -42,6 +48,7 @@ struct vk_device {
     uint32_t family = 0;
     VmaAllocator vma = nullptr;
     VkPhysicalDeviceProperties props{};
+    VkPhysicalDeviceDriverProperties driver{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES };
     VkPhysicalDeviceFeatures2 features{};
     VkPhysicalDeviceExtendedDynamicState2FeaturesEXT* dynamic_state2 = nullptr;
     VkPhysicalDeviceExtendedDynamicState3FeaturesEXT* dynamic_state3 = nullptr;
@@ -49,7 +56,17 @@ struct vk_device {
     uint8_t luid[8]{};
     bool luid_valid = false;
     std::vector<std::unique_ptr<uint8_t[]>> chain;
+    std::string unsupported;
+    void (*fatal)(VkResult result, const char* call) = nullptr;
 };
 
 bool vk_instance_create(vk_device& d, const char* const* extensions, uint32_t count);
 bool vk_device_create(vk_device& d, VkSurfaceKHR surface);
+[[noreturn]] void vk_fatal(const vk_device& d, VkResult result, const char* call);
+inline void vk_must(const vk_device& d, VkResult result, const char* call)
+{
+    if (result != VK_SUCCESS) vk_fatal(d, result, call);
+}
+void vk_wait(const vk_device& d, VkSemaphore timeline, uint64_t value);
+uint64_t vk_reached(const vk_device& d, VkSemaphore timeline);
+void vk_submit(vk_device& d, const VkSubmitInfo2& submit);

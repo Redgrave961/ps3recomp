@@ -1228,6 +1228,32 @@ static void fragment_tests(void)
     run_fp("large_400", 0x40);
 }
 
+static void run_utility(const char* name, int rc, rsx_spv_blob* b)
+{
+    char cname[160];
+    snprintf(cname, sizeof cname, "%s build", name);
+    check(cname, rc == 0);
+    if (rc == 0) validate(name, b);
+    printf("  util %-26s %6u words\n", name, b->count);
+    rsx_spv_blob_free(b);
+}
+
+static void utility_shaders(void)
+{
+    printf("utility shaders:\n");
+    rsx_spv_blob b = { 0 };
+    run_utility("util_depth_pack_d16", rsx_spv_depth_pack(1, &b), &b);
+    run_utility("util_depth_pack_d24s8", rsx_spv_depth_pack(0, &b), &b);
+    run_utility("util_box_down", rsx_spv_box_down(&b), &b);
+    run_utility("util_box_down_vs", rsx_spv_box_down_vs(&b), &b);
+    run_utility("util_box_down_fs2", rsx_spv_box_down_fs(2, &b), &b);
+    run_utility("util_box_down_fs3", rsx_spv_box_down_fs(3, &b), &b);
+    run_utility("util_box_down_fs4", rsx_spv_box_down_fs(4, &b), &b);
+    run_utility("util_overlay_vs", rsx_spv_overlay_vs(&b), &b);
+    run_utility("util_overlay_fs", rsx_spv_overlay_fs(&b), &b);
+    run_utility("util_motion_vectors", rsx_spv_motion_vectors(&b), &b);
+}
+
 int main(int argc, char** argv)
 {
     if (argc > 1) g_outdir = argv[1];
@@ -1235,6 +1261,7 @@ int main(int argc, char** argv)
     vertex_tests();
     fragment_tests();
     toolkit_samples();
+    utility_shaders();
     printf("\nchecks: %d passed, %d failed\n", g_pass, g_fail);
     printf("modules: %d written", g_modules);
     if (g_val) printf(", %d valid, %d invalid", g_valid, g_invalid);

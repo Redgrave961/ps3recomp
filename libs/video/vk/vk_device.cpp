@@ -1,8 +1,11 @@
 #define VMA_IMPLEMENTATION
 #include "vk_device.h"
 
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <thread>
 
 namespace {
 
@@ -38,6 +41,10 @@ const ext_entry k_extensions[] = {
       sizeof(VkPhysicalDevicePresentModeFifoLatestReadyFeaturesKHR), &vk_caps::fifo_latest_ready },
     { VK_EXT_PRESENT_MODE_FIFO_LATEST_READY_EXTENSION_NAME, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_MODE_FIFO_LATEST_READY_FEATURES_KHR,
       sizeof(VkPhysicalDevicePresentModeFifoLatestReadyFeaturesKHR), &vk_caps::fifo_latest_ready },
+    { VK_KHR_PRESENT_ID_EXTENSION_NAME, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR, sizeof(VkPhysicalDevicePresentIdFeaturesKHR),
+      &vk_caps::present_id },
+    { VK_KHR_PRESENT_WAIT_EXTENSION_NAME, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR, sizeof(VkPhysicalDevicePresentWaitFeaturesKHR),
+      &vk_caps::present_wait },
     { VK_EXT_MEMORY_BUDGET_EXTENSION_NAME, VkStructureType(0), 0, &vk_caps::memory_budget },
     { VK_NVX_BINARY_IMPORT_EXTENSION_NAME, VkStructureType(0), 0, nullptr },
     { VK_NVX_IMAGE_VIEW_HANDLE_EXTENSION_NAME, VkStructureType(0), 0, nullptr },
@@ -86,20 +93,20 @@ int find_family(VkPhysicalDevice gpu, VkSurfaceKHR surface)
     return -1;
 }
 
-bool suitable(VkPhysicalDevice gpu, VkSurfaceKHR surface)
+const char* unsuitable(VkPhysicalDevice gpu, const VkPhysicalDeviceProperties& props, VkSurfaceKHR surface)
 {
-    VkPhysicalDeviceProperties props;
-    vkGetPhysicalDeviceProperties(gpu, &props);
-    if (props.apiVersion < VK_API_VERSION_1_3) return false;
+    if (props.apiVersion < VK_API_VERSION_1_3) return "its driver supports only an older Vulkan version, 1.3 is required";
     const std::vector<VkExtensionProperties> exts = device_extensions(gpu);
-    if (!has_extension(exts, VK_KHR_SWAPCHAIN_EXTENSION_NAME) || !has_extension(exts, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME)) return false;
+    if (!has_extension(exts, VK_KHR_SWAPCHAIN_EXTENSION_NAME)) return "its driver cannot display Vulkan output";
+    if (!has_extension(exts, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME)) return "its driver lacks the push descriptor extension";
     VkPhysicalDeviceVulkan12Features f12{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
     VkPhysicalDeviceVulkan13Features f13{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, &f12 };
     VkPhysicalDeviceFeatures2 f{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f13 };
     vkGetPhysicalDeviceFeatures2(gpu, &f);
     if (!f13.dynamicRendering || !f13.synchronization2 || !f13.shaderDemoteToHelperInvocation || !f12.timelineSemaphore || !f12.hostQueryReset)
-        return false;
-    return find_family(gpu, surface) >= 0;
+        return "its driver lacks required Vulkan 1.3 features";
+    if (find_family(gpu, surface) < 0) return "it cannot present to this window";
+    return nullptr;
 }
 
 int rank(VkPhysicalDevice gpu)
@@ -134,9 +141,14 @@ bool first_feature(const void* s)
 
 bool vk_instance_create(vk_device& d, const char* const* extensions, uint32_t count)
 {
-    VK_TRY(volkInitialize());
+    if (volkInitialize() != VK_SUCCESS) {
+        d.unsupported = "Vulkan is not installed on this PC.\n";
+        std::fprintf(stderr, "[vk] %s", d.unsupported.c_str());
+        return false;
+    }
     if (volkGetInstanceVersion() < VK_API_VERSION_1_3) {
-        std::fprintf(stderr, "[vk] Vulkan 1.3 loader required\n");
+        d.unsupported = "The installed Vulkan runtime is older than 1.3.\n";
+        std::fprintf(stderr, "[vk] %s", d.unsupported.c_str());
         return false;
     }
     std::vector<const char*> ext(extensions, extensions + count);
@@ -185,10 +197,22 @@ bool vk_device_create(vk_device& d, VkSurfaceKHR surface)
     vkEnumeratePhysicalDevices(d.instance, &n, nullptr);
     std::vector<VkPhysicalDevice> gpus(n);
     vkEnumeratePhysicalDevices(d.instance, &n, gpus.data());
-    for (VkPhysicalDevice gpu : gpus)
-        if (suitable(gpu, surface) && (!d.gpu || rank(gpu) > rank(d.gpu))) d.gpu = gpu;
+    std::string rejected;
+    for (VkPhysicalDevice gpu : gpus) {
+        VkPhysicalDeviceProperties props;
+        vkGetPhysicalDeviceProperties(gpu, &props);
+        if (const char* why = unsuitable(gpu, props, surface)) {
+            char line[512];
+            std::snprintf(line, sizeof line, "%s (Vulkan %u.%u): %s.\n", props.deviceName, VK_API_VERSION_MAJOR(props.apiVersion),
+                          VK_API_VERSION_MINOR(props.apiVersion), why);
+            rejected += line;
+        } else if (!d.gpu || rank(gpu) > rank(d.gpu)) {
+            d.gpu = gpu;
+        }
+    }
     if (!d.gpu) {
-        std::fprintf(stderr, "[vk] no Vulkan 1.3 GPU with dynamic rendering, synchronization2, timeline semaphores and host query reset\n");
+        d.unsupported = gpus.empty() ? "No graphics card with Vulkan support was found.\n" : "No graphics card in this PC can run it:\n" + rejected;
+        std::fprintf(stderr, "[vk] %s", d.unsupported.c_str());
         return false;
     }
     vkGetPhysicalDeviceProperties(d.gpu, &d.props);
@@ -234,6 +258,7 @@ bool vk_device_create(vk_device& d, VkSurfaceKHR surface)
         }
     }
     if (d.dynamic_state3 && !d.caps.dynamic_state3) d.caps.dynamic_state3 = d.dynamic_state3->extendedDynamicState3PolygonMode != VK_FALSE;
+    d.caps.present_wait = d.caps.present_wait && d.caps.present_id;
     d.caps.buffer_address = f12->bufferDeviceAddress != VK_FALSE;
     d.caps.mirror_clamp_to_edge = f12->samplerMirrorClampToEdge != VK_FALSE;
     if (d.props.deviceType != VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
@@ -245,8 +270,19 @@ bool vk_device_create(vk_device& d, VkSurfaceKHR surface)
                                               VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
         d.caps.rgba16_unorm = (fp.optimalTilingFeatures & need) == need;
     }
+    const auto format_has = [&](VkFormat format, VkFormatFeatureFlags need) {
+        VkFormatProperties fp{};
+        vkGetPhysicalDeviceFormatProperties(d.gpu, format, &fp);
+        return (fp.optimalTilingFeatures & need) == need;
+    };
+    constexpr VkFormatFeatureFlags k_texture = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+                                               VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+    d.caps.r8_srgb = format_has(VK_FORMAT_R8_SRGB, k_texture);
+    d.caps.r8g8_srgb = format_has(VK_FORMAT_R8G8_SRGB, k_texture);
+    d.caps.r16_uint_storage = d.features.features.shaderStorageImageExtendedFormats &&
+                              format_has(VK_FORMAT_R16_UINT, VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT);
     {
-        VkPhysicalDeviceIDProperties idp{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES };
+        VkPhysicalDeviceIDProperties idp{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES, &d.driver };
         VkPhysicalDeviceProperties2 p2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &idp };
         vkGetPhysicalDeviceProperties2(d.gpu, &p2);
         if (idp.deviceLUIDValid) {
@@ -289,9 +325,48 @@ bool vk_device_create(vk_device& d, VkSurfaceKHR surface)
     if (d.caps.maintenance5) ai.flags |= VMA_ALLOCATOR_CREATE_KHR_MAINTENANCE5_BIT;
     VK_TRY(vmaCreateAllocator(&ai, &d.vma));
 
-    std::fprintf(stderr, "[vk] %s, Vulkan %u.%u.%u: push descriptors %d, dynamic state 3 %d, pipeline library %d, custom border %d (%u), fifo latest ready %d, rgba16_unorm %d\n",
-                 d.props.deviceName, VK_API_VERSION_MAJOR(d.props.apiVersion), VK_API_VERSION_MINOR(d.props.apiVersion),
-                 VK_API_VERSION_PATCH(d.props.apiVersion), d.caps.push_descriptor, d.caps.dynamic_state3, d.caps.pipeline_library,
-                 d.caps.custom_border_color, d.caps.max_custom_border_samplers, d.caps.fifo_latest_ready, d.caps.rgba16_unorm);
+    std::fprintf(stderr, "[vk] %s, driver %s %s, Vulkan %u.%u.%u: push descriptors %d, dynamic state 3 %d, pipeline library %d, custom border %d (%u), fifo latest ready %d, present wait %d, rgba16_unorm %d\n",
+                 d.props.deviceName, d.driver.driverName, d.driver.driverInfo, VK_API_VERSION_MAJOR(d.props.apiVersion),
+                 VK_API_VERSION_MINOR(d.props.apiVersion), VK_API_VERSION_PATCH(d.props.apiVersion), d.caps.push_descriptor,
+                 d.caps.dynamic_state3, d.caps.pipeline_library, d.caps.custom_border_color, d.caps.max_custom_border_samplers,
+                 d.caps.fifo_latest_ready, d.caps.present_wait, d.caps.rgba16_unorm);
     return true;
+}
+
+void vk_fatal(const vk_device& d, VkResult result, const char* call)
+{
+    static std::atomic<bool> logged{ false };
+    if (!logged.exchange(true))
+        std::fprintf(stderr, "[vk] %s failed: %d on %s (vendor 0x%04X device 0x%04X), driver %s %s (id %d, version 0x%08X)\n", call,
+                     (int)result, d.props.deviceName, d.props.vendorID, d.props.deviceID, d.driver.driverName, d.driver.driverInfo,
+                     (int)d.driver.driverID, d.props.driverVersion);
+    std::fflush(stderr);
+    d.fatal(result, call);
+    for (;;) std::this_thread::sleep_for(std::chrono::hours(1));
+}
+
+void vk_wait(const vk_device& d, VkSemaphore timeline, uint64_t value)
+{
+    VkSemaphoreWaitInfo wi{ VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
+    wi.semaphoreCount = 1;
+    wi.pSemaphores = &timeline;
+    wi.pValues = &value;
+    vk_must(d, vkWaitSemaphores(d.dev, &wi, UINT64_MAX), "vkWaitSemaphores");
+}
+
+uint64_t vk_reached(const vk_device& d, VkSemaphore timeline)
+{
+    uint64_t value = 0;
+    vk_must(d, vkGetSemaphoreCounterValue(d.dev, timeline, &value), "vkGetSemaphoreCounterValue");
+    return value;
+}
+
+void vk_submit(vk_device& d, const VkSubmitInfo2& submit)
+{
+    VkResult r;
+    {
+        std::lock_guard<std::mutex> hold(d.queue_lock);
+        r = vkQueueSubmit2(d.queue, 1, &submit, VK_NULL_HANDLE);
+    }
+    vk_must(d, r, "vkQueueSubmit2");
 }

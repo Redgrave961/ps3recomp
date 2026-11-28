@@ -7,9 +7,6 @@
 #include <stdlib.h>
 #include <errno.h>
 #include <sys/types.h>
-#ifndef _WIN32
-  #include <time.h>
-#endif
 
 sys_fs_fd_info  g_sys_fs_fds[SYS_FS_FD_MAX];
 sys_fs_dir_info g_sys_fs_dirs[SYS_FS_DIR_MAX];
@@ -68,79 +65,73 @@ static void fs_forward_slashes(char* p)
 
 extern __attribute__((weak)) const char* cellGame_get_hdd_title_id(void);
 
+static int fs_try_alt(char* path, size_t cap, char* alt, size_t head, const char* fmt, const char* tail, int native_sep)
+{
+    ps3_vstat st;
+    memcpy(alt, path, head);
+    const int n = snprintf(alt + head, cap - head, fmt, tail);
+    if (n < 0 || (size_t)n >= cap - head) return 0;
+    if (native_sep) fs_normalize_sep(alt);
+    if (ps3_vfs_stat(alt, &st) != 0) return 0;
+    memcpy(path, alt, head + (size_t)n + 1);
+    return 1;
+}
+
 static void ps3_vfs_ps3game_fallback(char* path, size_t cap)
 {
     ps3_vstat st;
     if (!path || !*path || ps3_vfs_stat(path, &st) == 0)
         return;
-    {
-        const char* id = cellGame_get_hdd_title_id ? cellGame_get_hdd_title_id() : NULL;
-        char key[48];
-        char* g;
-        if (id && snprintf(key, sizeof key, "/game/%s/", id) < (int)sizeof key
-            && ((g = strstr(path, key)) != NULL
-                || (snprintf(key, sizeof key, "\\game\\%s\\", id), g = strstr(path, key)) != NULL)) {
-            char alt[1024];
-            const size_t head = (size_t)(g - path);
-            if (head + 10 + strlen(g + strlen(key)) < sizeof alt) {
-                memcpy(alt, path, head);
-                snprintf(alt + head, sizeof alt - head, "/PS3_GAME/%s", g + strlen(key));
-                fs_normalize_sep(alt);
-                if (ps3_vfs_stat(alt, &st) == 0) { snprintf(path, cap, "%s", alt); return; }
-            }
-        }
+    char* alt = (char*)malloc(cap);
+    if (!alt) return;
+    const char* id = cellGame_get_hdd_title_id ? cellGame_get_hdd_title_id() : NULL;
+    char key[48];
+    char* g;
+    if (id && snprintf(key, sizeof key, "/game/%s/", id) < (int)sizeof key
+        && ((g = strstr(path, key)) != NULL
+            || (snprintf(key, sizeof key, "\\game\\%s\\", id), g = strstr(path, key)) != NULL)
+        && fs_try_alt(path, cap, alt, (size_t)(g - path), "/PS3_GAME/%s", g + strlen(key), 1)) {
+        free(alt);
+        return;
     }
     char* p = strstr(path, "/PS3_GAME/");
     if (!p) {
         char* u = strstr(path, "/USRDIR/");
         if (!u) u = strstr(path, "\\USRDIR\\");
-        if (!u) return;
-        char alt[1024];
-        size_t head = (size_t)(u - path);
-        if (head + 10 + strlen(u) >= sizeof alt) return;
-        memcpy(alt, path, head);
-        snprintf(alt + head, sizeof alt - head, "/PS3_GAME%s", u);
-        fs_normalize_sep(alt);
-        if (ps3_vfs_stat(alt, &st) == 0) snprintf(path, cap, "%s", alt);
-        return;
+        if (u) fs_try_alt(path, cap, alt, (size_t)(u - path), "/PS3_GAME%s", u, 1);
+    } else {
+        fs_try_alt(path, cap, alt, (size_t)(p - path), "/%s", p + 10, 0);
     }
-    char alt[1024];
-    size_t head = (size_t)(p - path);
-    if (head + 1 >= sizeof alt)
-        return;
-    memcpy(alt, path, head);
-    snprintf(alt + head, sizeof alt - head, "/%s", p + 10);
-    if (ps3_vfs_stat(alt, &st) != 0)
-        return;
-    snprintf(path, cap, "%s", alt);
+    free(alt);
 }
 
-void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size)
+static int fs_join_root(char* host_path, size_t cap, const char* root, const char* rel)
+{
+    const int n = snprintf(host_path, cap, "%s/%s", root, rel);
+    fs_forward_slashes(host_path);
+    return n >= 0 && (size_t)n < cap;
+}
+
+int sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size)
 {
     const size_t cap = (size_t)host_path_size;
 
     static const char* hdd0_root = NULL; static int hdd0_init = 0;
     if (!hdd0_init) { hdd0_root = getenv("PS3_HDD0_ROOT"); hdd0_init = 1; }
-    if (hdd0_root && strncmp(ps3_path, "/dev_hdd0/", 10) == 0) {
-        snprintf(host_path, cap, "%s/%s", hdd0_root, ps3_path + 10);
-        fs_forward_slashes(host_path);
-        return;
-    }
+    if (hdd0_root && strncmp(ps3_path, "/dev_hdd0/", 10) == 0)
+        return fs_join_root(host_path, cap, hdd0_root, ps3_path + 10);
 
     static const char* hdd1_root = NULL; static int hdd1_init = 0;
     if (!hdd1_init) { hdd1_root = getenv("PS3_HDD1_ROOT"); hdd1_init = 1; }
-    if (hdd1_root && *hdd1_root && strncmp(ps3_path, "/dev_hdd1/", 10) == 0) {
-        snprintf(host_path, cap, "%s/%s", hdd1_root, ps3_path + 10);
-        fs_forward_slashes(host_path);
-        return;
-    }
+    if (hdd1_root && *hdd1_root && strncmp(ps3_path, "/dev_hdd1/", 10) == 0)
+        return fs_join_root(host_path, cap, hdd1_root, ps3_path + 10);
 
     if (strncmp(ps3_path, "/dev_flash/", 11) == 0) {
         const char* fw = getenv("PS3_DEV_FLASH");
         if (!fw || !*fw) fw = "D:/recomp/tools/rpcs3/dev_flash";
-        ps3_dev_flash_path(host_path, cap, fw, ps3_path + 11);
+        const int fits = ps3_dev_flash_path(host_path, cap, fw, ps3_path + 11);
         fs_forward_slashes(host_path);
-        return;
+        return fits;
     }
 
     static const char* const mounts[] = {
@@ -157,9 +148,39 @@ void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_
         }
     }
     if (rel == ps3_path && ps3_path[0] == '/') rel = ps3_path + 1;
-    snprintf(host_path, cap, "%s/%s", ppu_vfs_root, rel);
-    fs_forward_slashes(host_path);
+    if (!fs_join_root(host_path, cap, ppu_vfs_root, rel)) return 0;
     ps3_vfs_ps3game_fallback(host_path, cap);
+    return 1;
+}
+
+#ifdef _WIN32
+#define SYS_FS_SHARE_RETRIES   50
+#define SYS_FS_SHARE_RETRY_MS  10
+
+static int fs_sharing_violation(void)
+{
+    return _doserrno == ERROR_SHARING_VIOLATION || _doserrno == ERROR_LOCK_VIOLATION;
+}
+#endif
+
+static ps3_vfile* fs_open_host(const char* host_path, const char* mode, int* open_errno)
+{
+#ifdef _WIN32
+    _doserrno = 0;
+#endif
+    ps3_vfile* fp = ps3_vfile_open(host_path, mode);
+#ifdef _WIN32
+    int retries = 0;
+    for (; !fp && retries < SYS_FS_SHARE_RETRIES && fs_sharing_violation(); retries++) {
+        Sleep(SYS_FS_SHARE_RETRY_MS);
+        _doserrno = 0;
+        fp = ps3_vfile_open(host_path, mode);
+    }
+    if (fp && retries)
+        fprintf(stderr, "[sys_fs] open recovered after %d sharing-violation retries: %s\n", retries, host_path);
+#endif
+    *open_errno = errno;
+    return fp;
 }
 
 int64_t sys_fs_open(ppu_context* ctx)
@@ -172,8 +193,9 @@ int64_t sys_fs_open(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_EINVAL;
 
     const char* ps3_path = (const char*)vm_to_host(path_addr);
-    char host_path[1024];
-    sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
+    char host_path[SYS_FS_HOST_PATH_MAX];
+    if (!sys_fs_translate_path(ps3_path, host_path, sizeof(host_path)))
+        return (int64_t)(int32_t)CELL_ENAMETOOLONG;
 
     const char* mode;
     int access = flags & CELL_FS_O_ACCMODE;
@@ -222,21 +244,8 @@ int64_t sys_fs_open(ppu_context* ctx)
             return (int64_t)(int32_t)CELL_EEXIST;
     }
 
-    ps3_vfile* fp = ps3_vfile_open(host_path, mode);
-    const int open_errno = errno;
-
-    if (!fp && open_errno != ENOENT &&
-        !(flags & (CELL_FS_O_CREAT | CELL_FS_O_WRONLY | CELL_FS_O_TRUNC))) {
-        for (int _r = 0; !fp && _r < 3000; _r++) {
-#ifdef _WIN32
-            Sleep(1);
-#else
-            { struct timespec _d = { 0, 1000 * 1000 }; nanosleep(&_d, NULL); }
-#endif
-            fp = ps3_vfile_open(host_path, mode);
-        }
-        if (fp) fprintf(stderr, "[sys_fs] open recovered after retry: %s\n", host_path);
-    }
+    int open_errno;
+    ps3_vfile* fp = fs_open_host(host_path, mode, &open_errno);
 
     if (!fp && (flags & CELL_FS_O_CREAT) && open_errno == ENOENT) {
         fp = ps3_vfile_open(host_path, "w+b");
@@ -270,8 +279,6 @@ int64_t sys_fs_open(ppu_context* ctx)
     sys_fs_fd_info* f = &g_sys_fs_fds[slot];
     f->fp     = fp;
     f->flags  = flags;
-    strncpy(f->path, host_path, sizeof(f->path) - 1);
-    f->path[sizeof(f->path) - 1] = '\0';
     f->active = 1;
     fs_slot_unlock();
 
@@ -428,8 +435,9 @@ int64_t sys_fs_stat(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_EINVAL;
 
     const char* ps3_path = (const char*)vm_to_host(path_addr);
-    char host_path[1024];
-    sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
+    char host_path[SYS_FS_HOST_PATH_MAX];
+    if (!sys_fs_translate_path(ps3_path, host_path, sizeof(host_path)))
+        return (int64_t)(int32_t)CELL_ENAMETOOLONG;
 
     ps3_vstat st;
     if (ps3_vfs_stat(host_path, &st) != 0)
@@ -467,8 +475,9 @@ int64_t sys_fs_opendir(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_EINVAL;
 
     const char* ps3_path = (const char*)vm_to_host(path_addr);
-    char host_path[1024];
-    sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
+    char host_path[SYS_FS_HOST_PATH_MAX];
+    if (!sys_fs_translate_path(ps3_path, host_path, sizeof(host_path)))
+        return (int64_t)(int32_t)CELL_ENAMETOOLONG;
 
     ps3_vdir* dir = ps3_vdir_open(host_path);
     if (!dir)
@@ -562,8 +571,9 @@ int64_t sys_fs_mkdir(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_EINVAL;
 
     const char* ps3_path = (const char*)vm_to_host(path_addr);
-    char host_path[1024];
-    sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
+    char host_path[SYS_FS_HOST_PATH_MAX];
+    if (!sys_fs_translate_path(ps3_path, host_path, sizeof(host_path)))
+        return (int64_t)(int32_t)CELL_ENAMETOOLONG;
 
     int rc = ps3_utf8_mkdir(host_path);
 
@@ -588,10 +598,10 @@ int64_t sys_fs_rename(ppu_context* ctx)
     const char* old_ps3 = (const char*)vm_to_host(old_addr);
     const char* new_ps3 = (const char*)vm_to_host(new_addr);
 
-    char old_host[1024], new_host[1024];
-    sys_fs_translate_path(old_ps3, old_host, sizeof(old_host));
-    sys_fs_translate_path(new_ps3, new_host, sizeof(new_host));
-
+    char old_host[SYS_FS_HOST_PATH_MAX], new_host[SYS_FS_HOST_PATH_MAX];
+    if (!sys_fs_translate_path(old_ps3, old_host, sizeof(old_host)) ||
+        !sys_fs_translate_path(new_ps3, new_host, sizeof(new_host)))
+        return (int64_t)(int32_t)CELL_ENAMETOOLONG;
     if (ps3_utf8_rename(old_host, new_host) != 0)
         return (int64_t)(int32_t)CELL_ENOENT;
 
@@ -606,8 +616,9 @@ int64_t sys_fs_unlink(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_EINVAL;
 
     const char* ps3_path = (const char*)vm_to_host(path_addr);
-    char host_path[1024];
-    sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
+    char host_path[SYS_FS_HOST_PATH_MAX];
+    if (!sys_fs_translate_path(ps3_path, host_path, sizeof(host_path)))
+        return (int64_t)(int32_t)CELL_ENAMETOOLONG;
 
     if (ps3_utf8_unlink(host_path) != 0)
     {
@@ -632,8 +643,9 @@ int64_t sys_fs_rmdir(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_EINVAL;
 
     const char* ps3_path = (const char*)vm_to_host(path_addr);
-    char host_path[1024];
-    sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
+    char host_path[SYS_FS_HOST_PATH_MAX];
+    if (!sys_fs_translate_path(ps3_path, host_path, sizeof(host_path)))
+        return (int64_t)(int32_t)CELL_ENAMETOOLONG;
 
     if (ps3_utf8_rmdir(host_path) != 0)
     {
