@@ -459,13 +459,13 @@ void trophy_toast::ensure_font()
     }
 }
 
-void trophy_toast::render_card(const pending_item& item, uint32_t screen_h)
+void trophy_toast::render_card(const pending_item& item, uint32_t ref_h)
 {
     ensure_font();
     stbtt_fontinfo font{};
     const bool has_font = !m_font_data.empty() && stbtt_InitFont(&font, m_font_data.data(), stbtt_GetFontOffsetForIndex(m_font_data.data(), 0));
 
-    const float k = std::clamp((float)screen_h / 720.f, 0.75f, 3.0f);
+    const float k = std::clamp((float)ref_h / 720.f, 0.75f, 3.0f);
     const int shadow = std::max(4, (int)std::lround(8.f * k));
     const int card_h = (int)std::lround(68.f * k);
     const int pad = (int)std::lround(9.f * k);
@@ -498,7 +498,7 @@ void trophy_toast::render_card(const pending_item& item, uint32_t screen_h)
     const int tex_h = card_h + shadow * 2;
     m_tex_w = (uint32_t)tex_w;
     m_tex_h = (uint32_t)tex_h;
-    m_built_screen_h = screen_h;
+    m_built_ref_h = ref_h;
     m_pixels.assign((size_t)tex_w * tex_h * 4u, 0);
 
     const float cx = shadow + card_w * 0.5f;
@@ -750,14 +750,15 @@ bool trophy_toast::record(VkCommandBuffer cmd, VkImage target, VkImageView targe
             m_queue.pop_front();
         }
     }
+    const uint32_t ref_h = std::min(extent.height, extent.width * 9u / 16u);
     if (!m_active) {
         if (m_queue.empty()) return false;
-        render_card(m_queue.front(), extent.height);
+        render_card(m_queue.front(), ref_h);
         m_start_ns = toast_now_ns();
         m_active = true;
         play_chime();
-    } else if (m_built_screen_h != extent.height && !m_queue.empty()) {
-        render_card(m_queue.front(), extent.height);
+    } else if (m_built_ref_h != ref_h && !m_queue.empty()) {
+        render_card(m_queue.front(), ref_h);
     }
 
     if (m_needs_upload) upload_card(cmd);
@@ -775,7 +776,7 @@ bool trophy_toast::record(VkCommandBuffer cmd, VkImage target, VkImageView targe
     }
     if (e <= 0.004f) return false;
 
-    const float k = std::clamp((float)extent.height / 720.f, 0.75f, 3.0f);
+    const float k = std::clamp((float)ref_h / 720.f, 0.75f, 3.0f);
     const float margin = 18.f * k;
     const float slide = (1.f - e) * 44.f * k;
     const float px0 = (float)extent.width - (float)m_tex_w - margin + slide;

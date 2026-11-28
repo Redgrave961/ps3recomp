@@ -37,7 +37,7 @@ private:
 
     bool ensure_pipeline(VkFormat format);
     void ensure_font();
-    void render_card(const pending_item& item, uint32_t screen_h);
+    void render_card(const pending_item& item, uint32_t ref_h);
     void upload_card(VkCommandBuffer cmd);
     void retire_current();
     void gc_retired();
@@ -70,7 +70,7 @@ private:
     bool m_active = false;
     uint64_t m_start_ns = 0;
     uint64_t m_hold_ns = 4500000000ull;
-    uint32_t m_built_screen_h = 0;
+    uint32_t m_built_ref_h = 0;
 
     bool m_font_tried = false;
     std::vector<uint8_t> m_font_data;

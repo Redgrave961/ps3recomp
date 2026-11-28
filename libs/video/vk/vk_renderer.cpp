@@ -540,7 +540,7 @@ scale2d renderer::scale_for(u32 width, u32 height, u32 aa_u, u32 aa_v, bool dept
     if (std::max(width, height) < 128u || std::min(width, height) < 64u) return {};
     if (width <= 640u && height <= 360u) return {};
     const bool wide = (width * aa_u) * 10u >= (height * aa_v) * 15u;
-    const scale2d s = wide ? base : scale2d{ base.y, base.y };
+    const scale2d s = wide ? base : scale2d{ base.iso(), base.iso() };
     const u32 max_dim = m_d ? m_d->props.limits.maxImageDimension2D : 4096u;
     if (s.x.edge(width * aa_u) > max_dim || s.y.edge(height * aa_v) > max_dim) return {};
     return s;
@@ -1682,7 +1682,7 @@ bool renderer::run_upscale(const rsx_vk_upscale_frame& frame)
         return upscale_failed(UP_DEPTH_SIZE);
 
     const bool wide = (m_scene_color->width * m_scene_color->aa_u) * 10u >= (m_scene_color->height * m_scene_color->aa_v) * 15u;
-    const scale2d dst_scale = display_scale.unit() ? scale2d{} : (wide ? display_scale : scale2d{ display_scale.y, display_scale.y });
+    const scale2d dst_scale = display_scale.unit() ? scale2d{} : (wide ? display_scale : scale2d{ display_scale.iso(), display_scale.iso() });
     const u32 out_w = dst_scale.x.edge(m_scene_color->width * m_scene_color->aa_u);
     const u32 out_h = dst_scale.y.edge(m_scene_color->height * m_scene_color->aa_v);
     if (!out_w || !out_h) return upscale_failed(UP_INVALID);

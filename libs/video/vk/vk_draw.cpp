@@ -369,7 +369,7 @@ bool renderer::upload_vertices(const rsx::draw_clause& clause, u32 first, u32 co
     layout.clip_planes = planes;
     layout.transform_branch_bits = r(rsx::M_TRANSFORM_BRANCH_BITS);
     layout.point_size = f(rsx::M_POINT_SIZE);
-    layout.point_scale = m_fb.scale.y.value();
+    layout.point_scale = m_fb.scale.iso().value();
 
     return upload(m_layout_upload, &layout, sizeof layout, layout_info);
 }

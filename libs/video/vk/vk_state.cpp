@@ -173,7 +173,8 @@ void set_dynamic_state(VkCommandBuffer cmd, const frontend& f, const vk_device& 
     s.scissor = { { (int32_t)ex, (int32_t)ey }, { t.scale.x.edge(x1 * t.aa_u) - ex, t.scale.y.edge(y1 * t.aa_v) - ey } };
 
     const uint32_t lw = f.r(rsx::M_LINE_WIDTH);
-    const float width = ((float)(lw >> 3) + (float)(lw & 7u) / 8.f) * t.scale.y.value();
+    const float iso = t.scale.iso().value();
+    const float width = ((float)(lw >> 3) + (float)(lw & 7u) / 8.f) * iso;
     s.line_width = d.features.features.wideLines ? std::clamp(width, d.props.limits.lineWidthRange[0], d.props.limits.lineWidthRange[1]) : 1.f;
 
     const uint32_t cls = topology_class(prim);
@@ -184,8 +185,7 @@ void set_dynamic_state(VkCommandBuffer cmd, const frontend& f, const vk_device& 
     if (s.bias_enable) {
         s.bias[0] = game_bias && t.depth_float ? f.f(rsx::M_POLY_OFFSET_BIAS) : 0.f;
         s.bias[1] = 0.f;
-        s.bias[2] = (game_bias ? f.f(rsx::M_POLY_OFFSET_SCALE) * t.scale.y.value() : 0.f) +
-                    (t.shadow_map ? k_shadow_slope_bias * t.scale.y.value() : 0.f);
+        s.bias[2] = (game_bias ? f.f(rsx::M_POLY_OFFSET_SCALE) * iso : 0.f) + (t.shadow_map ? k_shadow_slope_bias * iso : 0.f);
     }
 
     const uint32_t c1 = f.r(rsx::M_BLEND_COLOR);

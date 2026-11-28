@@ -24,6 +24,7 @@ struct ratio {
 struct scale2d {
     ratio x;
     ratio y;
+    ratio iso() const { return y > x ? x : y; }
     bool unit() const { return x.unit() && y.unit(); }
     bool operator==(const scale2d&) const = default;
 };

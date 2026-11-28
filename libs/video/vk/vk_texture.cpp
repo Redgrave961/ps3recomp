@@ -579,7 +579,7 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
             state.control |= 0xFu << RSX_SPV_TEXC_SEXT_SHIFT;
         }
         if (s->depth && d.ops.depth_compare) {
-            const float sc = std::max(s->scale.y.value(), 1.0f);
+            const float sc = std::max(s->scale.iso().value(), 1.0f);
             const float pcf_rad = sc > 1.0f ? std::min(1.0f, (sc - 1.0f) * 0.5f) : 0.0f;
             std::memcpy(&state.remap, &pcf_rad, sizeof pcf_rad);
         }
