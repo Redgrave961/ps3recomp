@@ -77,6 +77,9 @@ struct surface {
     u64 depth_version = 0;
     image native;
     u64 native_version = ~0ull;
+    image alt;
+    scale2d alt_scale;
+    u64 alt_flip = 0;
     u32 bytes() const { return pitch * height * aa_v; }
 };
 
@@ -160,7 +163,7 @@ private:
     surface* surface_at(u32 ea, u32 pitch, u32 bpp, u32& x, u32& y);
     surface* scanout_surface(u32 ea, u32 pitch) const;
     scale2d scale_for(u32 width, u32 height, u32 aa_u, u32 aa_v, bool depth, bool depth_only = false) const;
-    void rescale_surface(VkCommandBuffer c, surface& s, scale2d to);
+    void rescale_surface(VkCommandBuffer c, surface& s, scale2d to, bool keep = true);
     surface* surface_for(u32 ea, u32 pitch, u32 width, u32 height, u32 format, bool depth, u32 aa_u, u32 aa_v,
                          const surface* const* keep = nullptr, u32 keep_count = 0, bool depth_only = false);
     bool create_image(image& img, VkFormat format, u32 width, u32 height, VkImageUsageFlags usage, VkImageAspectFlags aspect);
@@ -190,6 +193,7 @@ private:
     bool m_fb_valid = false;
     bool m_fb_dirty = true;
     u32 m_fb_context = ~0u;
+    u32 m_clear_discard = 0;
     u32 m_dyn_dirty = ~0u;
     u32 m_last_dyn_prim = ~0u;
     bool m_last_dyn_restart = false;

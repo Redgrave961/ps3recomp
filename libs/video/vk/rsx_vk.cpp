@@ -1362,6 +1362,11 @@ extern "C" int rsx_vk_upscaler_active(void)
     return g.upscale_active.load(std::memory_order_relaxed);
 }
 
+extern "C" void rsx_vk_on_crash(void)
+{
+    vk::drop_caches_if_compiling();
+}
+
 extern "C" int rsx_vk_upscaler_caps(void)
 {
     return g.r.upscaler_caps();

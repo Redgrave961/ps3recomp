@@ -21,6 +21,15 @@ namespace vk {
 
 class shader_cache;
 
+struct compile_guard {
+    compile_guard();
+    ~compile_guard();
+    compile_guard(const compile_guard&) = delete;
+    compile_guard& operator=(const compile_guard&) = delete;
+};
+
+void drop_caches_if_compiling();
+
 struct blend_attachment {
     uint32_t enable;
     uint32_t src_color;

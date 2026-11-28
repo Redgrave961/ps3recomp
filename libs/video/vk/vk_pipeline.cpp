@@ -9,6 +9,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #else
+#include <fcntl.h>
 #include <sys/resource.h>
 #include <unistd.h>
 #endif
@@ -18,6 +19,8 @@ namespace vk {
 namespace {
 
 thread_local bool g_replay = false;
+thread_local unsigned t_compiling = 0;
+std::string g_cache_files[2];
 
 constexpr unsigned k_urgent_workers = 2;
 
@@ -77,6 +80,31 @@ bool read_file(const std::string& path, std::vector<uint8_t>& out)
     return ok;
 }
 
+void truncate_utf8(const std::string& path)
+{
+#ifdef _WIN32
+    wchar_t w[2048];
+    if (MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, w, 2048) <= 0) return;
+    const HANDLE h = CreateFileW(w, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, TRUNCATE_EXISTING, 0, nullptr);
+    if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+#else
+    const int fd = open(path.c_str(), O_WRONLY | O_TRUNC);
+    if (fd >= 0) close(fd);
+#endif
+}
+
+}
+
+compile_guard::compile_guard() { t_compiling++; }
+
+compile_guard::~compile_guard() { t_compiling--; }
+
+void drop_caches_if_compiling()
+{
+    if (!t_compiling) return;
+    for (const std::string& f : g_cache_files)
+        if (!f.empty()) truncate_utf8(f);
+    std::fprintf(stderr, "[vk] crashed while compiling shaders: shader caches discarded, they rebuild on the next launch\n");
 }
 
 bool pipelines::create(vk_device& d, const std::string& cache_path)
@@ -115,15 +143,22 @@ bool pipelines::create(vk_device& d, const std::string& cache_path)
     li.pSetLayouts = m_sets;
     VK_TRY(vkCreatePipelineLayout(d.dev, &li, nullptr, &m_layout));
 
+    const size_t slash = m_cache_path.find_last_of("/\\");
+    m_db_path = m_cache_path.substr(0, slash == std::string::npos ? 0 : slash + 1) + "vk_shaders.db";
+    g_cache_files[0] = m_cache_path;
+    g_cache_files[1] = m_db_path;
     std::vector<uint8_t> blob;
     read_file(m_cache_path, blob);
     VkPipelineCacheCreateInfo ci{ VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
     ci.initialDataSize = blob.size();
     ci.pInitialData = blob.empty() ? nullptr : blob.data();
-    if (vkCreatePipelineCache(d.dev, &ci, nullptr, &m_cache) != VK_SUCCESS) {
-        ci.initialDataSize = 0;
-        ci.pInitialData = nullptr;
-        VK_TRY(vkCreatePipelineCache(d.dev, &ci, nullptr, &m_cache));
+    {
+        const compile_guard guard;
+        if (vkCreatePipelineCache(d.dev, &ci, nullptr, &m_cache) != VK_SUCCESS) {
+            ci.initialDataSize = 0;
+            ci.pInitialData = nullptr;
+            VK_TRY(vkCreatePipelineCache(d.dev, &ci, nullptr, &m_cache));
+        }
     }
 
     m_dynamic = {
@@ -218,8 +253,6 @@ bool pipelines::create(vk_device& d, const std::string& cache_path)
         }
     }
 
-    const size_t slash = m_cache_path.find_last_of("/\\");
-    m_db_path = m_cache_path.substr(0, slash == std::string::npos ? 0 : slash + 1) + "vk_shaders.db";
     m_db = open_utf8(m_db_path, "ab+");
     const unsigned n = std::max(k_urgent_workers + 1u, std::thread::hardware_concurrency());
     m_background_limit = d.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 2u : n - k_urgent_workers;
@@ -427,7 +460,8 @@ void pipelines::precompile(shader_cache& shaders)
         std::fseek(m_db, 0, SEEK_END);
         std::unordered_set<uint64_t> seen;
         size_t total_raw = 0;
-        for (size_t at = 0; at + 9 <= data->size();) {
+        size_t at = 0;
+        while (at + 9 <= data->size()) {
             rec r{ (char)(*data)[at] };
             std::memcpy(&r.an, data->data() + at + 1, 4);
             std::memcpy(&r.bn, data->data() + at + 5, 4);
@@ -445,7 +479,7 @@ void pipelines::precompile(shader_cache& shaders)
             if (r.bn) h = shader_cache::hash(r.b, r.bn, h);
             if (seen.insert(h).second) recs->push_back(r);
         }
-        if (recs->size() < total_raw) {
+        if (recs->size() < total_raw || at < data->size()) {
             const std::string tmp = m_db_path + ".tmp";
             if (FILE* f = open_utf8(tmp, "wb")) {
                 bool ok = true;
@@ -567,6 +601,7 @@ VkPipeline pipelines::create_pipeline(VkGraphicsPipelineCreateInfo pi) const
     const VkPipelineCreationFeedbackCreateInfo fi{ VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO, pi.pNext, &feedback, 0, nullptr };
     pi.pNext = &fi;
     VkPipeline p = VK_NULL_HANDLE;
+    const compile_guard guard;
     if (vkCreateGraphicsPipelines(m_d->dev, m_cache, 1, &pi, nullptr, &p) != VK_SUCCESS) return VK_NULL_HANDLE;
     if (!(feedback.flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT))
         m_cache_dirty.store(true, std::memory_order_relaxed);

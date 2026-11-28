@@ -117,6 +117,7 @@ const vertex_program* shader_cache::vertex(const uint32_t* program_in, const rsx
         const uint32_t* program = words.data();
         auto vp = std::make_unique<vertex_program>();
         vp->hash = h;
+        const compile_guard guard;
         rsx_spv_blob blob{};
         const bool ok = rsx_spv_vertex(program, &mk, &blob, &vp->info) == 0 && make_module(vp->code, blob, VK_SHADER_STAGE_VERTEX_BIT);
         rsx_spv_blob_free(&blob);
@@ -162,6 +163,7 @@ const fragment_program* shader_cache::fragment(const uint32_t* ucode, uint32_t m
         const uint32_t end = (uint32_t)words.size();
         auto fp = std::make_unique<fragment_program>();
         fp->hash = h;
+        const compile_guard guard;
         rsx_spv_blob blob{};
         const bool ok = rsx_spv_fragment(words.data(), end, &mk, &blob, &fp->info) == 0 && make_module(fp->code, blob, VK_SHADER_STAGE_FRAGMENT_BIT);
         rsx_spv_blob_free(&blob);

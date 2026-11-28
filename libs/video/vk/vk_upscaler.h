@@ -29,7 +29,7 @@ private:
     void destroy_mv_image();
     bool init_ffx();
     void destroy_ffx_context();
-    bool ensure_ffx_context(uint32_t render_w, uint32_t render_h, uint32_t display_w, uint32_t display_h);
+    bool ensure_ffx_context(uint32_t max_w, uint32_t max_h);
     bool init_ngx(const std::string& cache_path);
     void release_ffx();
     void release_ngx();
@@ -49,7 +49,7 @@ private:
 
     void* m_ffx_mod = nullptr;
     void* m_ffx_ctx = nullptr;
-    uint32_t m_ffx_rw = 0, m_ffx_rh = 0, m_ffx_dw = 0, m_ffx_dh = 0;
+    uint32_t m_ffx_dw = 0, m_ffx_dh = 0;
     char m_fsr_version[32] = "3.1";
 
     void* m_ngx_mod = nullptr;

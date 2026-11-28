@@ -160,6 +160,7 @@ void renderer::close()
         destroy_image(s->snapshot);
         destroy_image(s->as_color);
         destroy_image(s->native);
+        destroy_image(s->alt);
     }
     for (auto& g : m_garbage) destroy_image(g.second);
     destroy_image(m_display);
@@ -525,6 +526,7 @@ void renderer::retire(surface* s)
     discard(s->snapshot);
     discard(s->as_color);
     discard(s->native);
+    discard(s->alt);
     auto it = std::find_if(m_surfaces.begin(), m_surfaces.end(), [s](const std::unique_ptr<surface>& p) { return p.get() == s; });
     if (it != m_surfaces.end()) m_surfaces.erase(it);
     m_binding_gen++;
@@ -555,7 +557,8 @@ surface* renderer::surface_for(u32 ea, u32 pitch, u32 width, u32 height, u32 for
         if (s->gcm_format != format || s->pitch != pitch || s->aa_u != aa_u || s->aa_v != aa_v) continue;
         if (s->scale != scale && s->width >= width && s->height >= height) {
             end_rendering();
-            rescale_surface(cmd(), *s, scale);
+            const bool cleared = (m_clear_discard & (depth ? 2u : 1u)) && s->width == width && s->height == height;
+            rescale_surface(cmd(), *s, scale, !cleared);
             m_binding_gen++;
         }
         if (s->scale != scale) continue;
@@ -1180,16 +1183,24 @@ void renderer::on_clear(u32 mask)
     u32 context = 0;
     if (mask & CLEAR_RGBA) context |= FB_CLEAR_COLOR;
     if (mask & (CLEAR_Z | CLEAR_S)) context |= FB_CLEAR_DEPTH;
-    if (!bind_framebuffer(context == (FB_CLEAR_COLOR | FB_CLEAR_DEPTH) ? 3u : context)) return;
-
     const u32 sh = r(rsx::M_SCISSOR_H), sv = r(rsx::M_SCISSOR_V);
+    const u32 fmt = r(rsx::M_SURFACE_FORMAT);
+    const u32 color_fmt = fmt & 0x1Fu, depth_fmt = (fmt >> 5) & 7u;
+    const bool covers = !(sh & 0xFFFFu) && !(sv & 0xFFFFu) && (sh >> 16) >= (r(rsx::M_SURFACE_CLIP_H) >> 16) &&
+                        (sv >> 16) >= (r(rsx::M_SURFACE_CLIP_V) >> 16);
+    if (covers) {
+        if ((mask & CLEAR_RGBA) == CLEAR_RGBA && color_fmt != 11 && color_fmt != 12 && color_fmt != 13) m_clear_discard |= 1u;
+        if ((mask & CLEAR_Z) && (depth_fmt == 1 || (depth_fmt == 2 && (mask & CLEAR_S)))) m_clear_discard |= 2u;
+    }
+    const bool bound = bind_framebuffer(context == (FB_CLEAR_COLOR | FB_CLEAR_DEPTH) ? 3u : context);
+    m_clear_discard = 0;
+    if (!bound) return;
+
     const u32 x0 = std::min(sh & 0xFFFFu, m_fb.width), y0 = std::min(sv & 0xFFFFu, m_fb.height);
     const u32 x1 = std::min((sh & 0xFFFFu) + (sh >> 16), m_fb.width), y1 = std::min((sv & 0xFFFFu) + (sv >> 16), m_fb.height);
     if (x1 <= x0 || y1 <= y0) return;
     const bool full = x0 == 0 && y0 == 0 && x1 == m_fb.width && y1 == m_fb.height;
 
-    const u32 fmt = r(rsx::M_SURFACE_FORMAT);
-    const u32 color_fmt = fmt & 0x1Fu, depth_fmt = (fmt >> 5) & 7u;
     u32 color_mask = mask & CLEAR_RGBA;
     if (color_fmt == 11 || color_fmt == 12 || color_fmt == 13) color_mask = 0;
     const bool full_color = color_mask == CLEAR_RGBA;
@@ -1639,13 +1650,16 @@ void renderer::flip_reset()
     m_fb_valid = false;
     m_fb_dirty = true;
     m_dyn_dirty = ~0u;
-    if ((++m_flips & 255u) == 0)
+    if ((++m_flips & 255u) == 0) {
         m_textures.erase_if([this](uint64_t, const std::unique_ptr<texture_entry>& e) {
             if (m_flips - e->used <= 1800u) return false;
             discard(e->img);
             m_binding_gen++;
             return true;
         });
+        for (auto& p : m_surfaces)
+            if (m_flips - p->alt_flip > 256u) discard(p->alt);
+    }
     if ((m_flips & 63u) == 0) evict(64);
 }
 
@@ -1680,28 +1694,39 @@ bool renderer::run_upscale(const rsx_vk_upscale_frame& frame)
         return true;
     }
 
-    const VkFormat src_fmt = m_scene_color->img.format;
-    const bool need_conv = src_fmt != VK_FORMAT_R16G16B16A16_SFLOAT;
-    const VkFormat up_fmt = VK_FORMAT_R16G16B16A16_SFLOAT;
+    constexpr VkFormat k_up_fmt = VK_FORMAT_R16G16B16A16_SFLOAT;
+    surface& scene = *m_scene_color;
+    const VkFormat scene_fmt = scene.img.format;
+    const bool direct_in = scene_fmt == k_up_fmt || scene_fmt == VK_FORMAT_R8G8B8A8_UNORM || scene_fmt == VK_FORMAT_B8G8R8A8_UNORM;
+    const bool direct_out = scene_fmt == k_up_fmt || scene_fmt == VK_FORMAT_R8G8B8A8_UNORM;
 
     end_rendering();
     VkCommandBuffer c = cmd();
-    image* color_in = &m_scene_color->img;
-    if (need_conv) {
-        if (m_upscale_src.width != m_scene_color->img.width || m_upscale_src.height != m_scene_color->img.height || m_upscale_src.format != up_fmt) {
+    image* color_in = &scene.img;
+    if (!direct_in) {
+        if (m_upscale_src.width != scene.img.width || m_upscale_src.height != scene.img.height) {
             discard(m_upscale_src);
-            if (!create_image(m_upscale_src, up_fmt, m_scene_color->img.width, m_scene_color->img.height,
-                              VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT))
+            if (!create_image(m_upscale_src, k_up_fmt, scene.img.width, scene.img.height, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                              VK_IMAGE_ASPECT_COLOR_BIT))
                 return false;
         }
-        scale_blit(c, m_scene_color->img, m_upscale_src, VK_FILTER_NEAREST);
+        scale_blit(c, scene.img, m_upscale_src, VK_FILTER_NEAREST);
         color_in = &m_upscale_src;
     }
 
-    if (m_upscale_out.width != out_w || m_upscale_out.height != out_h || m_upscale_out.format != up_fmt) {
-        discard(m_upscale_out);
-        if (!create_image(m_upscale_out, up_fmt, out_w, out_h, surface_usage(false, true), VK_IMAGE_ASPECT_COLOR_BIT))
-            return false;
+    image& target = scene.alt;
+    if (!target.handle || target.width != out_w || target.height != out_h || target.format != scene_fmt ||
+        (direct_out && !(target.usage & VK_IMAGE_USAGE_STORAGE_BIT))) {
+        discard(target);
+        if (!create_image(target, scene_fmt, out_w, out_h, surface_usage(false, direct_out), VK_IMAGE_ASPECT_COLOR_BIT)) return false;
+    }
+    image* out = &target;
+    if (!direct_out) {
+        if (m_upscale_out.width != out_w || m_upscale_out.height != out_h) {
+            discard(m_upscale_out);
+            if (!create_image(m_upscale_out, k_up_fmt, out_w, out_h, surface_usage(false, true), VK_IMAGE_ASPECT_COLOR_BIT)) return false;
+        }
+        out = &m_upscale_out;
     }
 
     const VkImageView depth_view = (m_scene_depth->img.aspect == VK_IMAGE_ASPECT_DEPTH_BIT)
@@ -1725,7 +1750,7 @@ bool renderer::run_upscale(const rsx_vk_upscale_frame& frame)
             VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_READ_BIT);
     barrier(c, m_scene_depth->img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
             VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_READ_BIT);
-    barrier(c, m_upscale_out, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+    barrier(c, *out, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
             VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
 
     const bool ok = m_upscaler.dispatch(
@@ -1733,7 +1758,7 @@ bool renderer::run_upscale(const rsx_vk_upscale_frame& frame)
         color_in->handle, color_in->view, color_in->format,
         m_scene_depth->img.handle, depth_view, m_scene_depth->img.format,
         vel_view,
-        m_upscale_out.handle, m_upscale_out.view, m_upscale_out.format,
+        out->handle, out->view, out->format,
         color_in->width, color_in->height, out_w, out_h, f);
 
     invalidate_graphics_state();
@@ -1741,7 +1766,7 @@ bool renderer::run_upscale(const rsx_vk_upscale_frame& frame)
         std::fprintf(stderr, "[vk] upscale dispatch failed: mode=%d in=%ux%u(fmt=%d) depth=%ux%u(fmt=%d) out=%ux%u(fmt=%d)\n",
                      upscale_mode, color_in->width, color_in->height, (int)color_in->format,
                      m_scene_depth->img.width, m_scene_depth->img.height, (int)m_scene_depth->img.format,
-                     out_w, out_h, (int)m_upscale_out.format);
+                     out_w, out_h, (int)out->format);
         return upscale_failed(UP_DISPATCH);
     }
     m_up_count[UP_OK]++;
@@ -1750,26 +1775,19 @@ bool renderer::run_upscale(const rsx_vk_upscale_frame& frame)
     m_up_out[0] = out_w;
     m_up_out[1] = out_h;
 
-    m_upscale_out.layout = VK_IMAGE_LAYOUT_GENERAL;
-    m_upscale_out.stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    m_upscale_out.access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    out->layout = VK_IMAGE_LAYOUT_GENERAL;
+    out->stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    out->access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    if (!direct_out) scale_blit(c, m_upscale_out, target, VK_FILTER_NEAREST);
 
-    if (m_scene_color->img.width == out_w && m_scene_color->img.height == out_h) {
-        scale_blit(c, m_upscale_out, m_scene_color->img, VK_FILTER_NEAREST);
-    } else {
-        image dst_img{};
-        if (!create_image(dst_img, src_fmt, out_w, out_h, surface_usage(false), VK_IMAGE_ASPECT_COLOR_BIT))
-            return false;
-        scale_blit(c, m_upscale_out, dst_img, VK_FILTER_NEAREST);
-        discard(m_scene_color->img);
-        m_scene_color->img = std::move(dst_img);
-    }
-
-    discard(m_scene_color->snapshot);
-    discard(m_scene_color->as_color);
-    discard(m_scene_color->native);
-    m_scene_color->scale = dst_scale;
-    m_scene_color->version = ++m_content_clock;
+    std::swap(scene.img, scene.alt);
+    scene.alt_scale = scene.scale;
+    scene.alt_flip = m_flips;
+    discard(scene.snapshot);
+    discard(scene.as_color);
+    discard(scene.native);
+    scene.scale = dst_scale;
+    scene.version = ++m_content_clock;
     m_upscaled_this_frame = true;
     for (unit_binding& b : m_units) b.sampler = VK_NULL_HANDLE;
     m_fb_valid = false;
@@ -1790,26 +1808,38 @@ void renderer::rescale(scale2d scale)
     dirty |= rsx::D_TEXTURES;
     VkCommandBuffer c = cmd();
     end_rendering();
-    for (auto& p : m_surfaces) rescale_surface(c, *p, scale_for(p->width, p->height, p->aa_u, p->aa_v, p->depth, p->depth_only));
+    for (auto& p : m_surfaces) {
+        rescale_surface(c, *p, scale_for(p->width, p->height, p->aa_u, p->aa_v, p->depth, p->depth_only));
+        discard(p->alt);
+    }
 }
 
-void renderer::rescale_surface(VkCommandBuffer c, surface& s, scale2d to)
+void renderer::rescale_surface(VkCommandBuffer c, surface& s, scale2d to, bool keep)
 {
     if (to == s.scale) return;
+    const u32 w = to.x.edge(s.width * s.aa_u), h = to.y.edge(s.height * s.aa_v);
     image img{};
-    if (!create_image(img, s.img.format, to.x.edge(s.width * s.aa_u), to.y.edge(s.height * s.aa_v), surface_usage(s.depth), s.img.aspect)) {
+    if (s.alt.handle && s.alt_scale == to && s.alt.width == w && s.alt.height == h && s.alt.format == s.img.format) {
+        img = std::move(s.alt);
+        s.alt = image{};
+    } else if (!create_image(img, s.img.format, w, h, surface_usage(s.depth), s.img.aspect)) {
         discard(img);
         return;
     }
-    if (s.state == SURFACE_VALID) {
+    if (!keep) {
+        s.state = SURFACE_UNINITIALIZED;
+    } else if (s.state == SURFACE_VALID) {
         if (!s.depth) scale_blit(c, s.img, img, supports_linear_blit(s.img.format) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
         else if (!scale_depth(c, s.img, img)) s.state = SURFACE_UNINITIALIZED;
     }
-    discard(s.img);
+    discard(s.alt);
     discard(s.snapshot);
     discard(s.as_color);
     if (to.unit()) discard(s.native);
-    s.img = img;
+    s.alt = std::move(s.img);
+    s.alt_scale = s.scale;
+    s.alt_flip = m_flips;
+    s.img = std::move(img);
     s.scale = to;
     s.version = ++m_content_clock;
     s.depth_version = s.version;

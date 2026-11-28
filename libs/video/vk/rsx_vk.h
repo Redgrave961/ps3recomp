@@ -80,6 +80,7 @@ void rsx_vk_upscale_render_size(u32 display_w, u32 display_h, int mode, u32* out
 void rsx_vk_upscale_jitter(int mode, u32 render_w, u32 display_w, u32 frame_index, float* out_jx, float* out_jy);
 void rsx_vk_upscale_capture_velocity(void);
 void rsx_vk_upscale_trigger(const rsx_vk_upscale_frame* frame);
+void rsx_vk_on_crash(void);
 
 #ifdef __cplusplus
 }

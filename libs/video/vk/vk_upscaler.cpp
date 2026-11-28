@@ -210,6 +210,13 @@ float mode_ratio(int mode)
     }
 }
 
+VkExtent2D output_tier(uint32_t w, uint32_t h)
+{
+    if (w <= 1920u && h <= 1080u) return { 1920u, 1080u };
+    if (w <= 3840u && h <= 2160u) return { 3840u, 2160u };
+    return { std::max(w, 7680u), std::max(h, 4320u) };
+}
+
 bool is_fsr_mode(int mode)
 {
     return mode >= RSX_VK_UPSCALE_FSR_NATIVE && mode <= RSX_VK_UPSCALE_FSR_PERFORMANCE;
@@ -402,13 +409,12 @@ void upscaler::destroy_ffx_context()
         g_ffx.destroy(&ctx, nullptr);
     }
     m_ffx_ctx = nullptr;
-    m_ffx_rw = m_ffx_rh = m_ffx_dw = m_ffx_dh = 0;
+    m_ffx_dw = m_ffx_dh = 0;
 }
 
-bool upscaler::ensure_ffx_context(uint32_t render_w, uint32_t render_h, uint32_t display_w, uint32_t display_h)
+bool upscaler::ensure_ffx_context(uint32_t max_w, uint32_t max_h)
 {
-    if (m_ffx_ctx && m_ffx_rw == render_w && m_ffx_rh == render_h && m_ffx_dw == display_w && m_ffx_dh == display_h)
-        return true;
+    if (m_ffx_ctx && m_ffx_dw == max_w && m_ffx_dh == max_h) return true;
     destroy_ffx_context();
     ffxCreateBackendVKDesc backend{};
     backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
@@ -426,8 +432,8 @@ bool upscaler::ensure_ffx_context(uint32_t render_w, uint32_t render_h, uint32_t
     desc.header.pNext = &ver.header;
     desc.flags = FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE;
     desc.fpMessage = [](uint32_t, const wchar_t* message) { std::fprintf(stderr, "[ffx] %ls\n", message); };
-    desc.maxRenderSize = { render_w, render_h };
-    desc.maxUpscaleSize = { display_w, display_h };
+    desc.maxRenderSize = { max_w, max_h };
+    desc.maxUpscaleSize = { max_w, max_h };
 
     ffxContext ctx = nullptr;
     ffxReturnCode_t rc = g_ffx.create(&ctx, &desc.header, nullptr);
@@ -436,15 +442,12 @@ bool upscaler::ensure_ffx_context(uint32_t render_w, uint32_t render_h, uint32_t
         rc = g_ffx.create(&ctx, &desc.header, nullptr);
     }
     if (rc != FFX_API_RETURN_OK || !ctx) {
-        std::fprintf(stderr, "[vk] FSR context creation failed: code %d, render %ux%u, output %ux%u\n", (int)rc, render_w, render_h,
-                     display_w, display_h);
+        std::fprintf(stderr, "[vk] FSR context creation failed: code %d, output %ux%u\n", (int)rc, max_w, max_h);
         return false;
     }
     m_ffx_ctx = ctx;
-    m_ffx_rw = render_w;
-    m_ffx_rh = render_h;
-    m_ffx_dw = display_w;
-    m_ffx_dh = display_h;
+    m_ffx_dw = max_w;
+    m_ffx_dh = max_h;
     return true;
 }
 
@@ -649,8 +652,9 @@ bool upscaler::dispatch(VkCommandBuffer cmd, int mode,
     m_dropped = 0;
     const bool fsr = is_fsr_mode(mode) && m_ffx_mod;
     const bool dlss = is_dlss_mode(mode) && m_ngx_mod;
-    if (!m_mv_pipe || !(fsr || dlss) || !ensure_mv_image(render_w, render_h)) return false;
-    if (fsr ? !ensure_ffx_context(render_w, render_h, display_w, display_h)
+    const VkExtent2D tier = output_tier(display_w, display_h);
+    if (!m_mv_pipe || !(fsr || dlss) || !ensure_mv_image(tier.width, tier.height)) return false;
+    if (fsr ? !ensure_ffx_context(tier.width, tier.height)
             : !ensure_ngx_feature(cmd, mode, render_w, render_h, display_w, display_h)) {
         std::fprintf(stderr, "[vk] %s unavailable on this device, disabling it\n", fsr ? "FSR" : "DLSS");
         if (fsr) release_ffx();
@@ -748,7 +752,7 @@ bool upscaler::dispatch(VkCommandBuffer cmd, int mode,
     const VkImageSubresourceRange depth_sr{ VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 };
     NVSDK_NGX_Resource_VK r_color = NVSDK_NGX_Create_ImageView_Resource_VK(color_view, color_img, color_sr, color_fmt, render_w, render_h, false);
     NVSDK_NGX_Resource_VK r_depth = NVSDK_NGX_Create_ImageView_Resource_VK(depth_view, depth_img, depth_sr, depth_fmt, render_w, render_h, false);
-    NVSDK_NGX_Resource_VK r_mv = NVSDK_NGX_Create_ImageView_Resource_VK(m_mv_view, m_mv_img, color_sr, VK_FORMAT_R16G16_SFLOAT, render_w, render_h, false);
+    NVSDK_NGX_Resource_VK r_mv = NVSDK_NGX_Create_ImageView_Resource_VK(m_mv_view, m_mv_img, color_sr, VK_FORMAT_R16G16_SFLOAT, m_mv_w, m_mv_h, false);
     NVSDK_NGX_Resource_VK r_out = NVSDK_NGX_Create_ImageView_Resource_VK(out_view, out_img, color_sr, out_fmt, display_w, display_h, true);
     auto* p = static_cast<NVSDK_NGX_Parameter*>(m_ngx_params);
     g_ngx.set_ptr(p, NVSDK_NGX_Parameter_Color, &r_color);
